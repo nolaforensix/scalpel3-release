@@ -1,0 +1,60 @@
+.TH hpcscalpel3 "1" "" "The scalpel3 HPC Launcher" "The scalpel3 HPC Launcher"
+
+.SH NAME
+hpcscalpel3 \- HPC wrapper for distributed scalpel3 execution
+
+.SH SYNOPSIS
+.B hpcscalpel3
+[\fB-J\fR \fIstart_block\fR]
+[\fB-K\fR \fIend_block\fR]
+[\fB-A\fR \fIalgorithm\fR]
+[\fB-D\fR \fInum_nodes\fR]
+[\fB-P\fR]
+[\fB-Q\fR \fIblocksize\fR]
+[\fB-X\fR]
+\fIimgfilename\fR
+\fIblockmapfilename\fR
+\fB--scalpel\fR
+[\fIscalpel options\fR]
+
+.SH DESCRIPTION
+.PP
+\fBhpcscalpel3\fR is a high-performance computing wrapper that partitions
+a disk image into windows and launches multiple \fBscalpel3\fR(1) instances
+across distributed nodes.  Each instance processes a portion of the image,
+and results are merged afterward.
+.PP
+All options after \fB--scalpel\fR are passed directly to the underlying
+\fBscalpel3\fR instance.
+
+.SH OPTIONS
+.PP
+.TP
+.BI -J " start_block"
+Start block for the carve window.
+.TP
+.BI -K " end_block"
+End block for the carve window.
+.TP
+.BI -A " algorithm"
+Windowing algorithm for partitioning the image.
+.TP
+.BI -D " num_nodes"
+Number of distributed processes.
+.TP
+.B -P
+Auto-determine the number of processes.
+.TP
+.BI -Q " blocksize"
+Blocksize in bytes (must be divisible by 512).
+.TP
+.B -X
+Enable debug output.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR mergeblockmap (1),
+.BR mergecps (1)
+
+.SH AUTHOR
+Golden G. Richard III.

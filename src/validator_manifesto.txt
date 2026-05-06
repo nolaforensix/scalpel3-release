@@ -1,0 +1,65 @@
+THE SCALPEL3 FILE VALIDATOR AND CUSTOM REASSEMBLY MANIFESTO:
+------------------------------------------------------------
+
+o Contiguous validation must always succeed if the data is contiguous and valid.  This must also be
+  *as fast as possible*.  Contiguous is the most common case and these blocks must be moved out of
+  the search space as fast as possible.
+
+o If it's possible that a candidate can be reassembled, do not give up early.  Scalpel3 has other
+  mechanisms for quitting early, killing candidates, etc.  Exhaust all possibilities to recover the
+  candidate, but do this as quickly as possible.
+
+o Stateful is good # 1.  If there's a way for the file validator not to start from scratch and redo
+  work it's already done when it's called, that should happen.  But the state must be maintained and
+  must be consistent.
+
+o Stateful is good # 2.  A custom reassembly function (if there is one) should lose as little work
+  across checkpoint operations as possible.
+
+o In a custom reassembly function, if you need to iterate across blocks to choose appropriate blocks
+  to add to a candidate, use the block choice API in filemirror unless that doesn't make sense.
+  Before using something else, make sure it doesn't make sense to use the block choice API in
+  filemirror.
+
+o When selecting blocks, you probably want to supplement the checks performed by
+  blockvector_get_block_choice() with additional ones (e.g., blocks are of the correct type, maybe
+  minimize reservations, etc.).  Look at LR_reassembly_get_block_choice() and the galloping code to
+  see what's necessary to intelligently iterate through available apparent blocks.
+
+o In a custom reassembly function, you MUST be responsive to checkpointing operations.  If scalpel3
+  outputs RED "+" signs, you aren't responsive enough.
+
+o To be responsive to checkpointing operations in custom reassembly functions, you MUST use calls to
+  reassembly_time_to_checkpoint().  When you call that function, the reassembly candidate MUST be a
+  in a stable state, where work can be picked back up when it's reassigned to a reassembly thread.
+
+o Across checkpoints, it's possible that the number of uncovered blocks may *increase* as a result
+  of changes to the carve window boundaries.  Validators must not cache the number of covered blocks
+  across checkpoints.
+
+o Custom reassembly functions may receive candidates with internal blocks in the blockvector marked
+  invalid because these blocks have been covered.  You MUST deal with this.  If you don't understand
+  why this can happen, read the functions sync_and_validate_queues() (carve.c) and
+  validate_blockvector() (filemirror.c) Consider having a function like
+  LR_reassembly_init_candidate() in your custom reassembly function, where you handle a deep look at
+  the blockvector and any adjustments to carve state.
+
+o Custom reassembly functions are NOT required to share work with other threads through cloning. If it
+  makes sense, do it.  But unless there is randomization or some other heuristic in place (e.g., the
+  starting point for candidate block can be chosen in a way that truly explores different potential
+  solutions in each thread), work sharing makes no sense.  If the state can't be deep-cloned, work
+  sharing makes no sense.  It's more important to maintain state that accelerates validation than to
+  have a bunch of dumb, potentially overlapping efforts that have to grind away from index 0 every
+  time.
+
+o If you have a custom reassembly function and it doesn't share work with other threads, then DO NOT
+  care about block reservations when choosing blocks.
+
+o If possible, use a set of phases for file validation or custom reassembly function.  We'll call
+  these P1, P2, ... Pn.  P1 should be as cheap as possible.  It should fail only when it *can't*
+  generate the answer.  P2, P3, ... Pn should be progressively more expensive, and in general, each
+  Pi should fail only if it can't solve the problem or continuing to try to solve it would exceed
+  the cost of Pi+1.  If there are special cases or cheap requirements that can quickly validate a
+  block or chunk of data, do it.  Make them early phases.  We need all the heuristics we can find to
+  rapidly validate candidates or to determine that we can't validate some candidates, and to reduce
+  the number of blocks that must be considered overall for all reassembly operations.

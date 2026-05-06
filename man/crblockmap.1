@@ -1,0 +1,50 @@
+.TH crblockmap "1" "" "The scalpel3 Blockmap Creator" "The scalpel3 Blockmap Creator"
+
+.SH NAME
+crblockmap \- Create a new scalpel3 blockmap
+
+.SH SYNOPSIS
+.B crblockmap
+[\fB-j\fR \fIstartblock\fR]
+[\fB-k\fR \fIendblock\fR]
+[\fB-q\fR \fIclustersize\fR]
+img_filename
+blockmap_filename
+
+.SH DESCRIPTION
+.PP
+\fBcrblockmap\fR creates a new, empty blockmap associated with a specific image file and blocksize. It performs block deduplication and zero-block detection during creation.
+.PP
+If a carve window is specified via \fB-j\fR and \fB-k\fR, deduplication and zero block detection occur only within that window. Blocks outside the window are implicitly considered covered by scalpel3.
+
+.SH OPTIONS
+.PP
+.TP
+.BI -j " startblock"
+Start of the active carve window (default 0).
+
+.TP
+.BI -k " endblock"
+End of the active carve window (default is the last block of the image).
+
+.TP
+.BI -q " clustersize"
+Block / cluster size in bytes. Must be >= 512 and a multiple of 512. Default is 512.
+
+.TP
+.I img_filename
+The source disk image.
+
+.TP
+.I blockmap_filename
+The filename for the new blockmap. \fBcrblockmap\fR will not overwrite an existing file.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR modblockmap (1),
+.BR cmpblockmaps (1),
+.BR blockmapfs (1),
+.BR fragmentator (1)
+
+.SH AUTHOR
+Golden G. Richard III.

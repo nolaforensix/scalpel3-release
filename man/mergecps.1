@@ -1,0 +1,26 @@
+.TH mergecps "1" "" "The scalpel3 Checkpoint Merger" "The scalpel3 Checkpoint Merger"
+
+.SH NAME
+mergecps \- Merge scalpel3 checkpoint directories
+
+.SH SYNOPSIS
+.B mergecps
+\fIcheckpoint_dir1\fR
+\fIcheckpoint_dir2\fR
+\fIoutput_dir\fR
+
+.SH DESCRIPTION
+.PP
+\fBmergecps\fR combines two scalpel3 checkpoint directories into a single
+output directory.  This is used after distributed or windowed carving
+(e.g., via \fBhpcscalpel3\fR(1)) to unify checkpoint state from separate
+carving runs, allowing a subsequent \fBscalpel3\fR(1) invocation to
+resume from the merged state.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR mergeblockmap (1),
+.BR hpcscalpel3 (1)
+
+.SH AUTHOR
+Golden G. Richard III.

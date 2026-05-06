@@ -1,0 +1,105 @@
+.TH fragmentator "1" "" "The scalpel3 Fragmentator" "The scalpel3 Fragmentator"
+
+.SH NAME
+fragmentator \- Generate synthetic fragmented disk images for testing
+
+.SH SYNOPSIS
+.B fragmentator
+[\fB-a\fR \fIinitialrandomblocks\fR]
+[\fB-b\fR \fIinitialzeroblocks\fR]
+[\fB-c\fR]
+[\fB-f\fR \fIZERO|RANDOM|FILE\fR]
+[\fB-F\fR \fIZERO|RANDOM\fR]
+[\fB-h\fR]
+[\fB-H\fR \fIheaderblocks\fR]
+[\fB-o\fR \fIoutputfile\fR]
+[\fB-q\fR \fIblocksize\fR]
+[\fB-r\fR \fIrandompadblocks\fR]
+[\fB-R\fR \fIrandomblocks\fR]
+[\fB-s\fR \fIseed\fR]
+[\fB-v\fR]
+[\fB-z\fR \fIzeropadblocks\fR]
+[\fB-Z\fR \fIzeroblocks\fR]
+configfile
+
+.SH DESCRIPTION
+.PP
+\fBfragmentator\fR generates synthetic disk images for testing data carving tools based on instructions provided in a configuration file (usually ending in .frg). It produces an output image file and a corresponding \fI.key\fR file describing the layout.  Full documentation for \fBfragmentator\fR can be found in template.frg, included in the scalpel3 source distribution.
+.PP
+Global options specified in the \fIconfigfile\fR can be overridden via command-line flags. Care must be taken to ensure consistency (e.g., \fIRANDOMPADBLOCKS\fR and \fIZEROPADBLOCKS\fR are mutually exclusive).
+
+.SH OPTIONS
+.PP
+.TP
+.BI -a " initialrandomblocks"
+Override \fBINITIALRANDOMBLOCKS\fR (integer >= 0).
+
+.TP
+.BI -b " initialzeroblocks"
+Override \fBINITIALZEROBLOCKS\fR (integer >= 0).
+
+.TP
+.B -c
+Ignore all fragmentation directives in \fBFILE:\fR entries and generate a fully contiguous image file.
+
+.TP
+.BI -f " FILE|RANDOM|ZERO"
+Override \fBFILLHOLESPRIMARY\fR strategy.
+
+.TP
+.BI -F " RANDOM|ZERO"
+Override \fBFILLHOLESSECONDARY\fR strategy.
+
+.TP
+.B -h
+Display help text and exit.
+
+.TP
+.BI -H " headerblocks"
+Override \fBHEADERBLOCKS\fR (integer >= 0).
+
+.TP
+.BI -o " outputfile"
+Override \fBOUTPUTFILE\fR path. The filename must not end in ".frg".
+
+.TP
+.BI -q " blocksize"
+Override \fBBLOCKSIZE\fR. Must be a positive integer divisible by 512.
+
+.TP
+.BI -r " randompadblocks"
+Override \fBRANDOMPADBLOCKS\fR (integer >= 0). Mutually exclusive with \fB-z\fR.
+
+.TP
+.BI -R " randomblocks"
+Override \fBRANDOMBLOCKS\fR (integer >= 0).
+
+.TP
+.BI -s " seed"
+Override random \fBSEED\fR (integer >= 0).
+
+.TP
+.B -v
+Display global configuration. Specifying -v once outputs basic summary information. Specifying
+-v twice outputs FILE configs.  A third -v displays extensive debugging output.
+
+.TP
+.BI -z " zeropadblocks"
+Override \fBZEROPADBLOCKS\fR (integer >= 0). Mutually exclusive with \fB-r\fR.
+
+.TP
+.BI -Z " zeroblocks"
+Override \fBZEROBLOCKS\fR (integer >= 0).
+
+.SH CONFIGURATION FILE
+See \fItemplate.frg\fR provided with the source distribution for details on the configuration file syntax.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR crblockmap (1),
+.BR modblockmap (1),
+.BR cmpblockmaps (1),
+.BR blockmapfs (1)
+
+.SH AUTHOR
+Golden G. Richard III.

@@ -1,0 +1,27 @@
+.TH cmpblockmaps "1" "" "The scalpel3 Blockmap Comparator" "The scalpel3 Blockmap Comparator"
+
+.SH NAME
+cmpblockmaps \- Compare two scalpel3 blockmaps
+
+.SH SYNOPSIS
+.B cmpblockmaps
+blockmap_filename_1
+blockmap_filename_2
+
+.SH DESCRIPTION
+.PP
+\fBcmpblockmaps\fR compares two scalpel3 blockmap files and outputs the differences. Both blockmaps must represent the same number of blocks and have valid block sizes (>= 512 and multiples of 512).
+
+.SH OPTIONS
+.PP
+This utility takes exactly two positional arguments: the filenames of the two blockmaps to compare.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR crblockmap (1),
+.BR modblockmap (1),
+.BR blockmapfs (1),
+.BR fragmentator (1)
+
+.SH AUTHOR
+Golden G. Richard III.

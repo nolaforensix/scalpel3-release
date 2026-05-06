@@ -1,0 +1,275 @@
+.TH scalpel3 "1" "" "The scalpel3 File Carver" "The scalpel3 File Carver"
+
+.SH NAME
+scalpel3 \- Recover contiguous or fragmented data from an image file
+
+.SH SYNOPSIS
+.B scalpel3
+[\fB-a\fR]
+[\fB-A\fR \fIsecs\fR]
+[\fB-b\fR]
+[\fB-B\fR]
+[\fB-c\fR]
+[\fB-C\fR]
+[\fB-d\fR]
+[\fB-e\fR \fI#\fR]
+[\fB-f\fR]
+[\fB-F\fR \fIsecs\fR]
+[\fB-g\fR \fI#\fR]
+[\fB-G\fR \fI#\fR]
+[\fB-h\fR]
+[\fB-H\fR]
+[\fB-i\fR \fI#\fR]
+[\fB-I\fR \fIsecs\fR]
+[\fB-j\fR \fI#\fR]
+[\fB-k\fR \fI#\fR]
+[\fB-L\fR]
+[\fB-m\fR]
+[\fB-M\fR]
+[\fB-n\fR]
+[\fB-o\fR \fIscalpel_output_dir\fR]
+[\fB-O\fR]
+[\fB-p\fR]
+[\fB-P\fR]
+[\fB-q\fR \fIclustersize\fR]
+[\fB-R\fR]
+[\fB-r\fR \fI#\fR]
+[\fB-s\fR \fI#\fR]
+[\fB-t\fR \fI#\fR]
+[\fB-u\fR \fI#\fR]
+[\fB-U\fR \fIfiletype[,filetype]...\fR]
+[\fB-v\fR]
+[\fB-V\fR]
+[\fB-w\fR]
+[\fB-x\fR]
+[\fB-z\fR \fIfiletype[,filetype]...\fR]
+img_filename
+blockmap_filename
+
+.SH DESCRIPTION
+.PP
+Recover contiguous or fragmented data from an image file (typically sourced from a non-volatile
+storage device), based on file type-specific configurations.
+
+.SH OPTIONS
+.PP
+The following options are available:
+
+.TP
+.B -a
+Turn off aggressive memory allocation, to reduce overhead.  Default is on.
+Leave this on unless you experience out of memory errors or excessive swapping.
+
+.TP
+.BI -A " #"
+Create a checkpoint and stop execution after a specified number of seconds in the fragmented reassembly
+phase of execution. This option is not checkpointed and must be specified on every execution where this behavior
+is desired.
+
+.TP
+.B -b
+Write blockvectors.  Default is to not write blockvectors.
+
+.TP
+.B -B
+Don't backtrack.  Default is backtracking on.  Useful only for debugging.
+
+.TP
+.B -c
+Turn off reassembly thread work sharing. Default is on.
+
+.TP
+.B -C
+Turn off IPC.  Generally not recommended, but useful in environments that
+don't support Unix domain sockets. Default is on.
+
+.TP
+.B -d
+Turn off header reuse for contiguous files.  Default is on and you should
+generally leave this on.
+
+.TP
+.BI -e " #"
+Override detected number of physical CPU cores. scalpel3 detects the number of
+physical CPU cores for determining thread pool sizes. On systems with
+hyperthreading, it may be beneficial to increase the number of perceived CPU
+cores using -e.  On Apple Silicon systems, the number of performance cores is
+used to size thread pools and -e can be used to experimentally increase the
+sizes of thread pools.
+
+.TP
+.B -f
+Don't attempt fragmented recovery for any supported file type. This essentially sets NO_DEFRAG to true for all
+file types.
+
+.TP
+.BI -F " #"
+Create a checkpoint and stop execution when a new file hasn't been validated for
+a specified number of seconds in the fragmented reassembly phase of
+execution. This option is not checkpointed and must be specified on every
+execution where this behavior is desired.
+
+.TP
+.BI -g " #"
+Set reassembly gallop factor.
+
+.TP
+.BI -G " #"
+Set reassembly gallop limit.
+
+.TP
+.B -h
+Print this help message and then exit.
+
+.TP
+.B -H
+Write header/footer database and then exit.
+
+.TP
+.BI -i " #"
+Set minimum number of validated files to trigger checkpoint and blockmap swap.
+This overrides VALIDATION_CP_THRESHOLD in scalpel.h.  This option
+is not checkpointed and must be specified on every execution where this behavior is desired.
+Must be between 1 and 65536.
+
+.TP
+.BI -I " secs"
+Set automatic checkpointing interval (in seconds).  This overrides CHECKPOINTING_INTERVAL in scalpel.h.  This option
+is not checkpointed and must be specified on every execution where this behavior is desired.
+Must be between 5 and 65536.
+
+.TP
+.BI -j " #"
+Treat blocks in the image before the specified block number as covered.
+This option in conjunction with -k allows execution of scalpel3 against a window of blocks in the input file.
+
+.TP
+.BI -k " #"
+Treat blocks in the image after the specified block number as covered.  This option in
+conjunction with -j allows execution of scalpel3 against a window of blocks in the input file.
+
+.TP
+.B -L
+Provide a brief list of supported file types and exit.
+
+.TP
+.B -m
+Perform memory profiling.  Produces lots of output.
+
+.TP
+.B -M
+Disable shadow blockmap peeking for block selection.  The default is on. Only
+useful for debugging.
+
+.TP
+.B -n
+Disable backtrace on crash. The default is to generate backtraces and this
+should generally be left on.
+
+.TP
+.BI -o " scalpel_output_dir"
+Set output directory for carved files.
+
+.TP
+.B -O
+Don't organize carved files into subdirectories. Default is organize.
+
+.TP
+.B -p
+Turn on file type prioritization for fragmented file reassembly.  Default is off.
+
+.TP
+.B -P
+Write INPROGRESS files on every checkpoint.  The default is only to write
+INPROGRESS when requested via IPC (e.g., scalpel3\-ctl \-c).  This is
+primarily for debugging, as it adds substantial overhead.
+
+.TP
+.BI -q " clustersize"
+Specify block/cluster size. Default is 512 bytes. Must be a multiple of 512.
+
+.TP
+.B -R
+Resume from checkpoint.
+
+.TP
+.BI -r " #"
+Specify the maximum number of threads per filemirror pool.
+
+.TP
+.BI -s " #"
+Specify the maximum number of reassembly threads.
+
+.TP
+.BI -t " #"
+Specify the maximum number of search threads.
+
+.TP
+.BI -u " #"
+Specify the maximum number of validation threads.
+
+.TP
+.BI -U " filetype[,filetype]..."
+Deactivate carving for one or more file types, e.g., \fB-U JPG\fR or
+\fB-U JPG,PNG\fR. This option may be specified more than once.
+Not compatible with \fB-z\fR.
+
+.TP
+.B -v
+Verbose mode.
+
+.TP
+.B -V
+Print copyright information and exit.
+
+.TP
+.B -w
+Write promising candidates that didn't validate completely. The default is to only
+write fully validated files, to save disk space, but you probably want this on if
+partial results are useful (e.g., initial fragments of photographic images).
+
+.TP
+.B -x
+Override checkpoint integrity checks. Use this only if you know what you're doing!
+
+
+.TP
+.BI -z " filetype[,filetype]..."
+Carve only one or more specified file types, e.g., \fB-z JPG\fR or
+\fB-z JPG,PNG\fR. This option may be specified more than once. Not compatible
+with \fB-U\fR.
+
+.SH CONFIGURATION FILE
+Unlike previous versions of scalpel, scalpel3 requires recompilation
+(and commonly, custom code) to support new file types.  The file
+"scalpelconf.c" contains configurations for the file types that are supported
+by scalpel3.  Please see this source file for more information.
+
+.SH AUTHORS
+The scalpel3 backend and toolchain as well as some of the block/file validators were written by
+Golden G. Richard III.  A host of other smart people have helped with scalpel3.  A complete list of
+scalpel3 team members can be found in the AUTHORS file in the source distribution.
+
+.SH "REPORTING BUGS"
+When submitting a bug report, please include a description of the problem, how
+you found it, and your contact information.  If the bug involves a scalpel3
+crash, please note that scalpel3 attempts to provide a backtrace that you
+can submit to us.
+.PP
+Please send bug reports to golden@cct.lsu.edu.
+
+.SH COPYRIGHT
+.PP
+This is free software.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+.SH "SEE ALSO"
+
+.BR fragmentator (1),
+.BR modblockmap (1),
+.BR crblockmap (1),
+.BR cmpblockmaps (1),
+.BR blockmapfs (1)
+
+More information on scalpel3 appears in the README.md file, distributed
+with the scalpel3 source code.

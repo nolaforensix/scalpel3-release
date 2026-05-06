@@ -1,0 +1,3 @@
+#!/bin/bash
+./fragmentator TESTS/diskviz.frg
+./diskviz TESTS/diskviz.img.key

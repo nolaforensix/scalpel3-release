@@ -1,0 +1,66 @@
+.TH modblockmap "1" "" "The scalpel3 Blockmap Modifier" "The scalpel3 Blockmap Modifier"
+
+.SH NAME
+modblockmap \- Manipulate existing scalpel3 blockmaps
+
+.SH SYNOPSIS
+.B modblockmap
+[\fB-j\fR \fIstart_block\fR]
+[\fB-k\fR \fIend_block\fR]
+img_filename
+blockmap_filename
+[0:block#] [1:block#] [?:block#]
+[0:block#-block#] [1:block#-block#] [?:block#-block#]
+[toolname tool_log_filename]
+
+.SH DESCRIPTION
+.PP
+\fBmodblockmap\fR allows the user to cover (mark as used) or uncover (mark as available) single blocks or ranges of blocks within an existing scalpel3 blockmap. It also supports adjusting the active carve window and parsing logs from external tools (e.g., \fBphotorec\fR) to update coverage.
+.PP
+If only the image and blockmap filenames are provided, the current contents of the blockmap are displayed.
+
+.SH OPTIONS
+.PP
+.TP
+.BI -j " start_block"
+Set the start of the active carve window. Must be >= 0.
+
+.TP
+.BI -k " end_block"
+Set the end of the active carve window. Must be >= 0.
+
+.SH OPERATIONS
+Operations are specified as positional arguments after the filenames.
+.PP
+.B Single Block Operations:
+.br
+\fB0:\fIblock\fR   - Uncover block.
+.br
+\fB1:\fIblock\fR   - Cover block.
+.br
+\fB?:\fIblock\fR   - Query block status.
+.PP
+.B Range Operations:
+.br
+\fB0:\fIstart\fR-\fIend\fR - Uncover range.
+.br
+\fB1:\fIstart\fR-\fIend\fR - Cover range.
+.br
+\fB?:\fIstart\fR-\fIend\fR - Query range status.
+.PP
+.B External Tool Integration:
+.br
+\fBphotorec\fR \fIlogfile\fR
+.br
+Parses a PhotoRec log file and covers blocks associated with files recovered by PhotoRec.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR crblockmap (1),
+.BR cmpblockmaps (1),
+.BR blockmapfs (1),
+.BR fragmentator (1)
+
+
+.SH AUTHOR
+Golden G. Richard III.

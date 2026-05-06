@@ -1,0 +1,110 @@
+# Prerequisites
+*.d
+
+# Test files 
+*.frg
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# Dirty VSCode config files
+.vscode/
+
+# initscalpel artifacts
+compile
+depcomp
+INSTALL
+install-sh
+Makefile
+Makefile.in
+aclocal.m4
+config.log
+config.guess
+config.status
+config.sub
+configure
+configure~
+libtool
+ltmain.sh
+m4/
+missing
+
+man/Makefile
+man/Makefile.in
+
+src/Makefile
+src/Makefile.am
+src/Makefile.in
+src/blockmapfs
+src/cmpblockmaps
+src/crblockmap
+src/fragmentator
+src/guesslang/guesslang.egg-info/SOURCES.txt
+src/guesslang/guesslang.egg-info/requires.txt
+src/mergeblockmap
+src/modblockmap
+src/scalpel3
+src/scalpel3-ctl
+src/hpcscalpel3
+
+src/libbacktrace/
+
+autom4te.cache/
+.deps/
+.dirstamp
+src/simde/
+src/venv/
+src/zlib-ng
+
+# Mac artifacts
+.DS_Store
+
+# RAR development
+RARTEST/

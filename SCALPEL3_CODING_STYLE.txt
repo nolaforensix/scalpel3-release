@@ -1,0 +1,156 @@
+:'######:::'######:::::'###::::'##:::::::'########::'########:'##::::::::'#######::
+'##... ##:'##... ##:::'## ##::: ##::::::: ##.... ##: ##.....:: ##:::::::'##.... ##:
+ ##:::..:: ##:::..:::'##:. ##:: ##::::::: ##:::: ##: ##::::::: ##:::::::..::::: ##:
+. ######:: ##:::::::'##:::. ##: ##::::::: ########:: ######::: ##::::::::'#######::
+:..... ##: ##::::::: #########: ##::::::: ##.....::: ##...:::: ##::::::::...... ##:
+'##::: ##: ##::: ##: ##.... ##: ##::::::: ##:::::::: ##::::::: ##:::::::'##:::: ##:
+. ######::. ######:: ##:::: ##: ########: ##:::::::: ########: ########:. #######::
+:......::::......:::..:::::..::........::..:::::::::........::........:::.......:::
+                 :'######::'########:'##:::'##:'##:::::::'########:
+                 '##... ##:... ##..::. ##:'##:: ##::::::: ##.....::
+                  ##:::..::::: ##:::::. ####::: ##::::::: ##:::::::
+                 . ######::::: ##::::::. ##:::: ##::::::: ######:::
+                 :..... ##:::: ##::::::: ##:::: ##::::::: ##...::::
+                 '##::: ##:::: ##::::::: ##:::: ##::::::: ##:::::::
+                 . ######::::: ##::::::: ##:::: ########: ########:
+                 :......::::::..::::::::..:::::........::........::
+                 :'######:::'##::::'##:'####:'########::'########:
+                 '##... ##:: ##:::: ##:. ##:: ##.... ##: ##.....::
+                  ##:::..::: ##:::: ##:: ##:: ##:::: ##: ##:::::::
+                  ##::'####: ##:::: ##:: ##:: ##:::: ##: ######:::
+                  ##::: ##:: ##:::: ##:: ##:: ##:::: ##: ##...::::
+                  ##::: ##:: ##:::: ##:: ##:: ##:::: ##: ##:::::::
+                 . ######:::. #######::'####: ########:: ########:
+                 :......:::::.......:::....::........:::........::
+
+We aren't style dictators, but since scalpel3 is an established codebase, it's
+nice if the code maintains some basic style consistency.  The following lays out
+the basic style that we've used as well as some conventions.
+
+WARNINGS:
+
+No warnings from the build system (except for the single symbolic one in the
+png.h code) is our rule.
+
+FUNCTION PROTOTYPES:
+
+Please always use function prototypes for both private and public functions.
+For new file types, all the associated code, including both the public file
+validator and block validator functions as well as private helper functions and
+types, goes in the associated .h file.
+
+BRACES (always use them):
+
+if (...) {
+
+}
+
+while (...) {
+
+
+}
+
+void f(...) {
+
+
+}
+
+INTEGER TYPES:
+
+Please use types in <stdint.h> and <inttypes.h>, e.g., uint32_t instead of
+unsigned int, int64_t instead of long, etc.
+
+SYMBOLIC CONSTANTS / VARIABLES / TYPES / FUNCTIONS NAMING:
+
+All caps:
+
+#define TEST_BACKTRACE                      0
+
+Mixed case:
+
+typedef enum StateSerialization {
+  SERIALIZE, DESERIALIZE
+} StateSerialization;
+
+All lower case, with underscores:
+
+uint64_t *validates_to;
+uint32_t needleidx,
+
+void write_clone(CarveInfo *candidate);
+
+ERROR HANDLING:
+
+Please use handle_error(), defined in util.c, and add appropriate symbolic constants
+for the error condition in scalpel.h.
+
+MEMORY ALLOCATION:
+
+  (*b) = malloc(sizeof(BlockVector));
+
+PLEASE ALWAYS CALL check_memory_allocation() AFTER malloc / realloc / calloc,
+et al, LIKE THIS:
+
+check_memory_allocation(b, __LINE__, __FILE__, "b");
+
+OUTPUT:
+
+With very few exceptions (actually two, the PRINTCARVESTATEFUNC and
+PRINTBLOCKSTATEFUNC that are part of scalpel3's state API--see scalpelconf.c for
+more information), lock_fprintf() should always be used for output in lieu of
+printf(), fprint(), etc.  lock_fprintf() uses locks to allow sane input in the
+midst of massive threading.  If the output should only be generated for
+debugging purposes, bracket the lock_fprintf() call with a check of
+scalpel_state.mode_verbose (set true by the -v command line option):
+
+if (scalpel_state.mode_verbose) {
+    lock_fprintf(stdout,"Initializing new blockvector %p.\n", *b);
+ }
+
+DOCUMENTING FUNCTIONS:
+
+Please include a comment block before the function that offers a basic
+description of the function and its parameters, any assumptions, etc.  The
+following function illustrates that and defines the indentation style that we
+use.
+
+// initialize a blockvector 'b' that will contain at most 'num_blocks' blocks.
+// Storage for data is *not* allocated by this function, but is handled
+// separately by inflate_blockvector().
+//
+void init_blockvector(FileMirror *state, BlockVector **b,
+		      uint64_t num_blocks) {
+
+  uint64_t i;
+
+  (*b) = malloc(sizeof(BlockVector));
+  check_memory_allocation(b, __LINE__, __FILE__, "b");
+
+  if (scalpel_state.mode_verbose) {
+    lock_fprintf(stdout,"Initializing new blockvector %p.\n", *b);
+  }
+
+  (*b)->filemirror = state;
+  (*b)->num_blocks = num_blocks;
+  (*b)->malloc_length = num_blocks + MALLOC_SLACK;
+  (*b)->actual_blocknumber = malloc(sizeof(int64_t) * (*b)->malloc_length);
+  check_memory_allocation((*b)->actual_blocknumber, __LINE__, __FILE__, "b");
+  (*b)->apparent_blocknumber = malloc(sizeof(int64_t) * (*b)->malloc_length);
+  check_memory_allocation((*b)->apparent_blocknumber, __LINE__, __FILE__, "b");
+  (*b)->valid = malloc(sizeof(bool) * (*b)->malloc_length);
+  check_memory_allocation((*b)->valid, __LINE__, __FILE__, "b");
+
+  for (i = 0; i < (*b)->num_blocks; i++) {
+    (*b)->actual_blocknumber[i] = -1;
+    (*b)->apparent_blocknumber[i] = -1;
+    (*b)->valid[i] = false;
+  }
+
+  (*b)->length = 0;
+  (*b)->data = NULL;
+  (*b)->choices = NULL;
+
+  if (scalpel_state.mode_verbose) {
+    lock_fprintf(stdout,"Initialization of blockvector %p complete.\n", *b);
+  }
+}

@@ -1,0 +1,47 @@
+.TH blockmapfs "1" "" "The scalpel3 Blockmap Filesystem" "The scalpel3 Blockmap Filesystem"
+
+.SH NAME
+blockmapfs \- Read-only FUSE filesystem for blockmap-aware file access
+
+.SH SYNOPSIS
+.B blockmapfs
+mnt root
+
+.SH DESCRIPTION
+.PP
+\fBblockmapfs\fR is a read-only FUSE (Filesystem in Userspace) filesystem. It presents a view of files located in \fIroot\fR mounted at \fImnt\fR.
+.PP
+For every file accessed in the \fIroot\fR, \fBblockmapfs\fR expects a corresponding valid blockmap file named \fIfilename.blockmap\fR. When a file is read through the mount point, \fBblockmapfs\fR consults the blockmap to determine which blocks are "covered" (already carved or irrelevant). Covered blocks are hidden from the file view, effectively presenting the file as if those blocks were removed/skipped.
+
+.SH REQUIREMENTS
+.PP
+.IP \(bu 2
+FUSE (Linux) or macFUSE (macOS) must be installed.
+.IP \(bu 2
+Each file in \fIroot\fR must have an associated blockmap in the same directory.
+.IP \(bu 2
+Files in \fIroot\fR (source files and blockmaps) \fBMUST NOT\fR be modified while the filesystem is mounted, as blockmap data is cached.
+
+.SH OPTIONS
+.PP
+\fBblockmapfs\fR takes exactly two arguments:
+
+.TP
+.I mnt
+The directory where the filesystem will be mounted.
+
+.TP
+.I root
+The source directory containing the raw files and their associated \fI.blockmap\fR files.
+
+.SH EXIT STATUS
+Returns 0 on success, or -1 if arguments are missing or paths are invalid.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR crblockmap (1),
+.BR modblockmap (1),
+.BR cmpblockmaps (1)
+
+.SH AUTHOR
+Golden G. Richard III.
