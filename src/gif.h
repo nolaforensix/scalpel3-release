@@ -278,6 +278,8 @@ typedef struct GIFCarveState {
   uint32_t reassembly_checkpoint_plateau_blocks;
   bool reassembly_scan_cursor_valid;
   int64_t reassembly_scan_cursor;
+  bool reassembly_scan_cursor_actual_valid;
+  int64_t reassembly_scan_cursor_actual;
   uint64_t reassembly_scan_cursor_length;
   bool reassembly_live_retry_used;
   bool reassembly_preserved_frontier;
@@ -997,16 +999,40 @@ static inline void gif_reassembly_copy_runtime_fields(
       src->reassembly_checkpoint_plateau_blocks;
   dst->reassembly_scan_cursor_valid = src->reassembly_scan_cursor_valid;
   dst->reassembly_scan_cursor = src->reassembly_scan_cursor;
+  dst->reassembly_scan_cursor_actual_valid =
+      src->reassembly_scan_cursor_actual_valid;
+  dst->reassembly_scan_cursor_actual = src->reassembly_scan_cursor_actual;
   dst->reassembly_scan_cursor_length =
       src->reassembly_scan_cursor_length;
   dst->reassembly_live_retry_used = src->reassembly_live_retry_used;
+}
+
+static inline bool gif_reassembly_current_apparent_block_valid(
+    int64_t apparentblocknumber) {
+  uint64_t apparent_blocks = 0;
+
+  if (apparentblocknumber < 0 || !scalpel_state.filemirror) {
+    return false;
+  }
+
+  apparent_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  return (uint64_t)apparentblocknumber < apparent_blocks;
 }
 
 static inline void gif_reassembly_set_return_start(
     GIFCarveState *state, int64_t apparentblocknumber, bool deferred) {
   int64_t actualblocknumber = -1;
 
-  if (!state || apparentblocknumber < 0) {
+  if (!state) {
+    return;
+  }
+
+  if (!gif_reassembly_current_apparent_block_valid(apparentblocknumber)) {
+    state->reassembly_return_pending = false;
+    state->reassembly_return_deferred = false;
+    state->reassembly_return_start = -1;
+    state->reassembly_return_actual_valid = false;
+    state->reassembly_return_actual = -1;
     return;
   }
 
@@ -1037,6 +1063,18 @@ static inline void gif_reassembly_clear_return_start(GIFCarveState *state) {
   state->reassembly_return_actual = -1;
 }
 
+static inline void gif_reassembly_clear_scan_cursor(GIFCarveState *state) {
+  if (!state) {
+    return;
+  }
+
+  state->reassembly_scan_cursor_valid = false;
+  state->reassembly_scan_cursor = -1;
+  state->reassembly_scan_cursor_actual_valid = false;
+  state->reassembly_scan_cursor_actual = -1;
+  state->reassembly_scan_cursor_length = 0;
+}
+
 static inline void gif_reassembly_normalize_return_start(
     GIFCarveState *state) {
   int64_t apparentblocknumber = -1;
@@ -1055,13 +1093,14 @@ static inline void gif_reassembly_normalize_return_start(
     apparentblocknumber =
         filemirror_apparent_blocknumber(scalpel_state.filemirror,
                                         state->reassembly_return_actual);
-    if (apparentblocknumber >= 0) {
+    if (gif_reassembly_current_apparent_block_valid(apparentblocknumber)) {
       state->reassembly_return_start = apparentblocknumber;
       return;
     }
   }
 
-  if (state->reassembly_return_start >= 0) {
+  if (gif_reassembly_current_apparent_block_valid(
+          state->reassembly_return_start)) {
     actualblocknumber =
         filemirror_actual_blocknumber(scalpel_state.filemirror,
                                       state->reassembly_return_start);
@@ -1073,6 +1112,75 @@ static inline void gif_reassembly_normalize_return_start(
   }
 
   gif_reassembly_clear_return_start(state);
+}
+
+static inline void gif_reassembly_normalize_scan_cursor(
+    GIFCarveState *state) {
+  int64_t apparentblocknumber = -1;
+  int64_t actualblocknumber = -1;
+
+  if (!state) {
+    return;
+  }
+
+  if (!state->reassembly_scan_cursor_valid) {
+    state->reassembly_scan_cursor_actual_valid = false;
+    state->reassembly_scan_cursor_actual = -1;
+    return;
+  }
+
+  if (state->reassembly_scan_cursor_actual_valid
+      && state->reassembly_scan_cursor_actual >= 0) {
+    apparentblocknumber =
+        filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                        state->reassembly_scan_cursor_actual);
+    if (gif_reassembly_current_apparent_block_valid(apparentblocknumber)) {
+      state->reassembly_scan_cursor = apparentblocknumber;
+      return;
+    }
+  }
+
+  if (gif_reassembly_current_apparent_block_valid(
+          state->reassembly_scan_cursor)) {
+    actualblocknumber =
+        filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                      state->reassembly_scan_cursor);
+    if (actualblocknumber >= 0) {
+      state->reassembly_scan_cursor_actual_valid = true;
+      state->reassembly_scan_cursor_actual = actualblocknumber;
+      return;
+    }
+  }
+
+  gif_reassembly_clear_scan_cursor(state);
+}
+
+static inline void gif_reassembly_set_scan_cursor(
+    GIFCarveState *state, int64_t apparentblocknumber, uint64_t data_length) {
+  int64_t actualblocknumber = -1;
+
+  if (!state) {
+    return;
+  }
+
+  if (!gif_reassembly_current_apparent_block_valid(apparentblocknumber)) {
+    gif_reassembly_clear_scan_cursor(state);
+    return;
+  }
+
+  state->reassembly_scan_cursor_valid = true;
+  state->reassembly_scan_cursor = apparentblocknumber;
+  state->reassembly_scan_cursor_actual_valid = false;
+  state->reassembly_scan_cursor_actual = -1;
+  state->reassembly_scan_cursor_length = data_length;
+
+  actualblocknumber =
+      filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                    apparentblocknumber);
+  if (actualblocknumber >= 0) {
+    state->reassembly_scan_cursor_actual_valid = true;
+    state->reassembly_scan_cursor_actual = actualblocknumber;
+  }
 }
 
 static inline uint32_t gif_reassembly_effective_plateau_blocks(
@@ -1089,43 +1197,6 @@ static inline uint32_t gif_reassembly_effective_plateau_blocks(
   }
 
   return plateau_blocks;
-}
-
-static inline void gif_reassembly_return_to_promising_queue(
-    int id, CarveInfo *candidate, uuid_string_t uuidp, uuid_string_t uuidc) {
-  struct timespec end;
-  uint64_t data_length = blockvector_get_data_length(candidate->b);
-  uint64_t committed_blocks = 0;
-  bool active_scan_slot = false;
-
-  if (scalpel_state.blocksize > 0 && data_length > 0) {
-    committed_blocks = CEILDIV(data_length,
-                               (uint64_t)scalpel_state.blocksize);
-    active_scan_slot =
-        blockvector_get_num_blocks(candidate->b) > committed_blocks;
-  }
-
-  candidate->no_initial_block_extension =
-      candidate->no_initial_block_extension
-      || active_scan_slot
-      || candidate->best_validates_to + 1 < data_length;
-
-  if (scalpel_state.mode_verbose) {
-    lock_fprintf(stdout,
-                 "\nReassembly thread # %1d: returning candidate with blockvector %p and UUIDs"
-                 "\n%s / %s\nto promising queue during checkpoint.\n",
-                 id, candidate->b, uuidp, uuidc);
-  }
-
-  delete_from_reassembly_queue(candidate);
-
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  candidate->qposition -=
-      (end.tv_sec - candidate->last_start.tv_sec) * 1000000000ULL
-      + (end.tv_nsec - candidate->last_start.tv_nsec);
-
-  add_to_queue_priority_relaxed(&promising_queue, &candidate,
-                                candidate->qposition);
 }
 
 static inline void gif_reassembly_capture_score_from_state(
@@ -1217,6 +1288,7 @@ static inline void gif_reassembly_load_state_raw(CarveInfo *candidate,
   memcpy(state, saved, sizeof(*state));
   gif_free_carve_state(&saved);
   gif_reassembly_normalize_return_start(state);
+  gif_reassembly_normalize_scan_cursor(state);
 }
 
 static inline void gif_reassembly_clamp_state_to_length(
@@ -4250,9 +4322,7 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
            && (!resume_current_slot
                || gif_state.reassembly_scan_cursor_length
                       != blockvector_get_data_length(candidate->b))) {
-    gif_state.reassembly_scan_cursor_valid = false;
-    gif_state.reassembly_scan_cursor = -1;
-    gif_state.reassembly_scan_cursor_length = 0;
+    gif_reassembly_clear_scan_cursor(&gif_state);
     scan_cursor_stale = true;
   }
   resume_plateau_blocks = gif_reassembly_effective_plateau_blocks(&gif_state);
@@ -5275,9 +5345,7 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
     gif_state.reassembly_actual_backscan_active = false;
     gif_state.reassembly_actual_backscan_anchor = -1;
     gif_state.reassembly_actual_backscan_next = -1;
-    gif_state.reassembly_scan_cursor_valid = false;
-    gif_state.reassembly_scan_cursor = -1;
-    gif_state.reassembly_scan_cursor_length = 0;
+    gif_reassembly_clear_scan_cursor(&gif_state);
     gif_state.reassembly_completion_probe_exhausted = false;
     gif_state.reassembly_completion_probe_exhausted_length = 0;
     gif_reassembly_clear_actual_run_rescue(&gif_state);
@@ -5520,14 +5588,11 @@ static inline void gif_reassembly_checkpoint_flush(CarveInfo *candidate) {
   if (preserve_scan_slot
       && saved_block_choice_start >= 0
       && blockvector_get_data_length(candidate->b) == original_length) {
-    saved_state.reassembly_scan_cursor_valid = true;
-    saved_state.reassembly_scan_cursor = saved_block_choice_start;
-    saved_state.reassembly_scan_cursor_length = original_length;
+    gif_reassembly_set_scan_cursor(&saved_state, saved_block_choice_start,
+                                   original_length);
   }
   else {
-    saved_state.reassembly_scan_cursor_valid = false;
-    saved_state.reassembly_scan_cursor = -1;
-    saved_state.reassembly_scan_cursor_length = 0;
+    gif_reassembly_clear_scan_cursor(&saved_state);
   }
 
   gif_reassembly_copy_runtime_fields(&cold_state, &saved_state);
@@ -6966,9 +7031,9 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
   while (1) {
     if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
       gif_reassembly_checkpoint_flush(candidate);
-      gif_reassembly_return_to_promising_queue(work->id, candidate,
-                                               uuidp, uuidc);
-      goto done_do_not_write_candidate;
+      if (reassembly_time_to_checkpoint(work->id, candidate, uuidp, uuidc)) {
+        goto done_do_not_write_candidate;
+      }
     }
 
     if (gif_reassembly_exceeded_max_size(work->id, candidate, uuidp, uuidc)) {
@@ -7099,9 +7164,9 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
 
       if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
         gif_reassembly_checkpoint_flush(candidate);
-        gif_reassembly_return_to_promising_queue(work->id, candidate,
-                                                 uuidp, uuidc);
-        goto done_do_not_write_candidate;
+        if (reassembly_time_to_checkpoint(work->id, candidate, uuidp, uuidc)) {
+          goto done_do_not_write_candidate;
+        }
       }
 
       if (stop_scanning) {
@@ -7270,9 +7335,11 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
           }
           if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                    memory_order_acquire)) {
-            gif_reassembly_return_to_promising_queue(work->id, candidate,
-                                                     uuidp, uuidc);
-            goto done_do_not_write_candidate;
+            gif_reassembly_checkpoint_flush(candidate);
+            if (reassembly_time_to_checkpoint(work->id, candidate,
+                    uuidp, uuidc)) {
+              goto done_do_not_write_candidate;
+            }
           }
         }
 
@@ -7281,9 +7348,6 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
             && committed_summary.validates_to + plateau_allowance
                    >= data_length - 1) {
           gif_reassembly_store_state(candidate, &committed_state);
-          gif_reassembly_return_to_promising_queue(work->id, candidate,
-                                                   uuidp, uuidc);
-          goto done_do_not_write_candidate;
         }
       }
 

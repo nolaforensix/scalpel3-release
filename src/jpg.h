@@ -6418,8 +6418,11 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                                   trial_score_validates_to);
       }
 
+      // A near/end-reaching forward trial is already a valid local bridge.
+      // Leave broader OOO repair for trials that do not reach the appended block.
       if (!validates
           && validates_to + 1 > accept_threshold
+          && !trial_effectively_reaches_end
           && apparent > tail_apparent + 1) {
         uint64_t skipped_blocks = (uint64_t)(apparent - tail_apparent - 1);
         bool prior_gap =

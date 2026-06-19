@@ -324,8 +324,10 @@
 #include "fzip.h"
 #include "mp3.h"
 #include "zip.h"
+// #include "rar.h"
 #include "123.h"
 #include "pdf.h"
+// #include "fpdf.h"
 #include "scalpel.h"
 
 ////////////////////////
@@ -346,7 +348,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
         //.HEADER = "/\xff\xd8\xff\xe0/",
         .FOOTER = "|\xff\xd9|",
         .SEARCHTYPE = SEARCHTYPE_FORWARD,
-        .BLOCKVALIDATOR = NULL,
+        // JPG reassembly does not currently use a block validator.
         .FILEVALIDATOR = jpg_file_validate,
         .SERIALIZEBLOCKSTATEFUNC = NULL,
         .CLONEBLOCKSTATEFUNC = NULL,
@@ -471,7 +473,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .FOOTER = {0},
       .FOOTERFUNC = NULL,
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
-//      .BLOCKVALIDATOR = elf_block_validate,
+      .BLOCKVALIDATOR = elf_block_validate,
       .FILEVALIDATOR = elf_file_validate,
       .PRIORITY = PRIORITY_HIGHEST,
       .SERIALIZEBLOCKSTATEFUNC = elf_serialize_block_state,
@@ -499,7 +501,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .FOOTER = {0},
       .FOOTERFUNC = NULL,
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
-      //     .BLOCKVALIDATOR = zip_block_validate,
+      .BLOCKVALIDATOR = zip_block_validate,
       .FILEVALIDATOR = zip_file_validate,
       .PRIORITY = PRIORITY_SIGMA,
       .NO_DEFRAG = true},
@@ -519,6 +521,23 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .REASSEMBLYFUNC = fzip_reassembly,
       .PRIORITY = PRIORITY_SIGMA,
     },
+
+  //   {
+  //     .FILETYPE = "rar",
+  //     .MASTER = false,
+  //     .MINIMUMSIZE = 512,
+  //       .MAXIMUMSIZE = 500000000,
+  //       // RAR 5, RAR 4, Legacy RAR
+  //       .HEADER = "/\x52\x61\x72\x21\x1A\x07\x01\\x{00}|\x52\x61\x72\x21\x1A\x07\\x{00}|\x52\x45\x7E\x5E/",
+  //       .FOOTER = {0}, // Legacy RAR having no footer requires us to process footer discovery in the validators
+  //       // .FOOTER = "/\x1D\x77\x56\x51\x03\x05\x04\\x{00}|\xC4\x3D\x7B\\x{00}\x40\x07\\x{00}|\\x{00}/",
+  //       .SEARCHTYPE = SEARCHTYPE_FORWARD,
+  //       .BLOCKVALIDATOR = rar_block_validate,
+  //       .FILEVALIDATOR = rar_file_validate,
+  //       // .REASSEMBLYFUNC = LR_reassembly,
+	// .PRIORITY = PRIORITY_SIGMA,
+  //       .NO_DEFRAG = true,
+  //   },
 
     // MP3 files
     //
@@ -567,17 +586,17 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .SEARCHTYPE               = SEARCHTYPE_FORWARD,
       .BLOCKVALIDATOR           = file_123_block_validate,
       .FILEVALIDATOR            = file_123_file_validate,
-      .SERIALIZEBLOCKSTATEFUNC  = char_serialize_block_state,
-      .CLONEBLOCKSTATEFUNC      = char_clone_block_state,
-      .FREEBLOCKSTATEFUNC       = char_free_block_state,
-      .SIZEOFBLOCKSTATEFUNC     = char_sizeof_block_state,
-      .PRINTBLOCKSTATEFUNC      = char_print_block_state,
-      .SERIALIZECARVESTATEFUNC  = file123_serialize_carve_state,
-      .CLONECARVESTATEFUNC      = file123_clone_carve_state,
-      .FREECARVESTATEFUNC       = file123_free_carve_state,
-      .SIZEOFCARVESTATEFUNC     = file123_sizeof_carve_state,
-      .PRINTCARVESTATEFUNC      = file123_print_carve_state,
-      .REASSEMBLYFUNC           = File123_reassembly,
+      .SERIALIZEBLOCKSTATEFUNC  = file_123_serialize_block_state,
+      .CLONEBLOCKSTATEFUNC      = file_123_clone_block_state,
+      .FREEBLOCKSTATEFUNC       = file_123_free_block_state,
+      .SIZEOFBLOCKSTATEFUNC     = file_123_sizeof_block_state,
+      .PRINTBLOCKSTATEFUNC      = file_123_print_block_state,
+      .SERIALIZECARVESTATEFUNC  = file_123_serialize_carve_state,
+      .CLONECARVESTATEFUNC      = file_123_clone_carve_state,
+      .FREECARVESTATEFUNC       = file_123_free_carve_state,
+      .SIZEOFCARVESTATEFUNC     = file_123_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC      = file_123_print_carve_state,
+      .REASSEMBLYFUNC           = file_123_reassembly,
       .PRIORITY                 = PRIORITY_HIGHEST,
     },
 

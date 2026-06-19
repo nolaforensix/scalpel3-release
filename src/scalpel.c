@@ -67,9 +67,9 @@ static void usage(void) {
                "Scalpel carves files or data fragments from a disk image based on a set of\n"
                "file carving patterns, which include headers, footers, and other information.\n\n"
 
-               "Usage: scalpel3 [-a] [-A secs] [-b] [-B] [-c] [-C] [-d] [-f] [-e #] [-F secs] [-g #] [-G #] [-h] [-H] [-i #]\n"
+               "Usage: scalpel3 [-a] [-A secs] [-b] [-B] [-c] [-C] [-d] [-e #] [-F secs] [-g #] [-G #] [-h] [-H] [-i #]\n"
                "                [-I secs] [-j #] [-k #] [-L] [-m] [-M] [-n] [-o scalpel_output_dir] [-O] [-p] [-P] [-q clustersize] [-R]\n"
-               "                [-r #] [-s #] [-t #] [-u #] [-U filetype[,filetype]...] [-v] [-V] [-w] [-x]\n"
+               "                [-r #] [-s #] [-S] [-t #] [-u #] [-U filetype[,filetype]...] [-v] [-V] [-w] [-x]\n"
                "                [-z filetype[,filetype]...]\n"
                "                img_filename blockmap_filename\n\n"
 
@@ -87,7 +87,9 @@ static void usage(void) {
 
                "-b  Write blockvectors.  Default is to not write blockvectors.\n"
 
-               "-c  Turn off reassembly thread work sharing. Default is on.\n"
+               "-c  Don't attempt fragmented recovery for any supported file type. This essentially sets NO_DEFRAG to true for "
+               "all\n"
+               "    file types.\n"
 
                "-C  Turn off IPC.  Generally not recommended, but useful in environments that don't support Unix domain sockets.\n"
                "    Default is on.\n"
@@ -98,10 +100,6 @@ static void usage(void) {
                "    determining thread pool sizes. On systems with hyperthreading, it may be beneficial to increase the number\n"
                "    of perceived CPU cores using -e. On Apple Silicon systems, the number of performance cores is used to size\n"
                "    thread pools and -e can be used to experimentally increase the sizes of all thread pools.\n"
-
-               "-f  Don't attempt fragmented recovery for any supported file type. This essentially sets NO_DEFRAG to true for "
-               "all\n"
-               "    file types.\n"
 
                "-F  Create a checkpoint and stop execution when a new file hasn't been validated for a specified\n"
                "    number of seconds in the fragmented reassembly phase of execution. This option is not checkpointed\n"
@@ -151,6 +149,8 @@ static void usage(void) {
                "-r  Specify the maximum number of threads per filemirror pool.\n"
 
                "-s  Specify the maximum number of reassembly threads.\n"
+
+               "-S  Turn off reassembly thread work sharing. Default is on.\n"
 
                "-t  Specify the maximum number of search threads.\n"
 
@@ -304,7 +304,7 @@ static void process_command_line_args(int argc, char *argv[]) {
 
   lock_fprintf(stderr, "%s", RED);
 
-  while ((i = getopt(argc, argv, "+aA:BbcCde:fF:g:G:hHi:I:j:k:LmMnNo:OpPq:r:Rs:t:u:U:vVwxz:")) != -1) {
+  while ((i = getopt(argc, argv, "+aA:BbcCde:F:g:G:hHi:I:j:k:LmMnNo:OpPq:r:Rs:St:u:U:vVwxz:")) != -1) {
     switch (i) {
     case 'a':
       scalpel_state.reduce_aggressive_allocation = true;
@@ -333,7 +333,7 @@ static void process_command_line_args(int argc, char *argv[]) {
       break;
 
     case 'c':
-      scalpel_state.share_reassembly = false;
+      scalpel_state.no_defrag = true;
       cp_restricted = true;
       break;
 
@@ -353,11 +353,6 @@ static void process_command_line_args(int argc, char *argv[]) {
         lock_fprintf(stderr, "%s", BLACK);
         exit(-1);
       }
-      break;
-
-    case 'f':
-      scalpel_state.no_defrag = true;
-      cp_restricted = true;
       break;
 
     case 'F':
@@ -534,6 +529,11 @@ static void process_command_line_args(int argc, char *argv[]) {
         exit(-1);
       }
       max_reassembly_threads_override = scalpel_state.max_reassembly_threads;
+      break;
+
+    case 'S':
+      scalpel_state.share_reassembly = false;
+      cp_restricted = true;
       break;
 
     case 't':
@@ -805,6 +805,7 @@ void initialize_state(int argc, char *argv[]) {
   scalpel_state.exit_after_secs = EXIT_AFTER_SECONDS;
   scalpel_state.exit_after_val_gap = EXIT_AFTER_VAL_GAP;
   scalpel_state.block_validation_complete = false;
+  scalpel_state.contiguous_recovery_complete = false;
   scalpel_state.F1_initiated = false;
   scalpel_state.F2_initiated = false;
   scalpel_state.neon = 0;

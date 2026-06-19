@@ -13,7 +13,6 @@ scalpel3 \- Recover contiguous or fragmented data from an image file
 [\fB-C\fR]
 [\fB-d\fR]
 [\fB-e\fR \fI#\fR]
-[\fB-f\fR]
 [\fB-F\fR \fIsecs\fR]
 [\fB-g\fR \fI#\fR]
 [\fB-G\fR \fI#\fR]
@@ -35,6 +34,7 @@ scalpel3 \- Recover contiguous or fragmented data from an image file
 [\fB-R\fR]
 [\fB-r\fR \fI#\fR]
 [\fB-s\fR \fI#\fR]
+[\fB-S\fR]
 [\fB-t\fR \fI#\fR]
 [\fB-u\fR \fI#\fR]
 [\fB-U\fR \fIfiletype[,filetype]...\fR]
@@ -76,7 +76,8 @@ Don't backtrack.  Default is backtracking on.  Useful only for debugging.
 
 .TP
 .B -c
-Turn off reassembly thread work sharing. Default is on.
+Don't attempt fragmented recovery for any supported file type. This essentially sets NO_DEFRAG to true for all
+file types.
 
 .TP
 .B -C
@@ -96,11 +97,6 @@ hyperthreading, it may be beneficial to increase the number of perceived CPU
 cores using -e.  On Apple Silicon systems, the number of performance cores is
 used to size thread pools and -e can be used to experimentally increase the
 sizes of thread pools.
-
-.TP
-.B -f
-Don't attempt fragmented recovery for any supported file type. This essentially sets NO_DEFRAG to true for all
-file types.
 
 .TP
 .BI -F " #"
@@ -199,6 +195,10 @@ Specify the maximum number of threads per filemirror pool.
 .TP
 .BI -s " #"
 Specify the maximum number of reassembly threads.
+
+.TP
+.B -S
+Turn off reassembly thread work sharing. Default is on.
 
 .TP
 .BI -t " #"

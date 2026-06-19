@@ -75,17 +75,31 @@
 // to take advantage of blockmap swaps, without "thrashing" and eliminating opportunities for
 // reassembly threads to make progress.  Periodic checkpoints only sync internal state to increase
 // performance--they are distinct from recovery checkpoints, which ensure restartability.
-#define PERIODIC_CHECKPOINTING_INTERVAL (2 * 60)
+//
+// IMPORTANT: This parameter can drastically impact performance and more testing needs to be done to
+// justify a default value.
+#define PERIODIC_CHECKPOINTING_INTERVAL (5 * 60)
 
 // default initial periodic checkpointing interval (in seconds).  To ensure that every candidate
 // gets some initial processing time (so that easily assembled candidates are eliminated quickly), a
 // wave of progress checkpoints every INITIAL_CHECKPOINTING_INTERVAL seconds occurs at the beginning
 // of reassembly, to provide a sweep over all reassembly candidates.
-#define INITIAL_PERIODIC_CHECKPOINTING_INTERVAL (30)
+//
+// IMPORTANT: This parameter can drastically impact performance and more testing needs to be done to
+// justify a default value.
+#define INITIAL_PERIODIC_CHECKPOINTING_INTERVAL (120)
 
 // default number of validated files during fragmented reassembly to trigger a blockmap swap and
 // periodic checkpoint.
-#define VALIDATION_CP_THRESHOLD 20
+//
+// IMPORTANT: This parameter can drastically impact performance and more testing needs to be done to
+// justify a default value.
+#define VALIDATION_CP_THRESHOLD 10000
+
+// if fragmented reassembly has validated files since the last periodic checkpoint
+// but then stops validating new files, trigger a blockmap sync without waiting for
+// the full periodic interval.
+#define VALIDATION_STALL_CP_INTERVAL 30
 
 // recovery checkpoints are taken every RECOVERY_CHECKPOINT seconds regardless of whether reassembly
 // threads have validated files.  This has no command line option override and ensures that large
@@ -403,14 +417,13 @@ typedef union SearchState {
 } SearchState;
 
 
-// result of block evaluation for block validator functions--this value MUST be
-// representable within an unsigned char and BLOCK_CONFIDENCE_INVALID MUST BE
-// ZERO.  The value indicates confidence that the block is of a specific file
-// type.
+// result of block evaluation for block validator functions--this value MUST be representable with 4
+// bits and BLOCK_CONFIDENCE_INVALID MUST BE ZERO.  The value indicates confidence that the block is
+// of a specific file type.
 typedef enum BlockValidationDecision {
   BLOCK_CONFIDENCE_INVALID = 0,  // block ABSOLUTELY DOES NOT validate as type ** MUST BE ZERO **
   BLOCK_CONFIDENCE_LOW = 1,      // possibly validates as type with low confidence
-  BLOCK_CONFIDENCE_VALID = 100   // possibly validates as type with highest possible confidence
+  BLOCK_CONFIDENCE_VALID = 15    // validates as type with highest possible confidence
 } BlockValidationDecision;
 
 
@@ -500,7 +513,8 @@ typedef struct CarveInfo {
   bool deposited;                   // candidate with this header previously deposited for
                                     // fragmented reassembly?
   bool partial_artifact_written;    // has PROMISING/INPROGRESS output been written?
-  int64_t qposition;                // enforces strict ordering in promising queue
+  int64_t qposition;                // CPU-time-decay scheduling priority in promising queue
+                                    // (relaxed priority; not strict FIFO among equal priorities)
   CarveInfoFlavor flavor;           // files only: validated, promising, or in progress
   bool no_initial_block_extension;  // if true, checkpoint interrupted best block selection
   bool fastpath;                    // if true, newly appended block maximizes best_validated_to
@@ -839,6 +853,7 @@ typedef struct ScalpelState {
   // the following indicate which phases were complete and assist in
   // lock optimization and checkpoint restart
   bool block_validation_complete;         // has block validation completed?              (C)
+  bool contiguous_recovery_complete;      // has initial contiguous recovery completed?   (C)
   bool F1_initiated;                      // F1 reassembly yet for current priority?      (C)
   bool F2_initiated;                      // F2 reassembly yet for current priority?      (C)
   // misc non-checkpointed state

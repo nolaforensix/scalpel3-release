@@ -131,6 +131,20 @@ atomic_bool TAKE_PERIODIC_CHECKPOINT;
 
 // controls progress checkpoints, which update INPROGRESS
 atomic_bool TAKE_PROGRESS_CHECKPOINT;
+static atomic_ulong progress_checkpoint_requested;
+static atomic_ulong progress_checkpoint_completed;
+
+typedef enum CheckpointRequestMask {
+  CHECKPOINT_REQUEST_EXIT = 1u << 0,
+  CHECKPOINT_REQUEST_RECOVERY = 1u << 1,
+  CHECKPOINT_REQUEST_PERIODIC = 1u << 2,
+  CHECKPOINT_REQUEST_PROGRESS = 1u << 3
+} CheckpointRequestMask;
+
+// tracks checkpoint requests already accepted by the current checkpoint handler. A raw request flag
+// can remain set while the checkpoint is being serviced, so status messages use this mask to avoid
+// reporting an accepted request as still pending.
+static atomic_uint checkpoint_servicing_mask;
 
 // contains blocks or carving candidates for validation threads
 static Queue carvelist;
@@ -212,6 +226,17 @@ static void validate_block(BlockInfo *blockinfo);
 static void validate_file(CarveInfo *candidate, unsigned int id);
 static void validate_blocks(void);
 static void add_file_validation_work(CarveInfo *candidate, int64_t priority);
+static uint32_t checkpoint_requested_mask(void);
+static void checkpoint_mark_serviced_requests(void);
+static const char *checkpoint_pending_status(void);
+static unsigned long checkpoint_request_progress_generation(void);
+static bool checkpoint_progress_generation_complete(unsigned long generation);
+static void checkpoint_service_inprogress_requests(bool *write_inprogress, bool *inprogress_updated);
+static void print_reassembly_status(uint64_t q_length,
+                                    long checkpoint_timer,
+                                    long recovery_checkpoint_timer,
+                                    uint64_t num_initial_checkpoints,
+                                    struct timespec *last_validation);
 static bool block_validation_memdiag_enabled(void);
 static void block_validation_memdiag_report(const char *stage,
                                             uint64_t num_blocks,
@@ -224,8 +249,10 @@ static void *search_thread(void *args);
 static void *validation_thread(void *args);
 static void *partial_cleanup_thread(void *args);
 static void sync_and_validate_queues(void);
+static void ensure_candidate_blockvector(CarveInfo *candidate);
 static uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority);
 static void carve_logically_contiguous_files(FILE_DEFRAG_PRIORITY priority);
+static void checkpoint_update_actions(bool *write_checkpoint_data, bool *write_inprogress, bool *swap_blockmaps);
 static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority);
 static void scalpel_state_serialization(StateSerialization mode, char *filename);
 static void insert_F2_reassembly_candidates(FILE_DEFRAG_PRIORITY priority);
@@ -251,6 +278,7 @@ static void init_optimized_pattern_search(void);
 static void free_pattern_list(PatternList *pl);
 static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs, bool headers);
 static void optimized_pattern_search(PatternList *pl, const unsigned char *buf, size_t len, BlockVector *b,
+                                     uint64_t emit_len,
                                      void (*callback)(uint32_t, uint64_t, size_t, bool));
 static void record_pattern_match(uint32_t needleidx, uint64_t position, size_t match_len, bool is_header);
 static bool has_wildcard(const char *pattern, size_t len);
@@ -889,6 +917,8 @@ static bool promising_queue_element_serialization(void **element, int64_t *prior
 
   // b (blockvector):
   if (mode == SERIALIZE) {
+    ensure_candidate_blockvector(c);
+
     // write important fields for the blockvector c->b. The data isn't written, as the blockvector
     // can be reinflated using image data on demand. This function will not return if there's an
     // error.
@@ -1144,6 +1174,166 @@ static bool primary_uuid_is_killed(uuid_t uuid) {
 
   return atomic_load_explicit(&kill_queue_initialized, memory_order_acquire)
          && element_in_queue(&kill_queue, uuid);
+}
+
+
+// return a bitmask describing currently requested checkpoint operations.
+static uint32_t checkpoint_requested_mask(void) {
+
+  uint32_t mask = 0;
+
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    mask |= CHECKPOINT_REQUEST_EXIT;
+  }
+
+  if (atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)) {
+    mask |= CHECKPOINT_REQUEST_RECOVERY;
+  }
+
+  if (atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)) {
+    mask |= CHECKPOINT_REQUEST_PERIODIC;
+  }
+
+  if (atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)) {
+    mask |= CHECKPOINT_REQUEST_PROGRESS;
+  }
+
+  return mask;
+}
+
+
+// mark currently requested checkpoint operations as accepted by the active checkpoint handler.
+static void checkpoint_mark_serviced_requests(void) {
+
+  atomic_fetch_or_explicit(&checkpoint_servicing_mask, checkpoint_requested_mask(), memory_order_acq_rel);
+}
+
+
+// return a short status suffix for pending checkpoint requests. This is used by phases that do not
+// service checkpoint requests immediately. Requests already accepted by the active checkpoint handler
+// are not reported as pending just because their raw request flags have not been cleared yet.
+static const char *checkpoint_pending_status(void) {
+
+  uint32_t servicing_mask = atomic_load_explicit(&checkpoint_servicing_mask, memory_order_acquire);
+
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+      && ! (servicing_mask & CHECKPOINT_REQUEST_EXIT)) {
+    return ", CHECKPOINT-AND-EXIT PENDING";
+  }
+
+  if (atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)
+      && ! (servicing_mask & CHECKPOINT_REQUEST_RECOVERY)) {
+    return ", RECOVERY CHECKPOINT PENDING";
+  }
+
+  if (atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)
+      && ! (servicing_mask & CHECKPOINT_REQUEST_PERIODIC)) {
+    return ", PERIODIC CHECKPOINT PENDING";
+  }
+
+  if (atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)
+      && ! (servicing_mask & CHECKPOINT_REQUEST_PROGRESS)) {
+    return ", PROGRESS CHECKPOINT PENDING";
+  }
+
+  return "";
+}
+
+
+// record a progress checkpoint request and return the generation the IPC client should wait for.
+static unsigned long checkpoint_request_progress_generation(void) {
+
+  unsigned long generation;
+
+  generation = atomic_fetch_add_explicit(&progress_checkpoint_requested, 1, memory_order_acq_rel) + 1;
+  atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, true, memory_order_release);
+
+  return generation;
+}
+
+
+// return true if the requested progress checkpoint generation has been written to INPROGRESS.
+static bool checkpoint_progress_generation_complete(unsigned long generation) {
+
+  return atomic_load_explicit(&progress_checkpoint_completed, memory_order_acquire) >= generation;
+}
+
+
+// update INPROGRESS for checkpoint actions and satisfy any progress checkpoint generations observed
+// before the update starts. Requests that arrive during the update retain TAKE_PROGRESS_CHECKPOINT
+// and will be serviced by a later update.
+static void checkpoint_service_inprogress_requests(bool *write_inprogress, bool *inprogress_updated) {
+
+  unsigned long requested;
+  unsigned long completed;
+
+  requested = atomic_load_explicit(&progress_checkpoint_requested, memory_order_acquire);
+  completed = atomic_load_explicit(&progress_checkpoint_completed, memory_order_acquire);
+
+  if ((*write_inprogress && ! *inprogress_updated) || requested > completed) {
+    update_inprogress_directories();
+    *inprogress_updated = true;
+
+    if (requested > completed) {
+      atomic_store_explicit(&progress_checkpoint_completed, requested, memory_order_release);
+    }
+  }
+
+  if (atomic_load_explicit(&progress_checkpoint_completed, memory_order_acquire)
+      >= atomic_load_explicit(&progress_checkpoint_requested, memory_order_acquire)) {
+    atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, false, memory_order_release);
+  }
+  else {
+    atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, true, memory_order_release);
+  }
+}
+
+
+static void print_reassembly_status(uint64_t q_length,
+                                    long checkpoint_timer,
+                                    long recovery_checkpoint_timer,
+                                    uint64_t num_initial_checkpoints,
+                                    struct timespec *last_validation) {
+  struct timespec endtime;
+  long now;
+  uint64_t total_wait;
+  double last_validation_gap;
+
+  now = time(NULL);
+  clock_gettime(CLOCK_MONOTONIC, &endtime);
+  total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9
+               + (endtime.tv_nsec - starttime.tv_nsec);
+  last_validation_gap = (endtime.tv_sec - last_validation->tv_sec)
+                        + (endtime.tv_nsec - last_validation->tv_nsec)
+                          / 1000000000.0;
+
+  lock_fprintf(stdout,
+               "\nStatus: promising queue: %" PRIu64 " elements, %d idle reassembly threads of %d, "
+               "periodic CP countdown: %ld secs%s,\n"
+               "last file validation: %.2lf secs, recovery CP countdown: %ld secs, "
+               "validated files: %lu, "
+               "total elapsed time: %.2lf secs.\n",
+               q_length,
+               atomic_load_explicit(&num_idle_reassembly_threads,
+                                    memory_order_acquire),
+               scalpel_state.max_reassembly_threads,
+               checkpoint_timer + (num_initial_checkpoints > 0
+                   ? INITIAL_PERIODIC_CHECKPOINTING_INTERVAL
+                   : scalpel_state.checkpointing_interval) - now >= 0
+                   ? checkpoint_timer + (num_initial_checkpoints > 0
+                       ? INITIAL_PERIODIC_CHECKPOINTING_INTERVAL
+                       : scalpel_state.checkpointing_interval) - now
+                   : 0,
+               now - checkpoint_timer > scalpel_state.checkpointing_interval + 5
+                   ? " [pending a validated file]"
+                   : "",
+               last_validation_gap,
+               recovery_checkpoint_timer + RECOVERY_CHECKPOINTING_INTERVAL - now >= 0
+                   ? recovery_checkpoint_timer + RECOVERY_CHECKPOINTING_INTERVAL - now
+                   : 0,
+               atomic_load_explicit(&scalpel_state.validated_files,
+                                    memory_order_acquire),
+               (double)total_wait / 1e9);
 }
 
 
@@ -1639,6 +1829,12 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
 
   if (fb(&(scalpel_state.block_validation_complete), sizeof(scalpel_state.block_validation_complete), 1, fp) != 1) {
     perror("scalpel_state block_validation_complete");
+    // fatal
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+
+  if (fb(&(scalpel_state.contiguous_recovery_complete), sizeof(scalpel_state.contiguous_recovery_complete), 1, fp) != 1) {
+    perror("scalpel_state contiguous_recovery_complete");
     // fatal
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
@@ -2473,6 +2669,8 @@ static void sync_and_validate_queues(void) {
     uuid_unparse_lower(c->binuuid, uuidp);
     uuid_unparse_lower(c->clone_binuuid, uuidc);
 
+    ensure_candidate_blockvector(c);
+
     // remember number of blocks before validation
     numblocks = blockvector_get_num_blocks(c->b);
     // validate_blockvector() will ensure reservations are removed from any blocks that are
@@ -2572,6 +2770,21 @@ static void sync_and_validate_queues(void) {
 }
 
 
+// initialize a candidate's blockvector if creation was deferred until reassembly. F2 header/footer
+// seeds and contiguous recovery candidates are queued without blockvectors to avoid allocation work
+// unless the candidate is actually processed. Checkpoint serialization and queue synchronization need
+// a concrete blockvector, so they use this helper to create the same initial contiguous vector that a
+// reassembly thread would create.
+static void ensure_candidate_blockvector(CarveInfo *candidate) {
+
+  if (! candidate || candidate->b) {
+    return;
+  }
+
+  init_contiguous_blockvector(scalpel_state.filemirror, &candidate->b, candidate->start, candidate->stop, false);
+}
+
+
 // threads to support multithreaded header/footer searches. Search threads are NOT responsive to
 // pending checkpoint operations.
 static void *search_thread(void *args) {
@@ -2585,6 +2798,8 @@ static void *search_thread(void *args) {
   char *bdata;
   size_t buflen;
   size_t blen;
+  uint64_t emitlen;
+  uint64_t match_offset;
   uint64_t start_location = 0;
   char temp[MAX_STRING_LENGTH];
 
@@ -2616,6 +2831,7 @@ static void *search_thread(void *args) {
     }
 
     blen = blockvector_get_data_length(work->b);
+    emitlen = blockvector_get_non_peekahead_data_length(work->b);
     bdata = blockvector_get_data_pointer(work->b);
     matchlen = 0;
     matchpos = (char *)1;
@@ -2652,10 +2868,13 @@ static void *search_thread(void *args) {
       }
 
       if (matchpos >= startpos) {  // only record a valid position
-        // header/footer locations are *absolute* offsets in the image file, so they can be used
-        // regardless of which blockmap is in use
-        start_location = blockvector_data_pointer_offset_to_actual_location(work->b, matchpos - bdata);
-        record_pattern_match(work->needleidx, start_location, matchlen, work->is_header);
+        match_offset = (uint64_t)(matchpos - bdata);
+        if (match_offset < emitlen) {
+          // header/footer locations are *absolute* offsets in the image file, so they can be used
+          // regardless of which blockmap is in use
+          start_location = blockvector_data_pointer_offset_to_actual_location(work->b, match_offset);
+          record_pattern_match(work->needleidx, start_location, matchlen, work->is_header);
+        }
       }
 
       if (matchpos < startpos) {  // header/footer functions is broken, avoid hang
@@ -2786,14 +3005,6 @@ static void validate_file(CarveInfo *candidate, unsigned int id) {
 
   if (promising && blockvector_get_data_length(candidate->b) > validates_to) {
     // the validator found a better limit on size of valid data for promising fragment
-
-    // GGRIII:
-
-    // validates_to is where validation began to fail in the candidate--if that wasn't on a block
-    // boundary, it's better to let fragmented reassembly determine the best block for the current
-    // tail as long as a full block would remain, because building on a block that didn't complete
-    // validate will very likely result in backtracking and additional work.
-
     if (validates_to + 1 < scalpel_state.blocksize) {
       blockvector_set_data_length(candidate->b, validates_to + 1);
       resize_blockvector(candidate->b, 1);
@@ -3322,10 +3533,10 @@ static void validate_blocks(void) {
 
       lock_fprintf(stdout,
                    "\nStatus: Blocks queued for validation: %" PRIu64
-                   ", %d idle block validation threads of %d, NOT CHECKPOINTING,\n"
+                   ", %d idle block validation threads of %d%s,\n"
                    "total elapsed time: %.2lf secs.\n",
                    q_length, (int)atomic_load_explicit(&num_idle_validation_threads, memory_order_acquire),
-                   (int)scalpel_state.max_validation_threads, (double)total_wait / 1e9);
+                   (int)scalpel_state.max_validation_threads, checkpoint_pending_status(), (double)total_wait / 1e9);
     }
   }
 
@@ -3972,6 +4183,7 @@ static void *ipc_thread(void *arg) {
   uuid_t killuuid;
   uuid_string_t textuuid;
   struct timeval tv;
+  unsigned long progress_generation;
   static struct timespec brief_wait = {.tv_sec = 0, .tv_nsec = 100 * 1000};
 
   (void)arg;
@@ -4201,12 +4413,8 @@ static void *ipc_thread(void *arg) {
         }
       }
       else if (! strcmp(buf, PROGRESSCHECKPOINT_CMD)) {
-        if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
-            || atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)
-            || atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)
-            || atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)
-            || atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
-          frame_message("IPC PROGRESS CHECKPOINT NOT INITIATED AS A CHECKPOINT IS UNDERWAY");
+        if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+          frame_message("IPC PROGRESS CHECKPOINT NOT INITIATED AS CHECKPOINT AND EXIT IS UNDERWAY");
           if (write(clientsock, PROGRESSCHECKPOINT_RESPONSE_NACK, PROGRESSCHECKPOINT_RESPONSE_NACK_LEN)
               != PROGRESSCHECKPOINT_RESPONSE_NACK_LEN) {
             lock_fprintf(stderr, "\nNon-fatal error: couldn't send response to IPC instance.\n");
@@ -4214,12 +4422,21 @@ static void *ipc_thread(void *arg) {
           }
         }
         else {
-          frame_message("INITIATING NEW IPC PROGRESS CHECKPOINT OPERATION");
-          atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, true, memory_order_release);
+          if (atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)
+              || atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)
+              || atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)
+              || atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            frame_message("IPC PROGRESS CHECKPOINT QUEUED ON ACTIVE CHECKPOINT");
+          }
+          else {
+            frame_message("INITIATING NEW IPC PROGRESS CHECKPOINT OPERATION");
+          }
+
+          progress_generation = checkpoint_request_progress_generation();
 
           // wait for progress checkpoint to complete before sending response, so client knows when update
           // is complete
-          while (atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)) {
+          while (! checkpoint_progress_generation_complete(progress_generation)) {
             nanosleep(&brief_wait, NULL);
           }
 
@@ -4925,12 +5142,17 @@ static inline bool verify_pattern_match(const unsigned char *match_ptr, const Pa
 
 // SIMD-accelerated pattern search
 static void optimized_pattern_search(PatternList *pl, const unsigned char *buf, size_t len, BlockVector *b,
+                                     uint64_t emit_len,
                                      void (*callback)(uint32_t, uint64_t, size_t, bool)) {
 
   uint64_t match_pos = 0;
 
   if (! pl || pl->num_patterns == 0) {
     return;
+  }
+
+  if (emit_len > len) {
+    emit_len = len;
   }
 
   if (scalpel_state.mode_verbose) {
@@ -4972,7 +5194,9 @@ static void optimized_pattern_search(PatternList *pl, const unsigned char *buf, 
         }
 
         if (verify_pattern_match(match_ptr, p)) {
-          callback(p->spec_idx, blockvector_data_pointer_offset_to_actual_location(b, match_pos), p->length, p->is_header);
+          if (match_pos < emit_len) {
+            callback(p->spec_idx, blockvector_data_pointer_offset_to_actual_location(b, match_pos), p->length, p->is_header);
+          }
         }
       }
       mask &= (mask - 1);      // clear the bit we just processed
@@ -5005,7 +5229,9 @@ static void optimized_pattern_search(PatternList *pl, const unsigned char *buf, 
         }
 
         if (verify_pattern_match(match_ptr, p)) {
-          callback(p->spec_idx, blockvector_data_pointer_offset_to_actual_location(b, pos), p->length, p->is_header);
+          if (pos < emit_len) {
+            callback(p->spec_idx, blockvector_data_pointer_offset_to_actual_location(b, pos), p->length, p->is_header);
+          }
         }
       }
     }
@@ -5214,10 +5440,12 @@ static void search_for_headers_footers_buffer(BlockVector *b) {
     clock_gettime(CLOCK_MONOTONIC, &search_start);
 
     if (header_pattern_list) {
-      optimized_pattern_search(header_pattern_list, (const unsigned char *)data, len, b, record_pattern_match);
+      optimized_pattern_search(header_pattern_list, (const unsigned char *)data, len, b,
+                               blockvector_get_non_peekahead_data_length(b), record_pattern_match);
     }
     if (footer_pattern_list) {
-      optimized_pattern_search(footer_pattern_list, (const unsigned char *)data, len, b, record_pattern_match);
+      optimized_pattern_search(footer_pattern_list, (const unsigned char *)data, len, b,
+                               blockvector_get_non_peekahead_data_length(b), record_pattern_match);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &search_end);
@@ -5266,12 +5494,12 @@ static void search_for_headers_footers(void) {
       clock_gettime(CLOCK_MONOTONIC, &endtime);
       total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
       lock_fprintf(stdout,
-                   "\nStatus: Header/footer search position %" PRIu64 " / %" PRIu64 " bytes (%3.1lf%%), NOT CHECKPOINTING,\n"
+                   "\nStatus: Header/footer search position %" PRIu64 " / %" PRIu64 " bytes (%3.1lf%%)%s,\n"
                    "total elapsed time: %.2lf secs.\n",
                    filemirror_ftello(scalpel_state.filemirror), filemirror_apparent_filesize(scalpel_state.filemirror),
                    (double)filemirror_ftello(scalpel_state.filemirror)
                        / (double)filemirror_apparent_filesize(scalpel_state.filemirror) * 100.0,
-                   (double)total_wait / 1e9);
+                   checkpoint_pending_status(), (double)total_wait / 1e9);
     }
     free_blockvector(&b);
   }
@@ -5280,10 +5508,10 @@ static void search_for_headers_footers(void) {
   total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
 
   lock_fprintf(stdout,
-               "\nStatus: Header/footer search position %" PRIu64 " / %" PRIu64 " bytes (%3.1lf%%), NOT CHECKPOINTING,\n"
+               "\nStatus: Header/footer search position %" PRIu64 " / %" PRIu64 " bytes (%3.1lf%%)%s,\n"
                "total elapsed time: %.2lf secs.\n",
                filemirror_apparent_filesize(scalpel_state.filemirror), filemirror_apparent_filesize(scalpel_state.filemirror),
-               100.0, (double)total_wait / 1e9);
+               100.0, checkpoint_pending_status(), (double)total_wait / 1e9);
 
   prune_header_footer_database();
 
@@ -5480,8 +5708,11 @@ void carve_files(void) {
 
     // first try phase C, which attempts to recover files whose apparent blocks are logically
     // contiguous
-    if (! first || ! scalpel_state.restore_from_checkpoint) {
+    if (! first || ! scalpel_state.restore_from_checkpoint || ! scalpel_state.contiguous_recovery_complete) {
       carve_logically_contiguous_files(PRIORITY_FLOOR);
+      if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+        scalpel_state.contiguous_recovery_complete = true;
+      }
     }
 
     first = false;
@@ -5524,13 +5755,16 @@ void carve_files(void) {
 
       // these are restored from the checkpoint, but the value only corresponds to the current
       // priority.
-      if (! scalpel_state.restore_from_checkpoint || ! first) {
+      if (! scalpel_state.restore_from_checkpoint || ! first || ! scalpel_state.contiguous_recovery_complete) {
         scalpel_state.F1_initiated = false;
         scalpel_state.F2_initiated = false;
 
         // first try phase C, which attempts to recover files whose apparent blocks are logically
         // contiguous
         carve_logically_contiguous_files(PRIORITY_FLOOR);
+        if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+          scalpel_state.contiguous_recovery_complete = true;
+        }
       }
 
       first = false;
@@ -5572,7 +5806,8 @@ void carve_files(void) {
 // are not considered are dealt with in a separate carving phase. Returns the number of validated
 // files that were carved. This function implements phase C ("logically contiguous") file recovery.
 //
-// This function is NOT responsive to a pending checkpoint operation.
+// This function drains and returns early if checkpoint-and-exit is requested. Other checkpoint
+// types are deferred until fragmented reassembly reaches a normal checkpoint boundary.
 uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
 
   SearchSpec *currentfilespec;  // current file type being processed
@@ -5658,6 +5893,12 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
     //
 
     for (headerindex = 0; headerindex < currentfilespec->offsets.numheaders; headerindex++) {
+      // checkpoint-and-exit can be requested during contiguous recovery. Stop enqueueing new work,
+      // then drain validation below so checkpoint state remains consistent.
+      if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+        break;
+      }
+
       // progress display
       if (headerindex % 1000 == 0 && ! scalpel_state.mode_verbose) {
         lock_fprintf(stdout, "%s+%s", GREEN, BLACK);
@@ -5824,6 +6065,10 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
         MUTEX_ERROR_CHECK(pthread_mutex_unlock(&validation_work_is_available), __LINE__, __FILE__);
       }
     }
+
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      break;
+    }
   }
 
   if (candidates == 0) {
@@ -5861,10 +6106,10 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
       total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
 
       lock_fprintf(stdout,
-                   "\nStatus: Files queued for validation: %" PRIu64 ", %d idle file validation threads of %d, NOT CHECKPOINTING,\n"
+                   "\nStatus: Files queued for validation: %" PRIu64 ", %d idle file validation threads of %d%s,\n"
                    "validated files: %lu, total elapsed time: %.2lf secs.\n",
                    q_length, (int)atomic_load_explicit(&num_idle_validation_threads, memory_order_acquire),
-                   (int)scalpel_state.max_validation_threads,
+                   (int)scalpel_state.max_validation_threads, checkpoint_pending_status(),
                    atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire), (double)total_wait / 1e9);
     }
     sched_yield();
@@ -5926,7 +6171,47 @@ static void carve_logically_contiguous_files(FILE_DEFRAG_PRIORITY priority) {
     frame_message("VALIDATING QUEUED PROMISING CANDIDATES");
     sync_and_validate_queues();
 
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      break;
+    }
+
   } while (verified_files);
+}
+
+
+// update local checkpoint action flags from the global checkpoint request flags. These action flags
+// are monotonic during a checkpoint: once set, this function never clears them. Checkpoint-and-exit
+// has the strongest semantics, because restartable checkpoint state must match the blockmap written
+// during shutdown.
+static void checkpoint_update_actions(bool *write_checkpoint_data, bool *write_inprogress, bool *swap_blockmaps) {
+
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    *write_checkpoint_data = true;
+    *swap_blockmaps = true;
+    if (atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)) {
+      *write_inprogress = true;
+    }
+    return;
+  }
+
+  if (atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)) {
+    *write_checkpoint_data = true;
+    *swap_blockmaps = true;
+    if (scalpel_state.write_inprogress) {
+      *write_inprogress = true;
+    }
+  }
+
+  if (atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)) {
+    *swap_blockmaps = true;
+    if (scalpel_state.write_inprogress) {
+      *write_inprogress = true;
+    }
+  }
+
+  if (atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)) {
+    *write_inprogress = true;
+  }
 }
 
 
@@ -5935,6 +6220,7 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
 
   uint64_t validated;
   uint64_t last_seen_validated;
+  uint64_t checkpoint_synced_validated;
   uint64_t q_length;
   uint64_t f_load;
   uint64_t pending_reassemblies;
@@ -5958,7 +6244,9 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
   bool write_checkpoint_data;
   bool write_inprogress;
   bool swap_blockmaps;
-  uint64_t num_initial_checkpoints;
+  bool checkpoint_saved;
+  bool inprogress_updated;
+  uint64_t num_initial_checkpoints = 0;
 
   if (scalpel_state.memory_profiling) {
     memory_footprint("start frag reassembly");
@@ -5976,7 +6264,7 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
   }
 
   // initially, a sweep over all candidates is performed by doing a wave of periodic checkpoints
-  num_initial_checkpoints = queue_length(&promising_queue) / scalpel_state.max_reassembly_threads + 1;
+  num_initial_checkpoints = queue_length(&promising_queue) / scalpel_state.max_reassembly_threads;
 
   // at this point, normal operation is resumed if a checkpoint was being restored.
   scalpel_state.restore_from_checkpoint = false;
@@ -5987,13 +6275,22 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
   // not taking a periodic checkpoint
   atomic_store_explicit(&REASS_RETURN_TO_IDLE, false, memory_order_release);
 
-  // broadcast to let reassembly threads know that work is available. pthreads requires that an
-  // associated lock be held to avoid lost signals.
-  MUTEX_ERROR_CHECK(pthread_mutex_lock(&reassembly_work_is_available), __LINE__, __FILE__);
-  pthread_cond_broadcast(&reassembly_check_work_available);
-  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&reassembly_work_is_available), __LINE__, __FILE__);
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    // checkpoint-and-exit may have been requested before fragmented reassembly was entered. Do
+    // not wake reassembly threads; save the current queue and exit at this safe boundary.
+    atomic_store_explicit(&REASS_RETURN_TO_IDLE, true, memory_order_release);
+    frame_message("REASSEMBLY PHASE PAUSED BECAUSE OF CHECKPOINT AND EXIT EVENT");
+    save_checkpoint();
+  }
+  else {
+    // broadcast to let reassembly threads know that work is available. pthreads requires that an
+    // associated lock be held to avoid lost signals.
+    MUTEX_ERROR_CHECK(pthread_mutex_lock(&reassembly_work_is_available), __LINE__, __FILE__);
+    pthread_cond_broadcast(&reassembly_check_work_available);
+    MUTEX_ERROR_CHECK(pthread_mutex_unlock(&reassembly_work_is_available), __LINE__, __FILE__);
+  }
 
-  // reassembly threads are now active
+  // if checkpoint-and-exit was not already pending, reassembly threads are now active
 
   while (! reassembly_complete && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
     validated = atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire);
@@ -6125,15 +6422,49 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
       // time for any kind of checkpoint? If so, reassembly threads will be forced into an idle
       // state before the checkpoint is taken
 
+      // A validation can land after the status/timer refresh above.  Refresh again before making
+      // checkpoint decisions so a stale last_validation_gap does not turn new progress into an
+      // immediate stall checkpoint.
+      uint64_t current_validated =
+          atomic_load_explicit(&scalpel_state.validated_files,
+                               memory_order_acquire);
+      if (current_validated > last_seen_validated) {
+	last_seen_validated = current_validated;
+	clock_gettime(CLOCK_MONOTONIC, &last_validation);
+      }
+      clock_gettime(CLOCK_MONOTONIC, &endtime);
+      last_validation_gap = (endtime.tv_sec - last_validation.tv_sec)
+                            + (endtime.tv_nsec - last_validation.tv_nsec) / 1000000000.0;
+
+      uint64_t validated_since_checkpoint = current_validated - validated;
+      bool validation_stalled_after_progress =
+          q_length > 0 && pending_reassemblies > 0
+          && validated_since_checkpoint > 0
+          && last_validation_gap > VALIDATION_STALL_CP_INTERVAL;
+
       if (q_length == 0) {
 	num_initial_checkpoints = 0;
       }
 
-      if ((num_initial_checkpoints > 0 && now - checkpoint_timer > INITIAL_PERIODIC_CHECKPOINTING_INTERVAL) ||
-	  (now - checkpoint_timer > scalpel_state.checkpointing_interval && (q_length != 0 || atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire) - validated > 0)) ||
-          (atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire) - validated >= scalpel_state.validation_cp_threshold)) {
+      // If the queue is empty but reassembly threads are still active, let those candidates drain
+      // naturally. A checkpoint here interrupts the hardest active candidates after easy tail files
+      // validate, causing repeated checkpoint churn.
+      if (validation_stalled_after_progress ||
+          (num_initial_checkpoints > 0 && now - checkpoint_timer > INITIAL_PERIODIC_CHECKPOINTING_INTERVAL) ||
+	  (now - checkpoint_timer > scalpel_state.checkpointing_interval && (q_length != 0 || validated_since_checkpoint > 0)) ||
+			          (validated_since_checkpoint >= scalpel_state.validation_cp_threshold)) {
 
         // periodic checkpoint
+        if (getenv("SCALPEL_CP_DEBUG")) {
+          lock_fprintf(stderr,
+              "CP_DEBUG q=%" PRIu64 " pending=%" PRIu64
+              " valid_since=%" PRIu64 " gap=%.2lf now_delta=%ld"
+              " initial=%" PRIu64 " threshold=%u stalled=%d\n",
+              q_length, pending_reassemblies, validated_since_checkpoint,
+              last_validation_gap, now - checkpoint_timer,
+              num_initial_checkpoints, scalpel_state.validation_cp_threshold,
+              validation_stalled_after_progress ? 1 : 0);
+        }
 
 	// only "use up" one initial checkpoint if it occurred for reasons other than validated
 	// files hitting the cap
@@ -6172,6 +6503,10 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
         write_checkpoint_data = false;
         write_inprogress = false;
         swap_blockmaps = false;
+        checkpoint_saved = false;
+        inprogress_updated = false;
+        checkpoint_synced_validated = validated;
+        atomic_store_explicit(&checkpoint_servicing_mask, 0, memory_order_release);
 
         // different checkpoints induce different behaviors. Periodic checkpoints simply sync
         // internal state; recovery & exit checkpoints write checkpoint data to disk; and progress
@@ -6180,18 +6515,11 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
         if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
           sprintf(buf, "REASSEMBLY PHASE PAUSED BECAUSE OF CHECKPOINT AND EXIT EVENT");
           frame_message(buf);
-          write_checkpoint_data = true;
-          swap_blockmaps = true;
         }
         else {
           if (atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)) {
             sprintf(buf, "REASSEMBLY PHASE PAUSED BECAUSE OF RECOVERY CHECKPOINT EVENT");
             frame_message(buf);
-	    write_checkpoint_data = true;
-            swap_blockmaps = true;
-	    if (scalpel_state.write_inprogress) {
-	      write_inprogress = true;
-	    }
           }
 
           if (atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)) {
@@ -6202,18 +6530,16 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
 	      sprintf(buf, "REASSEMBLY PHASE PAUSED BECAUSE OF PERIODIC CHECKPOINT EVENT");
 	    }
             frame_message(buf);
-            swap_blockmaps = true;
-	    if (scalpel_state.write_inprogress) {
-	      write_inprogress = true;
-	    }
           }
 
           if (atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)) {
             sprintf(buf, "REASSEMBLY PHASE PAUSED BECAUSE OF PROGRESS CHECKPOINT EVENT");
             frame_message(buf);
-            write_inprogress = true;
           }
         }
+
+        checkpoint_update_actions(&write_checkpoint_data, &write_inprogress, &swap_blockmaps);
+        checkpoint_mark_serviced_requests();
 
         // alert threads that a checkpoint is being taken, which forces them to dump work back into
         // the promising queue and return to an idle state ASAP
@@ -6253,12 +6579,27 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
         }
 
         frame_message("ALL REASSEMBLY THREADS ARE IDLE");
+        if (atomic_load_explicit(&scalpel_state.validated_files,
+                                  memory_order_acquire) > last_seen_validated) {
+          clock_gettime(CLOCK_MONOTONIC, &last_validation);
+          last_seen_validated =
+              atomic_load_explicit(&scalpel_state.validated_files,
+                                   memory_order_acquire);
+        }
+        print_reassembly_status(nolock_queue_length(&promising_queue),
+            checkpoint_timer, recovery_checkpoint_timer,
+            num_initial_checkpoints, &last_validation);
+
+        // checkpoint-and-exit may have been requested while waiting for reassembly threads to
+        // become idle. Refresh action flags before blockmap-sensitive work.
+        checkpoint_update_actions(&write_checkpoint_data, &write_inprogress, &swap_blockmaps);
+        checkpoint_mark_serviced_requests();
 
         if (swap_blockmaps) {
           // if any files were validated before the checkpoint was taken, swap blockmaps, prune the
           // header/footer database, try carving contiguous files again before waking up the
           // reassembly threads. This may potentially reduce the search space for fragmented files.
-          if (atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire) - validated > 0) {
+          if (atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire) - checkpoint_synced_validated > 0) {
             if (scalpel_state.mode_verbose) {
               lock_fprintf(stdout, "\nReassembly status before filemirror swap: %" PRIu64 " elements in promising queue.\n",
                            nolock_queue_length(&promising_queue));
@@ -6276,6 +6617,8 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
             // validate all fragments in the promising queue
             frame_message("VALIDATING QUEUED PROMISING CANDIDATES");
             sync_and_validate_queues();
+
+            checkpoint_synced_validated = atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire);
 
             // final carve phase is skipped on checkpoint and exit
             if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
@@ -6299,22 +6642,74 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
               if (validated > last_seen_validated) {
                 clock_gettime(CLOCK_MONOTONIC, &last_validation);
               }
-	      last_seen_validated = validated;
+              last_seen_validated = validated;
+              checkpoint_synced_validated = validated;
             }
           }
+        }
 
-          // write checkpoint data if this is a recovery checkpoint
-          if (write_checkpoint_data) {
-            save_checkpoint();
-          }
+        // checkpoint-and-exit may have been requested during contiguous recovery. Refresh action
+        // flags before final save/exit decisions.
+        checkpoint_update_actions(&write_checkpoint_data, &write_inprogress, &swap_blockmaps);
+        checkpoint_mark_serviced_requests();
+
+        // If a late checkpoint-and-exit request upgraded a progress checkpoint, make the blockmap
+        // and promising queue consistent before serializing restartable state.
+        if (swap_blockmaps
+            && atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire) - checkpoint_synced_validated > 0) {
+          frame_message("UPDATING BLOCKMAP");
+          filemirror_swap_blockmaps(scalpel_state.filemirror);
+
+          frame_message("PRUNING HEADER/FOOTER DATABASE");
+          prune_header_footer_database();
+
+          frame_message("VALIDATING QUEUED PROMISING CANDIDATES");
+          sync_and_validate_queues();
+
+          checkpoint_synced_validated = atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire);
+          validated = checkpoint_synced_validated;
+        }
+
+        // write checkpoint data if this is a recovery or checkpoint-and-exit checkpoint
+        if (write_checkpoint_data) {
+          save_checkpoint();
+          checkpoint_saved = true;
         }
 
         // update INPROGRESS data if appropriate
-        if (write_inprogress) {
-          update_inprogress_directories();
-        }
+        checkpoint_service_inprogress_requests(&write_inprogress, &inprogress_updated);
+
+        // checkpoint-and-exit may have been requested during INPROGRESS update. Refresh action
+        // flags one last time before deciding whether to resume reassembly threads.
+        checkpoint_update_actions(&write_checkpoint_data, &write_inprogress, &swap_blockmaps);
+        checkpoint_mark_serviced_requests();
+        checkpoint_service_inprogress_requests(&write_inprogress, &inprogress_updated);
 
         if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+          if (swap_blockmaps
+              && atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire) - checkpoint_synced_validated > 0) {
+            frame_message("UPDATING BLOCKMAP");
+            filemirror_swap_blockmaps(scalpel_state.filemirror);
+
+            frame_message("PRUNING HEADER/FOOTER DATABASE");
+            prune_header_footer_database();
+
+            frame_message("VALIDATING QUEUED PROMISING CANDIDATES");
+            sync_and_validate_queues();
+
+            checkpoint_synced_validated = atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire);
+            validated = checkpoint_synced_validated;
+            checkpoint_saved = false;
+            inprogress_updated = false;
+          }
+
+          checkpoint_service_inprogress_requests(&write_inprogress, &inprogress_updated);
+
+          if (write_checkpoint_data && ! checkpoint_saved) {
+            save_checkpoint();
+            checkpoint_saved = true;
+          }
+
           // threads won't be resumed since we are exiting
           stop = true;
           // cause while (load > 0 ...) loop to exit and bypass thread reawakening below
@@ -6333,9 +6728,9 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
           atomic_store_explicit(&TAKE_RECOVERY_CHECKPOINT, false, memory_order_release);
         }
 
-        if (write_inprogress) {
-          atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, false, memory_order_release);
-        }
+        checkpoint_service_inprogress_requests(&write_inprogress, &inprogress_updated);
+
+        atomic_store_explicit(&checkpoint_servicing_mask, 0, memory_order_release);
 
         // signal that checkpoint is complete
         frame_message("CHECKPOINT IS COMPLETE");
@@ -6362,6 +6757,19 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
         memory_footprint("periodic frag reassembly");
       }
     }  // bottom of load-checking loop
+
+    if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      if (atomic_load_explicit(&scalpel_state.validated_files,
+                               memory_order_acquire) > last_seen_validated) {
+        clock_gettime(CLOCK_MONOTONIC, &last_validation);
+        last_seen_validated =
+            atomic_load_explicit(&scalpel_state.validated_files,
+                                 memory_order_acquire);
+      }
+      print_reassembly_status(nolock_queue_length(&promising_queue),
+          checkpoint_timer, recovery_checkpoint_timer,
+          num_initial_checkpoints, &last_validation);
+    }
 
     // skip additional processing on checkpoint and exit, otherwise see if another round of
     // contiguous validation generates any activity
@@ -6620,10 +7028,7 @@ static void *reassembly_thread(void *args) {
     clock_gettime(CLOCK_MONOTONIC, &candidate->last_start);
 
     // moves creation of blockvector out of main thread
-    if (! candidate->b) {
-      // init blockvector for carve candidate
-      init_contiguous_blockvector(scalpel_state.filemirror, &candidate->b, candidate->start, candidate->stop, false);
-    }
+    ensure_candidate_blockvector(candidate);
 
     // mirror work assigned to reassembly threads (must be after blockvector init)
     add_to_reassembly_queue(candidate);

@@ -80,6 +80,6 @@ FILE: TESTS/music5.mp3
 
 # PDF
 
-FILE: TESTS/Berserk.pdf
-FILE: TESTS/BeeMovie.pdf
 FILE: TESTS/chemical_comp_titin.pdf
+FILE: TESTS/nist.fips.197.pdf
+FILE: TESTS/28233-pdf.pdf

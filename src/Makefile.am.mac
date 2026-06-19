@@ -1,4 +1,4 @@
-bin_PROGRAMS = scalpel3 blockmapfs scalpel3-ctl fragmentator crblockmap modblockmap cmpblockmaps mergeblockmap dumphf diskviz
+bin_PROGRAMS = scalpel3 blockmapfs scalpel3-ctl fragmentator crblockmap modblockmap cmpblockmaps dumphf diskviz
 
 ONNXRUNTIME_LIBDIR ?= /usr/local/lib
 ONNXRUNTIME_RPATH = -Wl,-rpath,$(ONNXRUNTIME_LIBDIR)
@@ -19,8 +19,6 @@ cmpblockmap_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -
 
 fragmentator_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -I /opt/local/include -O3 -g -fopenmp-simd -march=native -mtune=native
 
-mergeblockmap_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -O2 -g -fopenmp-simd -march=native -mtune=native
-
 blockmapfs_CPPFLAGS = -D_FILE_OFFSET_BITS=64
 blockmapfs_CFLAGS   = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -O3 -g -I /opt/local/include $(FUSE_CFLAGS) -fopenmp-simd -march=native -mtune=native
 blockmapfs_LDADD    = $(FUSE_LIBS)
@@ -40,14 +38,11 @@ modblockmap_SOURCES = modblockmap.c blockmap.c blockmap.h hashv4.c colors.c dedu
 
 fragmentator_SOURCES = fragmentator.c colors.c longsset.c common.c prioque.c *.h
 
-mergeblockmap_SOURCES = mergeblockmap.c blockmap.c blockmap.h colors.c hashv4.c dedup.c common.c prioque.c *.h
-
 dumphf_SOURCES = dumphf.c colors.c common.c prioque.c *.h
 
 diskviz_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -O2 -g \
                  @SDL2_CFLAGS@ @SDL2_IMAGE_CFLAGS@ @SDL2_TTF_CFLAGS@
 diskviz_SOURCES = diskviz.c colors.c hashv4.c common.c prioque.c *.h
-
 
 scalpel3_LDFLAGS  = $(LDFLAGS) -L$(ONNXRUNTIME_LIBDIR) -Wl,-rpath,$(ONNXRUNTIME_LIBDIR)
 scalpel3_LDADD    = -lonnxruntime
@@ -58,7 +53,6 @@ scalpel3_ctl_LDFLAGS = $(LDFLAGS)
 crblockmap_LDFLAGS   = $(LDFLAGS)
 modblockmap_LDFLAGS  = $(LDFLAGS)
 cmpblockmaps_LDFLAGS = $(LDFLAGS)
-mergeblockmap_LDFLAGS= $(LDFLAGS)
 dumphf_LDFLAGS= $(LDFLAGS)
 diskviz_LDFLAGS = $(LDFLAGS) @SDL2_LIBS@ @SDL2_IMAGE_LIBS@ @SDL2_TTF_LIBS@
 

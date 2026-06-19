@@ -190,8 +190,9 @@ typedef struct PNGBlockState {
 
 // ---- Global CRC hash table for IDAT algebraic solver ----
 // Maps CRC32 to lists of actual block numbers.  Built lazily under a mutex and
-// treated as read-only after publication.  If the active PNG needle changes,
-// the old table is freed and a replacement table is built under the same lock.
+// treated as read-only after publication.  Coverage is monotonic, so the table
+// is keyed by immutable actual block numbers and covered entries are filtered
+// at use time instead of rebuilding after every blockmap swap.
 // Maximum IDAT body length accepted in CRC solver structural checks.
 // PNG spec allows arbitrarily large IDATs.  128MB covers all practical encoders.
 #define PNG_MAX_IDAT_BODY_LEN 134217728U
@@ -199,10 +200,11 @@ typedef struct PNGBlockState {
 #define PNG_CRC_HASH_BUCKETS 65536
 #define PNG_GAP_WINDOW_BUCKETS 262144
 #define PNG_GAP_INDEX_MAX_M 8
+#define PNG_MARKER_BUCKETS 65536
 
 typedef struct PNGGapWindowEntry {
   uint32_t crc;
-  int64_t start_ab;
+  int64_t start_actual;
   struct PNGGapWindowEntry *next;
 } PNGGapWindowEntry;
 
@@ -225,14 +227,32 @@ typedef struct PNGCrcEntry {
   struct PNGCrcEntry *next;
 } PNGCrcEntry;
 
+typedef struct PNGMarkerEntry {
+  uint32_t offset;
+  PNGCrcEntry *entry;
+  struct PNGMarkerEntry *next;
+} PNGMarkerEntry;
+
 typedef struct PNGCrcHashTable {
   PNGCrcEntry *buckets[PNG_CRC_HASH_BUCKETS];
   int64_t total_entries;
-  uint32_t *apparent_crc;
-  unsigned char *apparent_valid;
+  uint32_t *actual_crc;
+  unsigned char *actual_valid;
+  int64_t actual_count;
   int64_t apparent_count;
   PNGGapWindowTable *gap_windows[PNG_GAP_INDEX_MAX_M + 1];
+  PNGMarkerEntry **marker_buckets;
+  PNGMarkerEntry *marker_pool;
+  uint64_t marker_count;
 } PNGCrcHashTable;
+
+static inline bool png_crc_actual_valid(PNGCrcHashTable *ht,
+                                        int64_t actual) {
+  return ht && scalpel_state.filemirror
+      && actual >= 0 && actual < ht->actual_count
+      && ht->actual_valid && ht->actual_valid[actual]
+      && !filemirror_actual_block_covered(scalpel_state.filemirror, actual);
+}
 
 static inline int64_t png_crc_actual_to_apparent(PNGCrcHashTable *ht,
                                                  int64_t actual) {
@@ -240,19 +260,33 @@ static inline int64_t png_crc_actual_to_apparent(PNGCrcHashTable *ht,
       || scalpel_state.blocksize == 0) {
     return -1;
   }
-  uint64_t max_actual = (filemirror_filesize(scalpel_state.filemirror)
-      + (uint64_t)scalpel_state.blocksize - 1)
-      / (uint64_t)scalpel_state.blocksize;
-  if ((uint64_t)actual >= max_actual
-      || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+  if (!png_crc_actual_valid(ht, actual)) {
     return -1;
   }
   int64_t ap = filemirror_apparent_blocknumber(scalpel_state.filemirror,
       actual);
-  if (ap < 0 || ap >= ht->apparent_count || !ht->apparent_valid[ap]) {
-    return -1;
-  }
   return ap;
+}
+
+static inline bool png_crc_apparent_crc(PNGCrcHashTable *ht,
+                                        int64_t apparent,
+                                        uint32_t *out_crc,
+                                        int64_t *out_actual) {
+  if (!ht || !scalpel_state.filemirror || apparent < 0) {
+    return false;
+  }
+  int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
+      apparent);
+  if (!png_crc_actual_valid(ht, actual)) {
+    return false;
+  }
+  if (out_crc) {
+    *out_crc = ht->actual_crc[actual];
+  }
+  if (out_actual) {
+    *out_actual = actual;
+  }
+  return true;
 }
 
 static inline bool png_crc_actual_pair_crc(PNGCrcHashTable *ht,
@@ -268,8 +302,10 @@ static inline bool png_crc_actual_pair_crc(PNGCrcHashTable *ht,
   if (ap0 < 0 || ap1 < 0 || ap0 == ap1) {
     return false;
   }
-  *out_crc = (uint32_t)crc32_combine((uLong)ht->apparent_crc[ap0],
-      (uLong)ht->apparent_crc[ap1], (z_off_t)scalpel_state.blocksize);
+  *out_crc = (uint32_t)crc32_combine(
+      (uLong)ht->actual_crc[actual_start],
+      (uLong)ht->actual_crc[actual_start + 1],
+      (z_off_t)scalpel_state.blocksize);
   *out_ap0 = ap0;
   *out_ap1 = ap1;
   return true;
@@ -287,6 +323,7 @@ static uint32_t png_crc_table_needleidx = UINT32_MAX;
 static atomic_ullong png_crc_table_epoch;
 static pthread_mutex_t png_crc_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t png_gap_window_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int png_debug_trace_events;
 
 /* Forward declarations for PNG carve state and solver cache ownership. */
 typedef struct PNGCarveState PNGCarveState;
@@ -332,6 +369,17 @@ static inline void png_gap_window_table_free(PNGGapWindowTable *gt) {
   free(gt);
 }
 
+static inline void png_crc_marker_index_free(PNGCrcHashTable *ht) {
+  if (!ht) {
+    return;
+  }
+  free(ht->marker_buckets);
+  free(ht->marker_pool);
+  ht->marker_buckets = NULL;
+  ht->marker_pool = NULL;
+  ht->marker_count = 0;
+}
+
 static inline void png_crc_table_free(PNGCrcHashTable *ht) {
   if (!ht) return;
   for (uint32_t i = 0; i < PNG_CRC_HASH_BUCKETS; i++) {
@@ -345,8 +393,9 @@ static inline void png_crc_table_free(PNGCrcHashTable *ht) {
   for (uint32_t m = 0; m <= PNG_GAP_INDEX_MAX_M; m++) {
     png_gap_window_table_free(ht->gap_windows[m]);
   }
-  free(ht->apparent_crc);
-  free(ht->apparent_valid);
+  png_crc_marker_index_free(ht);
+  free(ht->actual_crc);
+  free(ht->actual_valid);
   free(ht);
 }
 
@@ -365,12 +414,89 @@ static inline PNGCrcEntry *png_crc_table_next(PNGCrcEntry *prev, uint32_t crc) {
   return e;
 }
 
+static inline PNGMarkerEntry *png_crc_marker_find(PNGCrcHashTable *ht,
+                                                   uint32_t offset) {
+  if (!ht || !ht->marker_buckets) {
+    return NULL;
+  }
+  PNGMarkerEntry *m = ht->marker_buckets[offset % PNG_MARKER_BUCKETS];
+  while (m && m->offset != offset) {
+    m = m->next;
+  }
+  return m;
+}
+
+static inline PNGMarkerEntry *png_crc_marker_next(PNGMarkerEntry *prev,
+                                                   uint32_t offset) {
+  if (!prev) {
+    return NULL;
+  }
+  PNGMarkerEntry *m = prev->next;
+  while (m && m->offset != offset) {
+    m = m->next;
+  }
+  return m;
+}
+
+static inline void png_crc_marker_index_build(PNGCrcHashTable *ht) {
+  uint64_t count = 0;
+
+  if (!ht) {
+    return;
+  }
+
+  png_crc_marker_index_free(ht);
+
+  for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
+    for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
+      count += e->num_idat_markers;
+      if (e->has_iend) {
+        count++;
+      }
+    }
+  }
+  if (count == 0) {
+    return;
+  }
+
+  ht->marker_buckets = (PNGMarkerEntry **)calloc(PNG_MARKER_BUCKETS,
+      sizeof(PNGMarkerEntry *));
+  ht->marker_pool = (PNGMarkerEntry *)malloc(
+      (size_t)count * sizeof(PNGMarkerEntry));
+  if (!ht->marker_buckets || !ht->marker_pool) {
+    png_crc_marker_index_free(ht);
+    return;
+  }
+
+  uint64_t out = 0;
+  for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
+    for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
+      for (uint8_t mi = 0; mi < e->num_idat_markers && out < count; mi++) {
+        PNGMarkerEntry *m = &ht->marker_pool[out++];
+        m->offset = e->idat_offsets[mi];
+        m->entry = e;
+        uint32_t idx = m->offset % PNG_MARKER_BUCKETS;
+        m->next = ht->marker_buckets[idx];
+        ht->marker_buckets[idx] = m;
+      }
+      if (e->has_iend && out < count) {
+        PNGMarkerEntry *m = &ht->marker_pool[out++];
+        m->offset = e->iend_offset;
+        m->entry = e;
+        uint32_t idx = m->offset % PNG_MARKER_BUCKETS;
+        m->next = ht->marker_buckets[idx];
+        ht->marker_buckets[idx] = m;
+      }
+    }
+  }
+  ht->marker_count = out;
+}
+
 #define PNG_BBK_EXACT_ITER_CAP 50000000ULL
-/* BBK exact search is exponential in active fill positions.  The per-call
- * iteration cap keeps a single invocation bounded, but it still caused
- * large-corpus tail stalls by re-queueing impossible search spaces forever.
- * Use the filtered flat[] size and only enter exact search when the total
- * projected tree is tractable. */
+/* BBK exact search is exponential in active fill positions.  Keep the search
+ * space bounded with the filtered flat[] size and only enter exact search when
+ * the total projected tree is tractable.  The iteration cap below is now a
+ * checkpoint polling point, not a local scheduler yield. */
 #define PNG_BBK_EXACT_FEASIBLE_CAP 8000000ULL
 /* Single-swap has a cheap algebraic scan for full-middle blocks.  Boundary
  * blocks cannot use that prefilter and fall back to physical inflate+CRC per
@@ -406,6 +532,23 @@ static inline PNGCrcEntry *png_crc_table_next(PNGCrcEntry *prev, uint32_t crc) {
  * searches only; at full corpus scale this was the tail stall. */
 #define PNG_M3_PHASE_C_PAIR_CAP 8000000ULL
 
+// Try physically-near anchored pairs before broad M=2 search.  This handles
+// small local filler gaps without turning every candidate into a full-disk
+// pair search.
+#define PNG_M2_ANCHOR_SCAN_MAX 64U
+
+// For post-CRC gallop, keep local prefix progress only while the remaining
+// CRC span is still too wide for the strongest small-boundary solvers.
+#define PNG_POSTCRC_SMALL_SOLVER_FILL_MAX 4U
+
+// This is intentionally checkpoint-only.  PNG solvers may save progress when
+// REASS_RETURN_TO_IDLE is set, but they must not return to the promising queue
+// for local fairness or time-slice reasons.
+static inline bool png_reassembly_yield_requested(CarveInfo *candidate) {
+  (void)candidate;
+  return atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire);
+}
+
 static inline uint32_t png_bbk_copy_fill_positions_excluding(
     uint32_t *dst,
     const uint32_t *src,
@@ -424,6 +567,9 @@ static inline uint32_t png_bbk_copy_fill_positions_excluding(
   }
   return out;
 }
+
+static inline void png_solver_resize_trial(CarveInfo *candidate,
+                                            uint64_t num_blocks);
 
 static inline bool png_bbk_append_suffix_trial(
     int64_t *trial_ab,
@@ -584,6 +730,8 @@ static inline void png_bbk_resume_save(PNGCarveState *local,
                                         const int64_t *next_flat,
                                         const int64_t *chosen_flat,
                                         const int64_t *chosen_blocks);
+static inline PNGGapWindowTable *png_gap_window_table_get(
+    PNGCrcHashTable *ht, uint32_t M);
 
 static inline bool png_bbk_verify_crc(CarveInfo *candidate,
                                        uint64_t idat_start,
@@ -598,6 +746,22 @@ static inline bool png_bbk_verify_crc(CarveInfo *candidate,
   vc = crc32(vc, (const unsigned char *)(vd + idat_start),
       (uInt)bbk_crc_len);
   return vc == bbk_stored_crc;
+}
+
+static inline bool png_bbk_apparent_in_prefix(CarveInfo *candidate,
+                                               uint64_t suffix_start_nb,
+                                               int64_t apparent_block) {
+  if (!candidate || !candidate->b || apparent_block < 0) {
+    return false;
+  }
+
+  for (uint64_t i = 0; i < suffix_start_nb; i++) {
+    if (blockvector_get_apparent_blocknumber(candidate->b, i)
+        == apparent_block) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static inline BBKFillInfo *png_bbk_build_fill_info(uint64_t suffix_start_nb,
@@ -673,6 +837,350 @@ static inline bool png_bbk_compute_unknown_target(CarveInfo *candidate,
 
   *unknown_target = bbk_stored_crc ^ known_contrib;
   return true;
+}
+
+static inline int png_bbk_contiguous_run_solve(CarveInfo *candidate,
+                                                PNGCrcHashTable *ht,
+                                                uint64_t suffix_start_nb,
+                                                const uint32_t *fill_pos,
+                                                uint32_t n_fill,
+                                                int64_t last_block,
+                                                uint64_t idat_start,
+                                                uint64_t bbk_crc_len,
+                                                uint32_t bbk_stored_crc,
+                                                uint32_t unknown_target,
+                                                const BBKFillInfo *finfo) {
+  if (!candidate || !ht || !fill_pos || !finfo || n_fill == 0
+      || n_fill > PNG_GAP_INDEX_MAX_M) {
+    return 0;
+  }
+
+  for (uint32_t i = 1; i < n_fill; i++) {
+    if (fill_pos[i] != fill_pos[i - 1] + 1) {
+      return 0;
+    }
+  }
+  for (uint32_t i = 0; i < n_fill; i++) {
+    if (!finfo[i].full) {
+      return 0;
+    }
+  }
+
+  uint32_t inv[32];
+  if (!png_bbk_build_minv(inv, finfo[n_fill - 1].trail)) {
+    return 0;
+  }
+
+  uint32_t needed_run_crc = png_bbk_apply_minv(inv, unknown_target);
+  PNGGapWindowTable *runs = png_gap_window_table_get(ht, n_fill);
+  if (!runs) {
+    return 0;
+  }
+
+  int64_t apparent[PNG_GAP_INDEX_MAX_M];
+  uint32_t bucket = needed_run_crc % PNG_GAP_WINDOW_BUCKETS;
+  for (PNGGapWindowEntry *we = runs->buckets[bucket]; we; we = we->next) {
+    if (we->crc != needed_run_crc) {
+      continue;
+    }
+
+    bool ok = true;
+    for (uint32_t i = 0; i < n_fill; i++) {
+      int64_t ap = png_crc_actual_to_apparent(ht, we->start_actual + i);
+      if (ap < 0 || png_bbk_apparent_in_prefix(candidate, suffix_start_nb, ap)) {
+        ok = false;
+        break;
+      }
+      apparent[i] = ap;
+    }
+    if (!ok) {
+      continue;
+    }
+
+    for (uint32_t i = 0; i < n_fill; i++) {
+      blockvector_set_apparent_blocknumber(candidate->b,
+          suffix_start_nb + fill_pos[i], apparent[i]);
+      inflate_blockvector_single_block(candidate->b,
+          suffix_start_nb + fill_pos[i]);
+    }
+
+    if (png_bbk_verify_crc(candidate, idat_start,
+            bbk_crc_len, bbk_stored_crc)) {
+      if (scalpel_state.mode_verbose) {
+        lock_fprintf(stdout,
+            "%sPNG BBK RUN: n_fill=%u start_actual=%" PRId64 "%s\n",
+            GREEN, n_fill, we->start_actual, BLACK);
+      }
+      return 1;
+    }
+
+    png_bbk_restore_fill_positions(candidate, suffix_start_nb, fill_pos,
+        n_fill, last_block);
+  }
+
+  return 0;
+}
+
+static inline bool png_bbk_actual_run_contribution(PNGCrcHashTable *ht,
+                                                    int64_t start_actual,
+                                                    uint64_t suffix_start_nb,
+                                                    const uint32_t *fill_pos,
+                                                    uint32_t n_fill,
+                                                    uint64_t idat_end,
+                                                    const BBKFillInfo *finfo,
+                                                    uint32_t *out) {
+  if (!ht || !fill_pos || !finfo || !out || n_fill == 0) {
+    return false;
+  }
+
+  uint32_t bs = scalpel_state.blocksize;
+  uint32_t crc = crc32(0, NULL, 0);
+  uint64_t last_ov_end = 0;
+  bool have_bytes = false;
+  for (uint32_t i = 0; i < n_fill; i++) {
+    int64_t actual = start_actual + (int64_t)i;
+    if (!png_crc_actual_valid(ht, actual)) {
+      return false;
+    }
+    if (finfo[i].ov_end <= finfo[i].ov_start) {
+      continue;
+    }
+    if (have_bytes && finfo[i].ov_start != last_ov_end) {
+      return false;
+    }
+
+    uint64_t block_start = (suffix_start_nb + fill_pos[i]) * (uint64_t)bs;
+    uint64_t off = finfo[i].ov_start - block_start;
+    uint64_t len = finfo[i].ov_end - finfo[i].ov_start;
+    uint64_t actual_len = 0;
+    char *p = filemirror_actual_block_data_pointer(
+        scalpel_state.filemirror, actual, &actual_len);
+    if (!p || off + len > actual_len) {
+      return false;
+    }
+
+    crc = crc32(crc, (const unsigned char *)(p + off), (uInt)len);
+    last_ov_end = finfo[i].ov_end;
+    have_bytes = true;
+  }
+
+  if (!have_bytes || last_ov_end > idat_end) {
+    return false;
+  }
+  *out = (last_ov_end < idat_end)
+      ? (uint32_t)crc32_combine((uLong)crc, 0UL,
+          (z_off_t)(idat_end - last_ov_end))
+      : crc;
+  return true;
+}
+
+static inline int png_bbk_contiguous_run_scan_solve(CarveInfo *candidate,
+                                                     PNGCrcHashTable *ht,
+                                                     uint64_t suffix_start_nb,
+                                                     const uint32_t *fill_pos,
+                                                     uint32_t n_fill,
+                                                     int64_t last_block,
+                                                     uint64_t idat_start,
+                                                     uint64_t idat_end,
+                                                     uint64_t bbk_crc_len,
+                                                     uint32_t bbk_stored_crc,
+                                                     uint32_t unknown_target,
+                                                     const BBKFillInfo *finfo) {
+  (void)idat_start;
+
+  if (!candidate || !ht || !fill_pos || !finfo || n_fill == 0
+      || n_fill > PNG_GAP_INDEX_MAX_M) {
+    return 0;
+  }
+
+  for (uint32_t i = 1; i < n_fill; i++) {
+    if (fill_pos[i] != fill_pos[i - 1] + 1) {
+      return 0;
+    }
+  }
+
+  PNGGapWindowTable *runs = png_gap_window_table_get(ht, n_fill);
+  if (!runs) {
+    return 0;
+  }
+
+  uint64_t checked = 0;
+  int64_t apparent[PNG_GAP_INDEX_MAX_M];
+  for (uint32_t bucket = 0; bucket < PNG_GAP_WINDOW_BUCKETS; bucket++) {
+    for (PNGGapWindowEntry *we = runs->buckets[bucket]; we; we = we->next) {
+      if ((checked++ & 0x3FFULL) == 0ULL
+          && png_reassembly_yield_requested(candidate)) {
+        png_bbk_restore_fill_positions(candidate, suffix_start_nb,
+            fill_pos, n_fill, last_block);
+        return -1;
+      }
+
+      bool ok = true;
+      for (uint32_t i = 0; i < n_fill; i++) {
+        int64_t ap = png_crc_actual_to_apparent(ht, we->start_actual + i);
+        if (ap < 0
+            || png_bbk_apparent_in_prefix(candidate, suffix_start_nb, ap)) {
+          ok = false;
+          break;
+        }
+        apparent[i] = ap;
+      }
+      if (!ok) {
+        continue;
+      }
+
+      uint32_t contrib = 0;
+      if (!png_bbk_actual_run_contribution(ht, we->start_actual,
+              suffix_start_nb, fill_pos, n_fill, idat_end,
+              finfo, &contrib)
+          || contrib != unknown_target) {
+        continue;
+      }
+
+      for (uint32_t i = 0; i < n_fill; i++) {
+        blockvector_set_apparent_blocknumber(candidate->b,
+            suffix_start_nb + fill_pos[i], apparent[i]);
+        inflate_blockvector_single_block(candidate->b,
+            suffix_start_nb + fill_pos[i]);
+      }
+
+      if (png_bbk_verify_crc(candidate, idat_start,
+              bbk_crc_len, bbk_stored_crc)) {
+        if (scalpel_state.mode_verbose) {
+          lock_fprintf(stdout,
+              "%sPNG BBK RUNSCAN: n_fill=%u start_actual=%" PRId64 "%s\n",
+              GREEN, n_fill, we->start_actual, BLACK);
+        }
+        return 1;
+      }
+
+      png_bbk_restore_fill_positions(candidate, suffix_start_nb,
+          fill_pos, n_fill, last_block);
+    }
+  }
+
+  return 0;
+}
+
+static inline int png_bbk_contiguous_subrun_solve(CarveInfo *candidate,
+                                                   PNGCrcHashTable *ht,
+                                                   uint64_t suffix_start_nb,
+                                                   uint32_t fill_needed,
+                                                   uint32_t skip_pos,
+                                                   bool have_skip_pos,
+                                                   int64_t last_block,
+                                                   uint64_t idat_start,
+                                                   uint64_t idat_end,
+                                                   uint64_t bbk_crc_len,
+                                                   uint32_t bbk_stored_crc) {
+  if (!candidate || !ht || fill_needed == 0) {
+    return 0;
+  }
+
+  uint32_t max_width = fill_needed;
+  if (max_width > PNG_GAP_INDEX_MAX_M) {
+    max_width = PNG_GAP_INDEX_MAX_M;
+  }
+
+  uint32_t fill_pos[PNG_GAP_INDEX_MAX_M];
+  for (uint32_t width = max_width; width > 0; width--) {
+    for (uint32_t start = 0; start + width <= fill_needed; start++) {
+      if (have_skip_pos && skip_pos >= start && skip_pos < start + width) {
+        continue;
+      }
+      for (uint32_t i = 0; i < width; i++) {
+        fill_pos[i] = start + i;
+      }
+
+      bool all_full = false;
+      BBKFillInfo *finfo = png_bbk_build_fill_info(
+          suffix_start_nb, fill_pos, width, idat_start, idat_end,
+          &all_full);
+      uint32_t unknown_target = 0;
+      bool geom_ok = finfo
+          && png_bbk_compute_unknown_target(candidate,
+              idat_start, idat_end, finfo, width,
+              bbk_stored_crc, &unknown_target);
+      if (geom_ok && all_full) {
+        int rc = png_bbk_contiguous_run_solve(candidate, ht,
+            suffix_start_nb, fill_pos, width, last_block,
+            idat_start, bbk_crc_len, bbk_stored_crc,
+            unknown_target, finfo);
+        if (rc > 0) {
+          free(finfo);
+          return 1;
+        }
+      }
+      if (geom_ok && !all_full) {
+        int rc = png_bbk_contiguous_run_scan_solve(candidate, ht,
+            suffix_start_nb, fill_pos, width, last_block,
+            idat_start, idat_end, bbk_crc_len, bbk_stored_crc,
+            unknown_target, finfo);
+        if (rc != 0) {
+          free(finfo);
+          return rc;
+        }
+      }
+      free(finfo);
+    }
+  }
+
+  return 0;
+}
+
+static inline int png_bbk_current_idat_subrun_solve(CarveInfo *candidate,
+                                                     PNGCrcHashTable *ht,
+                                                     uint64_t suffix_start_nb,
+                                                     uint32_t fill_needed,
+                                                     int64_t last_block,
+                                                     uint64_t crc_pos,
+                                                     long idat_sz) {
+  if (!candidate || !candidate->b || !ht || fill_needed == 0
+      || idat_sz <= 0) {
+    return 0;
+  }
+
+  uint64_t idat_start = crc_pos + 4;
+  uint64_t bbk_crc_len = 4 + (uint64_t)idat_sz;
+  uint64_t idat_end = idat_start + bbk_crc_len;
+  uint64_t crc_field = idat_end;
+
+  png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+  png_bbk_restore_contiguous_window(candidate, suffix_start_nb,
+      fill_needed, last_block);
+
+  const char *bd = blockvector_get_data_pointer(candidate->b);
+  uint64_t bdl = blockvector_get_data_length(candidate->b);
+  if (!bd || crc_field + 4 > bdl) {
+    resize_blockvector(candidate->b, suffix_start_nb);
+    return 0;
+  }
+
+  const unsigned char *ep = (const unsigned char *)(bd + crc_field);
+  uint32_t stored_crc = ((uint32_t)ep[0] << 24)
+      | ((uint32_t)ep[1] << 16)
+      | ((uint32_t)ep[2] << 8)
+      | (uint32_t)ep[3];
+
+  bool have_skip_pos = false;
+  uint32_t skip_pos = 0;
+  uint64_t bs = (uint64_t)scalpel_state.blocksize;
+  if (bs > 0) {
+    uint64_t crc_block = crc_field / bs;
+    if (crc_block >= suffix_start_nb
+        && crc_block < suffix_start_nb + fill_needed) {
+      skip_pos = (uint32_t)(crc_block - suffix_start_nb);
+      have_skip_pos = true;
+    }
+  }
+
+  int rc = png_bbk_contiguous_subrun_solve(candidate, ht, suffix_start_nb,
+      fill_needed, skip_pos, have_skip_pos, last_block, idat_start,
+      idat_end, bbk_crc_len, stored_crc);
+  if (rc <= 0) {
+    resize_blockvector(candidate->b, suffix_start_nb);
+  }
+  return rc;
 }
 
 static inline int png_bbk_exact_solve(CarveInfo *candidate,
@@ -893,8 +1401,7 @@ static inline int png_bbk_exact_solve(CarveInfo *candidate,
 
       for (; leaf; leaf = png_crc_table_next(leaf, leaf_need_crc)) {
         if ((iter_count & 0x3FFULL) == 0ULL
-            && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                    memory_order_acquire)) {
+            && png_reassembly_yield_requested(candidate)) {
           png_bbk_resume_save(local, retry_mode, suffix_start_nb,
               idat_start, bbk_crc_len, bbk_stored_crc, fill_pos, n_fill,
               depth, true, leaf_need_crc, leaf_last_actual, iter_count,
@@ -910,20 +1417,17 @@ static inline int png_bbk_exact_solve(CarveInfo *candidate,
           continue;
         }
         if (++iter_count > PNG_BBK_EXACT_ITER_CAP) {
-          // Per the exhaust-all-orderings principle: an iteration-count cap
-          // is a per-call budget, not a permanent verdict.  Save the
-          // current leaf-scan position and yield — the candidate will be
-          // re-queued and resume from here on the next invocation with a
-          // fresh iter_count budget.  Never reset the resume state here;
-          // that would silently abandon a search that may still complete.
-          png_bbk_resume_save(local, retry_mode, suffix_start_nb,
-              idat_start, bbk_crc_len, bbk_stored_crc, fill_pos, n_fill,
-              depth, true, leaf_need_crc, leaf_last_actual, 0,
-              next_flat, chosen_flat, chosen_blocks);
-          free(flat); free(flat_ab);
-          free(chosen_entries); free(chosen_blocks);
-          free(chosen_flat);    free(next_flat);
-          return -1;
+          if (png_reassembly_yield_requested(candidate)) {
+            png_bbk_resume_save(local, retry_mode, suffix_start_nb,
+                idat_start, bbk_crc_len, bbk_stored_crc, fill_pos, n_fill,
+                depth, true, leaf_need_crc, leaf_last_actual, 0,
+                next_flat, chosen_flat, chosen_blocks);
+            free(flat); free(flat_ab);
+            free(chosen_entries); free(chosen_blocks);
+            free(chosen_flat);    free(next_flat);
+            return -1;
+          }
+          iter_count = 0;
         }
 
         for (uint32_t i = 0; i + 1 < n_fill; i++) {
@@ -970,8 +1474,7 @@ static inline int png_bbk_exact_solve(CarveInfo *candidate,
     bool advanced = false;
     for (int64_t idx = next_flat[depth]; idx < (int64_t)flat_count; idx++) {
       if ((iter_count & 0x3FFULL) == 0ULL
-          && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                  memory_order_acquire)) {
+          && png_reassembly_yield_requested(candidate)) {
         png_bbk_resume_save(local, retry_mode, suffix_start_nb,
             idat_start, bbk_crc_len, bbk_stored_crc, fill_pos, n_fill,
             depth, false, 0, -1, iter_count, next_flat, chosen_flat,
@@ -998,18 +1501,17 @@ static inline int png_bbk_exact_solve(CarveInfo *candidate,
         continue;
       }
       if (++iter_count > PNG_BBK_EXACT_ITER_CAP) {
-        // Same principle as the leaf-scan cap above: save state, yield,
-        // let the next invocation get a fresh budget.  This is a
-        // non-leaf level of the tree; save with at_leaf=false and the
-        // current next_flat/chosen_flat path already in place.
-        png_bbk_resume_save(local, retry_mode, suffix_start_nb,
-            idat_start, bbk_crc_len, bbk_stored_crc, fill_pos, n_fill,
-            depth, false, 0, -1, 0, next_flat, chosen_flat,
-            chosen_blocks);
-        free(flat); free(flat_ab);
-        free(chosen_entries); free(chosen_blocks);
-        free(chosen_flat);    free(next_flat);
-        return -1;
+        if (png_reassembly_yield_requested(candidate)) {
+          png_bbk_resume_save(local, retry_mode, suffix_start_nb,
+              idat_start, bbk_crc_len, bbk_stored_crc, fill_pos, n_fill,
+              depth, false, 0, -1, 0, next_flat, chosen_flat,
+              chosen_blocks);
+          free(flat); free(flat_ab);
+          free(chosen_entries); free(chosen_blocks);
+          free(chosen_flat);    free(next_flat);
+          return -1;
+        }
+        iter_count = 0;
       }
       chosen_entries[depth] = e;
       chosen_blocks[depth] = ab;
@@ -1124,8 +1626,7 @@ static inline int png_bbk_single_swap_solve(CarveInfo *candidate,
 
     for (uint32_t bk = 0; bk < PNG_CRC_HASH_BUCKETS; bk++) {
       if ((bk & 0xFFU) == 0U
-          && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                  memory_order_acquire)) {
+          && png_reassembly_yield_requested(candidate)) {
         return -1;
       }
       for (PNGCrcEntry *e = ht->buckets[bk]; e; e = e->next) {
@@ -1226,6 +1727,15 @@ static inline int png_bbk_run_solve(CarveInfo *candidate,
   bool solved = false;
 
   if (bbk_geom_ok && all_full) {
+    int run_rc = png_bbk_contiguous_run_solve(candidate, bbk_ht,
+        suffix_start_nb, active_fill_pos, active_n_fill, last_block,
+        idat_start, bbk_crc_len, bbk_stored_crc, unknown_target, finfo);
+    if (run_rc > 0) {
+      solved = true;
+    }
+  }
+
+  if (!solved && bbk_geom_ok && all_full) {
     int exact_rc = png_bbk_exact_solve(candidate, local, bbk_ht,
         suffix_start_nb, active_fill_pos, active_n_fill, last_block,
         idat_start, bbk_crc_len, bbk_stored_crc, retry_mode,
@@ -1821,6 +2331,9 @@ typedef struct PNGCarveState {
     time_t   exhausted_wait_checkpoint_sec;
     long     exhausted_wait_checkpoint_nsec;
 
+    uint64_t safe_partial_blocks;
+    uint64_t safe_partial_length;
+
     /* pngcheck locals */
     PNGCheckpointLocals loc;
 } PNGCarveState;
@@ -1872,6 +2385,8 @@ typedef struct PNGReassemblyPrivateState {
   uint64_t exhausted_wait_validated_files;
   time_t   exhausted_wait_checkpoint_sec;
   long     exhausted_wait_checkpoint_nsec;
+  uint64_t safe_partial_blocks;
+  uint64_t safe_partial_length;
 } PNGReassemblyPrivateState;
 
 static inline void png_solver_resume_reset(PNGCarveState *local) {
@@ -2135,6 +2650,8 @@ static inline void png_reassembly_private_save(
       src->exhausted_wait_checkpoint_sec;
   dst->exhausted_wait_checkpoint_nsec =
       src->exhausted_wait_checkpoint_nsec;
+  dst->safe_partial_blocks = src->safe_partial_blocks;
+  dst->safe_partial_length = src->safe_partial_length;
 }
 
 static inline void png_reassembly_private_restore(
@@ -2196,6 +2713,8 @@ static inline void png_reassembly_private_restore(
       src->exhausted_wait_checkpoint_sec;
   dst->exhausted_wait_checkpoint_nsec =
       src->exhausted_wait_checkpoint_nsec;
+  dst->safe_partial_blocks = src->safe_partial_blocks;
+  dst->safe_partial_length = src->safe_partial_length;
 }
 
 // the following structure and functions are used to replace fgetc(),
@@ -6633,6 +7152,31 @@ int pngcheck(PNGMemIO *mem) {
     if (mem->global_error > kWarning)
       return mem->global_error;
 
+    // IEND is only authoritative after the IDAT zlib stream has produced
+    // the complete image.  A wrong tail can contain self-consistent IDAT
+    // chunk CRCs plus IEND, but still leave inflate short of the required
+    // rows.  Treat that as structural failure before recording IEND as a
+    // verified frontier.
+    if (strcmp(chunkid, "IEND") == 0
+        && mem->check_zlib
+        && mem->zlib_started
+        && !mem->zlib_stopped) {
+      uint64_t safe_crc = idat_crc_ring_back3(mem->idat_crc_ring,
+                                              mem->idat_crc_ring_count);
+      if (safe_crc == 0 && mem->d4_restore_crc_pos > 0) {
+        safe_crc = mem->d4_restore_crc_pos;
+      }
+      if (safe_crc == 0 && mem->prev_idat_crc_pos > 0) {
+        safe_crc = mem->prev_idat_crc_pos;
+      }
+      if (safe_crc > 1) {
+        mem->errpos = (int64_t)(safe_crc - 2);
+        mem->errpos_is_precise = true;
+      }
+      set_err_no_errpos(kMajorError, mem);
+      return mem->global_error;
+    }
+
     /* CRC passed for this chunk — record position for any-chunk CRC tracking. */
     mem->last_chunk_crc_pos = mem->curpos;
 
@@ -8118,20 +8662,18 @@ static inline bool png_parse_first_idat(CarveInfo *candidate,
         | ((uint32_t)data[pos + 1] << 16)
         | ((uint32_t)data[pos + 2] << 8)
         | (uint32_t)data[pos + 3];
-    // P2 fix: bound chunk_len against remaining buffer before using it
-    // for arithmetic.  Without this, a malformed length field
-    // (e.g. 0xFFFFFFFF) makes downstream solvers walk phantom
-    // multi-GB "CRC regions" looking for matches that can't exist.
-    // A legit PNG chunk plus its 12 bytes of framing must fit in dl-pos.
-    if ((uint64_t)chunk_len + 12 > dl - pos) {
-      return false;
-    }
     if (data[pos + 4] == 'I' && data[pos + 5] == 'D'
         && data[pos + 6] == 'A' && data[pos + 7] == 'T') {
       *idat_body_start = pos + 8;
       *idat_body_size = chunk_len;
       *idat_crc_pos = pos + 8 + chunk_len;
       return true;
+    }
+    // Bound non-IDAT chunks before skipping them.  IDAT is handled above
+    // even when only its header is present, because fragmented reassembly
+    // needs the length to solve forward to the CRC boundary.
+    if ((uint64_t)chunk_len + 12 > dl - pos) {
+      return false;
     }
     // Skip: length(4) + type(4) + body(chunk_len) + crc(4)
     pos += 12 + (uint64_t)chunk_len;
@@ -8165,6 +8707,89 @@ typedef struct {
   uint32_t partial_crc;  /* CRC of body portion within this block */
   bool valid;
 } PNGSuffixCand;
+
+static inline bool png_suffix_candidate_from_entry(PNGSuffixCand *sc,
+                                                    PNGCrcEntry *e,
+                                                    CarveInfo *candidate,
+                                                    bool marker_required,
+                                                    uint32_t type_pos,
+                                                    bool crc_in_suffix,
+                                                    uint64_t crc_off_in_blk,
+                                                    bool body_in_suffix,
+                                                    uint64_t body_off,
+                                                    uint64_t suffix_partial_len,
+                                                    uint64_t crc_field_pos) {
+  if (!sc || !e) {
+    return false;
+  }
+
+  sc->actual_block = e->actual_block;
+  sc->apparent_block = filemirror_apparent_blocknumber(
+      scalpel_state.filemirror, e->actual_block);
+  sc->valid = false;
+  if (sc->apparent_block < 0) {
+    return false;
+  }
+  if (filemirror_actual_block_covered(scalpel_state.filemirror,
+          e->actual_block)) {
+    return false;
+  }
+
+  if (marker_required) {
+    bool has_marker = false;
+    for (uint8_t mi = 0; mi < e->num_idat_markers; mi++) {
+      if (e->idat_offsets[mi] == type_pos) {
+        has_marker = true;
+        break;
+      }
+    }
+    if (!has_marker && e->has_iend && e->iend_offset == type_pos) {
+      has_marker = true;
+    }
+    if (!has_marker) {
+      return false;
+    }
+  }
+
+  if (crc_in_suffix) {
+    unsigned char crc_buf[4];
+    if (! get_apparent_block_bytes(scalpel_state.filemirror,
+            sc->apparent_block, crc_off_in_blk, 4, crc_buf)) {
+      return false;
+    }
+    sc->stored_crc = ((uint32_t)crc_buf[0] << 24)
+        | ((uint32_t)crc_buf[1] << 16)
+        | ((uint32_t)crc_buf[2] << 8) | (uint32_t)crc_buf[3];
+  }
+  else {
+    sc->stored_crc = 0;
+    if (candidate && candidate->b
+        && crc_field_pos + 4 <= blockvector_get_data_length(candidate->b)) {
+      const unsigned char *sep = (const unsigned char *)(
+          blockvector_get_data_pointer(candidate->b) + crc_field_pos);
+      sc->stored_crc = ((uint32_t)sep[0] << 24)
+          | ((uint32_t)sep[1] << 16)
+          | ((uint32_t)sep[2] << 8) | (uint32_t)sep[3];
+    }
+  }
+
+  if (body_in_suffix && suffix_partial_len > 0) {
+    unsigned char pbuf[16384];
+    uint32_t plen = (suffix_partial_len > sizeof(pbuf))
+        ? (uint32_t)sizeof(pbuf) : (uint32_t)suffix_partial_len;
+    if (! get_apparent_block_bytes(scalpel_state.filemirror,
+            sc->apparent_block, body_off, plen, pbuf)) {
+      return false;
+    }
+    sc->partial_crc = crc32(0, pbuf, (uInt)plen);
+  }
+  else {
+    sc->partial_crc = crc32(0, NULL, 0);
+  }
+
+  sc->valid = true;
+  return true;
+}
 
 typedef struct PNGSolverContext {
     MitmEntry2 *left_pool;
@@ -8345,6 +8970,14 @@ static inline uint32_t png_get_block_crc(int64_t apparent_block,
   return crc;
 }
 
+static inline bool png_chunk_type_is_ascii(const uint8_t *type) {
+  return type
+      && isASCIIalpha((int)type[0])
+      && isASCIIalpha((int)type[1])
+      && isASCIIalpha((int)type[2])
+      && isASCIIalpha((int)type[3]);
+}
+
 static inline bool png_crc_inverse_for_len(z_off_t len, uint32_t inv[32]) {
   uint32_t aug[32];
   for (int i = 0; i < 32; i++) {
@@ -8396,9 +9029,9 @@ static inline uint32_t png_crc_apply_inverse(const uint32_t inv[32],
 static inline PNGGapWindowTable *png_gap_window_table_get(
     PNGCrcHashTable *ht, uint32_t M) {
   if (!ht || M == 0 || M > PNG_GAP_INDEX_MAX_M
-      || !ht->apparent_crc || !ht->apparent_valid
-      || ht->apparent_count <= 0
-      || (int64_t)M > ht->apparent_count) {
+      || !ht->actual_crc || !ht->actual_valid
+      || ht->actual_count <= 0
+      || (int64_t)M > ht->actual_count) {
     return NULL;
   }
 
@@ -8414,7 +9047,7 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
     return cached;
   }
 
-  int64_t max_windows64 = ht->apparent_count - (int64_t)M + 1;
+  int64_t max_windows64 = ht->actual_count - (int64_t)M + 1;
   if (max_windows64 <= 0 || max_windows64 > UINT32_MAX) {
     pthread_mutex_unlock(&png_gap_window_lock);
     return NULL;
@@ -8441,20 +9074,20 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
     bool ok_window = true;
     uint32_t run_crc = crc32(0, NULL, 0);
     for (uint32_t f = 0; f < M; f++) {
-      int64_t ab = start + (int64_t)f;
-      if (!ht->apparent_valid[ab]) {
+      int64_t actual = start + (int64_t)f;
+      if (!png_crc_actual_valid(ht, actual)) {
         ok_window = false;
         break;
       }
       run_crc = (uint32_t)crc32_combine((uLong)run_crc,
-          (uLong)ht->apparent_crc[ab], (z_off_t)bs);
+          (uLong)ht->actual_crc[actual], (z_off_t)bs);
     }
     if (!ok_window) {
       continue;
     }
     PNGGapWindowEntry *we = &gt->pool[gt->count++];
     we->crc = run_crc;
-    we->start_ab = start;
+    we->start_actual = start;
     uint32_t idx = run_crc % PNG_GAP_WINDOW_BUCKETS;
     we->next = gt->buckets[idx];
     gt->buckets[idx] = we;
@@ -8476,21 +9109,22 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
 static inline PNGCrcHashTable *png_build_crc_table(uint32_t png_needleidx) {
   PNGCrcHashTable *ht = (PNGCrcHashTable *)calloc(1, sizeof(PNGCrcHashTable));
   if (!ht) return NULL;
-  int64_t total = filemirror_apparent_blocks(scalpel_state.filemirror);
+  int64_t total = (int64_t)CEILDIV(filemirror_filesize(
+      scalpel_state.filemirror), (uint64_t)scalpel_state.blocksize);
   if (total > 0) {
-    ht->apparent_count = total;
-    ht->apparent_crc = (uint32_t *)calloc((size_t)total,
+    ht->actual_count = total;
+    ht->apparent_count = (int64_t)filemirror_apparent_blocks(
+        scalpel_state.filemirror);
+    ht->actual_crc = (uint32_t *)calloc((size_t)total,
         sizeof(uint32_t));
-    ht->apparent_valid = (unsigned char *)calloc((size_t)total,
+    ht->actual_valid = (unsigned char *)calloc((size_t)total,
         sizeof(unsigned char));
   }
   int64_t skipped_covered = 0;
-  for (int64_t ab = 0; ab < total; ab++) {
-    int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror, ab);
-    if (actual < 0) continue;
-    // Skip blocks already covered by validated files — they can't be
-    // part of an unsolved PNG.  This reduces N dramatically on mixed-type
-    // images where JPG/GIF/etc. are validated in the contiguous pass.
+  for (int64_t actual = 0; actual < total; actual++) {
+    // Skip blocks already covered by validated files.  Coverage is monotonic,
+    // so omitting these entries is safe; entries that become covered later are
+    // filtered at use time rather than forcing a full table rebuild.
     if (filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
       skipped_covered++;
       continue;
@@ -8505,9 +9139,9 @@ static inline PNGCrcHashTable *png_build_crc_table(uint32_t png_needleidx) {
       continue;
     }
     uint32_t crc = bs->block_crc;
-    if (ht->apparent_crc && ht->apparent_valid) {
-      ht->apparent_crc[ab] = crc;
-      ht->apparent_valid[ab] = 1;
+    if (ht->actual_crc && ht->actual_valid) {
+      ht->actual_crc[actual] = crc;
+      ht->actual_valid[actual] = 1;
     }
     // Check if this actual block is already in the table
     // (dedup: multiple apparent blocks can map to same actual)
@@ -8526,15 +9160,19 @@ static inline PNGCrcHashTable *png_build_crc_table(uint32_t png_needleidx) {
     lock_fprintf(stdout, "PNG CRC table: skipped %" PRId64 " covered blocks\n",
                  skipped_covered);
   }
+  png_crc_marker_index_build(ht);
   return ht;
 }
 
 static inline PNGCrcHashTable *png_ensure_crc_table(uint32_t png_needleidx) {
   pthread_mutex_lock(&png_crc_table_lock);
+  int64_t current_actual = scalpel_state.filemirror
+      ? (int64_t)CEILDIV(filemirror_filesize(scalpel_state.filemirror),
+                         (uint64_t)scalpel_state.blocksize) : 0;
   int64_t current_apparent = scalpel_state.filemirror
       ? (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror) : 0;
   if (!png_global_crc_table || png_crc_table_needleidx != png_needleidx
-      || png_global_crc_table->apparent_count != current_apparent) {
+      || png_global_crc_table->actual_count != current_actual) {
     if (png_global_crc_table) {
       png_crc_table_free(png_global_crc_table);
     }
@@ -8546,6 +9184,11 @@ static inline PNGCrcHashTable *png_ensure_crc_table(uint32_t png_needleidx) {
       lock_fprintf(stdout, "PNG CRC hash table built: %" PRId64 " entries\n",
                    png_global_crc_table->total_entries);
     }
+  }
+  else if (png_global_crc_table->apparent_count != current_apparent) {
+    png_global_crc_table->apparent_count = current_apparent;
+    atomic_fetch_add_explicit(&png_crc_table_epoch, 1,
+                              memory_order_acq_rel);
   }
   pthread_mutex_unlock(&png_crc_table_lock);
   return png_global_crc_table;
@@ -8754,7 +9397,6 @@ static inline bool png_solver_confirm_match(
     CarveInfo *candidate, PNGCarveState *local,
     ThreadWork *work, uuid_string_t uuidp, uuid_string_t uuidc,
     uint64_t crc_pos, long idat_sz) {
-  (void)crc_pos; (void)idat_sz;
   PNGSolverStateSnapshot snap;
   png_solver_snapshot(&snap, local);
 
@@ -8764,26 +9406,26 @@ static inline bool png_solver_confirm_match(
   if (validated) {
     return true;
   }
-  // Full validation rejected.  That's normal for multi-IDAT files where
-  // later IDATs still have wrong blocks at this solve iteration — the
-  // validator's complaint is "can't reach IEND", not "this IDAT is
-  // wrong".  So we don't reject on !validated alone; that would regress
-  // correct intermediate-IDAT placements (stuck10 falls 10 → 8 with
-  // strict).
-  //
-  // What we CAN reject: cases where the validator tripped its B15
-  // filter-type echo detector DURING this call — 16 consecutive non-
-  // Paeth rows in a Paeth-dominant image.  That's a high-confidence
-  // signature of LZ77-echo wrong data.  Pre-existing B15 state from an
-  // earlier call doesn't apply.
-  if (local->b15_freeze_pos != 0 && snap.b15_freeze_pos == 0) {
-    png_solver_restore(local, &snap);
-    return false;
+
+  uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
+  if (idat_sz > 0 && local->last_chunk_crc_pos >= target) {
+    // Full validation rejected.  That's normal for multi-IDAT files where
+    // later IDATs still have wrong blocks at this solve iteration.  Accept
+    // only if the validator actually walked past the IDAT solved here.
+    //
+    // B15 is useful for ordinary trial validation, but it can false-positive
+    // after a CRC-proven solver placement.  Keep accepted CRC progress while
+    // discarding speculative B15 state so the next pass can judge later data
+    // independently.
+    if (local->b15_freeze_pos != 0 && snap.b15_freeze_pos == 0) {
+      local->b15_freeze_pos = snap.b15_freeze_pos;
+      local->b15_consec_non_paeth = snap.b15_consec_non_paeth;
+    }
+    return true;
   }
-  // No definitive reject signal.  Accept; the validator's own H7 Paeth
-  // gate (png.h:7190-7209) will cap validates_to for echo-suspect data
-  // at the correct chunk boundary anyway.
-  return true;
+
+  png_solver_restore(local, &snap);
+  return false;
 }
 
 static inline bool png_solver_crc_marker_matches(
@@ -8832,6 +9474,63 @@ static inline bool png_solver_crc_marker_matches(
   return false;
 }
 
+static inline uint32_t png_gap_locality_score(CarveInfo *candidate,
+                                               uint64_t suffix_start_nb,
+                                               uint32_t first_full,
+                                               const int64_t *window_ap,
+                                               uint32_t M) {
+  if (!candidate || !candidate->b || !window_ap || suffix_start_nb == 0) {
+    return 0;
+  }
+
+  int64_t prefix_actual = blockvector_get_actual_blocknumber(candidate->b,
+      suffix_start_nb - 1);
+  if (prefix_actual < 0) {
+    return 0;
+  }
+
+  uint32_t score = 0;
+  for (uint32_t f = 0; f < M; f++) {
+    int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
+        window_ap[f]);
+    int64_t expected = prefix_actual + 1 + (int64_t)first_full + (int64_t)f;
+    if (actual == expected) {
+      score++;
+    }
+  }
+  return score;
+}
+
+static inline bool png_gap_match_better(bool validated, uint64_t validates_to,
+                                         uint64_t advance_to,
+                                         uint32_t locality,
+                                         bool best_found,
+                                         bool best_validated,
+                                         uint64_t best_validates_to,
+                                         uint64_t best_advance_to,
+                                         uint32_t best_locality) {
+  if (!best_found) {
+    return true;
+  }
+  if (validated != best_validated) {
+    return validated;
+  }
+  if (validates_to != best_validates_to) {
+    return validates_to > best_validates_to;
+  }
+  if (advance_to != best_advance_to) {
+    return advance_to > best_advance_to;
+  }
+  return locality > best_locality;
+}
+
+static inline void png_solver_resize_trial(CarveInfo *candidate,
+                                            uint64_t num_blocks) {
+  resize_blockvector(candidate->b, num_blocks);
+  blockvector_set_data_length(candidate->b,
+      num_blocks * (uint64_t)scalpel_state.blocksize);
+}
+
 // ---- IDAT CRC solver ----
 // Given the IDAT boundary info and a set of K block positions to fill,
 // use the CRC hash table to find displaced blocks algebraically.
@@ -8858,6 +9557,24 @@ static inline int png_crc_solve_idat(
     uint64_t crc_pos, long idat_sz,
     ThreadWork *work, uuid_string_t uuidp, uuid_string_t uuidc) {
   (void)total_apparent;
+
+  static int64_t png_trace_start_block = -2;
+  if (png_trace_start_block == -2) {
+    const char *trace_env = getenv("SCALPEL_PNG_TRACE_STARTBLOCK");
+    png_trace_start_block = trace_env ? strtoll(trace_env, NULL, 10) : -1;
+  }
+  static int64_t png_trace_actual_block = -2;
+  if (png_trace_actual_block == -2) {
+    const char *trace_actual_env = getenv("SCALPEL_PNG_TRACE_ACTUAL");
+    png_trace_actual_block = trace_actual_env
+        ? strtoll(trace_actual_env, NULL, 10) : -1;
+  }
+  bool png_trace_this = false;
+  if (png_trace_start_block >= 0 && candidate && candidate->b
+      && blockvector_get_num_blocks(candidate->b) > 0) {
+    png_trace_this = blockvector_get_actual_blocknumber(candidate->b, 0)
+        == png_trace_start_block;
+  }
 
   if (fill_needed == 0 || idat_sz <= 0) {
     return 0;
@@ -8958,6 +9675,15 @@ static inline int png_crc_solve_idat(
   uint32_t M = (last_full_plus1 > first_full)
       ? (last_full_plus1 - first_full) : 0;
 
+  if (png_trace_this) {
+    lock_fprintf(stdout,
+        "PNG_TRACE start=%" PRId64 " snb=%" PRIu64 " fill=%u"
+        " last=%" PRId64 " crc_pos=%" PRIu64 " idat=%ld"
+        " first_full=%u last_full_plus1=%u M=%u\n",
+        png_trace_start_block, suffix_start_nb, fill_needed, last_block,
+        crc_pos, idat_sz, first_full, last_full_plus1, M);
+  }
+
   if (M < 1) {
     // No full middle blocks — can't use algebraic hash table approach.
     // Fall back to direct CRC search for small IDATs.
@@ -8966,7 +9692,7 @@ static inline int png_crc_solve_idat(
       return 0;
     }
     // Place contiguous fill and check CRC
-    resize_blockvector(candidate->b, suffix_start_nb + fill_needed);
+    png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
     for (uint32_t f = 0; f < fill_needed; f++) {
       int64_t ab = last_block + 1 + (int64_t)f;
       blockvector_set_apparent_blocknumber(candidate->b,
@@ -8982,12 +9708,16 @@ static inline int png_crc_solve_idat(
         c0 = crc32(c0, (const unsigned char *)(d0 + type_start),
                    (uInt)crc_region_len);
         const unsigned char *e0p = (const unsigned char *)(d0 + crc_field_pos);
-        uint32_t s0 = ((uint32_t)e0p[0] << 24) | ((uint32_t)e0p[1] << 16)
-                     | ((uint32_t)e0p[2] << 8) | (uint32_t)e0p[3];
-        if (c0 == s0) {
-          return 1;  /* contiguous fast path */
-        }
-      }
+	        uint32_t s0 = ((uint32_t)e0p[0] << 24) | ((uint32_t)e0p[1] << 16)
+	                     | ((uint32_t)e0p[2] << 8) | (uint32_t)e0p[3];
+	        if (c0 == s0
+	            && png_solver_crc_marker_matches(candidate, type_start,
+	                crc_region_len, crc_field_pos, s0)
+	            && png_solver_confirm_match(candidate, local, work,
+	                uuidp, uuidc, crc_pos, idat_sz)) {
+	          return 1;  /* contiguous fast path */
+	        }
+	      }
     }
     // D=1 algebraic search: for each fill position, compute the needed
     // partial CRC via GF(2) algebra, scan candidates using mmap partial
@@ -9092,8 +9822,7 @@ static inline int png_crc_solve_idat(
         uint32_t bk_init = (fpos == d1_start_fpos) ? d1_start_bk : 0;
         for (uint32_t bk = bk_init; bk < PNG_CRC_HASH_BUCKETS; bk++) {
           if ((bk & 0xFF) == 0
-              && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                      memory_order_acquire)) {
+              && png_reassembly_yield_requested(candidate)) {
             // Save D=1 resume state in PNGCarveState direct fields.
             local->d1_resume_valid = true;
             local->d1_resume_fpos = fpos;
@@ -9230,7 +9959,7 @@ static inline int png_crc_solve_idat(
   if (last_block + (int64_t)fill_needed >= (int64_t)(filemirror_filesize(scalpel_state.filemirror) / (uint64_t)scalpel_state.blocksize)) {
     return 0;
   }
-  resize_blockvector(candidate->b, suffix_start_nb + fill_needed);
+  png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
   for (uint32_t f = 0; f < fill_needed; f++) {
     int64_t ab = last_block + 1 + (int64_t)f;
     blockvector_set_apparent_blocknumber(candidate->b, suffix_start_nb + f, ab);
@@ -9248,12 +9977,16 @@ static inline int png_crc_solve_idat(
     contig_crc = crc32(contig_crc, (const unsigned char *)(data + type_start),
                   (uInt)crc_region_len);
     const unsigned char *ep = (const unsigned char *)(data + crc_field_pos);
-    bv_stored_crc = ((uint32_t)ep[0] << 24) | ((uint32_t)ep[1] << 16)
-                   | ((uint32_t)ep[2] << 8) | (uint32_t)ep[3];
-    if (contig_crc == bv_stored_crc) {
-      return 1;  /* contiguous fast path */
-    }
-  }
+	    bv_stored_crc = ((uint32_t)ep[0] << 24) | ((uint32_t)ep[1] << 16)
+	                   | ((uint32_t)ep[2] << 8) | (uint32_t)ep[3];
+	    if (contig_crc == bv_stored_crc
+	        && png_solver_crc_marker_matches(candidate, type_start,
+	            crc_region_len, crc_field_pos, bv_stored_crc)
+	        && png_solver_confirm_match_strict(candidate, local, work,
+	            uuidp, uuidc)) {
+	      return 1;  /* contiguous fast path */
+	    }
+	  }
 
   // Compute prefix CRC: data from type_start to start of first full middle block.
   uint64_t first_full_byte = (suffix_start_nb + first_full) * (uint64_t)bs;
@@ -9279,29 +10012,6 @@ static inline int png_crc_solve_idat(
   uint32_t suffix_fill_pos = fill_needed - 1;  // last fill block
   uint64_t suffix_block_start = (suffix_start_nb + suffix_fill_pos) * (uint64_t)bs;
 
-  // Precompute suffix candidate data: inflate each viable block at the suffix
-  // position, extract stored_crc and compute partial body CRC.
-  // Store results in arrays indexed by hash table traversal order.
-
-  // Determine how many suffix candidates there are
-  int64_t suffix_cand_count = 0;
-  for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
-    for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
-      suffix_cand_count++;
-    }
-  }
-
-  PNGSuffixCand *suffix_cands = (PNGSuffixCand *)calloc(
-      (size_t)suffix_cand_count, sizeof(PNGSuffixCand));
-  if (!suffix_cands) {
-    resize_blockvector(candidate->b, suffix_start_nb);
-    return 0;
-  }
-
-  // Pre-filter and extract data from each candidate via mmap reads.
-  // Instead of inflating all N blocks (O(N*bs) I/O), read only the
-  // structural bytes needed.  This reduces S from N to ~1-5.
-
   // Offsets within the suffix block for the data we need:
   // - CRC field: crc_field_pos - suffix_block_start
   // - Structural check: 8 bytes after CRC field (next chunk len+type)
@@ -9314,99 +10024,65 @@ static inline int png_crc_solve_idat(
       && last_full_end >= suffix_block_start
       && last_full_end + suffix_partial_len <= suffix_block_start + bs);
   uint64_t body_off = body_in_suffix ? (last_full_end - suffix_block_start) : 0;
+  uint32_t suffix_type_pos = crc_in_suffix ? (uint32_t)(struct_off + 4) : 0;
 
-  int64_t sc_idx = 0;
-  for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
-    for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
-      PNGSuffixCand *sc = &suffix_cands[sc_idx++];
-      sc->actual_block = e->actual_block;
-      sc->apparent_block = filemirror_apparent_blocknumber(
-          scalpel_state.filemirror, e->actual_block);
-      sc->valid = false;
-      if (sc->apparent_block < 0) {
-        continue;
-      }
-      if (filemirror_actual_block_covered(scalpel_state.filemirror, e->actual_block)) {
-        continue;
-      }
-
-      if (! crc_in_suffix) {
-        // CRC field not in this block — use stored CRC from contiguous fill.
-        // Partial body still needs to be read if in this block.
-        sc->stored_crc = 0;
-        if (crc_field_pos + 4 <= blockvector_get_data_length(candidate->b)) {
-          const unsigned char *sep =
-              (const unsigned char *)(blockvector_get_data_pointer(candidate->b) + crc_field_pos);
-          sc->stored_crc = ((uint32_t)sep[0] << 24) | ((uint32_t)sep[1] << 16)
-                          | ((uint32_t)sep[2] << 8) | (uint32_t)sep[3];
-        }
-        if (body_in_suffix) {
-          unsigned char pbuf[16384];
-          uint32_t plen = (suffix_partial_len > sizeof(pbuf))
-              ? (uint32_t)sizeof(pbuf) : (uint32_t)suffix_partial_len;
-          if (get_apparent_block_bytes(scalpel_state.filemirror,
-                  sc->apparent_block, body_off, plen, pbuf)) {
-            sc->partial_crc = crc32(0, pbuf, (uInt)plen);
-          }
-          else {
-            continue;
-          }
-        }
-        else {
-          sc->partial_crc = crc32(0, NULL, 0);
-        }
-        sc->valid = true;
-        continue;
-      }
-
-      // CRC field IS in this suffix block.  Use cached structural markers
-      // to pre-filter: next chunk type must be IDAT or IEND at struct_off+4.
-      // Zero-I/O: markers were populated during block validation.
-      {
-        uint32_t type_pos = (uint32_t)(struct_off + 4);
-        bool has_marker = false;
-        for (uint8_t mi = 0; mi < e->num_idat_markers; mi++) {
-          if (e->idat_offsets[mi] == type_pos) {
-            has_marker = true;
-            break;
-          }
-        }
-        if (!has_marker && e->has_iend && e->iend_offset == type_pos) {
-          has_marker = true;
-        }
-        if (!has_marker) {
-          continue;  // no IDAT/IEND at expected position
-        }
-      }
-
-      // Passed pre-filter — read stored CRC
-      unsigned char crc_buf[4];
-      if (! get_apparent_block_bytes(scalpel_state.filemirror,
-              sc->apparent_block, crc_off_in_blk, 4, crc_buf)) {
-        continue;
-      }
-      sc->stored_crc = ((uint32_t)crc_buf[0] << 24) | ((uint32_t)crc_buf[1] << 16)
-                      | ((uint32_t)crc_buf[2] << 8) | (uint32_t)crc_buf[3];
-
-      // Read partial body CRC
-      if (body_in_suffix && suffix_partial_len > 0) {
-        unsigned char pbuf[16384];
-        uint32_t plen = (suffix_partial_len > sizeof(pbuf))
-            ? (uint32_t)sizeof(pbuf) : (uint32_t)suffix_partial_len;
-        if (get_apparent_block_bytes(scalpel_state.filemirror,
-                sc->apparent_block, body_off, plen, pbuf)) {
-          sc->partial_crc = crc32(0, pbuf, (uInt)plen);
-        }
-        else {
-          continue;
-        }
-      }
-      else {
-        sc->partial_crc = crc32(0, NULL, 0);
-      }
-      sc->valid = true;
+  // Precompute suffix candidate data.  When the suffix block contains the
+  // stored CRC, it must also contain an IDAT/IEND marker at suffix_type_pos;
+  // use the global marker-offset index instead of scanning every CRC entry.
+  int64_t suffix_cand_count = 0;
+  bool use_marker_index = crc_in_suffix && ht->marker_buckets;
+  if (use_marker_index) {
+    for (PNGMarkerEntry *m = png_crc_marker_find(ht, suffix_type_pos);
+         m; m = png_crc_marker_next(m, suffix_type_pos)) {
+      suffix_cand_count++;
     }
   }
+  else {
+    for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
+      for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
+        suffix_cand_count++;
+      }
+    }
+  }
+  if (suffix_cand_count == 0) {
+    resize_blockvector(candidate->b, suffix_start_nb);
+    return 0;
+  }
+
+  PNGSuffixCand *suffix_cands = (PNGSuffixCand *)calloc(
+      (size_t)suffix_cand_count, sizeof(PNGSuffixCand));
+  if (!suffix_cands) {
+    resize_blockvector(candidate->b, suffix_start_nb);
+    return 0;
+  }
+
+  int64_t sc_idx = 0;
+  if (use_marker_index) {
+    for (PNGMarkerEntry *m = png_crc_marker_find(ht, suffix_type_pos);
+         m && sc_idx < suffix_cand_count;
+         m = png_crc_marker_next(m, suffix_type_pos)) {
+      PNGSuffixCand sc;
+      if (png_suffix_candidate_from_entry(&sc, m->entry, candidate,
+              false, suffix_type_pos, crc_in_suffix, crc_off_in_blk,
+              body_in_suffix, body_off, suffix_partial_len, crc_field_pos)) {
+        suffix_cands[sc_idx++] = sc;
+      }
+    }
+  }
+  else {
+    for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
+      for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
+        PNGSuffixCand sc;
+        if (png_suffix_candidate_from_entry(&sc, e, candidate,
+                crc_in_suffix, suffix_type_pos, crc_in_suffix,
+                crc_off_in_blk, body_in_suffix, body_off,
+                suffix_partial_len, crc_field_pos)) {
+          suffix_cands[sc_idx++] = sc;
+        }
+      }
+    }
+  }
+  suffix_cand_count = sc_idx;
 
   // Keep only viable structural suffix candidates.  The initial allocation is
   // sized to the full CRC table for simple traversal, but leaving invalid
@@ -9427,6 +10103,30 @@ static inline int png_crc_solve_idat(
     suffix_valid_count++;
   }
   suffix_cand_count = suffix_valid_count;
+  if (png_trace_this) {
+    lock_fprintf(stdout,
+        "PNG_TRACE_SOLVER_CANDS snb=%" PRIu64 " crc=%" PRIu64
+        " suffix_cands=%" PRId64 " crc_in_suffix=%d"
+        " suffix_type_pos=%u suffix_partial=%" PRIu64
+        " trace_actual=%" PRId64 "\n",
+        suffix_start_nb, crc_pos, suffix_cand_count,
+        crc_in_suffix ? 1 : 0, suffix_type_pos,
+        suffix_partial_len, png_trace_actual_block);
+    if (png_trace_actual_block >= 0) {
+      for (int64_t i = 0; i < suffix_cand_count; i++) {
+        PNGSuffixCand *sc = &suffix_cands[i];
+        if (sc->valid && sc->actual_block == png_trace_actual_block) {
+          lock_fprintf(stdout,
+              "PNG_TRACE_SOLVER_CAND_MATCH idx=%" PRId64
+              " actual=%" PRId64 " apparent=%" PRId64
+              " stored=%08" PRIx32 " partial=%08" PRIx32 "\n",
+              i, sc->actual_block, sc->apparent_block,
+              sc->stored_crc, sc->partial_crc);
+          break;
+        }
+      }
+    }
+  }
   if (suffix_cand_count == 0) {
     free(suffix_cands);
     resize_blockvector(candidate->b, suffix_start_nb);
@@ -9445,6 +10145,497 @@ static inline int png_crc_solve_idat(
   // Build a direct-indexed array: apparent_block → block_crc for O(1) lookup.
   bool solved = false;
   if (M > 0) {
+    // Fast M=2 local-pair split:
+    //   known local pair + displaced suffix block.
+    // This is the small version of the anchored M=3 path below.  It handles
+    // GAP+OOO cases where the full IDAT middle blocks are still immediately
+    // after the trusted prefix, but the suffix/next-chunk block moved.
+    if (M == 2 && suffix_fill_pos == first_full + 2
+        && ht->actual_crc && ht->actual_valid && ht->actual_count > 0) {
+      int64_t prefix_last_actual = (suffix_start_nb > 0)
+          ? blockvector_get_actual_blocknumber(candidate->b,
+              suffix_start_nb - 1)
+          : -1;
+      if (prefix_last_actual >= 0) {
+        uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
+        bool best_found = false;
+        bool best_validated = false;
+        uint64_t best_validates_to = 0;
+        uint64_t best_advance_to = 0;
+        uint32_t best_locality = 0;
+        int64_t best_local_ap0 = -1;
+        int64_t best_local_ap1 = -1;
+        int64_t best_suffix_ap = -1;
+        uint64_t best_data_length = 0;
+        uint64_t best_num_blocks = 0;
+        PNGSolverStateSnapshot best_snap;
+
+        for (uint32_t delta = 0;
+             delta <= PNG_M2_ANCHOR_SCAN_MAX && !solved; delta++) {
+          uint32_t local_pair_crc = 0;
+          int64_t local_ap0 = -1;
+          int64_t local_ap1 = -1;
+          int64_t local_full_start_actual = prefix_last_actual + 1
+              + (int64_t)first_full + (int64_t)delta;
+          bool local_pair_ok = png_crc_actual_pair_crc(ht,
+                  local_full_start_actual, &local_pair_crc,
+                  &local_ap0, &local_ap1)
+              && !_AB_IN_BV_PREFIX(local_ap0)
+              && !_AB_IN_BV_PREFIX(local_ap1);
+          if (png_trace_this && (local_pair_ok || delta == 0)) {
+            lock_fprintf(stdout,
+                "PNG_TRACE_M2_ANCHOR prefix_actual=%" PRId64
+                " delta=%u local_start=%" PRId64
+                " local_pair_ok=%d local_ap=[%" PRId64 ",%" PRId64 "]"
+                " local_pair_crc=%08" PRIx32 "\n",
+                prefix_last_actual, delta, local_full_start_actual,
+                local_pair_ok ? 1 : 0, local_ap0, local_ap1,
+                local_pair_crc);
+          }
+          if (!local_pair_ok) {
+            continue;
+          }
+
+          for (int64_t si = 0; si < suffix_cand_count && !solved; si++) {
+            PNGSuffixCand *sc = &suffix_cands[si];
+            if (!sc->valid || sc->apparent_block < 0
+                || sc->apparent_block == local_ap0
+                || sc->apparent_block == local_ap1
+                || _AB_IN_BV_PREFIX(sc->apparent_block)
+                || filemirror_actual_block_covered(scalpel_state.filemirror,
+                    sc->actual_block)) {
+              continue;
+            }
+
+            png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full, local_ap0);
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full + 1, local_ap1);
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + suffix_fill_pos, sc->apparent_block);
+            for (uint32_t f = 0; f < fill_needed; f++) {
+              inflate_blockvector_single_block(candidate->b,
+                  suffix_start_nb + f);
+            }
+
+            PNGSolverStateSnapshot pre_snap;
+            png_solver_snapshot(&pre_snap, local);
+            uint64_t vt = 0;
+            bool validated = false;
+            uint64_t advance_to = local->last_chunk_crc_pos;
+            bool marker_ok = png_solver_crc_marker_matches(candidate,
+                type_start, crc_region_len, crc_field_pos, sc->stored_crc);
+            bool plausible = false;
+            if (marker_ok) {
+              validated = png_direct_validate(work->id, candidate, &vt,
+                  local, uuidp, uuidc);
+              advance_to = local->last_chunk_crc_pos;
+              plausible = validated || advance_to >= target;
+            }
+            uint32_t locality = PNG_M2_ANCHOR_SCAN_MAX - delta + 1;
+            if (png_trace_this) {
+              lock_fprintf(stdout,
+                  "PNG_TRACE_M2_ANCHOR_TRY si=%" PRId64
+                  " delta=%u sc_actual=%" PRId64
+                  " sc_ap=%" PRId64 " marker=%d validated=%d"
+                  " vt=%" PRIu64 " advance=%" PRIu64
+                  " target=%" PRIu64 " plausible=%d\n",
+                  si, delta, sc->actual_block, sc->apparent_block,
+                  marker_ok ? 1 : 0, validated ? 1 : 0, vt,
+                  advance_to, target, plausible ? 1 : 0);
+            }
+            if (plausible && png_gap_match_better(validated, vt, advance_to,
+                locality, best_found, best_validated, best_validates_to,
+                best_advance_to, best_locality)) {
+              best_found = true;
+              best_validated = validated;
+              best_validates_to = vt;
+              best_advance_to = advance_to;
+              best_locality = locality;
+              best_local_ap0 = local_ap0;
+              best_local_ap1 = local_ap1;
+              best_suffix_ap = sc->apparent_block;
+              best_data_length = blockvector_get_data_length(candidate->b);
+              best_num_blocks = blockvector_get_num_blocks(candidate->b);
+              png_solver_snapshot(&best_snap, local);
+              if (validated) {
+                solved = true;
+              }
+            }
+
+            png_solver_restore(local, &pre_snap);
+            png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+            for (uint32_t f = 0; f < fill_needed; f++) {
+              int64_t orig = last_block + 1 + (int64_t)f;
+              blockvector_set_apparent_blocknumber(candidate->b,
+                  suffix_start_nb + f, orig);
+              inflate_blockvector_single_block(candidate->b,
+                  suffix_start_nb + f);
+            }
+          }
+        }
+
+        if (best_found) {
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+          blockvector_set_apparent_blocknumber(candidate->b,
+              suffix_start_nb + first_full, best_local_ap0);
+          blockvector_set_apparent_blocknumber(candidate->b,
+              suffix_start_nb + first_full + 1, best_local_ap1);
+          blockvector_set_apparent_blocknumber(candidate->b,
+              suffix_start_nb + suffix_fill_pos, best_suffix_ap);
+          for (uint32_t f = 0; f < fill_needed; f++) {
+            inflate_blockvector_single_block(candidate->b,
+                suffix_start_nb + f);
+          }
+          if (best_data_length > 0) {
+            blockvector_set_data_length(candidate->b, best_data_length);
+          }
+          if (best_num_blocks > 0) {
+            resize_blockvector(candidate->b, best_num_blocks);
+          }
+          png_solver_restore(local, &best_snap);
+          if (scalpel_state.mode_verbose) {
+            lock_fprintf(stdout,
+                "%sPNG CRC SOLVER: M=2 anchored local pair "
+                "[%" PRId64 ",%" PRId64 "] suffix %" PRId64 "%s\n",
+                GREEN, best_local_ap0, best_local_ap1,
+                best_suffix_ap, BLACK);
+          }
+          solved = true;
+        }
+      }
+
+      if (solved) {
+        free(suffix_cands);
+        return 2;
+      }
+    }
+
+    // Fast M=3 anchored split:
+    //   known local pair + contiguous displaced tail pair.
+    // This handles the common case where two full middle blocks follow
+    // the validated prefix locally, while the final middle block and the
+    // suffix block moved together.  It is intentionally tried before the
+    // broad GAP scan so large corpora do not spend an entire time slice
+    // walking tens of thousands of structurally-plausible suffix blocks.
+    if (M == 3 && suffix_fill_pos == first_full + 3
+        && ht->actual_crc && ht->actual_valid && ht->actual_count > 0) {
+      data = blockvector_get_data_pointer(candidate->b);
+      dl = blockvector_get_data_length(candidate->b);
+
+      uint32_t quick_mid_crc[3];
+      bool quick_mid_ok = true;
+      for (int mi = 0; mi < 3; mi++) {
+        uint32_t fidx = first_full + (uint32_t)mi;
+        uint64_t blk_byte = (suffix_start_nb + fidx) * (uint64_t)bs;
+        if (data && blk_byte + bs <= dl) {
+          quick_mid_crc[mi] = crc32(crc32(0, NULL, 0),
+              (const unsigned char *)(data + blk_byte), (uInt)bs);
+        } else {
+          quick_mid_ok = false;
+        }
+      }
+
+      if (quick_mid_ok) {
+        z_off_t after[3];
+        uint32_t shifted_contig[3];
+        for (int mi = 0; mi < 3; mi++) {
+          uint64_t blk_end = (suffix_start_nb + first_full + (uint32_t)mi)
+              * (uint64_t)bs + (uint64_t)bs;
+          after[mi] = (z_off_t)(crc_region_end > blk_end
+              ? crc_region_end - blk_end : 0);
+          shifted_contig[mi] = (uint32_t)crc32_combine(
+              (uLong)quick_mid_crc[mi], 0UL, after[mi]);
+        }
+
+        int64_t prefix_last_actual = (suffix_start_nb > 0)
+            ? blockvector_get_actual_blocknumber(candidate->b,
+                suffix_start_nb - 1)
+            : -1;
+        uint32_t local_pair_crc = 0;
+        int64_t local_ap0 = -1;
+        int64_t local_ap1 = -1;
+        int64_t local_full_start_actual = prefix_last_actual + 1
+            + (int64_t)first_full;
+        bool local_pair_ok = prefix_last_actual >= 0
+            && png_crc_actual_pair_crc(ht, local_full_start_actual,
+                &local_pair_crc, &local_ap0, &local_ap1)
+            && !_AB_IN_BV_PREFIX(local_ap0)
+            && !_AB_IN_BV_PREFIX(local_ap1);
+        if (png_trace_this) {
+          lock_fprintf(stdout,
+              "PNG_TRACE_M3_ANCHOR prefix_actual=%" PRId64
+              " local_start=%" PRId64 " local_pair_ok=%d"
+              " local_ap=[%" PRId64 ",%" PRId64 "]"
+              " local_pair_crc=%08" PRIx32 "\n",
+              prefix_last_actual, local_full_start_actual,
+              local_pair_ok ? 1 : 0, local_ap0, local_ap1,
+              local_pair_crc);
+        }
+
+        if (local_pair_ok) {
+          uint32_t shifted_local_pair = (uint32_t)crc32_combine(
+              (uLong)local_pair_crc, 0UL, after[1]);
+
+          for (int64_t si = 0; si < suffix_cand_count && !solved; si++) {
+            PNGSuffixCand *sc = &suffix_cands[si];
+            if (!sc->valid || sc->apparent_block < 0
+                || _AB_IN_BV_PREFIX(sc->apparent_block)
+                || filemirror_actual_block_covered(scalpel_state.filemirror,
+                    sc->actual_block)) {
+              continue;
+            }
+
+            int64_t tail_actual = sc->actual_block - 1;
+            int64_t tail_ap = png_crc_actual_to_apparent(ht, tail_actual);
+            bool trace_anchor_sc = png_trace_this
+                && (png_trace_actual_block < 0
+                    || sc->actual_block == png_trace_actual_block);
+            if (tail_ap < 0 || tail_ap == local_ap0
+                || tail_ap == local_ap1 || tail_ap == sc->apparent_block
+                || _AB_IN_BV_PREFIX(tail_ap)) {
+              if (trace_anchor_sc) {
+                lock_fprintf(stdout,
+                    "PNG_TRACE_M3_ANCHOR_SKIP si=%" PRId64
+                    " sc_actual=%" PRId64 " sc_ap=%" PRId64
+                    " tail_actual=%" PRId64 " tail_ap=%" PRId64 "\n",
+                    si, sc->actual_block, sc->apparent_block,
+                    tail_actual, tail_ap);
+              }
+              continue;
+            }
+
+            uint32_t crc_up_to_suffix = crc_prefix;
+            for (int mi = 0; mi < 3; mi++) {
+              crc_up_to_suffix = (uint32_t)crc32_combine(
+                  (uLong)crc_up_to_suffix, (uLong)quick_mid_crc[mi],
+                  (z_off_t)bs);
+            }
+            uint32_t crc_with_sc = (uint32_t)crc32_combine(
+                (uLong)crc_up_to_suffix, (uLong)sc->partial_crc,
+                (z_off_t)suffix_partial_len);
+            uint32_t diff = sc->stored_crc ^ crc_with_sc;
+            if (diff == 0) {
+              continue;
+            }
+
+            uint32_t target_all = diff ^ shifted_contig[0]
+                ^ shifted_contig[1] ^ shifted_contig[2];
+            uint32_t shifted_tail = (uint32_t)crc32_combine(
+                (uLong)ht->actual_crc[tail_actual], 0UL, after[2]);
+            if (trace_anchor_sc) {
+              lock_fprintf(stdout,
+                  "PNG_TRACE_M3_ANCHOR_CHECK si=%" PRId64
+                  " sc_actual=%" PRId64 " sc_ap=%" PRId64
+                  " tail_actual=%" PRId64 " tail_ap=%" PRId64
+                  " target=%08" PRIx32 " local=%08" PRIx32
+                  " tail=%08" PRIx32 " lhs=%08" PRIx32 "\n",
+                  si, sc->actual_block, sc->apparent_block,
+                  tail_actual, tail_ap, target_all,
+                  shifted_local_pair, shifted_tail,
+                  target_all ^ shifted_tail);
+            }
+            if ((target_all ^ shifted_tail) != shifted_local_pair) {
+              continue;
+            }
+
+            png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full + 0, local_ap0);
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full + 1, local_ap1);
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full + 2, tail_ap);
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + suffix_fill_pos, sc->apparent_block);
+            for (uint32_t f = 0; f < fill_needed; f++) {
+              inflate_blockvector_single_block(candidate->b,
+                  suffix_start_nb + f);
+            }
+
+            bool trace_marker_ok = png_solver_crc_marker_matches(
+                candidate, type_start, crc_region_len, crc_field_pos,
+                sc->stored_crc);
+            bool trace_confirm_ok = false;
+            if (trace_marker_ok) {
+              trace_confirm_ok = png_solver_confirm_match(candidate, local,
+                  work, uuidp, uuidc, crc_pos, idat_sz);
+            }
+            if (trace_anchor_sc) {
+              lock_fprintf(stdout,
+                  "PNG_TRACE_M3_ANCHOR_TRY si=%" PRId64
+                  " marker=%d confirm=%d last_crc=%" PRIu64
+                  " target=%" PRIu64 "\n",
+                  si, trace_marker_ok ? 1 : 0,
+                  trace_confirm_ok ? 1 : 0,
+                  local->last_chunk_crc_pos,
+                  crc_pos + 12 + (uint64_t)idat_sz);
+            }
+            if (trace_marker_ok && trace_confirm_ok) {
+              if (scalpel_state.mode_verbose) {
+                lock_fprintf(stdout,
+                    "%sPNG CRC SOLVER: M=3 anchored 2+2 blocks "
+                    "[%" PRId64 ",%" PRId64 ",%" PRId64
+                    "] suffix %" PRId64 "%s\n",
+                    GREEN, local_ap0, local_ap1, tail_ap,
+                    sc->apparent_block, BLACK);
+              }
+              solved = true;
+              break;
+            }
+
+            for (uint32_t f = 0; f < fill_needed; f++) {
+              int64_t orig = last_block + 1 + (int64_t)f;
+              blockvector_set_apparent_blocknumber(candidate->b,
+                  suffix_start_nb + f, orig);
+              inflate_blockvector_single_block(candidate->b,
+                  suffix_start_nb + f);
+            }
+          }
+        }
+
+        if (!solved && prefix_last_actual >= 0) {
+          int64_t local_head_actual = local_full_start_actual;
+          int64_t local_head_ap = png_crc_actual_to_apparent(ht,
+              local_head_actual);
+          if (local_head_ap >= 0 && !_AB_IN_BV_PREFIX(local_head_ap)) {
+            uint32_t shifted_local_head = (uint32_t)crc32_combine(
+                (uLong)ht->actual_crc[local_head_actual], 0UL, after[0]);
+
+            for (int64_t si = 0; si < suffix_cand_count && !solved; si++) {
+              PNGSuffixCand *sc = &suffix_cands[si];
+              if (!sc->valid || sc->apparent_block < 0
+                  || _AB_IN_BV_PREFIX(sc->apparent_block)
+                  || filemirror_actual_block_covered(scalpel_state.filemirror,
+                      sc->actual_block)) {
+                continue;
+              }
+
+              int64_t tail1_actual = sc->actual_block - 2;
+              int64_t tail2_actual = sc->actual_block - 1;
+              int64_t tail1_ap = png_crc_actual_to_apparent(ht,
+                  tail1_actual);
+              int64_t tail2_ap = png_crc_actual_to_apparent(ht,
+                  tail2_actual);
+              if (tail1_ap < 0 || tail2_ap < 0
+                  || tail1_ap == tail2_ap
+                  || tail1_ap == local_head_ap
+                  || tail2_ap == local_head_ap
+                  || tail1_ap == sc->apparent_block
+                  || tail2_ap == sc->apparent_block
+                  || _AB_IN_BV_PREFIX(tail1_ap)
+                  || _AB_IN_BV_PREFIX(tail2_ap)) {
+                continue;
+              }
+
+              uint32_t crc_up_to_suffix = crc_prefix;
+              for (int mi = 0; mi < 3; mi++) {
+                crc_up_to_suffix = (uint32_t)crc32_combine(
+                    (uLong)crc_up_to_suffix, (uLong)quick_mid_crc[mi],
+                    (z_off_t)bs);
+              }
+              uint32_t crc_with_sc = (uint32_t)crc32_combine(
+                  (uLong)crc_up_to_suffix, (uLong)sc->partial_crc,
+                  (z_off_t)suffix_partial_len);
+              uint32_t diff = sc->stored_crc ^ crc_with_sc;
+              if (diff == 0) {
+                continue;
+              }
+
+              uint32_t target_all = diff ^ shifted_contig[0]
+                  ^ shifted_contig[1] ^ shifted_contig[2];
+              uint32_t shifted_tail1 = (uint32_t)crc32_combine(
+                  (uLong)ht->actual_crc[tail1_actual], 0UL, after[1]);
+              uint32_t shifted_tail2 = (uint32_t)crc32_combine(
+                  (uLong)ht->actual_crc[tail2_actual], 0UL, after[2]);
+              bool trace_anchor_sc = png_trace_this
+                  && (png_trace_actual_block < 0
+                      || sc->actual_block == png_trace_actual_block);
+              if (trace_anchor_sc) {
+                lock_fprintf(stdout,
+                    "PNG_TRACE_M3_ANCHOR_1P3_CHECK si=%" PRId64
+                    " sc_actual=%" PRId64 " sc_ap=%" PRId64
+                    " head_actual=%" PRId64 " head_ap=%" PRId64
+                    " tail1_actual=%" PRId64 " tail1_ap=%" PRId64
+                    " tail2_actual=%" PRId64 " tail2_ap=%" PRId64
+                    " target=%08" PRIx32 " head=%08" PRIx32
+                    " tail1=%08" PRIx32 " tail2=%08" PRIx32
+                    " rhs=%08" PRIx32 "\n",
+                    si, sc->actual_block, sc->apparent_block,
+                    local_head_actual, local_head_ap, tail1_actual, tail1_ap,
+                    tail2_actual, tail2_ap, target_all, shifted_local_head,
+                    shifted_tail1, shifted_tail2,
+                    shifted_local_head ^ shifted_tail1 ^ shifted_tail2);
+              }
+              if (target_all != (shifted_local_head
+                    ^ shifted_tail1 ^ shifted_tail2)) {
+                continue;
+              }
+
+              png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+              blockvector_set_apparent_blocknumber(candidate->b,
+                  suffix_start_nb + first_full + 0, local_head_ap);
+              blockvector_set_apparent_blocknumber(candidate->b,
+                  suffix_start_nb + first_full + 1, tail1_ap);
+              blockvector_set_apparent_blocknumber(candidate->b,
+                  suffix_start_nb + first_full + 2, tail2_ap);
+              blockvector_set_apparent_blocknumber(candidate->b,
+                  suffix_start_nb + suffix_fill_pos, sc->apparent_block);
+              for (uint32_t f = 0; f < fill_needed; f++) {
+                inflate_blockvector_single_block(candidate->b,
+                    suffix_start_nb + f);
+              }
+
+              bool trace_marker_ok = png_solver_crc_marker_matches(
+                  candidate, type_start, crc_region_len, crc_field_pos,
+                  sc->stored_crc);
+              bool trace_confirm_ok = false;
+              if (trace_marker_ok) {
+                trace_confirm_ok = png_solver_confirm_match(candidate, local,
+                    work, uuidp, uuidc, crc_pos, idat_sz);
+              }
+              if (trace_anchor_sc) {
+                lock_fprintf(stdout,
+                    "PNG_TRACE_M3_ANCHOR_1P3_TRY si=%" PRId64
+                    " marker=%d confirm=%d last_crc=%" PRIu64
+                    " target=%" PRIu64 "\n",
+                    si, trace_marker_ok ? 1 : 0,
+                    trace_confirm_ok ? 1 : 0,
+                    local->last_chunk_crc_pos,
+                    crc_pos + 12 + (uint64_t)idat_sz);
+              }
+              if (trace_marker_ok && trace_confirm_ok) {
+                if (scalpel_state.mode_verbose) {
+                  lock_fprintf(stdout,
+                      "%sPNG CRC SOLVER: M=3 anchored 1+3 blocks "
+                      "[%" PRId64 ",%" PRId64 ",%" PRId64
+                      "] suffix %" PRId64 "%s\n",
+                      GREEN, local_head_ap, tail1_ap, tail2_ap,
+                      sc->apparent_block, BLACK);
+                }
+                solved = true;
+                break;
+              }
+
+              for (uint32_t f = 0; f < fill_needed; f++) {
+                int64_t orig = last_block + 1 + (int64_t)f;
+                blockvector_set_apparent_blocknumber(candidate->b,
+                    suffix_start_nb + f, orig);
+                inflate_blockvector_single_block(candidate->b,
+                    suffix_start_nb + f);
+              }
+            }
+          }
+        }
+      }
+
+      if (solved) {
+        free(suffix_cands);
+        return 2;
+      }
+    }
+
     PNGGapWindowTable *gap_index = png_gap_window_table_get(ht, M);
     uint32_t gap_suffix_inv[32];
     if (gap_index
@@ -9472,16 +10663,28 @@ static inline int png_crc_solve_idat(
         local->gap_fast_M = M;
       }
 
-      z_off_t middle_len = (z_off_t)((uint64_t)M * (uint64_t)bs);
-      uint32_t shifted_prefix = (uint32_t)crc32_combine(
-          (uLong)crc_prefix, 0UL, middle_len);
-      int64_t current_total_ap = (int64_t)filemirror_apparent_blocks(
-          scalpel_state.filemirror);
+	      z_off_t middle_len = (z_off_t)((uint64_t)M * (uint64_t)bs);
+	      uint32_t shifted_prefix = (uint32_t)crc32_combine(
+	          (uLong)crc_prefix, 0UL, middle_len);
+	      int64_t current_total_ap = (int64_t)filemirror_apparent_blocks(
+	          scalpel_state.filemirror);
+	      uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
+	      bool best_found = false;
+	      bool best_validated = false;
+	      uint64_t best_validates_to = 0;
+	      uint64_t best_advance_to = 0;
+	      uint32_t best_locality = 0;
+	      int64_t best_window_ap[PNG_GAP_INDEX_MAX_M];
+	      int64_t best_suffix_ap = -1;
+	      uint64_t best_data_length = 0;
+	      uint64_t best_num_blocks = 0;
+	      PNGSolverStateSnapshot best_snap;
+	      bool stop_gap_scan = false;
 
-      for (int64_t si = resume_si; si < suffix_cand_count && !solved; si++) {
-        if ((si & 0x3FF) == 0
-            && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                    memory_order_acquire)) {
+	      for (int64_t si = resume_si;
+	           si < suffix_cand_count && !stop_gap_scan; si++) {
+	        if ((si & 0x3FF) == 0
+	            && png_reassembly_yield_requested(candidate)) {
           local->gap_fast_resume_valid = true;
           local->gap_fast_exhausted = false;
           local->gap_fast_si = si;
@@ -9518,26 +10721,34 @@ static inline int png_crc_solve_idat(
         uint32_t req_run = req_left ^ shifted_prefix;
         uint32_t bucket = req_run % PNG_GAP_WINDOW_BUCKETS;
 
-        for (PNGGapWindowEntry *we = gap_index->buckets[bucket];
-             we && !solved; we = we->next) {
+	        for (PNGGapWindowEntry *we = gap_index->buckets[bucket];
+	             we && !stop_gap_scan; we = we->next) {
           if (we->crc != req_run) {
             continue;
           }
-          if (we->start_ab < 0
-              || we->start_ab + (int64_t)M > current_total_ap) {
+          if (we->start_actual < 0
+              || we->start_actual + (int64_t)M > ht->actual_count) {
             continue;
           }
 
           bool window_ok = true;
+          int64_t window_ap[PNG_GAP_INDEX_MAX_M];
           for (uint32_t f = 0; f < M; f++) {
-            int64_t ab = we->start_ab + (int64_t)f;
-            int64_t actual = filemirror_actual_blocknumber(
-                scalpel_state.filemirror, ab);
-            if (actual < 0
+            int64_t actual = we->start_actual + (int64_t)f;
+            int64_t ab = png_crc_actual_to_apparent(ht, actual);
+            if (ab < 0 || ab >= current_total_ap
                 || actual == sc->actual_block
-                || filemirror_actual_block_covered(
-                    scalpel_state.filemirror, actual)
                 || _AB_IN_BV_PREFIX(ab)) {
+              window_ok = false;
+              break;
+            }
+            window_ap[f] = ab;
+          }
+          if (!window_ok) {
+            continue;
+          }
+          for (uint32_t f = 0; f < M; f++) {
+            if (sc->apparent_block == window_ap[f]) {
               window_ok = false;
               break;
             }
@@ -9545,16 +10756,11 @@ static inline int png_crc_solve_idat(
           if (!window_ok) {
             continue;
           }
-          if (sc->apparent_block >= we->start_ab
-              && sc->apparent_block < we->start_ab + (int64_t)M) {
-            continue;
-          }
 
-          resize_blockvector(candidate->b, suffix_start_nb + fill_needed);
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
           for (uint32_t f = 0; f < M; f++) {
             blockvector_set_apparent_blocknumber(candidate->b,
-                suffix_start_nb + first_full + f,
-                we->start_ab + (int64_t)f);
+                suffix_start_nb + first_full + f, window_ap[f]);
           }
           blockvector_set_apparent_blocknumber(candidate->b,
               suffix_start_nb + suffix_fill_pos, sc->apparent_block);
@@ -9568,13 +10774,50 @@ static inline int png_crc_solve_idat(
           uint64_t vt;
           bool validated = png_direct_validate(work->id, candidate, &vt,
               local, uuidp, uuidc);
-          uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
-          if (validated || local->last_chunk_crc_pos >= target) {
-            solved = true;
-            break;
+          uint64_t advance_to = local->last_chunk_crc_pos;
+          uint32_t locality = png_gap_locality_score(candidate,
+              suffix_start_nb, first_full, window_ap, M);
+          // CRC algebra plus the next PNG marker identifies the seam.  If every
+          // filled block is also the physical local continuation, accept the
+          // match even when the streaming validator does not advance state.
+          bool plausible = validated || advance_to >= target
+              || locality == M;
+          if (png_trace_this) {
+            lock_fprintf(stdout,
+                "PNG_TRACE_GAP_INDEX_TRY si=%" PRId64
+                " sc_actual=%" PRId64 " sc_ap=%" PRId64
+                " start_actual=%" PRId64 " aps0=%" PRId64
+                " M=%u validated=%d vt=%" PRIu64
+                " advance=%" PRIu64 " target=%" PRIu64
+                " locality=%u plausible=%d\n",
+                si, sc->actual_block, sc->apparent_block,
+                we->start_actual, window_ap[0], M,
+                validated ? 1 : 0, vt, advance_to, target,
+                locality, plausible ? 1 : 0);
+          }
+          if (plausible && png_gap_match_better(validated, vt, advance_to,
+              locality, best_found, best_validated, best_validates_to,
+              best_advance_to, best_locality)) {
+            best_found = true;
+            best_validated = validated;
+            best_validates_to = vt;
+            best_advance_to = advance_to;
+            best_locality = locality;
+            memcpy(best_window_ap, window_ap,
+                M * sizeof(best_window_ap[0]));
+            best_suffix_ap = sc->apparent_block;
+            best_data_length = blockvector_get_data_length(candidate->b);
+            best_num_blocks = blockvector_get_num_blocks(candidate->b);
+            png_solver_snapshot(&best_snap, local);
+            if (validated) {
+              stop_gap_scan = true;
+            }
           }
 
           png_solver_restore(local, &pre_snap);
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+          blockvector_set_data_length(candidate->b,
+              (suffix_start_nb + fill_needed) * (uint64_t)bs);
           for (uint32_t f = 0; f < fill_needed; f++) {
             int64_t orig = last_block + 1 + (int64_t)f;
             blockvector_set_apparent_blocknumber(candidate->b,
@@ -9585,7 +10828,29 @@ static inline int png_crc_solve_idat(
         }
       }
 
-      local->gap_fast_resume_valid = false;
+	      if (best_found) {
+	        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+	        for (uint32_t f = 0; f < M; f++) {
+	          blockvector_set_apparent_blocknumber(candidate->b,
+	              suffix_start_nb + first_full + f, best_window_ap[f]);
+	        }
+	        blockvector_set_apparent_blocknumber(candidate->b,
+	            suffix_start_nb + suffix_fill_pos, best_suffix_ap);
+	        for (uint32_t f = 0; f < fill_needed; f++) {
+	          inflate_blockvector_single_block(candidate->b,
+	              suffix_start_nb + f);
+	        }
+	        if (best_data_length > 0) {
+	          blockvector_set_data_length(candidate->b, best_data_length);
+	        }
+	        if (best_num_blocks > 0) {
+	          resize_blockvector(candidate->b, best_num_blocks);
+	        }
+	        png_solver_restore(local, &best_snap);
+	        solved = true;
+	      }
+
+	      local->gap_fast_resume_valid = false;
       if (!solved) {
         local->gap_fast_exhausted = true;
         local->gap_fast_suffix_nb = suffix_start_nb;
@@ -9691,8 +10956,7 @@ static inline int png_crc_solve_idat(
                  && !gap_yielded;
              start++) {
           if ((start & 0xFF) == 0
-              && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                      memory_order_acquire)) {
+              && png_reassembly_yield_requested(candidate)) {
             // GAP fast path yield — save progress directly in PNGCarveState
             // so the next call can resume rather than rescan from 0.
             local->gap_fast_resume_valid = true;
@@ -9760,20 +11024,28 @@ static inline int png_crc_solve_idat(
       }
 
 
-      // ---- Phase 2: try each collected match.  First one whose validator
-      // walks past this IDAT's CRC field commits; others are rolled back.
-      // If none advance, solver returns 0 and caller falls through to MitM
-      // / BBK.  The "pick farthest advance" across matches wasn't needed —
-      // per diagnostic the stuck-N corpus has typically 1 match per call;
-      // the multi-match handling matters for HIGHER-match-count cases seen
-      // at full 3000-file scale.
-      uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
-      for (uint32_t mi = 0; mi < gap_match_count && !solved; mi++) {
-        int64_t m_start = gap_match_start[mi];
-        int64_t m_si = gap_match_sc_idx[mi];
+	      // ---- Phase 2: try each collected match.  First one whose validator
+	      // walks farthest commits; others are rolled back.  CRC equality
+	      // proves the current chunk bytes, but at corpus scale multiple
+	      // placements can satisfy that equality.  Ranking by downstream
+	      // validation avoids committing the first same-offset echo match.
+	      uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
+	      bool best_found = false;
+	      bool best_validated = false;
+	      uint64_t best_validates_to = 0;
+	      uint64_t best_advance_to = 0;
+	      uint32_t best_locality = 0;
+	      int64_t best_start = -1;
+	      int64_t best_sc_idx = -1;
+	      uint64_t best_data_length = 0;
+	      uint64_t best_num_blocks = 0;
+	      PNGSolverStateSnapshot best_snap;
+	      for (uint32_t mi = 0; mi < gap_match_count && !solved; mi++) {
+	        int64_t m_start = gap_match_start[mi];
+	        int64_t m_si = gap_match_sc_idx[mi];
         PNGSuffixCand *m_sc = &suffix_cands[m_si];
         // Place blocks.
-        resize_blockvector(candidate->b, suffix_start_nb + fill_needed);
+        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
         for (uint32_t f = 0; f < M; f++) {
           blockvector_set_apparent_blocknumber(candidate->b,
               suffix_start_nb + first_full + f, m_start + (int64_t)f);
@@ -9792,13 +11064,50 @@ static inline int png_crc_solve_idat(
         bool validated = png_direct_validate(work->id, candidate, &vt,
             local, uuidp, uuidc);
         uint64_t advance_to = local->last_chunk_crc_pos;
-        bool accept = validated || (advance_to >= target);
-        if (accept) {
-          solved = true;
-          break;
+        int64_t window_ap[PNG_GAP_INDEX_MAX_M];
+        for (uint32_t f = 0; f < M; f++) {
+          window_ap[f] = m_start + (int64_t)f;
         }
-        // Reject — restore state and BV for next match.
+        uint32_t locality = png_gap_locality_score(candidate,
+            suffix_start_nb, first_full, window_ap, M);
+        bool accept = validated || (advance_to >= target)
+            || locality == M;
+        if (png_trace_this) {
+          lock_fprintf(stdout,
+              "PNG_TRACE_GAP_SCAN_TRY mi=%u si=%" PRId64
+              " sc_actual=%" PRId64 " sc_ap=%" PRId64
+              " start=%" PRId64 " M=%u validated=%d"
+              " vt=%" PRIu64 " advance=%" PRIu64
+              " target=%" PRIu64 " locality=%u plausible=%d\n",
+              mi, m_si, m_sc->actual_block, m_sc->apparent_block,
+              m_start, M, validated ? 1 : 0, vt, advance_to,
+              target, locality, accept ? 1 : 0);
+        }
+        if (accept) {
+          if (png_gap_match_better(validated, vt, advance_to, locality,
+              best_found, best_validated, best_validates_to,
+              best_advance_to, best_locality)) {
+            best_found = true;
+            best_validated = validated;
+            best_validates_to = vt;
+            best_advance_to = advance_to;
+            best_locality = locality;
+            best_start = m_start;
+            best_sc_idx = m_si;
+            best_data_length = blockvector_get_data_length(candidate->b);
+            best_num_blocks = blockvector_get_num_blocks(candidate->b);
+            png_solver_snapshot(&best_snap, local);
+          }
+          if (validated) {
+            solved = true;
+          }
+        }
+        // Restore state and BV for next match.  Accepted candidates are
+        // committed after ranking, not inside this loop.
         png_solver_restore(local, &pre_snap);
+        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+        blockvector_set_data_length(candidate->b,
+            (suffix_start_nb + fill_needed) * (uint64_t)bs);
         for (uint32_t f = 0; f < fill_needed; f++) {
           int64_t orig = last_block + 1 + (int64_t)f;
           blockvector_set_apparent_blocknumber(candidate->b,
@@ -9807,9 +11116,31 @@ static inline int png_crc_solve_idat(
               suffix_start_nb + f);
         }
       }
-      if (!solved && gap_match_count > 0) {
-        // All matches rejected.  Leave state clean.
-        resize_blockvector(candidate->b, suffix_start_nb);
+	      if (best_found && best_sc_idx >= 0) {
+	        PNGSuffixCand *best_sc = &suffix_cands[best_sc_idx];
+	        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+	        for (uint32_t f = 0; f < M; f++) {
+	          blockvector_set_apparent_blocknumber(candidate->b,
+	              suffix_start_nb + first_full + f, best_start + (int64_t)f);
+	        }
+	        blockvector_set_apparent_blocknumber(candidate->b,
+	            suffix_start_nb + suffix_fill_pos, best_sc->apparent_block);
+	        for (uint32_t f = 0; f < fill_needed; f++) {
+	          inflate_blockvector_single_block(candidate->b,
+	              suffix_start_nb + f);
+	        }
+	        if (best_data_length > 0) {
+	          blockvector_set_data_length(candidate->b, best_data_length);
+	        }
+	        if (best_num_blocks > 0) {
+	          resize_blockvector(candidate->b, best_num_blocks);
+	        }
+	        png_solver_restore(local, &best_snap);
+	        solved = true;
+	      }
+	      if (!solved && gap_match_count > 0) {
+	        // All matches rejected.  Leave state clean.
+	        resize_blockvector(candidate->b, suffix_start_nb);
       }
       if (!solved && gap_match_cap_reached
           && gap_cap_resume_si < suffix_cand_count) {
@@ -9866,8 +11197,8 @@ static inline int png_crc_solve_idat(
    * the CRC shift and use the existing raw block CRC hash table directly.
    */
   if (!solved && M == 3 && suffix_fill_pos == first_full + 3
-      && ht->apparent_crc && ht->apparent_valid
-      && ht->apparent_count > 0) {
+      && ht->actual_crc && ht->actual_valid
+      && ht->actual_count > 0) {
     data = blockvector_get_data_pointer(candidate->b);
     dl = blockvector_get_data_length(candidate->b);
 
@@ -9905,15 +11236,18 @@ static inline int png_crc_solve_idat(
       uint32_t pair_after2_inv[32];
       bool pair_after2_inv_ok = png_crc_inverse_for_len(after[2],
           pair_after2_inv);
-      int64_t total_ap = ht->apparent_count;
+      int64_t total_ap = (int64_t)filemirror_apparent_blocks(
+          scalpel_state.filemirror);
 
       #define PNG_M3_FAST_AP_VALID(_ap) \
-        ((_ap) >= 0 && (_ap) < total_ap && ht->apparent_valid[(_ap)])
+        ((_ap) >= 0 && (_ap) < total_ap \
+         && png_crc_apparent_crc(ht, (_ap), NULL, NULL))
       #define PNG_M3_FAST_AP_FROM_ACT(_act) \
         png_crc_actual_to_apparent(ht, (_act))
       #define PNG_M3_FAST_SHIFT_AP(_ap, _pos) \
-        ((uint32_t)crc32_combine((uLong)ht->apparent_crc[(_ap)], 0UL, \
-                                 after[(_pos)]))
+        ({ uint32_t _ap_crc = 0; \
+           (void)png_crc_apparent_crc(ht, (_ap), &_ap_crc, NULL); \
+           (uint32_t)crc32_combine((uLong)_ap_crc, 0UL, after[(_pos)]); })
       #define PNG_M3_FAST_RESTORE_CONTIG() do { \
         for (uint32_t _rf = 0; _rf < fill_needed; _rf++) { \
           int64_t _orig = last_block + 1 + (int64_t)_rf; \
@@ -9971,10 +11305,28 @@ static inline int png_crc_solve_idat(
               inflate_blockvector_single_block(candidate->b, \
                   suffix_start_nb + _if); \
             } \
-            if (png_solver_crc_marker_matches(candidate, type_start, \
-                    crc_region_len, crc_field_pos, _sc->stored_crc) \
-                && png_solver_confirm_match(candidate, local, work, \
-                    uuidp, uuidc, crc_pos, idat_sz)) { \
+            bool _trace_try = png_trace_this \
+                && (png_trace_actual_block < 0 \
+                    || _sc->actual_block == png_trace_actual_block); \
+            bool _marker_ok = png_solver_crc_marker_matches(candidate, \
+                type_start, crc_region_len, crc_field_pos, _sc->stored_crc); \
+            bool _confirm_ok = false; \
+            if (_marker_ok) { \
+              _confirm_ok = png_solver_confirm_match(candidate, local, work, \
+                  uuidp, uuidc, crc_pos, idat_sz); \
+            } \
+            if (_trace_try) { \
+              lock_fprintf(stdout, \
+                  "PNG_TRACE_M3_FAST_TRY kind=%s sc_actual=%" PRId64 \
+                  " sc_ap=%" PRId64 " aps=[%" PRId64 ",%" PRId64 \
+                  ",%" PRId64 "] marker=%d confirm=%d last_crc=%" PRIu64 \
+                  " target=%" PRIu64 "\n", \
+                  (_kind), _sc->actual_block, _ps, _pa0, _pa1, _pa2, \
+                  _marker_ok ? 1 : 0, _confirm_ok ? 1 : 0, \
+                  local->last_chunk_crc_pos, \
+                  crc_pos + 12 + (uint64_t)idat_sz); \
+            } \
+            if (_marker_ok && _confirm_ok) { \
               if (scalpel_state.mode_verbose) { \
                 lock_fprintf(stdout, \
                     "%sPNG CRC SOLVER: M=3 fast suffix %s blocks " \
@@ -10073,7 +11425,8 @@ static inline int png_crc_solve_idat(
             if (prefix_last_actual >= 0) {
               uint32_t pair_crc = 0;
               int64_t p0 = -1, p1 = -1;
-              if (png_crc_actual_pair_crc(ht, prefix_last_actual + 1,
+              if (png_crc_actual_pair_crc(ht,
+                      prefix_last_actual + 1 + (int64_t)first_full,
                       &pair_crc, &p0, &p1)
                   && pair_crc == req_pair) {
                 PNG_M3_FAST_TRY(p0, p1, r2c, sap, sc,
@@ -10087,16 +11440,18 @@ static inline int png_crc_solve_idat(
                 if (we->crc != req_pair) {
                   continue;
                 }
-                int64_t start = we->start_ab;
-                if (!PNG_M3_FAST_AP_VALID(start)
-                    || !PNG_M3_FAST_AP_VALID(start + 1)
-                    || start == r2c || start + 1 == r2c
-                    || start == sap || start + 1 == sap
-                    || _AB_IN_BV_PREFIX(start)
-                    || _AB_IN_BV_PREFIX(start + 1)) {
+                uint32_t pair_crc = 0;
+                int64_t p0 = -1, p1 = -1;
+                if (!png_crc_actual_pair_crc(ht, we->start_actual,
+                        &pair_crc, &p0, &p1)
+                    || pair_crc != req_pair
+                    || p0 == r2c || p1 == r2c
+                    || p0 == sap || p1 == sap
+                    || _AB_IN_BV_PREFIX(p0)
+                    || _AB_IN_BV_PREFIX(p1)) {
                   continue;
                 }
-                PNG_M3_FAST_TRY(start, start + 1, r2c, sap, sc,
+                PNG_M3_FAST_TRY(p0, p1, r2c, sap, sc,
                     "2+2-run");
               }
             }
@@ -10110,7 +11465,8 @@ static inline int png_crc_solve_idat(
          */
         if (!solved && pair_after2_inv_ok) {
           int64_t ab0 = (prefix_last_actual >= 0)
-              ? PNG_M3_FAST_AP_FROM_ACT(prefix_last_actual + 1)
+              ? PNG_M3_FAST_AP_FROM_ACT(prefix_last_actual + 1
+                    + (int64_t)first_full)
               : -1;
           if (PNG_M3_FAST_AP_VALID(ab0)
               && !_AB_IN_BV_PREFIX(ab0)) {
@@ -10125,16 +11481,18 @@ static inline int png_crc_solve_idat(
                 if (we->crc != req_pair) {
                   continue;
                 }
-                int64_t start = we->start_ab;
-                if (!PNG_M3_FAST_AP_VALID(start)
-                    || !PNG_M3_FAST_AP_VALID(start + 1)
-                    || start == ab0 || start + 1 == ab0
-                    || start == sap || start + 1 == sap
-                    || _AB_IN_BV_PREFIX(start)
-                    || _AB_IN_BV_PREFIX(start + 1)) {
+                uint32_t pair_crc = 0;
+                int64_t p0 = -1, p1 = -1;
+                if (!png_crc_actual_pair_crc(ht, we->start_actual,
+                        &pair_crc, &p0, &p1)
+                    || pair_crc != req_pair
+                    || p0 == ab0 || p1 == ab0
+                    || p0 == sap || p1 == sap
+                    || _AB_IN_BV_PREFIX(p0)
+                    || _AB_IN_BV_PREFIX(p1)) {
                   continue;
                 }
-                PNG_M3_FAST_TRY(ab0, start, start + 1, sap, sc,
+                PNG_M3_FAST_TRY(ab0, p0, p1, sap, sc,
                     "1+2+1-run");
               }
             }
@@ -10406,16 +11764,32 @@ static inline int png_crc_solve_idat(
       resume_chunk_j = local->solver_chunk_j;
     }
 
-    // Suffix candidate loop — M=2 (right_count == 1) uses sc->stored_crc.
-    for (int64_t si = resume_si; si < suffix_cand_count && !solved; si++) {
-      PNGSuffixCand *sc = &sc_arr[si];
-      if (!sc->valid) {
-        continue;
-      }
-      if (right_count == 1) {
-        // M=2: left=1, right=1. For each right middle block:
-        for (uint32_t br = 0; br < PNG_CRC_HASH_BUCKETS && !solved; br++) {
-          for (PNGCrcEntry *er = ht->buckets[br]; er && !solved; er = er->next) {
+	    bool m2_best_found = false;
+	    bool m2_best_validated = false;
+	    uint64_t m2_best_validates_to = 0;
+	    uint64_t m2_best_advance_to = 0;
+	    uint32_t m2_best_locality = 0;
+	    int64_t m2_best_left = -1;
+	    int64_t m2_best_right = -1;
+	    int64_t m2_best_suffix = -1;
+	    uint64_t m2_best_data_length = 0;
+	    uint64_t m2_best_num_blocks = 0;
+	    PNGSolverStateSnapshot m2_best_snap;
+	    bool stop_m2_scan = false;
+
+	    // Suffix candidate loop — M=2 (right_count == 1) uses sc->stored_crc.
+	    for (int64_t si = resume_si;
+	         si < suffix_cand_count && !stop_m2_scan; si++) {
+	      PNGSuffixCand *sc = &sc_arr[si];
+	      if (!sc->valid) {
+	        continue;
+	      }
+	      if (right_count == 1) {
+	        // M=2: left=1, right=1. For each right middle block:
+	        for (uint32_t br = 0;
+	             br < PNG_CRC_HASH_BUCKETS && !stop_m2_scan; br++) {
+	          for (PNGCrcEntry *er = ht->buckets[br];
+	               er && !stop_m2_scan; er = er->next) {
             /* Skip covered or unmapped right-candidates at loop time —
              * they can't be placed, so the expensive algebra below is
              * wasted on them.  Also skip blocks already in BV prefix. */
@@ -10509,40 +11883,99 @@ static inline int png_crc_solve_idat(
                           | ((uint32_t)_ic[2] << 8) | (uint32_t)_ic[3];
                       if (_icrc == 0xAE426082U) { _sok = true; }
                     }
-                  }
-                  if (_sok) {
-                    uint64_t _crc_pre = local->last_chunk_crc_pos;
-                    bool _sv2; uint64_t _svt2;
-                    _sv2 = png_direct_validate(work->id, candidate,
-                        &_svt2, local, uuidp, uuidc);
-                    if (_sv2 || local->last_chunk_crc_pos > _crc_pre) {
-                      if (scalpel_state.mode_verbose) {
-                        lock_fprintf(stdout,
-                            "%sPNG CRC SOLVER: M=2 found! blocks [%"
-                            PRId64 ",%" PRId64 "] suffix %" PRId64 "%s\n",
-                            GREEN, ab_l, ab_r, sc->apparent_block, BLACK);
-                      }
-                      solved = true;
-                    } else {
-                      local->last_chunk_crc_pos = _crc_pre;
-                    }
-                  }
-                }
-              }
-              if (!solved) {
-                // Undo — restore contiguous
-                for (uint32_t f = 0; f < fill_needed; f++) {
-                  int64_t orig = last_block + 1 + (int64_t)f;
-                  blockvector_set_apparent_blocknumber(candidate->b,
-                      suffix_start_nb + f, orig);
-                  inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
-                }
-              }
-            }
-          }
-        }
-      }
-    } // end suffix candidate loop (M=2)
+	                  }
+	                  if (_sok) {
+	                    PNGSolverStateSnapshot _pre_snap;
+	                    png_solver_snapshot(&_pre_snap, local);
+	                    uint64_t _crc_pre = local->last_chunk_crc_pos;
+	                    bool _sv2; uint64_t _svt2;
+	                    _sv2 = png_direct_validate(work->id, candidate,
+	                        &_svt2, local, uuidp, uuidc);
+	                    uint64_t _advance = local->last_chunk_crc_pos;
+	                    bool _plausible = _sv2 || _advance > _crc_pre;
+	                    int64_t _window_ap[PNG_GAP_INDEX_MAX_M];
+	                    _window_ap[0] = ab_l;
+	                    _window_ap[1] = ab_r;
+	                    uint32_t _locality = png_gap_locality_score(candidate,
+	                        suffix_start_nb, first_full, _window_ap, M);
+	                    if (png_trace_this) {
+	                      lock_fprintf(stdout,
+	                          "PNG_TRACE_M2_TRY si=%" PRId64
+	                          " left=%" PRId64 " right=%" PRId64
+	                          " suffix=%" PRId64 " suffix_actual=%" PRId64
+	                          " validated=%d vt=%" PRIu64
+	                          " advance=%" PRIu64 " pre=%" PRIu64
+	                          " locality=%u plausible=%d\n",
+	                          si, ab_l, ab_r, sc->apparent_block,
+	                          sc->actual_block, _sv2 ? 1 : 0, _svt2,
+	                          _advance, _crc_pre, _locality,
+	                          _plausible ? 1 : 0);
+	                    }
+	                    if (_plausible && png_gap_match_better(_sv2, _svt2,
+	                        _advance, _locality, m2_best_found,
+	                        m2_best_validated, m2_best_validates_to,
+	                        m2_best_advance_to, m2_best_locality)) {
+	                      m2_best_found = true;
+	                      m2_best_validated = _sv2;
+	                      m2_best_validates_to = _svt2;
+	                      m2_best_advance_to = _advance;
+	                      m2_best_locality = _locality;
+	                      m2_best_left = ab_l;
+	                      m2_best_right = ab_r;
+	                      m2_best_suffix = sc->apparent_block;
+	                      m2_best_data_length =
+	                          blockvector_get_data_length(candidate->b);
+	                      m2_best_num_blocks =
+	                          blockvector_get_num_blocks(candidate->b);
+	                      png_solver_snapshot(&m2_best_snap, local);
+	                      if (_sv2 || _locality == M) {
+	                        stop_m2_scan = true;
+	                      }
+	                    }
+	                    png_solver_restore(local, &_pre_snap);
+	                  }
+	                }
+	              }
+	              // Undo — restore contiguous before trying the next match.
+	              for (uint32_t f = 0; f < fill_needed; f++) {
+	                int64_t orig = last_block + 1 + (int64_t)f;
+	                blockvector_set_apparent_blocknumber(candidate->b,
+	                    suffix_start_nb + f, orig);
+	                inflate_blockvector_single_block(candidate->b,
+	                    suffix_start_nb + f);
+	              }
+	            }
+	          }
+	        }
+	      }
+	    } // end suffix candidate loop (M=2)
+
+	    if (m2_best_found) {
+	      png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+	      blockvector_set_apparent_blocknumber(candidate->b,
+	          suffix_start_nb + first_full, m2_best_left);
+	      blockvector_set_apparent_blocknumber(candidate->b,
+	          suffix_start_nb + first_full + 1, m2_best_right);
+	      blockvector_set_apparent_blocknumber(candidate->b,
+	          suffix_start_nb + suffix_fill_pos, m2_best_suffix);
+	      for (uint32_t f = 0; f < fill_needed; f++) {
+	        inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
+	      }
+	      if (m2_best_data_length > 0) {
+	        blockvector_set_data_length(candidate->b, m2_best_data_length);
+	      }
+	      if (m2_best_num_blocks > 0) {
+	        resize_blockvector(candidate->b, m2_best_num_blocks);
+	      }
+	      png_solver_restore(local, &m2_best_snap);
+	      if (scalpel_state.mode_verbose) {
+	        lock_fprintf(stdout,
+	            "%sPNG CRC SOLVER: M=2 selected blocks [%" PRId64
+	            ",%" PRId64 "] suffix %" PRId64 "%s\n",
+	            GREEN, m2_best_left, m2_best_right, m2_best_suffix, BLACK);
+	      }
+	      solved = true;
+	    }
 
     // ================================================================
     // M=3 algebraic solver: O(S × N) where S ~ 1-5 suffix candidates.
@@ -10859,10 +12292,10 @@ static inline int png_crc_solve_idat(
                   if (prefix_last_actual >= 0) {
                     uint32_t pair_crc = 0;
                     int64_t p0 = -1, p1 = -1;
-                    if (png_crc_actual_pair_crc(ht,
-                            prefix_last_actual + 1,
-                            &pair_crc, &p0, &p1)
-                        && pair_crc == req_pair) {
+                  if (png_crc_actual_pair_crc(ht,
+                          prefix_last_actual + 1 + (int64_t)first_full,
+                          &pair_crc, &p0, &p1)
+                      && pair_crc == req_pair) {
                       PNG_M3_TRY_SUFFIX_PLACEMENT(p0, p1, r2c,
                         "2+2-run-actual");
                     }
@@ -10874,16 +12307,18 @@ static inline int png_crc_solve_idat(
                       if (we->crc != req_pair) {
                         continue;
                       }
-                      int64_t start = we->start_ab;
-                      if (!PNG_M3_AP_VALID(start)
-                          || !PNG_M3_AP_VALID(start + 1)
-                          || start == r2c || start + 1 == r2c
-                          || start == sap || start + 1 == sap
-                          || _AB_IN_BV_PREFIX(start)
-                          || _AB_IN_BV_PREFIX(start + 1)) {
+                      uint32_t pair_crc = 0;
+                      int64_t p0 = -1, p1 = -1;
+                      if (!png_crc_actual_pair_crc(ht, we->start_actual,
+                              &pair_crc, &p0, &p1)
+                          || pair_crc != req_pair
+                          || p0 == r2c || p1 == r2c
+                          || p0 == sap || p1 == sap
+                          || _AB_IN_BV_PREFIX(p0)
+                          || _AB_IN_BV_PREFIX(p1)) {
                         continue;
                       }
-                      PNG_M3_TRY_SUFFIX_PLACEMENT(start, start + 1, r2c,
+                      PNG_M3_TRY_SUFFIX_PLACEMENT(p0, p1, r2c,
                         "2+2-run");
                     }
                   }
@@ -10897,7 +12332,8 @@ static inline int png_crc_solve_idat(
               if (!solved && pair_after2_inv_ok) {
                 int ti_0 = M3_TAB(0);
                 int64_t ab0 = (prefix_last_actual >= 0)
-                    ? PNG_M3_AP_FROM_ACT(prefix_last_actual + 1)
+                    ? PNG_M3_AP_FROM_ACT(prefix_last_actual + 1
+                          + (int64_t)first_full)
                     : -1;
                 if (PNG_M3_AP_VALID(ab0)
                     && !_AB_IN_BV_PREFIX(ab0) && m3_htab[ti_0]) {
@@ -10912,16 +12348,18 @@ static inline int png_crc_solve_idat(
                       if (we->crc != req_pair) {
                         continue;
                       }
-                      int64_t start = we->start_ab;
-                      if (!PNG_M3_AP_VALID(start)
-                          || !PNG_M3_AP_VALID(start + 1)
-                          || start == ab0 || start + 1 == ab0
-                          || start == sap || start + 1 == sap
-                          || _AB_IN_BV_PREFIX(start)
-                          || _AB_IN_BV_PREFIX(start + 1)) {
+                      uint32_t pair_crc = 0;
+                      int64_t p0 = -1, p1 = -1;
+                      if (!png_crc_actual_pair_crc(ht, we->start_actual,
+                              &pair_crc, &p0, &p1)
+                          || pair_crc != req_pair
+                          || p0 == ab0 || p1 == ab0
+                          || p0 == sap || p1 == sap
+                          || _AB_IN_BV_PREFIX(p0)
+                          || _AB_IN_BV_PREFIX(p1)) {
                         continue;
                       }
-                      PNG_M3_TRY_SUFFIX_PLACEMENT(ab0, start, start + 1,
+                      PNG_M3_TRY_SUFFIX_PLACEMENT(ab0, p0, p1,
                           "1+2+1-run");
                     }
                   }
@@ -10985,8 +12423,7 @@ static inline int png_crc_solve_idat(
               for (int64_t start = start_init;
                    start + 1 < m3_total_ap && !solved; start++) {
                 if ((start & 0xFFF) == 0
-                    && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                            memory_order_acquire)) {
+                    && png_reassembly_yield_requested(candidate)) {
                   local->solver_phase = 4;
                   local->solver_pair_idx = (uint8_t)spi;
                   local->solver_suffix_idx = si;
@@ -11237,8 +12674,7 @@ static inline int png_crc_solve_idat(
               for (uint32_t ei = ei_start;
                    ei < ti_a_count && !solved; ei++) {
                 if ((ei & 0xFF) == 0
-                    && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                            memory_order_acquire)) {
+                    && png_reassembly_yield_requested(candidate)) {
                   local->solver_phase = 1;
                   local->solver_pair_idx = (uint8_t)pi;
                   local->solver_suffix_idx = si;
@@ -11356,9 +12792,7 @@ static inline int png_crc_solve_idat(
                 }
 
               // Yield check per pair.
-              if (!solved
-                  && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                          memory_order_acquire)) {
+              if (!solved && png_reassembly_yield_requested(candidate)) {
                 local->solver_phase = 1;
                 local->solver_pair_idx = (uint8_t)pi;
                 local->solver_suffix_idx = si;
@@ -11406,8 +12840,7 @@ static inline int png_crc_solve_idat(
 
               // Yield check every 16 iterations for responsiveness.
               if (!solved && (ei & 0xF) == 0
-                  && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                          memory_order_acquire)) {
+                  && png_reassembly_yield_requested(candidate)) {
                 local->solver_phase = 2;
                 local->solver_pair_idx = 0;
                 local->solver_suffix_idx = si;
@@ -11443,8 +12876,7 @@ static inline int png_crc_solve_idat(
               for (uint32_t e1 = e1_start;
                    e1 < ti_1_count && !solved; e1++) {
                 if ((e1 & 0xFF) == 0
-                    && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                            memory_order_acquire)) {
+                    && png_reassembly_yield_requested(candidate)) {
                   local->solver_phase = 2;
                   local->solver_pair_idx = 0;
                   local->solver_suffix_idx = si;
@@ -11639,8 +13071,7 @@ static inline int png_crc_solve_idat(
             if (cj_end > fi) cj_end = fi;
 
             // Yield check between chunks.
-            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                     memory_order_acquire)) {
+            if (png_reassembly_yield_requested(candidate)) {
               local->solver_phase = 3;
               local->solver_pair_idx = 0;
               local->solver_chunk_i = ci;
@@ -11696,8 +13127,7 @@ static inline int png_crc_solve_idat(
                   ? (uint32_t)resume_er1 : 0;
               for (uint32_t er = er_start; er < fi && !solved; er++) {
                 if ((er & 0xFF) == 0
-                    && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                            memory_order_acquire)) {
+                    && png_reassembly_yield_requested(candidate)) {
                   local->solver_phase = 3;
                   local->solver_pair_idx = 0;
                   local->solver_chunk_i = ci;
@@ -12261,6 +13691,156 @@ static inline bool png_preserve_crc_frontier_in_candidate(
   return true;
 }
 
+static inline bool png_trim_output_blind_idat_tail(
+    PNGCarveState *local, CarveInfo *candidate) {
+  if (!local || !candidate || !candidate->b
+      || candidate->flavor == VALIDATED
+      || local->have_iend) {
+    return false;
+  }
+
+  const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer(
+      candidate->b);
+  uint64_t dl = blockvector_get_data_length(candidate->b);
+
+  if (!data || dl < 20 || scalpel_state.blocksize <= 0) {
+    return false;
+  }
+
+  uint64_t pos = 8;
+  uint64_t prev_idat_end = 0;
+  uint64_t last_idat_end = 0;
+  uint64_t idat_end_ring[IDAT_CRC_RING_SZ] = {0};
+  uint32_t idat_end_count = 0;
+  uint64_t keep_pos = 0;
+  while (pos + 8 <= dl) {
+    uint32_t chunk_len = ((uint32_t)data[pos] << 24)
+        | ((uint32_t)data[pos + 1] << 16)
+        | ((uint32_t)data[pos + 2] << 8)
+        | (uint32_t)data[pos + 3];
+    const uint8_t *type = data + pos + 4;
+    if (!png_chunk_type_is_ascii(type) || chunk_len > 100000000U) {
+      break;
+    }
+
+    uint64_t crc_at = pos + 8 + (uint64_t)chunk_len;
+    if (crc_at + 4 > dl) {
+      if (type[0] == 'I' && type[1] == 'D'
+          && type[2] == 'A' && type[3] == 'T'
+          && prev_idat_end > 0) {
+        keep_pos = prev_idat_end;
+      }
+      break;
+    }
+
+    uint32_t computed = crc32(0, NULL, 0);
+    computed = crc32(computed, data + pos + 4,
+        (uInt)(4 + chunk_len));
+    uint32_t stored = ((uint32_t)data[crc_at] << 24)
+        | ((uint32_t)data[crc_at + 1] << 16)
+        | ((uint32_t)data[crc_at + 2] << 8)
+        | (uint32_t)data[crc_at + 3];
+    if (computed != stored) {
+      break;
+    }
+
+    uint64_t chunk_end = crc_at + 4;
+    if (type[0] == 'I' && type[1] == 'D'
+        && type[2] == 'A' && type[3] == 'T') {
+      prev_idat_end = last_idat_end;
+      last_idat_end = chunk_end;
+      idat_end_ring[idat_end_count % IDAT_CRC_RING_SZ] = chunk_end;
+      idat_end_count++;
+    }
+    else if (type[0] == 'I' && type[1] == 'E'
+             && type[2] == 'N' && type[3] == 'D') {
+      // Non-VALIDATED output with IEND means the chunk envelope closed
+      // but full validation rejected it.  Roll back before the terminal
+      // IDATs rather than writing a structurally neat but wrong tail.
+      if (idat_end_count >= 3) {
+        keep_pos = idat_end_ring[(idat_end_count - 3)
+                                 % IDAT_CRC_RING_SZ];
+      }
+      else if (idat_end_count >= 2) {
+        keep_pos = idat_end_ring[(idat_end_count - 2)
+                                 % IDAT_CRC_RING_SZ];
+      }
+      break;
+    }
+    pos = chunk_end;
+  }
+
+  if (keep_pos == 0) {
+    return false;
+  }
+
+  uint64_t keep_blocks = CEILDIV(keep_pos,
+      (uint64_t)scalpel_state.blocksize);
+  if (keep_blocks == 0
+      || keep_blocks >= blockvector_get_num_blocks(candidate->b)) {
+    return false;
+  }
+
+  resize_blockvector(candidate->b, keep_blocks);
+  blockvector_set_data_length(candidate->b,
+      keep_blocks * (uint64_t)scalpel_state.blocksize);
+  local->last_chunk_crc_pos = keep_pos;
+  local->last_idat_crc_pos = keep_pos;
+  return true;
+}
+
+static inline void png_trim_checkpoint_candidate(
+    PNGCarveState *local, CarveInfo *candidate) {
+  if (!local || !candidate || !candidate->b
+      || candidate->flavor == VALIDATED) {
+    return;
+  }
+
+  uint64_t cur_blocks = blockvector_get_num_blocks(candidate->b);
+  uint64_t keep_blocks = cur_blocks;
+
+  if (local->solver_phase != 0
+      && local->solver_suffix_nb > 0
+      && local->solver_suffix_nb < keep_blocks) {
+    keep_blocks = local->solver_suffix_nb;
+  }
+  if (local->bbk_resume_active
+      && local->bbk_resume_suffix_nb > 0
+      && local->bbk_resume_suffix_nb < keep_blocks) {
+    keep_blocks = local->bbk_resume_suffix_nb;
+  }
+  if (local->d1_resume_valid
+      && local->d1_resume_suffix_nb > 0
+      && local->d1_resume_suffix_nb < keep_blocks) {
+    keep_blocks = local->d1_resume_suffix_nb;
+  }
+  if (local->gap_fast_resume_valid
+      && !local->gap_fast_exhausted
+      && local->gap_fast_suffix_nb > 0
+      && local->gap_fast_suffix_nb < keep_blocks) {
+    keep_blocks = local->gap_fast_suffix_nb;
+  }
+  if (local->safe_partial_blocks > 0
+      && local->safe_partial_blocks < keep_blocks) {
+    keep_blocks = local->safe_partial_blocks;
+  }
+
+  if (keep_blocks < cur_blocks) {
+    resize_blockvector(candidate->b, keep_blocks);
+    if (local->safe_partial_blocks == keep_blocks
+        && local->safe_partial_length > 0) {
+      blockvector_set_data_length(candidate->b,
+          local->safe_partial_length);
+    }
+    else {
+      blockvector_set_data_length(candidate->b,
+          keep_blocks * (uint64_t)scalpel_state.blocksize);
+    }
+  }
+
+  png_preserve_crc_frontier_in_candidate(local, candidate);
+}
+
 static inline bool png_should_defer_exhausted_partial(
     PNGCarveState *local, uint64_t suffix_start_nb, uint64_t crc_pos) {
   if (!local || scalpel_state.max_reassembly_threads <= 1) {
@@ -12306,24 +13886,13 @@ static inline bool png_should_defer_exhausted_partial(
   return true;
 }
 
-static inline void png_return_candidate_to_promising_queue(
-    void *carvehashkey, PNGCarveState *local, CarveInfo *candidate) {
-  struct timespec end;
+static inline bool png_reassembly_checkpoint_candidate(
+    int id, void *carvehashkey, PNGCarveState *local, CarveInfo *candidate,
+    uuid_string_t uuidp, uuid_string_t uuidc) {
 
-  delete_from_reassembly_queue(candidate);
-
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  candidate->qposition -=
-      (end.tv_sec - candidate->last_start.tv_sec) * 1000000000ULL
-      + (end.tv_nsec - candidate->last_start.tv_nsec);
-
-  if (scalpel_state.reduce_aggressive_allocation) {
-    deflate_blockvector(candidate->b);
-  }
-
+  png_trim_checkpoint_candidate(local, candidate);
   png_publish_reassembly_state(carvehashkey, local, candidate);
-  add_to_queue_priority_relaxed(&promising_queue, &candidate,
-                                candidate->qposition);
+  return reassembly_time_to_checkpoint(id, candidate, uuidp, uuidc);
 }
 
 static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
@@ -12336,6 +13905,8 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
   bool complete_probe_validated = false;
   bool solver_advanced_last_pass = false;  // true if solver placed blocks past CRC
   bool state_published = false;
+  uint64_t safe_partial_blocks = 0;
+  uint64_t safe_partial_length = 0;
 
   // Local carve state — ONE get from hash table.  All reads/writes go
   // through this pointer; hash table is only synced at checkpoints + end.
@@ -12377,13 +13948,13 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
                  nb_after_sanity, first_ab, last_ab);
   }
 
+png_reassembly_restart:
   while (1) {
     if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                              memory_order_acquire)) {
-      png_publish_reassembly_state(local_carvehashkey, local, candidate);
       state_published = true;
-      if (reassembly_time_to_checkpoint(work->id, candidate,
-              uuidp, uuidc)) {
+      if (png_reassembly_checkpoint_candidate(work->id, local_carvehashkey,
+              local, candidate, uuidp, uuidc)) {
         goto done_do_not_write_candidate;
       }
       state_published = false;
@@ -12396,21 +13967,11 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
     }
 
     if (blockvector_get_num_blocks(candidate->b) == 0) {
-      // Don't destroy: block 0 may be covered now but could become
-      // uncovered later if the covering file is reassigned.  Return
-      // to promising queue for retry (same path as checkpoint).
       if (scalpel_state.mode_verbose) {
         lock_fprintf(stdout,
-            "PNG reassembly: 0-block BV, returning to promising queue\n");
+            "PNG reassembly: 0-block BV, destroying candidate\n");
       }
-      delete_from_reassembly_queue(candidate);
-      /* Publish state before re-adding to promising: otherwise a peer
-       * reassembly thread can pick up the candidate and see stale
-       * hash-table state (review finding #3). */
-      png_publish_reassembly_state(local_carvehashkey, local, candidate);
-      state_published = true;
-      add_to_queue_priority_relaxed(&promising_queue,
-          &candidate, candidate->qposition);
+      destroy_candidate(&candidate);
       goto done_do_not_write_candidate;
     }
 
@@ -12433,58 +13994,47 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
     // =====================================================================
     {
       uint64_t crc_pos = local->last_chunk_crc_pos;
-      // Get the NEXT IDAT's body length.  Use idat_data_sz from the
-      // carve state as the primary source, but verify against the actual
-      // chunk header in BV data at last_idat_crc_pos + 4 (position of
-      // the next chunk after the last verified IDAT CRC).  The carve
-      // state value can be stale if the current IDAT has a different
-      // size than the previous one (common for the last IDAT in a PNG).
+      // Get the next PNG chunk's body length.  Most of the machinery below
+      // was built for IDAT CRC solving, but PNG CRC geometry is identical
+      // for ancillary chunks.  That matters when fragmentation occurs in
+      // metadata before the first IDAT: the next proof point is the current
+      // ancillary chunk's CRC, not an image-data CRC.
       long idat_sz = 0;
       if (local->idat_data_sz > 0
           && local->idat_data_start == crc_pos + 8) {
         idat_sz = local->idat_data_sz;
       }
-      // Read actual IDAT size from BV data.  crc_pos = curpos AFTER the
-      // last verified CRC = start of next chunk.  Fixes stale idat_data_sz
-      // when the last IDAT is shorter than preceding ones.
+      // Read actual chunk size from BV data.  crc_pos = curpos AFTER the
+      // last verified CRC = start of next chunk.  For IDAT this also fixes
+      // stale idat_data_sz when the last IDAT is shorter than preceding ones.
       if (crc_pos > 0) {
         const uint8_t *bvd =
             (const uint8_t *)blockvector_get_data_pointer(candidate->b);
         uint64_t bvdl = blockvector_get_data_length(candidate->b);
-        // Verify crc_pos points to a valid chunk boundary (IDAT or IEND).
+        // Verify crc_pos points to a valid chunk boundary.
         // The validator's last_chunk_crc_pos can drift when ancillary chunks
         // (iCCP, sRGB, etc.) shift byte positions between IHDR and IDAT.
         // If misaligned, walk the chunk chain to find the correct position.
         if (bvd && crc_pos + 8 <= bvdl
-            && !(bvd[crc_pos + 4] == 'I' && bvd[crc_pos + 5] == 'D'
-                 && bvd[crc_pos + 6] == 'A' && bvd[crc_pos + 7] == 'T')
-            && !(bvd[crc_pos + 4] == 'I' && bvd[crc_pos + 5] == 'E'
-                 && bvd[crc_pos + 6] == 'N' && bvd[crc_pos + 7] == 'D')) {
+            && !png_chunk_type_is_ascii(bvd + crc_pos + 4)) {
           // crc_pos is misaligned. Walk chunk chain from byte 8 but
           // ONLY through the verified prefix (up to crc_pos).  Don't
-          // walk into unverified fill data — random bytes could produce
-          // fake chunk lengths and "IDAT" markers at large N.
-          uint64_t walk_limit = crc_pos + 128;  // bounded margin past crc_pos
+          // walk into unverified fill data -- random bytes could produce
+          // fake chunk lengths and markers at large N.
+          uint64_t walk_limit = crc_pos + 128;
           if (walk_limit > bvdl) { walk_limit = bvdl; }
           uint64_t p = 8;
           while (p + 12 <= walk_limit) {
-            uint32_t cl = ((uint32_t)bvd[p] << 24) | ((uint32_t)bvd[p+1] << 16)
-                | ((uint32_t)bvd[p+2] << 8) | (uint32_t)bvd[p+3];
+            uint32_t cl = ((uint32_t)bvd[p] << 24)
+                | ((uint32_t)bvd[p + 1] << 16)
+                | ((uint32_t)bvd[p + 2] << 8)
+                | (uint32_t)bvd[p + 3];
             if (cl > 100000000U) { break; }
             uint64_t nxt = p + 12 + (uint64_t)cl;
             if (nxt > walk_limit) { break; }
-            // Is next chunk start past the stale crc_pos?
             if (nxt > crc_pos
                 && nxt + 8 <= bvdl
-                && bvd[nxt + 4] == 'I' && bvd[nxt + 5] == 'D'
-                && bvd[nxt + 6] == 'A' && bvd[nxt + 7] == 'T') {
-              crc_pos = nxt;
-              local->last_chunk_crc_pos = nxt;
-              break;
-            }
-            if (nxt + 8 <= bvdl
-                && bvd[nxt + 4] == 'I' && bvd[nxt + 5] == 'E'
-                && bvd[nxt + 6] == 'N' && bvd[nxt + 7] == 'D') {
+                && png_chunk_type_is_ascii(bvd + nxt + 4)) {
               crc_pos = nxt;
               local->last_chunk_crc_pos = nxt;
               break;
@@ -12493,8 +14043,9 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
           }
         }
         if (bvd && crc_pos + 8 <= bvdl
-            && bvd[crc_pos + 4] == 'I' && bvd[crc_pos + 5] == 'D'
-            && bvd[crc_pos + 6] == 'A' && bvd[crc_pos + 7] == 'T') {
+            && png_chunk_type_is_ascii(bvd + crc_pos + 4)
+            && !(bvd[crc_pos + 4] == 'I' && bvd[crc_pos + 5] == 'E'
+                 && bvd[crc_pos + 6] == 'N' && bvd[crc_pos + 7] == 'D')) {
           long actual_sz = (long)(((uint32_t)bvd[crc_pos] << 24)
                                 | ((uint32_t)bvd[crc_pos + 1] << 16)
                                 | ((uint32_t)bvd[crc_pos + 2] << 8)
@@ -12536,6 +14087,28 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
 
       uint64_t suffix_start_nb = blockvector_get_num_blocks(candidate->b);
       uint64_t suffix_start_dl = blockvector_get_data_length(candidate->b);
+      safe_partial_blocks = suffix_start_nb;
+      safe_partial_length = suffix_start_dl;
+      local->safe_partial_blocks = suffix_start_nb;
+      local->safe_partial_length = suffix_start_dl;
+      bool png_trace_suffix = false;
+      int png_trace_event = -1;
+      const char *png_trace_suffix_env = getenv("SCALPEL_PNG_TRACE_SUFFIX_NB");
+      if (png_trace_suffix_env) {
+        int64_t png_trace_nb = strtoll(png_trace_suffix_env, NULL, 10);
+        png_trace_suffix = png_trace_nb < 0
+            || suffix_start_nb == (uint64_t)png_trace_nb;
+        if (png_trace_suffix) {
+          const char *png_trace_limit_env = getenv("SCALPEL_PNG_TRACE_LIMIT");
+          int png_trace_limit = png_trace_limit_env
+              ? atoi(png_trace_limit_env) : 200;
+          png_trace_event = atomic_fetch_add_explicit(
+              &png_debug_trace_events, 1, memory_order_acq_rel);
+          if (png_trace_event >= png_trace_limit) {
+            png_trace_suffix = false;
+          }
+        }
+      }
 
       uint32_t fill_needed;
       bool accept_on_validates_to;
@@ -12550,6 +14123,22 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
       bool have_first_idat = png_parse_first_idat(candidate,
           &first_idat_body_start, &first_idat_body_size,
           &first_idat_crc_pos);
+      if (png_trace_suffix) {
+        int64_t png_first_ab = suffix_start_nb > 0
+            ? blockvector_get_apparent_blocknumber(candidate->b, 0) : -1;
+        int64_t png_last_ab = suffix_start_nb > 0
+            ? blockvector_get_apparent_blocknumber(candidate->b,
+                suffix_start_nb - 1) : -1;
+        lock_fprintf(stdout,
+            "PNG_TRACE_SUFFIX event=%d snb=%" PRIu64 " dl=%" PRIu64
+            " first=%" PRId64 " last=%" PRId64 " crc=%" PRIu64
+            " idat_sz=%ld have_first=%d first_body=%" PRIu64
+            " first_size=%u first_crc=%" PRIu64 "\n",
+            png_trace_event, suffix_start_nb, suffix_start_dl,
+            png_first_ab, png_last_ab, crc_pos, idat_sz,
+            have_first_idat ? 1 : 0, first_idat_body_start,
+            first_idat_body_size, first_idat_crc_pos);
+      }
 
       if (idat_sz <= 0 && crc_pos > 0) {
         uint64_t inferred_idat_sz = 0;
@@ -12586,10 +14175,11 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
         }
         accept_on_validates_to = false;
       } else if (have_first_idat && first_idat_crc_pos + 4 > suffix_start_dl) {
-        // Pre-CRC but IDAT chunk header is in the prefix: compute
-        // fill_needed to reach the first CRC boundary.  This enables
-        // Tier 1C (CRC-based full-image search).  Require CRC-based
-        // proof here as well; the BBK solver handles the suffix.
+        // Pre-CRC but IDAT chunk header is in the prefix.  Compute the
+        // fill needed to reach the first CRC boundary.  If that span is
+        // large, first let zlib/filter validation advance through any
+        // contiguous local prefix; otherwise the CRC solver sees a huge
+        // artificial M and wastes time solving blocks that are already local.
         uint64_t target = first_idat_crc_pos + 4;  // include CRC itself
         uint64_t end_blk = (target + (uint64_t)scalpel_state.blocksize - 1)
                            / (uint64_t)scalpel_state.blocksize;
@@ -12600,7 +14190,7 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
               / (uint64_t)scalpel_state.blocksize + 2);
           if (fill_needed > _fn_cap) { fill_needed = _fn_cap; }
         }
-        accept_on_validates_to = false;  // BBK algebraic solver handles this via CRC
+        accept_on_validates_to = (fill_needed > PNG_GAP_INDEX_MAX_M);
       } else {
         // No IDAT info at all: bootstrap just far enough to expose the
         // first IDAT header, then switch to CRC-driven logic.  Do not
@@ -12728,13 +14318,21 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
           int64_t max_ab = (int64_t)filemirror_apparent_blocks(
               scalpel_state.filemirror);
           uint64_t gal_nb = suffix_start_nb;
-          uint64_t gal_cap = (idat_sz > 0)
-              ? (uint64_t)((idat_sz + 12) / scalpel_state.blocksize + 1)
-              : scalpel_state.gallop_factor;
-          if (gal_cap < scalpel_state.gallop_factor)
-            gal_cap = scalpel_state.gallop_factor;
-          if (gal_cap > scalpel_state.gallop_limit)
-            gal_cap = scalpel_state.gallop_limit;
+	          uint64_t gal_cap = (idat_sz > 0)
+	              ? (uint64_t)((idat_sz + 12) / scalpel_state.blocksize + 1)
+	              : scalpel_state.gallop_factor;
+	          if (gal_cap < scalpel_state.gallop_factor)
+	            gal_cap = scalpel_state.gallop_factor;
+	          if (gal_cap > scalpel_state.gallop_limit)
+	            gal_cap = scalpel_state.gallop_limit;
+	          if (gal_cap > fill_needed) {
+	            gal_cap = fill_needed;
+	          }
+	          if (fill_needed > PNG_GAP_INDEX_MAX_M && gal_cap > 4) {
+	            gal_cap = 4;
+	          } else if (fill_needed > 3 && gal_cap > 1) {
+	            gal_cap = 1;
+	          }
           while (gal_ab < max_ab && gal_nb < suffix_start_nb + gal_cap
                  && !filemirror_actual_block_covered(
                      scalpel_state.filemirror,
@@ -12746,29 +14344,94 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
             gal_nb++;
             gal_ab++;
           }
-          if (gal_nb > suffix_start_nb) {
-            uint64_t crc_before_gallop = local->last_chunk_crc_pos;
-            bool gsv; uint64_t gsvt;
-            gsv = png_direct_validate(work->id, candidate,
-                &gsvt, local, uuidp, uuidc);
-            if (gsv) {
-              goto done_write_candidate;
-            }
-            if (local->last_chunk_crc_pos > crc_before_gallop) {
-              // CRC advanced! Contiguous blocks worked. Trim to verified.
-              if (local->last_idat_crc_pos > 0) {
-                uint64_t trim_blk = (local->last_idat_crc_pos
-                    + (uint64_t)scalpel_state.blocksize - 1)
+	          if (gal_nb > suffix_start_nb) {
+	            uint64_t crc_before_gallop = local->last_chunk_crc_pos;
+	            bool gsv; uint64_t gsvt;
+	            gsv = png_direct_validate(work->id, candidate,
+	                &gsvt, local, uuidp, uuidc);
+	            {
+	              static int64_t png_post_trace_start_block = -2;
+	              if (png_post_trace_start_block == -2) {
+	                const char *trace_env =
+	                    getenv("SCALPEL_PNG_TRACE_STARTBLOCK");
+	                png_post_trace_start_block = trace_env
+	                    ? strtoll(trace_env, NULL, 10) : -1;
+	              }
+	              if (png_post_trace_start_block >= 0
+	                  && blockvector_get_num_blocks(candidate->b) > 0
+	                  && blockvector_get_actual_blocknumber(candidate->b, 0)
+	                      == png_post_trace_start_block) {
+	                lock_fprintf(stdout,
+	                    "PNG_TRACE_POSTCRC_GALLOP start=%" PRId64
+	                    " snb=%" PRIu64 " fill=%u gal_nb=%" PRIu64
+	                    " gsv=%d gsvt=%" PRIu64 " suffix_dl=%" PRIu64
+	                    " crc_before=%" PRIu64 " crc_after=%" PRIu64
+	                    " idat_crc=%" PRIu64 "\n",
+	                    png_post_trace_start_block, suffix_start_nb,
+	                    fill_needed, gal_nb, gsv ? 1 : 0, gsvt,
+	                    suffix_start_dl, crc_before_gallop,
+	                    local->last_chunk_crc_pos,
+	                    crc_pos + 8 + (uint64_t)idat_sz);
+	              }
+	            }
+	            if (gsv) {
+	              goto done_write_candidate;
+	            }
+	            if (local->last_chunk_crc_pos > crc_before_gallop) {
+	              // CRC advanced! Contiguous blocks worked. Trim to verified.
+	              if (local->last_idat_crc_pos > 0) {
+	                uint64_t trim_blk = (local->last_idat_crc_pos
+	                    + (uint64_t)scalpel_state.blocksize - 1)
                     / (uint64_t)scalpel_state.blocksize;
                 if (trim_blk < blockvector_get_num_blocks(candidate->b)) {
                   resize_blockvector(candidate->b, trim_blk);
                 }
               }
-              suffix_found = true;
-              continue;  // gallop again from new position
-            }
-            // Gallop didn't advance CRC — trim back to suffix start.
-            resize_blockvector(candidate->b, suffix_start_nb);
+	              suffix_found = true;
+	              continue;  // gallop again from new position
+	            }
+	            if (fill_needed > PNG_POSTCRC_SMALL_SOLVER_FILL_MAX
+	                && gsvt >= suffix_start_dl + scalpel_state.blocksize - 1) {
+	              uint64_t idat_crc_field_pos =
+	                  crc_pos + 8 + (uint64_t)idat_sz;
+	              if (gsvt < idat_crc_field_pos) {
+	                // Keep the structurally proven local prefix so the next
+	                // pass solves only the actual seam near the CRC.
+	                uint64_t proven_blk =
+	                    (gsvt + 1 + (uint64_t)scalpel_state.blocksize - 1)
+	                    / (uint64_t)scalpel_state.blocksize;
+	                if (proven_blk > suffix_start_nb) {
+	                  if (proven_blk < blockvector_get_num_blocks(candidate->b)) {
+	                    resize_blockvector(candidate->b, proven_blk);
+	                  }
+	                  suffix_found = true;
+	                  solver_advanced_last_pass = true;
+	                  continue;
+	                }
+	              }
+	            }
+	            // Gallop didn't advance CRC — trim back to suffix start.
+	            resize_blockvector(candidate->b, suffix_start_nb);
+	          }
+	        }
+
+        if (!suffix_found && local && local->gap_fast_exhausted
+            && fill_needed >= PNG_GAP_INDEX_MAX_M
+            && crc_pos > 0 && idat_sz > 0) {
+          PNGCrcHashTable *pre_bbk_ht =
+              png_ensure_crc_table(candidate->needleidx);
+          int pre_bbk_rc = png_bbk_current_idat_subrun_solve(candidate,
+              pre_bbk_ht, suffix_start_nb, fill_needed, last_block,
+              crc_pos, idat_sz);
+          if (pre_bbk_rc < 0) {
+            continue;
+          }
+          if (pre_bbk_rc > 0) {
+            local->last_chunk_crc_pos =
+                crc_pos + 8 + (uint64_t)idat_sz + 4;
+            suffix_found = true;
+            solver_advanced_last_pass = true;
+            continue;
           }
         }
 
@@ -12778,9 +14441,13 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
             suffix_start_nb, fill_needed, last_block, total_apparent,
             crc_pos, idat_sz, work, uuidp, uuidc);
         if (solver_result == -1) {
-          // Solver yielded for checkpoint — go directly to while(1)
-          // top where reassembly_time_to_checkpoint handles the yield.
-          continue;
+          state_published = true;
+          if (png_reassembly_checkpoint_candidate(work->id,
+                  local_carvehashkey, local, candidate, uuidp, uuidc)) {
+            goto done_do_not_write_candidate;
+          }
+          state_published = false;
+          goto png_reassembly_restart;
         }
         suffix_found = (solver_result > 0);
         if (suffix_found) {
@@ -12859,7 +14526,7 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
           PNGCrcHashTable *bbk_ht = png_ensure_crc_table(candidate->needleidx);
           if (bbk_ht && bbk_ht->total_entries > 0) {
             // Place contiguous fill first (baseline).
-            resize_blockvector(candidate->b, suffix_start_nb + fill_needed);
+            png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
             for (uint32_t f = 0; f < fill_needed; f++) {
               int64_t ab = last_block + 1 + (int64_t)f;
               blockvector_set_apparent_blocknumber(candidate->b,
@@ -13095,27 +14762,20 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
                     suffix_start_nb, solve_fill_pos, solve_n_fill, last_block,
                     idat_start, idat_end, bbk_crc_len, bbk_stored_crc, false);
                 if (solve_rc < 0) {
-                  // Yield (iteration-budget hit or external idle signal).
-                  // Preserve CRC state and explicitly re-queue into the
-                  // promising queue at relaxed priority so other candidates
-                  // can make progress and this one can resume later with
-                  // a fresh per-call budget.  Without this explicit
-                  // re-queue the thread keeps picking up the same
-                  // candidate and spins on the same yield point.
                   png_bbk_restore_contiguous_window(candidate,
                       suffix_start_nb, fill_needed, last_block);
                   resize_blockvector(candidate->b, suffix_start_nb);
                   free(solve_fill_tmp);
                   free(retry_fill_pos);
                   free(fill_pos);
-                  delete_from_reassembly_queue(candidate);
-                  /* Publish state before re-queue (review finding #3). */
-                  png_publish_reassembly_state(local_carvehashkey, local,
-                      candidate);
                   state_published = true;
-                  add_to_queue_priority_relaxed(&promising_queue,
-                      &candidate, candidate->qposition);
-                  goto done_do_not_write_candidate;
+                  if (png_reassembly_checkpoint_candidate(work->id,
+                          local_carvehashkey, local, candidate,
+                          uuidp, uuidc)) {
+                    goto done_do_not_write_candidate;
+                  }
+                  state_published = false;
+                  goto png_reassembly_restart;
                 }
                 if (solve_rc > 0) {
                   if (scalpel_state.mode_verbose) {
@@ -13132,6 +14792,39 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
                   break;
                 }
                 free(solve_fill_tmp);
+
+                if (!suffix_found && retry_fill_pos && n_fill < fill_needed) {
+                  int subrun_rc = png_bbk_contiguous_subrun_solve(candidate,
+                      bbk_ht, suffix_start_nb, fill_needed, suffix_pos,
+                      bbk_suffix_fixed, last_block, idat_start, idat_end,
+                      bbk_crc_len, bbk_stored_crc);
+                  if (subrun_rc < 0) {
+                    png_bbk_restore_contiguous_window(candidate,
+                        suffix_start_nb, fill_needed, last_block);
+                    resize_blockvector(candidate->b, suffix_start_nb);
+                    free(retry_fill_pos);
+                    free(fill_pos);
+                    state_published = true;
+                    if (png_reassembly_checkpoint_candidate(work->id,
+                            local_carvehashkey, local, candidate,
+                            uuidp, uuidc)) {
+                      goto done_do_not_write_candidate;
+                    }
+                    state_published = false;
+                    goto png_reassembly_restart;
+                  }
+                  if (subrun_rc > 0) {
+                    local->last_chunk_crc_pos =
+                        crc_pos + 8 + (uint64_t)idat_sz + 4;
+                    suffix_found = true;
+                    solver_advanced_last_pass = true;
+                    if (scalpel_state.mode_verbose) {
+                      lock_fprintf(stdout,
+                          "%sPNG BBK SUBRUN: SOLVED fill=%u%s\n",
+                          GREEN, fill_needed, BLACK);
+                    }
+                  }
+                }
 
                 if (!suffix_found && retry_fill_pos && n_fill < fill_needed) {
                   uint32_t retry_n_fill = 0;
@@ -13159,20 +14852,19 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
                       last_block, idat_start, idat_end, bbk_crc_len,
                       bbk_stored_crc, true);
                   if (retry_rc < 0) {
-                    // Same yield-and-requeue pattern as above.
                     png_bbk_restore_contiguous_window(candidate,
                         suffix_start_nb, fill_needed, last_block);
                     resize_blockvector(candidate->b, suffix_start_nb);
                     free(retry_fill_pos);
                     free(fill_pos);
-                    delete_from_reassembly_queue(candidate);
-                    /* Publish state before re-queue (review finding #3). */
-                    png_publish_reassembly_state(local_carvehashkey, local,
-                        candidate);
                     state_published = true;
-                    add_to_queue_priority_relaxed(&promising_queue,
-                        &candidate, candidate->qposition);
-                    goto done_do_not_write_candidate;
+                    if (png_reassembly_checkpoint_candidate(work->id,
+                            local_carvehashkey, local, candidate,
+                            uuidp, uuidc)) {
+                      goto done_do_not_write_candidate;
+                    }
+                    state_published = false;
+                    goto png_reassembly_restart;
                   }
                   if (retry_rc > 0) {
                     local->last_chunk_crc_pos =
@@ -13297,7 +14989,7 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
         // inflate errors, chunk boundary violations).  Accept on
         // CRC advance or validates_to progress.
         if (last_block + (int64_t)fill_needed < (int64_t)(filemirror_filesize(scalpel_state.filemirror) / (uint64_t)scalpel_state.blocksize)) {
-          resize_blockvector(candidate->b, suffix_start_nb + fill_needed);
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
           for (uint32_t f = 0; f < fill_needed; f++) {
             int64_t ab = last_block + 1 + (int64_t)f;
             if (!IDAT_FILTER_CHECK(last_block + 1)) {
@@ -13314,6 +15006,17 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
           sv = png_direct_validate(work->id, candidate,
               &svt, local, uuidp, uuidc);
           uint64_t crc_after = local->last_chunk_crc_pos;
+          if (png_trace_suffix) {
+            lock_fprintf(stdout,
+                "PNG_TRACE_PRECRC event=%d snb=%" PRIu64
+                " fill=%u accept_vt=%d sv=%d svt=%" PRIu64
+                " suffix_dl=%" PRIu64 " first_crc=%" PRIu64
+                " crc_before=%" PRIu64 " crc_after=%" PRIu64 "\n",
+                png_trace_event, suffix_start_nb, fill_needed,
+                accept_on_validates_to ? 1 : 0, sv ? 1 : 0, svt,
+                suffix_start_dl, first_idat_crc_pos, crc_before,
+                crc_after);
+          }
           if (sv) {
             goto done_write_candidate;
           }
@@ -13322,7 +15025,9 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
             suffix_found = true;
             continue;
           }
-          if (accept_on_validates_to && svt >= suffix_start_dl) {
+          if (accept_on_validates_to
+              && svt >= suffix_start_dl + scalpel_state.blocksize - 1
+              && svt < first_idat_crc_pos) {
             // Pre-CRC structural validation proved up to svt.
             // Trim BV to only the PROVEN portion — don't keep trailing
             // unproven blocks (they may be fill data that generates Cat6).
@@ -13348,6 +15053,16 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
                   + (uint64_t)scalpel_state.blocksize - 1)
                   / (uint64_t)scalpel_state.blocksize;
               if (milestone_blk < 1) { milestone_blk = 1; }
+              if (png_trace_suffix) {
+                lock_fprintf(stdout,
+                    "PNG_TRACE_MILESTONE event=%d snb=%" PRIu64
+                    " old_dl=%" PRIu64 " trial_body=%" PRIu64
+                    " trial_size=%u trial_crc=%" PRIu64
+                    " milestone=%" PRIu64 " cur_nb=%" PRIu64 "\n",
+                    png_trace_event, suffix_start_nb, suffix_start_dl,
+                    trial_body_start, trial_body_size, trial_crc_pos,
+                    milestone_blk, blockvector_get_num_blocks(candidate->b));
+              }
               if (milestone_blk < blockvector_get_num_blocks(candidate->b)) {
                 resize_blockvector(candidate->b, milestone_blk);
               }
@@ -13371,7 +15086,13 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
               fi_chunk_start, (long)first_idat_body_size,
               work, uuidp, uuidc);
           if (solver_result == -1) {
-            continue;
+            state_published = true;
+            if (png_reassembly_checkpoint_candidate(work->id,
+                    local_carvehashkey, local, candidate, uuidp, uuidc)) {
+              goto done_do_not_write_candidate;
+            }
+            state_published = false;
+            goto png_reassembly_restart;
           }
           if (solver_result > 0) {
             bool sv2; uint64_t svt2;
@@ -13527,16 +15248,12 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
         continue;
       }
 
-      // All strategies exhausted for this pass.  If the deterministic
-      // solvers made no progress, do not requeue the same frontier forever:
-      // write the CRC-verified prefix as a partial candidate and let the
-      // caller/classifier report it as partial rather than burning CPU.
       if (local->last_chunk_crc_pos > entry_last_chunk_crc_pos) {
         if (scalpel_state.mode_verbose) {
           lock_fprintf(stdout,
                        "PNG SUFFIX: CRC frontier advanced %" PRIu64
                        " -> %" PRIu64
-                       "; requeueing improved prefix for next pass\n",
+                       "; continuing from improved prefix\n",
                        entry_last_chunk_crc_pos,
                        local->last_chunk_crc_pos);
         }
@@ -13544,29 +15261,8 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
           resize_blockvector(candidate->b, suffix_start_nb);
           blockvector_set_data_length(candidate->b, suffix_start_dl);
         }
-        png_return_candidate_to_promising_queue(local_carvehashkey, local,
-                                                candidate);
-        state_published = true;
-        goto done_do_not_write_candidate;
-      }
-
-      if (png_should_defer_exhausted_partial(local, suffix_start_nb,
-              local->last_chunk_crc_pos)) {
-        if (scalpel_state.mode_verbose) {
-          lock_fprintf(stdout,
-                       "PNG SUFFIX: exhausted at %" PRIu64
-                       " blocks but concurrent PNG work is pending; "
-                       "deferring partial until checkpoint/blockmap swap\n",
-                       suffix_start_nb);
-        }
-        if (!png_preserve_crc_frontier_in_candidate(local, candidate)) {
-          resize_blockvector(candidate->b, suffix_start_nb);
-          blockvector_set_data_length(candidate->b, suffix_start_dl);
-        }
-        png_return_candidate_to_promising_queue(local_carvehashkey, local,
-                                                candidate);
-        state_published = true;
-        goto done_do_not_write_candidate;
+        entry_last_chunk_crc_pos = local->last_chunk_crc_pos;
+        continue;
       }
 
       if (local->last_chunk_crc_pos > 0) {
@@ -13599,6 +15295,28 @@ static inline void png_reassembly(ThreadWork *work, CarveInfo **c,
   }
 
 done_write_candidate:
+  bool wrote_crc_frontier = false;
+  if (candidate->flavor != VALIDATED && local) {
+    wrote_crc_frontier = png_preserve_crc_frontier_in_candidate(
+        local, candidate);
+    png_trim_output_blind_idat_tail(local, candidate);
+  }
+
+  if (!wrote_crc_frontier
+      && candidate->flavor != VALIDATED
+      && local
+      && local->safe_partial_blocks > 0
+      && local->safe_partial_blocks < blockvector_get_num_blocks(candidate->b)) {
+    resize_blockvector(candidate->b, local->safe_partial_blocks);
+    blockvector_set_data_length(candidate->b, local->safe_partial_length);
+  }
+  else if (candidate->flavor != VALIDATED
+      && safe_partial_blocks > 0
+      && safe_partial_blocks < blockvector_get_num_blocks(candidate->b)) {
+    resize_blockvector(candidate->b, safe_partial_blocks);
+    blockvector_set_data_length(candidate->b, safe_partial_length);
+  }
+
   // Final IEND trim: for VALIDATED files, run a fresh validation to get
   // the exact file length.  Skip if already trimmed (data length is not
   // a multiple of blocksize, meaning it was already trimmed by have_iend).

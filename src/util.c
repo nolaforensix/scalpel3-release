@@ -468,9 +468,11 @@ static void *sigint_handler_thread(void *arg) {
       MUTEX_ERROR_CHECK(pthread_mutex_lock(&printf_is_available), __LINE__, __FILE__);
 
       fprintf(stderr, "%s", RED);
-      fprintf(stderr, "\n\nREALLY quit? Type Y to quit, N to continue, or C to checkpoint before quitting.\n"
-		      "Important: Only C will output end-of-execution stats.  Y will exit immediately without cleanup.\n"
-		      "Generally C is the best choice.\n\n"
+      fprintf(stderr,
+	      "\n\nREALLY quit? Type Y to quit immediately, N to continue, or C to checkpoint and quit at the next\n"
+	      "safe checkpoint boundary.  Checkpoints may be delayed during block validation, header/footer search, and\n"
+	      "contiguous recovery phases, so be patient.  Finally, only C will output end-of-execution stats.  Y will\n"
+	      "exit immediately without cleanup. Generally C is the best choice.\n\n"
                       "(Y[es] / N[o] / C[heckpoint]) ? ");
       fprintf(stderr, "%s", BLACK);
 
@@ -484,6 +486,7 @@ static void *sigint_handler_thread(void *arg) {
       else if (c == 'c' || c == 'C') {
         // remove IPC endpoint file if it exists to stop IPC
         unlink(sockname);
+        fprintf(stderr, "\nCheckpoint-and-exit requested. Scalpel3 will checkpoint and stop at the next safe checkpoint boundary.\n");
         atomic_store(&TAKE_CHECKPOINT_AND_EXIT, true);
       }
 

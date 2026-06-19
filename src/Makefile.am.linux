@@ -1,4 +1,4 @@
-bin_PROGRAMS = scalpel3 blockmapfs scalpel3-ctl fragmentator crblockmap modblockmap cmpblockmaps mergeblockmap dumphf diskviz
+bin_PROGRAMS = scalpel3 blockmapfs scalpel3-ctl fragmentator crblockmap modblockmap cmpblockmaps dumphf diskviz
 
 ONNXRUNTIME_LIBDIR = /usr/local/lib
 
@@ -20,8 +20,6 @@ cmpblockmap_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -
 
 fragmentator_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -O2 -g -fopenmp-simd -march=native -mtune=native
 
-mergeblockmap_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -O2 -g -fopenmp-simd -march=native -mtune=native
-
 blockmapfs_CFLAGS = -D_FILE_OFFSET_BITS=64 -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -O2 -g `pkg-config fuse --cflags` -fopenmp-simd -march=native -mtune=native
 
 scalpel3_SOURCES = scalpel.c scalpelconf.c filemirror.c carve.c util.c prioque.c base_name.c blockmap.c reassembly.c colors.c roaring.c hashv4.c scalpelsimd.c dedup.c common.c exe_vision/unix/elf_seg_onnx.cpp exe_vision/unix/elf_seg_onnx_cabi.cpp exe_vision/unix/elf_onnx_global.c *.h
@@ -38,8 +36,6 @@ modblockmap_SOURCES = modblockmap.c blockmap.c blockmap.h hashv4.c colors.c dedu
 
 fragmentator_SOURCES = fragmentator.c colors.c longsset.c common.c prioque.c *.h
 
-mergeblockmap_SOURCES = mergeblockmap.c blockmap.c blockmap.h colors.c hashv4.c dedup.c common.c prioque.c *.h
-
 dumphf_SOURCES = dumphf.c colors.c common.c prioque.c *.h
 
 diskviz_CFLAGS = -Wno-deprecated-declarations -Wmissing-prototypes -Wextra -Wall -Wstrict-prototypes -O2 -g \
@@ -55,7 +51,6 @@ scalpel3_ctl_LDFLAGS = $(LDFLAGS)
 crblockmap_LDFLAGS   =  $(LDFLAGS)
 modblockmap_LDFLAGS  = $(LDFLAGS)
 cmpblockmaps_LDFLAGS = $(LDFLAGS)
-mergeblockmap_LDFLAGS=  $(LDFLAGS)
 dumphf_LDFLAGS= $(LDFLAGS)
 diskviz_LDFLAGS = $(LDFLAGS)
 diskviz_LDADD   = @SDL2_LIBS@ @SDL2_IMAGE_LIBS@ @SDL2_TTF_LIBS@

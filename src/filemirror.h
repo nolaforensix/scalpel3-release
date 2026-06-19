@@ -112,6 +112,7 @@ void init_contiguous_blockvector(FileMirror *state, BlockVector **b,
                                  int64_t start, int64_t stop, bool disable_reservations);
 void blockvector_set_data_length(BlockVector *b, uint64_t length);
 uint64_t blockvector_get_data_length(BlockVector *b);
+uint64_t blockvector_get_non_peekahead_data_length(BlockVector *b);
 uint64_t blockvector_get_num_blocks(BlockVector *b);
 void blockvector_set_apparent_blocknumber(BlockVector *b, uint64_t index, int64_t blocknumber);
 int64_t blockvector_get_apparent_blocknumber(BlockVector *b, uint64_t index);

@@ -10,25 +10,30 @@ This script:
 - fills holes in phases using remaining selectable image blocks
 - copies selected image blocks into the corresponding ELF candidate file
 
-Default behavior is conservative:
+Default behavior:
+- post-processed ELF files are written in-place, replacing originals (same filename, .elf extension)
+- no JSON report files are written to the output directory
 - strongest phases run first
 - only selectable blocks are used
 - unresolved holes are left empty
 - Phase 4 (proximity-based fills) is DISABLED by default
-- original .elf files are NOT modified unless --in-place is passed
+
+Analysis/test mode (--analysis):
+- post-processed ELF files are written beside originals with suffix ".POSTPROC.elf"
+- JSON report files are written to a hidden temp directory (.elf_postproc_tmp/) during
+  processing, then deleted on completion
+- pass --keep-reports to retain those JSON files (moved to output root) after processing
 
 Usage example:
-  python3 elf_postprocess_no_phase4.py \
-      --image /path/to/image.dd \
-      --blockmap /path/to/scalpel.blockmap \
+  python3 postprocess_elf.py \\
+      --image /path/to/image.dd \\
+      --blockmap /path/to/scalpel.blockmap \\
       --output-root /path/to/scalpel-output-dir
 
 Notes:
 - "available" is interpreted using Scalpel's block selectability semantics:
     in active window, uncovered, and dedup/exemplar bits must match.
   This mirrors is_block_selectable() in blockmap.c.
-- By default, patched ELF files are written beside the originals with suffix
-  ".POSTPROC.elf". Reports are written as JSON with suffix ".POSTPROC.json".
 """
 
 from __future__ import annotations
@@ -44,6 +49,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 UUID_PREFIX_RE = re.compile(r'^UUIDS-\$\$([0-9a-fA-F-]{36})\$\$')
 BV_LINE_RE = re.compile(r'^\s*(\d+)\s+(\d+)\s+(\d+)\s*$')
+
+TEMP_DIR_NAME = '.elf_postproc_tmp'
 
 
 def bit_is_set(bitmap: bytes, j: int) -> bool:
@@ -468,8 +475,12 @@ def build_report(candidate: Candidate, original_vec: List[Optional[int]], final_
     }
 
 
-def determine_output_elf_path(elf_path: Path, in_place: bool) -> Path:
-    if in_place:
+def determine_output_elf_path(elf_path: Path, analysis_mode: bool) -> Path:
+    """
+    Default (analysis_mode=False): overwrite the original .elf file in place.
+    Analysis mode (analysis_mode=True): write a separate .POSTPROC.elf beside the original.
+    """
+    if not analysis_mode:
         return elf_path
     if elf_path.suffix == '.elf':
         return elf_path.with_name(f'{elf_path.stem}.POSTPROC.elf')
@@ -481,9 +492,12 @@ def main():
     ap.add_argument('--image', required=True, type=Path, help='Path to source disk/image file')
     ap.add_argument('--blockmap', required=True, type=Path, help='Path to Scalpel binary blockmap')
     ap.add_argument('--output-root', required=True, type=Path, help='Root Scalpel output directory to search')
-    ap.add_argument('--in-place', action='store_true', help='Modify original ELF candidates in place')
-    ap.add_argument('--dry-run', action='store_true', help='Compute fills and write only reports')
+    ap.add_argument('--dry-run', action='store_true', help='Compute fills only; do not write any ELF files')
     ap.add_argument('--enable-phase4', action='store_true', help='Enable Phase 4 proximity-based fills (disabled by default)')
+    ap.add_argument('--analysis', action='store_true',
+                    help=f'Analysis/test mode: write .POSTPROC.elf files beside originals instead of '
+                         f'overwriting them, and write JSON diagnostic reports into a hidden folder '
+                         f'({TEMP_DIR_NAME}/) under output-root')
     args = ap.parse_args()
 
     blockmap = read_blockmap(args.blockmap)
@@ -496,39 +510,45 @@ def main():
         if blockmap.is_selectable(j) and blockmap.is_reserved(j) == 0
     }
 
-    summary = {
-        'image': str(args.image),
-        'blockmap': str(args.blockmap),
-        'output_root': str(args.output_root),
-        'blocksize': blockmap.blocksize,
-        'numblocks': blockmap.numblocks,
-        'window': {'start_block': blockmap.start_block, 'end_block': blockmap.end_block},
-        'phase4_enabled': args.enable_phase4,
-        'initial_available_blocks': len(available),
-        'candidates_processed': [],
-    }
+    # Only create the hidden report dir when --analysis is active; otherwise no
+    # JSON is written anywhere and the output directory stays uncontaminated.
+    temp_dir: Optional[Path] = None
+    if args.analysis:
+        temp_dir = args.output_root / TEMP_DIR_NAME
+        temp_dir.mkdir(exist_ok=True)
 
     for cand in sorted(candidates, key=lambda c: (str(c.elf_path.parent), str(c.elf_path.name))):
         original_vec = cand.to_vector()
         final_vec, fills = process_candidate(cand, blockmap, available, enable_phase4=args.enable_phase4)
 
-        out_elf = determine_output_elf_path(cand.elf_path, args.in_place)
-        report_path = out_elf.with_suffix(out_elf.suffix + '.POSTPROC.json')
+        out_elf = determine_output_elf_path(cand.elf_path, args.analysis)
 
         if not args.dry_run:
             patch_elf_from_vector(args.image, cand.elf_path, out_elf, final_vec, blockmap.blocksize)
 
-        report = build_report(cand, original_vec, final_vec, fills, phase4_enabled=args.enable_phase4)
-        report['output_elf_path'] = str(out_elf)
-        report_path.write_text(json.dumps(report, indent=2))
-        summary['candidates_processed'].append(report)
+        if args.analysis and temp_dir is not None:
+            report = build_report(cand, original_vec, final_vec, fills, phase4_enabled=args.enable_phase4)
+            report['output_elf_path'] = str(out_elf)
+            report_filename = out_elf.stem + out_elf.suffix + '.POSTPROC.json'
+            (temp_dir / report_filename).write_text(json.dumps(report, indent=2))
 
         print(f'Processed {cand.bv_path.name}: {len(fills)} new block placements -> {out_elf.name}')
 
-    summary['remaining_available_blocks'] = len(available)
-    summary_path = args.output_root / 'elf_postprocess_summary.json'
-    summary_path.write_text(json.dumps(summary, indent=2))
-    print(f'Wrote summary: {summary_path}')
+    if args.analysis and temp_dir is not None:
+        summary = {
+            'image': str(args.image),
+            'blockmap': str(args.blockmap),
+            'output_root': str(args.output_root),
+            'blocksize': blockmap.blocksize,
+            'numblocks': blockmap.numblocks,
+            'window': {'start_block': blockmap.start_block, 'end_block': blockmap.end_block},
+            'phase4_enabled': args.enable_phase4,
+            'remaining_available_blocks': len(available),
+        }
+        (temp_dir / 'elf_postprocess_summary.json').write_text(json.dumps(summary, indent=2))
+        print(f'Wrote diagnostic reports to: {temp_dir}')
+
+    print('Done.')
 
 
 if __name__ == '__main__':

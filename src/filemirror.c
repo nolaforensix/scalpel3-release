@@ -135,6 +135,7 @@ typedef struct BlockVector {
   int64_t *actual_blocknumber;    // vector of actual block numbers in
                                   // file being mirrored
   uint64_t length;                // length of 'data' in blockvector
+  uint64_t non_peekahead_length;  // length excluding sequential read peekahead bytes
   roaring64_bitmap_t **choices;   // array of bitmaps representing
                                   // possible suitable block numbers for each block
   FileMirror *filemirror;         // associated file mirror
@@ -187,12 +188,19 @@ atomic_ullong random_write_wait;
 void blockvector_set_data_length(BlockVector *b, uint64_t length) {
 
   b->length = length <= b->numblocks * b->filemirror->blocksize ? length : b->numblocks * b->filemirror->blocksize;
+  b->non_peekahead_length = b->length;
 }
 
 
 // get apparent length of data associated with blockvector
 uint64_t blockvector_get_data_length(BlockVector *b) {
   return b->length;
+}
+
+
+uint64_t blockvector_get_non_peekahead_data_length(BlockVector *b) {
+
+  return b->non_peekahead_length < b->length ? b->non_peekahead_length : b->length;
 }
 
 
@@ -345,6 +353,8 @@ void normalize_blockvector(BlockVector *b) {
     }
   }
 
+  b->non_peekahead_length = b->length;
+
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Normalization of blockvector %p complete.\n", b);
   }
@@ -358,6 +368,7 @@ void clone_blockvector(BlockVector *s, BlockVector **d, bool clone_choices) {
 
   uint64_t i;
   uint64_t saved_length;
+  uint64_t saved_non_peekahead_length;
 
   if (! s) {
     // fatal
@@ -369,8 +380,10 @@ void clone_blockvector(BlockVector *s, BlockVector **d, bool clone_choices) {
   }
 
   saved_length = s->length;
+  saved_non_peekahead_length = s->non_peekahead_length;
   inflate_blockvector(s);
   s->length = saved_length;
+  s->non_peekahead_length = saved_non_peekahead_length;
 
   init_blockvector(s->filemirror, d, s->numblocks, false);
 
@@ -379,6 +392,7 @@ void clone_blockvector(BlockVector *s, BlockVector **d, bool clone_choices) {
 
   (*d)->seqdata = s->seqdata;
   (*d)->length = s->length;
+  (*d)->non_peekahead_length = s->non_peekahead_length;
 
   if (! (*d)->seqdata) {
     inflate_blockvector_no_IO((*d));
@@ -438,6 +452,7 @@ void init_blockvector(FileMirror *state, BlockVector **b, uint64_t num_blocks, b
   memset((*b)->valid, false, (*b)->numblocks);
 
   (*b)->length = 0;
+  (*b)->non_peekahead_length = 0;
   (*b)->data = NULL;
   (*b)->seqdata = NULL;
   (*b)->choices = NULL;
@@ -762,6 +777,9 @@ resize_complete:
   if (b->length > b->numblocks * b->filemirror->blocksize) {
     b->length = b->numblocks * b->filemirror->blocksize;
   }
+  if (b->non_peekahead_length > b->length) {
+    b->non_peekahead_length = b->length;
+  }
 
   if (scalpel_state.memory_profiling) {
     memory_footprint("after BV resize");
@@ -806,6 +824,7 @@ void init_contiguous_blockvector(FileMirror *state, BlockVector **b, int64_t sta
     blockvector_reserve_blocks(*b, 0, (*b)->numblocks - 1);
   }
   (*b)->length = 0;
+  (*b)->non_peekahead_length = 0;
   (*b)->data = NULL;
   (*b)->seqdata = NULL;
   (*b)->choices = NULL;
@@ -896,6 +915,7 @@ static void inflate_blockvector_no_IO(BlockVector *b) {
         && b->filemirror->filesize % b->filemirror->blocksize) {
       b->length -= b->filemirror->blocksize - b->filemirror->filesize % b->filemirror->blocksize;
     }
+    b->non_peekahead_length = b->length;
 
     // make all blocks valid
     for (i = 0; i < b->numblocks; i++) {
@@ -992,6 +1012,7 @@ uint64_t inflate_blockvector_single_block(BlockVector *b, uint64_t apparentindex
   if (newlength > b->length) {
     b->length = newlength;
   }
+  b->non_peekahead_length = b->length;
 
   // Fast check: if we were already consecutive, verify the new block is
   // contiguous with BOTH its predecessor and successor.  Current usage is
@@ -1068,6 +1089,7 @@ void deflate_blockvector_single_block(BlockVector *b, uint64_t apparentindex, ui
   b->valid[apparentindex] = false;
   blockvector_set_actual_blocknumber(b, apparentindex, -1);
   b->length = oldlength;
+  b->non_peekahead_length = b->length;
   // if we were in fast (seqdata) mode, the sequence is no longer fully consecutive, so clear
   // seqdata to avoid leaving a stale pointer that misrepresents the blockvector state.
   // Also free b->data so the next blockvector_get_data_pointer() call triggers a full
@@ -1103,6 +1125,7 @@ void deflate_blockvector(BlockVector *b) {
   b->data = NULL;
   b->seqdata = NULL;
   b->length = 0;
+  b->non_peekahead_length = 0;
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Deflation of blockvector %p complete.\n", b);
@@ -1760,6 +1783,7 @@ static BlockVector *sequential_read(FileMirror *state) {
   memset(b->valid, false, b->numblocks);
 
   b->length = 0;
+  b->non_peekahead_length = 0;
   b->data = NULL;
   b->seqdata = NULL;
   b->choices = NULL;
@@ -1865,6 +1889,16 @@ static BlockVector *sequential_read(FileMirror *state) {
           && state->filesize % state->blocksize) {
         b->length -= state->blocksize - state->filesize % state->blocksize;
       }
+    }
+
+    if (b->numblocks > readahead_blocks) {
+      b->non_peekahead_length = readahead_blocks * state->blocksize;
+      if (b->non_peekahead_length > b->length) {
+        b->non_peekahead_length = b->length;
+      }
+    }
+    else {
+      b->non_peekahead_length = b->length;
     }
   }
 
@@ -2694,6 +2728,7 @@ static void read_vector(BlockVector *b) {
     memcpy(b->data + startindex * b->filemirror->blocksize, b->filemirror->mmap + start, length);
     b->length += length;
   }
+  b->non_peekahead_length = b->length;
 
   clock_gettime(CLOCK_MONOTONIC, &endtime);
   atomic_fetch_add_explicit(&random_read_wait, (endtime.tv_sec - begintime.tv_sec) * 1e9 + (endtime.tv_nsec - begintime.tv_nsec),
@@ -3236,6 +3271,7 @@ void seq_read_blockvector(FileMirror *state, BlockVector **b, FILE *fp) {
     perror("length");
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
+  (*b)->non_peekahead_length = (*b)->length;
 
   // read choices data
 
