@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -35,11 +35,15 @@
 // Written by Golden G. Richard III (@nolaforensix), 2026.
 //
 
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
+#include <stdint.h>
 #include <termios.h>
 
 #define SCALPEL3_EXTERNAL
 #include "colors.h"
+#include "diskviz_index.h"
 #include "hashv4.h"
 #include "scalpel.h"
 #include "scalpelv.h"
@@ -63,8 +67,9 @@
 #define LABEL_FONT_SIZE 11
 #define MEDIUM_FONT_SIZE 22
 #define TITLE_FONT_SIZE 40
-
-typedef enum { BTYPE_FILE, BTYPE_HEADER, BTYPE_ZERO, BTYPE_RANDOM } BlockType;
+#define BLOCK_LABEL_CACHE_SIZE 2048
+#define TITLE_AREA_HEIGHT 70
+#define FRAME_AREA_HEIGHT 36
 
 typedef enum {
   FTYPE_PNG,
@@ -81,11 +86,15 @@ typedef enum {
 } FileType;
 
 typedef struct {
-  BlockType type;
-  int file_id;                 // index into files[], -1 for ZERO/RANDOM
-  int file_block;              // block within the file, -1 for ZERO/RANDOM
-  int disk_block;
-} DiskBlock;
+  SDL_Texture *texture;
+  int width;
+  int height;
+} TextTexture;
+
+typedef struct {
+  int block_index;
+  TextTexture text;
+} BlockLabelCacheEntry;
 
 typedef struct {
   char path[MAX_PATH_LEN];
@@ -96,6 +105,9 @@ typedef struct {
   int img_w, img_h;            // decoded image dimensions
   int tile_cols, tile_rows;    // 2D tile grid for image slicing
   int tile_w, tile_h;          // pixel size of each tile in the source image
+  TextTexture label_name;
+  TextTexture linear_name;
+  TextTexture panel_name;
 } FileInfo;
 
 typedef struct {
@@ -106,6 +118,8 @@ typedef struct {
   int max_files;
   FileInfo *files;
   oa_hash *file_hash;          // hash table for file path -> index
+  int type_counts[FTYPE_COUNT];
+  DiskvizIndex index;
 
   int grid_cols, grid_rows;
   int cell_w, cell_h;
@@ -121,6 +135,17 @@ typedef struct {
   TTF_Font *font_title;        // larger font for frame titles (~40pt)
   SDL_Texture *noise_tex;
   SDL_Texture *prev_frame_tex; // texture for crossfade transition
+  TextTexture zero_text;
+  TextTexture hf_text[2];
+  TextTexture type_text[FTYPE_COUNT];
+  TextTexture title_text[8];
+  TextTexture frame_text[8];
+  TextTexture disk_text;
+  TextTexture filesystem_text;
+  TextTexture tooltip_text;
+  int tooltip_block;
+  BlockLabelCacheEntry block_label_cache[BLOCK_LABEL_CACHE_SIZE];
+  uint32_t draw_seed;
 
   int hover_block;
   bool dirty;
@@ -186,6 +211,14 @@ static bool parse_keyfile(const char *path, AppState *st);
 static void load_visual_files(AppState *st);
 static void create_noise_texture(AppState *st);
 static void calc_grid(AppState *st);
+static bool ensure_text_texture(AppState *st, TextTexture *text,
+                                TTF_Font *font, const char *label,
+                                SDL_Color color);
+static void destroy_text_texture(TextTexture *text);
+static void destroy_text_caches(AppState *st);
+static TextTexture *block_label_texture(AppState *st, int block_index);
+static void visible_block_range(AppState *st, int *first, int *last);
+static void render_hf_marker(AppState *st, SDL_Rect *dst, bool header);
 static void render_tooltip(AppState *st, int mx, int my);
 static void render_block(AppState *st, int idx, SDL_Rect *dst);
 static void render_title(AppState *st);
@@ -374,11 +407,35 @@ static char *trim(char *s) {
   while (*s && isspace((unsigned char)*s)) {
     s++;
   }
+  if (! *s) {
+    return s;
+  }
   char *end = s + strlen(s) - 1;
   while (end > s && isspace((unsigned char)*end)) {
     *end-- = '\0';
   }
   return s;
+}
+
+
+static bool parse_key_integer(const char *text, int *value) {
+  while (isspace((unsigned char)*text)) {
+    text++;
+  }
+  errno = 0;
+  char *end = NULL;
+  long parsed = strtol(text, &end, 10);
+  if (text == end || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX) {
+    return false;
+  }
+  while (isspace((unsigned char)*end)) {
+    end++;
+  }
+  if (*end != '\0') {
+    return false;
+  }
+  *value = (int)parsed;
+  return true;
 }
 
 static void *oa_int_cp(const void *p) {
@@ -422,29 +479,27 @@ static int find_or_add_file(AppState *st, const char *path) {
   }
 
   if (st->num_files >= st->max_files) {
+    if (st->max_files > INT_MAX / 2 ||
+        (size_t)(st->max_files * 2) > SIZE_MAX / sizeof(FileInfo)) {
+      fprintf(stderr, "%sERROR: Too many files in key file.%s\n", RED,
+              BLACK);
+      exit(1);
+    }
     st->max_files *= 2;
-    st->files = realloc(st->files, st->max_files * sizeof(FileInfo));
-    if (! st->files) {
+    FileInfo *files = realloc(st->files,
+                              (size_t)st->max_files * sizeof(FileInfo));
+    if (! files) {
       fprintf(stderr, "%sERROR: Memory allocation failure.%s\n", RED, BLACK);
       exit(1);
     }
+    st->files = files;
   }
   int idx = st->num_files++;
   FileInfo *f = &st->files[idx];
-  strncpy(f->path, path, MAX_PATH_LEN - 1);
+  memset(f, 0, sizeof(*f));
+  snprintf(f->path, sizeof(f->path), "%s", path);
   f->ftype = classify_filetype(path);
-  f->total_blocks = 0;
-  f->texture = NULL;
-  f->img_w = f->img_h = 0;
-
-  // compute type_ordinal: count how many files of same type already exist
-  int count = 0;
-  for (int i = 0; i < idx; i++) {
-    if (st->files[i].ftype == f->ftype) {
-      count++;
-    }
-  }
-  f->type_ordinal = count + 1;
+  f->type_ordinal = ++st->type_counts[f->ftype];
 
   // insert into hash table
   oa_hash_put(st->file_hash, path, &idx);
@@ -476,10 +531,18 @@ static bool parse_keyfile(const char *path, AppState *st) {
 
   // first pass: count blocks to allocate also parse header config
   int capacity = 4096;
-  DiskBlock *tmp = malloc(capacity * sizeof(DiskBlock));
+  DiskBlock *tmp = malloc((size_t)capacity * sizeof(DiskBlock));
+  if (! tmp) {
+    fprintf(stderr, "%sERROR: Memory allocation failure.%s\n", RED, BLACK);
+    fclose(fp);
+    return false;
+  }
   int count = 0;
+  bool parse_failed = false;
+  int line_number = 0;
 
   while (fgets(line, sizeof(line), fp)) {
+    line_number++;
     // update progress
     bytes_read += strlen(line);
     if (file_size > 0) {
@@ -553,10 +616,22 @@ static bool parse_keyfile(const char *path, AppState *st) {
     }
     strncpy(fb_str, pipe2 + 1, len);
     fb_str[len] = '\0';
-    int file_block = atoi(trim(fb_str));
+    int file_block;
+    if (! parse_key_integer(trim(fb_str), &file_block)) {
+      fprintf(stderr, "%sERROR: Invalid file block on key file line %d.%s\n",
+              RED, line_number, BLACK);
+      parse_failed = true;
+      break;
+    }
 
     // extract disk block number (after the ] )
-    int disk_block = atoi(close + 1);
+    int disk_block;
+    if (! parse_key_integer(close + 1, &disk_block) || disk_block < 0) {
+      fprintf(stderr, "%sERROR: Invalid disk block on key file line %d.%s\n",
+              RED, line_number, BLACK);
+      parse_failed = true;
+      break;
+    }
 
     // determine block type
     BlockType btype;
@@ -580,13 +655,34 @@ static bool parse_keyfile(const char *path, AppState *st) {
     int file_id = -1;
     if (btype == BTYPE_FILE || btype == BTYPE_HEADER) {
       file_id = find_or_add_file(st, ps);
+      if (st->files[file_id].total_blocks == INT_MAX) {
+        fprintf(stderr, "%sERROR: Too many blocks for file '%s'.%s\n", RED,
+                ps, BLACK);
+        parse_failed = true;
+        break;
+      }
       st->files[file_id].total_blocks++;
     }
 
     // grow array if needed
     if (count >= capacity) {
+      if (capacity > INT_MAX / 2 ||
+          (size_t)(capacity * 2) > SIZE_MAX / sizeof(DiskBlock)) {
+        fprintf(stderr, "%sERROR: Too many entries in key file.%s\n", RED,
+                BLACK);
+        parse_failed = true;
+        break;
+      }
       capacity *= 2;
-      tmp = realloc(tmp, capacity * sizeof(DiskBlock));
+      DiskBlock *blocks =
+          realloc(tmp, (size_t)capacity * sizeof(DiskBlock));
+      if (! blocks) {
+        fprintf(stderr, "%sERROR: Memory allocation failure.%s\n", RED,
+                BLACK);
+        parse_failed = true;
+        break;
+      }
+      tmp = blocks;
     }
 
     tmp[count].type = btype;
@@ -603,15 +699,31 @@ static bool parse_keyfile(const char *path, AppState *st) {
   fprintf(stdout, "\b\b\b\b%3d%%\n", 100);
   fflush(stdout);
 
+  if (parse_failed) {
+    free(tmp);
+    return false;
+  }
   if (count == 0) {
     fprintf(stderr, "%sERROR: No blocks found in key file.%s\n", RED, BLACK);
+    free(tmp);
+    return false;
+  }
+  if (max_disk_block < 0 || max_disk_block == INT_MAX ||
+      (size_t)(max_disk_block + 1) > SIZE_MAX / sizeof(DiskBlock)) {
+    fprintf(stderr, "%sERROR: Invalid disk block range in key file.%s\n",
+            RED, BLACK);
     free(tmp);
     return false;
   }
 
   // allocate final block array indexed by disk block
   st->total_blocks = max_disk_block + 1;
-  st->blocks = calloc(st->total_blocks, sizeof(DiskBlock));
+  st->blocks = calloc((size_t)st->total_blocks, sizeof(DiskBlock));
+  if (! st->blocks) {
+    fprintf(stderr, "%sERROR: Memory allocation failure.%s\n", RED, BLACK);
+    free(tmp);
+    return false;
+  }
 
   // initialize all as ZERO by default
   for (int i = 0; i < st->total_blocks; i++) {
@@ -672,7 +784,7 @@ static void load_visual_files(AppState *st) {
       snprintf(fullpath, sizeof(fullpath), "%s/%s", st->basedir, f->path);
     }
     else {
-      strncpy(fullpath, f->path, sizeof(fullpath) - 1);
+      snprintf(fullpath, sizeof(fullpath), "%s", f->path);
     }
 
     SDL_Surface *surf = IMG_Load(fullpath);
@@ -742,6 +854,170 @@ static void create_noise_texture(AppState *st) {
 
   st->noise_tex = SDL_CreateTextureFromSurface(st->renderer, surf);
   SDL_FreeSurface(surf);
+  st->draw_seed = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+}
+
+
+static bool ensure_text_texture(AppState *st, TextTexture *text,
+                                TTF_Font *font, const char *label,
+                                SDL_Color color) {
+  if (text->texture) {
+    return true;
+  }
+  if (! font || ! label) {
+    return false;
+  }
+
+  SDL_Surface *surface = TTF_RenderUTF8_Blended(font, label, color);
+  if (! surface) {
+    return false;
+  }
+  SDL_Texture *texture = SDL_CreateTextureFromSurface(st->renderer, surface);
+  if (texture) {
+    text->texture = texture;
+    text->width = surface->w;
+    text->height = surface->h;
+  }
+  SDL_FreeSurface(surface);
+  return texture != NULL;
+}
+
+
+static void destroy_text_texture(TextTexture *text) {
+  if (text->texture) {
+    SDL_DestroyTexture(text->texture);
+  }
+  memset(text, 0, sizeof(*text));
+}
+
+
+static void destroy_text_caches(AppState *st) {
+  for (int i = 0; i < st->num_files; i++) {
+    destroy_text_texture(&st->files[i].label_name);
+    destroy_text_texture(&st->files[i].linear_name);
+    destroy_text_texture(&st->files[i].panel_name);
+  }
+  destroy_text_texture(&st->zero_text);
+  destroy_text_texture(&st->hf_text[0]);
+  destroy_text_texture(&st->hf_text[1]);
+  for (int i = 0; i < FTYPE_COUNT; i++) {
+    destroy_text_texture(&st->type_text[i]);
+  }
+  for (int i = 0; i < 8; i++) {
+    destroy_text_texture(&st->title_text[i]);
+    destroy_text_texture(&st->frame_text[i]);
+  }
+  destroy_text_texture(&st->disk_text);
+  destroy_text_texture(&st->filesystem_text);
+  destroy_text_texture(&st->tooltip_text);
+  for (int i = 0; i < BLOCK_LABEL_CACHE_SIZE; i++) {
+    destroy_text_texture(&st->block_label_cache[i].text);
+  }
+}
+
+
+static TextTexture *block_label_texture(AppState *st, int block_index) {
+  if (block_index < 0 || block_index >= st->total_blocks ||
+      ! st->font_label) {
+    return NULL;
+  }
+
+  DiskBlock *block = &st->blocks[block_index];
+  if (block->file_id < 0 || block->file_id >= st->num_files) {
+    return NULL;
+  }
+
+  uint32_t hash = (uint32_t)block_index * UINT32_C(2654435761);
+  BlockLabelCacheEntry *entry =
+      &st->block_label_cache[hash % BLOCK_LABEL_CACHE_SIZE];
+  if (entry->block_index != block_index) {
+    destroy_text_texture(&entry->text);
+    entry->block_index = block_index;
+  }
+
+  if (! entry->text.texture) {
+    FileInfo *file = &st->files[block->file_id];
+    char label[32];
+    snprintf(label, sizeof(label), "%s %d/%d", type_labels[file->ftype],
+             file->type_ordinal, block->file_block);
+    SDL_Color black = {0, 0, 0, 255};
+    if (! ensure_text_texture(st, &entry->text, st->font_label, label,
+                              black)) {
+      return NULL;
+    }
+  }
+  return &entry->text;
+}
+
+
+static void visible_block_range(AppState *st, int *first, int *last) {
+  int win_w, win_h;
+  SDL_GetRendererOutputSize(st->renderer, &win_w, &win_h);
+  if (win_w < 1) {
+    win_w = 1;
+  }
+  if (win_h < 1) {
+    win_h = 1;
+  }
+  (void)win_w;
+
+  int64_t first_row = 0;
+  int64_t top = (int64_t)st->scroll_y - st->grid_y;
+  if (top > 0) {
+    first_row = top / st->cell_h;
+  }
+
+  int64_t bottom = (int64_t)st->scroll_y + win_h - st->grid_y;
+  int64_t last_row = 0;
+  if (bottom > 0) {
+    last_row = (bottom + st->cell_h - 1) / st->cell_h;
+  }
+  if (last_row > st->grid_rows) {
+    last_row = st->grid_rows;
+  }
+
+  int64_t first_block = first_row * st->grid_cols;
+  int64_t last_block = last_row * st->grid_cols;
+  if (first_block < 0) {
+    first_block = 0;
+  }
+  if (first_block > st->total_blocks) {
+    first_block = st->total_blocks;
+  }
+  if (last_block > st->total_blocks) {
+    last_block = st->total_blocks;
+  }
+  *first = (int)first_block;
+  *last = (int)last_block;
+}
+
+
+static void render_hf_marker(AppState *st, SDL_Rect *dst, bool header) {
+  SDL_Color color = header ? (SDL_Color){30, 255, 30, 255}
+                           : (SDL_Color){255, 30, 30, 255};
+  SDL_SetRenderDrawColor(st->renderer, color.r, color.g, color.b, color.a);
+
+  int borders = 6;
+  int max_borders = (dst->w < dst->h ? dst->w : dst->h) / 2;
+  if (borders > max_borders) {
+    borders = max_borders;
+  }
+  for (int border = 0; border < borders; border++) {
+    SDL_Rect outline = {dst->x + border, dst->y + border,
+                        dst->w - 2 * border, dst->h - 2 * border};
+    SDL_RenderDrawRect(st->renderer, &outline);
+  }
+
+  if (! st->font_label || dst->w < 12 || dst->h < 12) {
+    return;
+  }
+  TextTexture *text = &st->hf_text[header ? 0 : 1];
+  if (! ensure_text_texture(st, text, st->font_label, header ? "H" : "F",
+                            color)) {
+    return;
+  }
+  SDL_Rect label = {dst->x + 6, dst->y + 6, text->width, text->height};
+  SDL_RenderCopy(st->renderer, text->texture, NULL, &label);
 }
 
 
@@ -749,18 +1025,45 @@ static void calc_grid(AppState *st) {
   // use renderer output size (handles HiDPI correctly)
   int win_w, win_h;
   SDL_GetRendererOutputSize(st->renderer, &win_w, &win_h);
+  if (win_w < 1) {
+    win_w = 1;
+  }
+  if (win_h < 1) {
+    win_h = 1;
+  }
 
-  // find column count where total_blocks divides evenly and cells are closest to square
+  if (st->total_blocks <= 0) {
+    st->grid_cols = 1;
+    st->grid_rows = 0;
+    st->cell_w = MIN_CELL_SIZE;
+    st->cell_h = MIN_CELL_SIZE;
+    st->grid_x = 0;
+    st->grid_y = TITLE_AREA_HEIGHT;
+    st->scroll_y = 0;
+    st->max_scroll_y = 0;
+    st->dirty = true;
+    return;
+  }
+
+  // find a near-square grid without creating columns narrower than the viewport.
   double aspect = (double)win_w / win_h;
   int best_cols = (int)round(sqrt((double)st->total_blocks * aspect) / st->zoom);
   if (best_cols < 1) {
     best_cols = 1;
   }
+  int max_cols = win_w / MIN_CELL_SIZE;
+  if (max_cols < 1) {
+    max_cols = 1;
+  }
+  if (best_cols > max_cols) {
+    best_cols = max_cols;
+  }
 
   // search nearby column counts for one that divides evenly
   int cols = best_cols;
   for (int delta = 0; delta <= 4; delta++) {
-    if (best_cols + delta > 0 && st->total_blocks % (best_cols + delta) == 0) {
+    if (best_cols + delta > 0 && best_cols + delta <= max_cols &&
+        st->total_blocks % (best_cols + delta) == 0) {
       cols = best_cols + delta;
       break;
     }
@@ -769,13 +1072,13 @@ static void calc_grid(AppState *st) {
       break;
     }
   }
-  int rows = (st->total_blocks + cols - 1) / cols;
+  int rows = (int)(((int64_t)st->total_blocks + cols - 1) / cols);
 
   st->grid_cols = cols;
   st->grid_rows = rows;
   // reserve space for title bar (top) and frame indicator (bottom)
-  int top_margin = 70;    // clear 40pt title bar
-  int bot_margin = 36;    // clear frame indicator dots
+  int top_margin = TITLE_AREA_HEIGHT;
+  int bot_margin = FRAME_AREA_HEIGHT;
   int avail_h = win_h - top_margin - bot_margin;
   if (avail_h < 100) avail_h = 100;
   st->cell_w = win_w / cols;
@@ -790,8 +1093,9 @@ static void calc_grid(AppState *st) {
     st->cell_h = MIN_CELL_SIZE;
   }
 
-  int total_h = rows * st->cell_h;
-  st->max_scroll_y = total_h > avail_h ? total_h - avail_h : 0;
+  int64_t total_h = (int64_t)rows * st->cell_h;
+  int64_t max_scroll = total_h > avail_h ? total_h - avail_h : 0;
+  st->max_scroll_y = max_scroll > INT_MAX ? INT_MAX : (int)max_scroll;
   if (st->scroll_y > st->max_scroll_y) {
     st->scroll_y = st->max_scroll_y;
   }
@@ -830,18 +1134,30 @@ static void render_tooltip(AppState *st, int mx, int my) {
              f->total_blocks);
   }
 
-  SDL_Color white = {255, 255, 255, 255};
-  SDL_Surface *surf = TTF_RenderText_Blended_Wrapped(st->font_tooltip, tip, white, 400);
-  if (! surf) {
-    return;
+  if (st->tooltip_block != st->hover_block) {
+    destroy_text_texture(&st->tooltip_text);
+    st->tooltip_block = st->hover_block;
   }
-
-  SDL_Texture *tex = SDL_CreateTextureFromSurface(st->renderer, surf);
-  int tw = surf->w, th = surf->h;
-  SDL_FreeSurface(surf);
-  if (! tex) {
-    return;
+  if (! st->tooltip_text.texture) {
+    SDL_Color white = {255, 255, 255, 255};
+    SDL_Surface *surface = TTF_RenderUTF8_Blended_Wrapped(
+        st->font_tooltip, tip, white, 400);
+    if (! surface) {
+      return;
+    }
+    st->tooltip_text.texture =
+        SDL_CreateTextureFromSurface(st->renderer, surface);
+    if (st->tooltip_text.texture) {
+      st->tooltip_text.width = surface->w;
+      st->tooltip_text.height = surface->h;
+    }
+    SDL_FreeSurface(surface);
+    if (! st->tooltip_text.texture) {
+      return;
+    }
   }
+  int tw = st->tooltip_text.width;
+  int th = st->tooltip_text.height;
 
   // position tooltip near mouse, clamped to window
   int win_w, win_h;
@@ -871,8 +1187,7 @@ static void render_tooltip(AppState *st, int mx, int my) {
   SDL_RenderDrawRect(st->renderer, &bg);
 
   SDL_Rect dst = {tx, ty, tw, th};
-  SDL_RenderCopy(st->renderer, tex, NULL, &dst);
-  SDL_DestroyTexture(tex);
+  SDL_RenderCopy(st->renderer, st->tooltip_text.texture, NULL, &dst);
 }
 
 
@@ -883,23 +1198,20 @@ static void render_block(AppState *st, int idx, SDL_Rect *dst) {
     // dark background filled with repeating "0"s
     SDL_SetRenderDrawColor(st->renderer, 20, 20, 20, 255);
     SDL_RenderFillRect(st->renderer, dst);
-    if (st->font_label) {
+    if (st->font_tooltip) {
       SDL_Color dim = {200, 200, 200, 255};
-      SDL_Surface *zsurf = TTF_RenderText_Blended(st->font_tooltip, "0", dim);
-      if (zsurf) {
-        SDL_Texture *ztex = SDL_CreateTextureFromSurface(st->renderer, zsurf);
-        if (ztex) {
-          int zw = zsurf->w, zh = zsurf->h;
-          int pad = 2;
-          for (int y = dst->y + pad; y < dst->y + dst->h - pad; y += zh + pad) {
-            for (int x = dst->x + pad; x < dst->x + dst->w - pad; x += zw + pad) {
-              SDL_Rect zr = {x, y, zw, zh};
-              SDL_RenderCopy(st->renderer, ztex, NULL, &zr);
-            }
+      if (ensure_text_texture(st, &st->zero_text, st->font_tooltip, "0",
+                              dim)) {
+        int pad = 2;
+        for (int y = dst->y + pad; y < dst->y + dst->h - pad;
+             y += st->zero_text.height + pad) {
+          for (int x = dst->x + pad; x < dst->x + dst->w - pad;
+               x += st->zero_text.width + pad) {
+            SDL_Rect zero = {x, y, st->zero_text.width,
+                             st->zero_text.height};
+            SDL_RenderCopy(st->renderer, st->zero_text.texture, NULL, &zero);
           }
-          SDL_DestroyTexture(ztex);
         }
-        SDL_FreeSurface(zsurf);
       }
     }
     return;
@@ -963,30 +1275,23 @@ static void render_block(AppState *st, int idx, SDL_Rect *dst) {
     SDL_RenderFillRect(st->renderer, dst);
 
     // draw label if cells are large enough
-    if (st->font_label && st->cell_w >= 28 && st->cell_h >= 14) {
-      char label[32];
-      snprintf(label, sizeof(label), "%s %d/%d", type_labels[f->ftype], f->type_ordinal, b->file_block);
-
-      SDL_Color black = {0, 0, 0, 255};
-      SDL_Surface *surf = TTF_RenderText_Blended(st->font_label, label, black);
-      if (surf) {
-        SDL_Texture *tex = SDL_CreateTextureFromSurface(st->renderer, surf);
-        if (tex) {
-          // center the text in the cell, scale down if needed
-          int tw = surf->w, th = surf->h;
-          if (tw > dst->w - 2) {
-            th = th * (dst->w - 2) / tw;
-            tw = dst->w - 2;
-          }
-          if (th > dst->h - 2) {
-            tw = tw * (dst->h - 2) / th;
-            th = dst->h - 2;
-          }
-          SDL_Rect tdst = {dst->x + (dst->w - tw) / 2, dst->y + (dst->h - th) / 2, tw, th};
-          SDL_RenderCopy(st->renderer, tex, NULL, &tdst);
-          SDL_DestroyTexture(tex);
+    if (st->font_label && dst->w >= 28 && dst->h >= 14) {
+      TextTexture *text = block_label_texture(st, idx);
+      if (text) {
+        // center the text in the cell, scaling it down only when needed.
+        int tw = text->width;
+        int th = text->height;
+        if (tw > dst->w - 2) {
+          th = th * (dst->w - 2) / tw;
+          tw = dst->w - 2;
         }
-        SDL_FreeSurface(surf);
+        if (th > dst->h - 2) {
+          tw = tw * (dst->h - 2) / th;
+          th = dst->h - 2;
+        }
+        SDL_Rect label = {dst->x + (dst->w - tw) / 2,
+                          dst->y + (dst->h - th) / 2, tw, th};
+        SDL_RenderCopy(st->renderer, text->texture, NULL, &label);
       }
     }
   }
@@ -1011,16 +1316,12 @@ static void render_title(AppState *st) {
   (void)win_h;
 
   SDL_Color white = {255, 255, 255, 255};
-  SDL_Surface *surf = TTF_RenderUTF8_Blended(font, title, white);
-  if (! surf) {
+  TextTexture *text = &st->title_text[st->view_mode];
+  if (! ensure_text_texture(st, text, font, title, white)) {
     return;
   }
-  SDL_Texture *tex = SDL_CreateTextureFromSurface(st->renderer, surf);
-  int tw = surf->w, th = surf->h;
-  SDL_FreeSurface(surf);
-  if (! tex) {
-    return;
-  }
+  int tw = text->width;
+  int th = text->height;
 
   int pad = 8;
   int bar_h = th + pad * 2;
@@ -1032,8 +1333,7 @@ static void render_title(AppState *st) {
 
   // centered text
   SDL_Rect tdst = {(win_w - tw) / 2, pad, tw, th};
-  SDL_RenderCopy(st->renderer, tex, NULL, &tdst);
-  SDL_DestroyTexture(tex);
+  SDL_RenderCopy(st->renderer, text->texture, NULL, &tdst);
 }
 
 
@@ -1058,16 +1358,11 @@ static void render_frame_indicator(AppState *st) {
     char label[16];
     snprintf(label, sizeof(label), "%d/8", st->view_mode + 1);
     SDL_Color white = {200, 200, 200, 255};
-    SDL_Surface *surf = TTF_RenderText_Blended(font, label, white);
-    if (surf) {
-      SDL_Texture *tex = SDL_CreateTextureFromSurface(st->renderer, surf);
-      if (tex) {
-        int tw = surf->w, th = surf->h;
-        SDL_Rect tdst = {cx_start - tw - 16, cy - th / 2, tw, th};
-        SDL_RenderCopy(st->renderer, tex, NULL, &tdst);
-        SDL_DestroyTexture(tex);
-      }
-      SDL_FreeSurface(surf);
+    TextTexture *text = &st->frame_text[st->view_mode];
+    if (ensure_text_texture(st, text, font, label, white)) {
+      SDL_Rect tdst = {cx_start - text->width - 16,
+                       cy - text->height / 2, text->width, text->height};
+      SDL_RenderCopy(st->renderer, text->texture, NULL, &tdst);
     }
   }
 
@@ -1121,6 +1416,52 @@ static void render_frame_indicator(AppState *st) {
 }
 
 
+static int ordered_file_id(AppState *st, bool fragmented, int position) {
+  int disk_block = fragmented ? position : st->index.linear_map[position];
+  if (disk_block < 0 || disk_block >= st->total_blocks) {
+    return -1;
+  }
+  return st->blocks[disk_block].file_id;
+}
+
+
+static int strip_position_y(int position, int total_blocks, int strip_top,
+                            int strip_height) {
+  int start = (int)((int64_t)position * strip_height / total_blocks);
+  int end = (int)(((int64_t)position + 1) * strip_height / total_blocks);
+  if (end <= start) {
+    end = start + 1;
+  }
+  return strip_top + 2 + (start + end) / 2;
+}
+
+
+static void render_connector(AppState *st, int x1, int y1, int x2, int y2) {
+  for (int offset = -2; offset <= 2; offset++) {
+    SDL_RenderDrawLine(st->renderer, x1, y1 + offset, x2, y2 + offset);
+  }
+
+  double dx = x1 - x2;
+  double dy = y1 - y2;
+  double length = sqrt(dx * dx + dy * dy);
+  if (length <= 10) {
+    return;
+  }
+  double ux = dx / length;
+  double uy = dy / length;
+  int ax = x1 - (int)(ux * 14);
+  int ay = y1 - (int)(uy * 14);
+  int px = (int)(-uy * 7);
+  int py = (int)(ux * 7);
+  for (int offset = -1; offset <= 1; offset++) {
+    SDL_RenderDrawLine(st->renderer, x1, y1 + offset, ax + px,
+                       ay + py + offset);
+    SDL_RenderDrawLine(st->renderer, x1, y1 + offset, ax - px,
+                       ay - py + offset);
+  }
+}
+
+
 // -------------------------------------------------------------------
 // render_cards: frames 0, 1, 4, 5
 // show_overlay: draw disk strip + lines (frames 1, 5)
@@ -1133,6 +1474,11 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
   SDL_SetRenderDrawColor(st->renderer, 18, 18, 28, 255);
   SDL_RenderClear(st->renderer);
 
+  if (win_w < 80 ||
+      win_h < TITLE_AREA_HEIGHT + FRAME_AREA_HEIGHT + 24) {
+    return;
+  }
+
   int nfiles = st->num_files;
   if (nfiles == 0) {
     return;
@@ -1141,21 +1487,42 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
   // filesystem overlay: cards on left, tall vertical disk strip on right
   int sidebar_w = show_overlay ? (int)(win_w * 0.22) : 0;
   int card_area_w = win_w - sidebar_w;
-  int card_area_h = win_h;
+  int card_area_h = win_h - TITLE_AREA_HEIGHT - FRAME_AREA_HEIGHT;
+  if (card_area_h < 1) {
+    card_area_h = 1;
+  }
+
+  // a card needs at least two pixels in each dimension to remain visible.
+  int max_cols = card_area_w / 2;
+  int max_rows = card_area_h / 2;
+  if (max_cols < 1) {
+    max_cols = 1;
+  }
+  if (max_rows < 1) {
+    max_rows = 1;
+  }
+  int64_t max_cards = (int64_t)max_cols * max_rows;
+  int displayed_files = nfiles;
+  if (displayed_files > max_cards) {
+    displayed_files = (int)max_cards;
+  }
 
   // card grid layout
   int cols, rows;
-  if (nfiles <= 3) {
-    cols = nfiles;
+  if (displayed_files <= 3) {
+    cols = displayed_files;
     rows = 1;
   }
-  else if (nfiles <= 6) {
+  else if (displayed_files <= 6) {
     cols = 3;
-    rows = (nfiles + 2) / 3;
+    rows = (int)(((int64_t)displayed_files + 2) / 3);
   }
   else {
-    cols = (int)ceil(sqrt((double)nfiles * 1.3));
-    rows = (nfiles + cols - 1) / cols;
+    cols = (int)ceil(sqrt((double)displayed_files * 1.3));
+    if (cols > max_cols) {
+      cols = max_cols;
+    }
+    rows = (int)(((int64_t)displayed_files + cols - 1) / cols);
   }
 
   int h_pad = card_area_w / 30;
@@ -1163,20 +1530,33 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
   int card_w = (card_area_w - h_pad * (cols + 1)) / cols;
   int card_h = (card_area_h - v_pad * (rows + 1)) / rows;
 
-  // title bar height (approx) - leave space at top
-  int title_bar_h = 40;
+  // dense layouts use padding relative to each cell instead of the window.
+  if (card_w < 2 || card_h < 2) {
+    h_pad = card_area_w / (cols * 8);
+    v_pad = card_area_h / (rows * 8);
+    if (h_pad < 1) {
+      h_pad = 1;
+    }
+    if (v_pad < 1) {
+      v_pad = 1;
+    }
+    card_w = (card_area_w - h_pad * (cols + 1)) / cols;
+    card_h = (card_area_h - v_pad * (rows + 1)) / rows;
+    if (card_w < 1) {
+      card_w = 1;
+    }
+    if (card_h < 1) {
+      card_h = 1;
+    }
+  }
 
-  // card center-bottom positions for line drawing
-  int *card_cx = malloc(nfiles * sizeof(int));
-  int *card_cy_bottom = malloc(nfiles * sizeof(int));
-
-  for (int i = 0; i < nfiles; i++) {
+  for (int i = 0; i < displayed_files; i++) {
     FileInfo *f = &st->files[i];
     int r = i / cols;
     int c = i % cols;
 
     int sx = h_pad + c * (card_w + h_pad);
-    int sy = title_bar_h + v_pad + r * (card_h + v_pad);
+    int sy = TITLE_AREA_HEIGHT + v_pad + r * (card_h + v_pad);
 
     SDL_Color clr = type_colors[f->ftype];
     SDL_Rect card_rect = {sx, sy, card_w, card_h};
@@ -1246,16 +1626,15 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
         // type label centered in icon
         if (st->font_label) {
           SDL_Color black = {0, 0, 0, 255};
-          SDL_Surface *surf = TTF_RenderText_Blended(st->font_label, type_labels[f->ftype], black);
-          if (surf) {
-            SDL_Texture *tex = SDL_CreateTextureFromSurface(st->renderer, surf);
-            if (tex) {
-              int tw = surf->w, th = surf->h;
-              SDL_Rect tdst = {sx + img_pad + (img_area_w - tw) / 2, sy + img_pad + (img_area_h - th) / 2, tw, th};
-              SDL_RenderCopy(st->renderer, tex, NULL, &tdst);
-              SDL_DestroyTexture(tex);
-            }
-            SDL_FreeSurface(surf);
+          TextTexture *text = &st->type_text[f->ftype];
+          if (ensure_text_texture(st, text, st->font_label,
+                                  type_labels[f->ftype], black)) {
+            SDL_Rect tdst = {sx + img_pad +
+                                 (img_area_w - text->width) / 2,
+                             sy + img_pad +
+                                 (img_area_h - text->height) / 2,
+                             text->width, text->height};
+            SDL_RenderCopy(st->renderer, text->texture, NULL, &tdst);
           }
         }
       }
@@ -1265,27 +1644,20 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
         const char *fname = strrchr(f->path, '/');
         fname = fname ? fname + 1 : f->path;
         SDL_Color light = {200, 200, 220, 255};
-        SDL_Surface *surf = TTF_RenderText_Blended(st->font_label, fname, light);
-        if (surf) {
-          SDL_Texture *tex = SDL_CreateTextureFromSurface(st->renderer, surf);
-          if (tex) {
-            int tw = surf->w, th = surf->h;
-            if (tw > card_w - 4) {
-              th = th * (card_w - 4) / tw;
-              tw = card_w - 4;
-            }
-            int ty_label = sy + card_h - label_h + (label_h - th) / 2;
-            SDL_Rect tdst = {sx + (card_w - tw) / 2, ty_label, tw, th};
-            SDL_RenderCopy(st->renderer, tex, NULL, &tdst);
-            SDL_DestroyTexture(tex);
+        if (ensure_text_texture(st, &f->label_name, st->font_label, fname,
+                                light)) {
+          int tw = f->label_name.width;
+          int th = f->label_name.height;
+          if (tw > card_w - 4) {
+            th = th * (card_w - 4) / tw;
+            tw = card_w - 4;
           }
-          SDL_FreeSurface(surf);
+          int ty_label = sy + card_h - label_h + (label_h - th) / 2;
+          SDL_Rect tdst = {sx + (card_w - tw) / 2, ty_label, tw, th};
+          SDL_RenderCopy(st->renderer, f->label_name.texture, NULL, &tdst);
         }
       }
     }
-
-    card_cx[i] = sx + card_w / 2;
-    card_cy_bottom[i] = sy + card_h;
   }
 
   // Filesystem overlay: cards on left, tall vertical disk strip on right.
@@ -1296,79 +1668,59 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
     int tb = st->total_blocks;
     int sb_x = card_area_w + 4;
     int sb_w = sidebar_w - 8;
-    int sb_top = 50;
-    int sb_bot = win_h - 30;
+    int sb_top = TITLE_AREA_HEIGHT + 20;
+    int sb_bot = win_h - FRAME_AREA_HEIGHT;
     int sb_h = sb_bot - sb_top;
     if (sb_h < 20) sb_h = 20;
 
     SDL_SetRenderDrawBlendMode(st->renderer, SDL_BLENDMODE_BLEND);
 
-    // Build per-position file_id map
-    int *strip_file = malloc(tb * sizeof(int));
-    for (int i = 0; i < tb; i++) strip_file[i] = -1;
+    SDL_SetRenderDrawColor(st->renderer, 10, 10, 20, 255);
+    SDL_Rect sb_bg = {sb_x, sb_top, sb_w, sb_h};
+    SDL_RenderFillRect(st->renderer, &sb_bg);
+    SDL_SetRenderDrawColor(st->renderer, 70, 70, 90, 255);
+    SDL_RenderDrawRect(st->renderer, &sb_bg);
 
-    if (fragmented) {
-      // disk order — scattered
-      for (int b = 0; b < tb; b++) {
-        if (st->blocks[b].file_id >= 0)
-          strip_file[b] = st->blocks[b].file_id;
+    // draw only the output rows; when blocks share a row, the last block wins
+    // just as it did when every block was painted separately.
+    int strip_h = sb_h - 4;
+    int run_start = 0;
+    int run_file = -2;
+    for (int y = 0; y <= strip_h; y++) {
+      int file = -2;
+      if (y < strip_h) {
+        int position = (int)(((int64_t)(y + 1) * tb - 1) / strip_h);
+        file = ordered_file_id(st, fragmented, position);
       }
-    } else {
-      // contiguous file order
-      int pos = 0;
-      for (int fi = 0; fi < nfiles && pos < tb; fi++) {
-        for (int k = 0; k < st->files[fi].total_blocks && pos < tb; k++)
-          strip_file[pos++] = fi;
+      if (y == 0) {
+        run_file = file;
       }
-    }
-
-    // Arrays to store per-block pixel positions for line drawing
-    int *blk_cx = malloc(tb * sizeof(int));
-    int *blk_cy = malloc(tb * sizeof(int));
-
-    // Both views use the same tall colored strip — only the block
-    // ordering differs.  Unfragmented: contiguous file order.
-    // Fragmented: actual disk order (scattered).
-    {
-      SDL_SetRenderDrawColor(st->renderer, 10, 10, 20, 255);
-      SDL_Rect sb_bg = {sb_x, sb_top, sb_w, sb_h};
-      SDL_RenderFillRect(st->renderer, &sb_bg);
-      SDL_SetRenderDrawColor(st->renderer, 70, 70, 90, 255);
-      SDL_RenderDrawRect(st->renderer, &sb_bg);
-
-      // Draw colored rows using strip_file (already set above:
-      // disk order for fragmented, contiguous for unfragmented)
-      for (int p = 0; p < tb; p++) {
-        int py = sb_top + 2 + (int)((double)p / tb * (sb_h - 4));
-        int py2 = sb_top + 2 + (int)((double)(p+1) / tb * (sb_h - 4));
-        if (py2 <= py) py2 = py + 1;
-
-        if (strip_file[p] >= 0 && strip_file[p] < nfiles) {
-          SDL_Color c = type_colors[st->files[strip_file[p]].ftype];
-          SDL_SetRenderDrawColor(st->renderer, c.r, c.g, c.b, 240);
-        } else {
+      else if (file != run_file) {
+        if (run_file >= 0 && run_file < nfiles) {
+          SDL_Color color = type_colors[st->files[run_file].ftype];
+          SDL_SetRenderDrawColor(st->renderer, color.r, color.g, color.b,
+                                 240);
+        }
+        else {
           SDL_SetRenderDrawColor(st->renderer, 25, 25, 35, 200);
         }
-        SDL_Rect row = {sb_x + 2, py, sb_w - 4, py2 - py};
-        SDL_RenderFillRect(st->renderer, &row);
-
-        blk_cx[p] = sb_x;
-        blk_cy[p] = (py + py2) / 2;
+        SDL_Rect run = {sb_x + 2, sb_top + 2 + run_start, sb_w - 4,
+                        y - run_start};
+        SDL_RenderFillRect(st->renderer, &run);
+        run_start = y;
+        run_file = file;
       }
     }
 
     // "DISK" label above
     if (st->font_tooltip) {
       SDL_Color dim = {160, 160, 180, 255};
-      SDL_Surface *ls = TTF_RenderText_Blended(st->font_tooltip, "DISK", dim);
-      if (ls) {
-        SDL_Texture *lt = SDL_CreateTextureFromSurface(st->renderer, ls);
-        if (lt) {
-          SDL_Rect lr = {sb_x + (sb_w - ls->w) / 2, sb_top - ls->h - 2, ls->w, ls->h};
-          SDL_RenderCopy(st->renderer, lt, NULL, &lr);
-          SDL_DestroyTexture(lt);
-        }
-        SDL_FreeSurface(ls);
+      if (ensure_text_texture(st, &st->disk_text, st->font_tooltip, "DISK",
+                              dim)) {
+        SDL_Rect label = {sb_x + (sb_w - st->disk_text.width) / 2,
+                          sb_top - st->disk_text.height - 2,
+                          st->disk_text.width, st->disk_text.height};
+        SDL_RenderCopy(st->renderer, st->disk_text.texture, NULL, &label);
       }
     }
 
@@ -1381,55 +1733,36 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
       {255, 0, 120, 255}, {160, 255, 0, 255}, {255, 180, 0, 255},
     };
     int vp_size = (int)(sizeof(vp) / sizeof(vp[0]));
-    int max_segs_per_file = 12;
-    for (int fi = 0; fi < nfiles; fi++) {
+    for (int fi = 0; fi < displayed_files; fi++) {
       SDL_Color vc = vp[fi % vp_size];
       SDL_SetRenderDrawColor(st->renderer, vc.r, vc.g, vc.b, 255);
-      int seg_count = 0;
-      int seg_start = -1;
-      for (int p = 0; p <= tb; p++) {
-        bool is_mine = (p < tb && strip_file[p] == fi);
+      int row = fi / cols;
+      int col = fi % cols;
+      int x1 = h_pad + col * (card_w + h_pad);
+      int y1 = TITLE_AREA_HEIGHT + v_pad + row * (card_h + v_pad);
 
-        if (is_mine && seg_start < 0) {
-          seg_start = p;
-        }
-        else if (!is_mine && seg_start >= 0) {
-          if (seg_count < max_segs_per_file) {
-            int x1 = card_cx[fi] - card_w / 2;
-            int y1 = card_cy_bottom[fi] - card_h;
-            int x2 = blk_cx[seg_start];
-            int y2 = blk_cy[seg_start];
-            // thick line (5px)
-            for (int d = -2; d <= 2; d++) {
-              SDL_RenderDrawLine(st->renderer, x1, y1 + d, x2, y2 + d);
-            }
-            // arrowhead at card end
-            double dx = x1 - x2, dy = y1 - y2;
-            double len = sqrt(dx*dx + dy*dy);
-            if (len > 10) {
-              double ux = dx / len, uy = dy / len;
-              int ax = x1 - (int)(ux * 14);
-              int ay = y1 - (int)(uy * 14);
-              int px = (int)(-uy * 7), py = (int)(ux * 7);
-              for (int d = -1; d <= 1; d++) {
-                SDL_RenderDrawLine(st->renderer, x1, y1 + d, ax + px, ay + py + d);
-                SDL_RenderDrawLine(st->renderer, x1, y1 + d, ax - px, ay - py + d);
-              }
-            }
-          }
-          seg_count++;
-          seg_start = -1;
-        }
+      int first_segment;
+      int last_segment;
+      if (fragmented) {
+        first_segment = st->index.segment_offsets[fi];
+        last_segment = st->index.segment_offsets[fi + 1];
+      }
+      else if (st->index.file_start[fi] >= 0) {
+        first_segment = 0;
+        last_segment = 1;
+      }
+      else {
+        continue;
+      }
+
+      for (int segment = first_segment; segment < last_segment; segment++) {
+        int position = fragmented ? st->index.segment_starts[segment]
+                                  : st->index.file_start[fi];
+        int y2 = strip_position_y(position, tb, sb_top, strip_h);
+        render_connector(st, x1, y1, sb_x, y2);
       }
     }
-
-    free(strip_file);
-    free(blk_cx);
-    free(blk_cy);
   }
-
-  free(card_cx);
-  free(card_cy_bottom);
 }
 
 
@@ -1440,74 +1773,14 @@ static void render_cards(AppState *st, bool show_overlay, bool fragmented) {
 // highlight_hf: bright markers on header/footer blocks (frame 3)
 // -------------------------------------------------------------------
 static void render_linear(AppState *st, bool highlight_hf) {
-  int win_w, win_h;
-  SDL_GetRendererOutputSize(st->renderer, &win_w, &win_h);
-
   SDL_SetRenderDrawColor(st->renderer, 0, 0, 0, 255);
   SDL_RenderClear(st->renderer);
 
-  if (st->total_blocks == 0 || st->num_files == 0) {
+  if (st->total_blocks == 0) {
     return;
   }
 
-  // Build a linear block ordering: files in order, each file's blocks
-  // sorted by file_block.  This is the "unfragmented" view — every
-  // file is contiguous, like it would be on a fresh filesystem.
   int tb = st->total_blocks;
-  int *linear_map = malloc(tb * sizeof(int));
-  if (!linear_map) return;
-  for (int i = 0; i < tb; i++) linear_map[i] = -1;
-
-  // find max file_block per file for footer detection
-  int *max_fb = calloc(st->num_files, sizeof(int));
-  if (!max_fb) { free(linear_map); return; }
-  for (int i = 0; i < st->num_files; i++) max_fb[i] = -1;
-  for (int b = 0; b < tb; b++) {
-    DiskBlock *blk = &st->blocks[b];
-    if (blk->file_id >= 0 && blk->file_id < st->num_files) {
-      if (blk->file_block > max_fb[blk->file_id])
-        max_fb[blk->file_id] = blk->file_block;
-    }
-  }
-
-  // For each file, gather its disk blocks sorted by file_block
-  int pos = 0;
-  for (int fi = 0; fi < st->num_files && pos < tb; fi++) {
-    int cap = st->files[fi].total_blocks + 1;
-    int cnt = 0;
-    int *buf_fb = malloc(cap * sizeof(int));
-    int *buf_db = malloc(cap * sizeof(int));
-    if (!buf_fb || !buf_db) { free(buf_fb); free(buf_db); break; }
-    for (int b = 0; b < tb; b++) {
-      if (st->blocks[b].file_id == fi) {
-        if (cnt >= cap) {
-          cap *= 2;
-          buf_fb = realloc(buf_fb, cap * sizeof(int));
-          buf_db = realloc(buf_db, cap * sizeof(int));
-        }
-        buf_fb[cnt] = st->blocks[b].file_block;
-        buf_db[cnt] = b;
-        cnt++;
-      }
-    }
-    // insertion sort by file_block
-    for (int a = 1; a < cnt; a++) {
-      int kfb = buf_fb[a], kdb = buf_db[a];
-      int j = a - 1;
-      while (j >= 0 && buf_fb[j] > kfb) {
-        buf_fb[j+1] = buf_fb[j]; buf_db[j+1] = buf_db[j]; j--;
-      }
-      buf_fb[j+1] = kfb; buf_db[j+1] = kdb;
-    }
-    for (int k = 0; k < cnt && pos < tb; k++, pos++)
-      linear_map[pos] = buf_db[k];
-    free(buf_fb); free(buf_db);
-  }
-  // fill remaining with ZERO/RANDOM
-  for (int b = 0; b < tb && pos < tb; b++) {
-    if (st->blocks[b].type == BTYPE_ZERO || st->blocks[b].type == BTYPE_RANDOM)
-      linear_map[pos++] = b;
-  }
 
   // Use the same grid layout as jigsaw so the block count and
   // proportions are identical — only the ORDER changes.
@@ -1515,26 +1788,13 @@ static void render_linear(AppState *st, bool highlight_hf) {
   int cw = st->cell_w;
   int ch = st->cell_h;
 
-  // Track start position of each file group for drawing borders
-  int *file_start_pos = calloc(st->num_files, sizeof(int));
-  int *file_end_pos = calloc(st->num_files, sizeof(int));
-  for (int i = 0; i < st->num_files; i++) {
-    file_start_pos[i] = tb;
-    file_end_pos[i] = -1;
-  }
-  for (int i = 0; i < tb; i++) {
-    int di = (linear_map[i] >= 0) ? linear_map[i] : i;
-    int fid = st->blocks[di].file_id;
-    if (fid >= 0 && fid < st->num_files) {
-      if (i < file_start_pos[fid]) file_start_pos[fid] = i;
-      if (i > file_end_pos[fid]) file_end_pos[fid] = i;
-    }
-  }
-
-  for (int i = 0; i < tb; i++) {
+  int first;
+  int last;
+  visible_block_range(st, &first, &last);
+  for (int i = first; i < last; i++) {
     int row = i / cols;
     int col = i % cols;
-    int disk_idx = (linear_map[i] >= 0) ? linear_map[i] : i;
+    int disk_idx = st->index.linear_map[i];
 
     SDL_Rect dst = {st->grid_x + col * cw,
                     st->grid_y + row * ch - st->scroll_y,
@@ -1549,11 +1809,11 @@ static void render_linear(AppState *st, bool highlight_hf) {
       // Check if this block is at the boundary of its file group
       int prev_fid = -1, next_fid = -1;
       if (i > 0) {
-        int pi = (linear_map[i-1] >= 0) ? linear_map[i-1] : i-1;
+        int pi = st->index.linear_map[i - 1];
         prev_fid = st->blocks[pi].file_id;
       }
       if (i < tb - 1) {
-        int ni = (linear_map[i+1] >= 0) ? linear_map[i+1] : i+1;
+        int ni = st->index.linear_map[i + 1];
         next_fid = st->blocks[ni].file_id;
       }
 
@@ -1578,25 +1838,26 @@ static void render_linear(AppState *st, bool highlight_hf) {
       }
 
       // Label at the start of each file group
-      if (i == file_start_pos[fid] && st->font_label && cw >= 20 && ch >= 14) {
+      if (i == st->index.file_start[fid] && st->font_label && cw >= 20 &&
+          ch >= 14) {
         const char *fname = strrchr(st->files[fid].path, '/');
         fname = fname ? fname + 1 : st->files[fid].path;
         SDL_Color white = {255, 255, 255, 255};
-        SDL_Surface *ls = TTF_RenderText_Blended(st->font_label, fname, white);
-        if (ls) {
-          SDL_Texture *lt = SDL_CreateTextureFromSurface(st->renderer, ls);
-          if (lt) {
-            int lw = ls->w, lh = ls->h;
-            if (lw > cw * 4) { lh = lh * cw * 4 / lw; lw = cw * 4; }
-            SDL_Rect lr = {dst.x + 2, dst.y + 2, lw, lh};
-            // dark background behind label for readability
-            SDL_SetRenderDrawColor(st->renderer, 0, 0, 0, 180);
-            SDL_Rect lbg = {lr.x - 1, lr.y - 1, lr.w + 2, lr.h + 2};
-            SDL_RenderFillRect(st->renderer, &lbg);
-            SDL_RenderCopy(st->renderer, lt, NULL, &lr);
-            SDL_DestroyTexture(lt);
+        TextTexture *text = &st->files[fid].linear_name;
+        if (ensure_text_texture(st, text, st->font_label, fname, white)) {
+          int lw = text->width;
+          int lh = text->height;
+          if (lw > cw * 4) {
+            lh = lh * cw * 4 / lw;
+            lw = cw * 4;
           }
-          SDL_FreeSurface(ls);
+          SDL_Rect label = {dst.x + 2, dst.y + 2, lw, lh};
+          // dark background behind label for readability
+          SDL_SetRenderDrawColor(st->renderer, 0, 0, 0, 180);
+          SDL_Rect background = {label.x - 1, label.y - 1, label.w + 2,
+                                 label.h + 2};
+          SDL_RenderFillRect(st->renderer, &background);
+          SDL_RenderCopy(st->renderer, text->texture, NULL, &label);
         }
       }
     }
@@ -1605,50 +1866,47 @@ static void render_linear(AppState *st, bool highlight_hf) {
       // Use position in linear ordering: first block of file group = Header,
       // last block of file group = Footer.
       int fid = st->blocks[disk_idx].file_id;
-      bool is_header = (fid >= 0 && fid < st->num_files && i == file_start_pos[fid]);
-      bool is_footer = (fid >= 0 && fid < st->num_files && i == file_end_pos[fid] && !is_header);
+      bool is_header = (fid >= 0 && fid < st->num_files &&
+                        i == st->index.file_start[fid]);
+      bool is_footer = (fid >= 0 && fid < st->num_files &&
+                        i == st->index.file_end[fid] && ! is_header);
 
       if (is_header) {
-        // Header: thick green border + green "H"
-        SDL_SetRenderDrawColor(st->renderer, 30, 255, 30, 255);
-        for (int b = 0; b < 6; b++) {
-          SDL_Rect br = {dst.x + b, dst.y + b, dst.w - 2*b, dst.h - 2*b};
-          SDL_RenderDrawRect(st->renderer, &br);
-        }
-        if (st->font_label && cw >= 12 && ch >= 12) {
-          SDL_Color yc = {30, 255, 30, 255};
-          SDL_Surface *s = TTF_RenderText_Blended(st->font_label, "H", yc);
-          if (s) {
-            SDL_Texture *t = SDL_CreateTextureFromSurface(st->renderer, s);
-            if (t) { SDL_Rect r = {dst.x+6, dst.y+6, s->w, s->h}; SDL_RenderCopy(st->renderer, t, NULL, &r); SDL_DestroyTexture(t); }
-            SDL_FreeSurface(s);
-          }
-        }
+        render_hf_marker(st, &dst, true);
       }
       else if (is_footer) {
-        // Footer: thick red border + red "F"
-        SDL_SetRenderDrawColor(st->renderer, 255, 30, 30, 255);
-        for (int b = 0; b < 6; b++) {
-          SDL_Rect br = {dst.x + b, dst.y + b, dst.w - 2*b, dst.h - 2*b};
-          SDL_RenderDrawRect(st->renderer, &br);
-        }
-        if (st->font_label && cw >= 12 && ch >= 12) {
-          SDL_Color cc = {255, 30, 30, 255};
-          SDL_Surface *s = TTF_RenderText_Blended(st->font_label, "F", cc);
-          if (s) {
-            SDL_Texture *t = SDL_CreateTextureFromSurface(st->renderer, s);
-            if (t) { SDL_Rect r = {dst.x+6, dst.y+6, s->w, s->h}; SDL_RenderCopy(st->renderer, t, NULL, &r); SDL_DestroyTexture(t); }
-            SDL_FreeSurface(s);
-          }
-        }
+        render_hf_marker(st, &dst, false);
       }
     }
   }
+}
 
-  free(linear_map);
-  free(max_fb);
-  free(file_start_pos);
-  free(file_end_pos);
+
+static int greatest_common_divisor(int left, int right) {
+  while (right != 0) {
+    int remainder = left % right;
+    left = right;
+    right = remainder;
+  }
+  return left;
+}
+
+
+static int permutation_stride(int count, uint32_t seed) {
+  if (count <= 1) {
+    return 1;
+  }
+  int stride = (int)(seed % (uint32_t)count);
+  if (stride == 0) {
+    stride = 1;
+  }
+  while (greatest_common_divisor(stride, count) != 1) {
+    stride++;
+    if (stride == count) {
+      stride = 1;
+    }
+  }
+  return stride;
 }
 
 
@@ -1665,6 +1923,11 @@ static void render_fs_grid(AppState *st) {
   SDL_SetRenderDrawColor(st->renderer, 12, 12, 22, 255);
   SDL_RenderClear(st->renderer);
 
+  if (win_w < 96 ||
+      win_h < TITLE_AREA_HEIGHT + FRAME_AREA_HEIGHT + 24) {
+    return;
+  }
+
   int tb = st->total_blocks;
   int nfiles = st->num_files;
   if (tb == 0 || nfiles == 0) return;
@@ -1672,57 +1935,70 @@ static void render_fs_grid(AppState *st) {
   // Layout: jigsaw grid on left, file cards on right
   int panel_w = (int)(win_w * 0.30);
   int grid_left = 4;
-  int grid_top = 70;   // clear the 40pt title bar
+  int grid_top = TITLE_AREA_HEIGHT;
   int grid_w = win_w - panel_w - grid_left - 8;
-  int grid_h = win_h - grid_top - 30;
+  int grid_h = win_h - grid_top - FRAME_AREA_HEIGHT;
   int panel_x = win_w - panel_w;
-
-  // Compute grid layout for the left area (same algorithm as calc_grid/render_jigsaw)
-  double aspect = (double)grid_w / grid_h;
-  int gcols = (int)round(sqrt((double)tb * aspect));
-  if (gcols < 1) gcols = 1;
-  int best = gcols;
-  for (int d = 0; d <= 4; d++) {
-    if (gcols + d > 0 && tb % (gcols + d) == 0) { best = gcols + d; break; }
-    if (gcols - d > 0 && tb % (gcols - d) == 0) { best = gcols - d; break; }
+  if (grid_w < 2) {
+    grid_w = 2;
   }
-  gcols = best;
-  int grows = (tb + gcols - 1) / gcols;
+  if (grid_h < 2) {
+    grid_h = 2;
+  }
+
+  // keep the overview bounded by aggregating blocks only when one minimum-size
+  // cell per block cannot fit in the available grid.
+  int max_cols = grid_w / MIN_CELL_SIZE;
+  int max_rows = grid_h / MIN_CELL_SIZE;
+  if (max_cols < 1) {
+    max_cols = 1;
+  }
+  if (max_rows < 1) {
+    max_rows = 1;
+  }
+  int64_t max_cells = (int64_t)max_cols * max_rows;
+  int block_step = (int)(((int64_t)tb + max_cells - 1) / max_cells);
+  int display_blocks =
+      (int)(((int64_t)tb + block_step - 1) / block_step);
+
+  double aspect = (double)grid_w / grid_h;
+  int gcols = (int)round(sqrt((double)display_blocks * aspect));
+  if (gcols < 1) {
+    gcols = 1;
+  }
+  if (gcols > max_cols) {
+    gcols = max_cols;
+  }
+  int grows = (int)(((int64_t)display_blocks + gcols - 1) / gcols);
+  if (grows > max_rows) {
+    grows = max_rows;
+    gcols = (int)(((int64_t)display_blocks + grows - 1) / grows);
+  }
   int gcw = grid_w / gcols;
   int gch = grid_h / grows;
-  if (gcw < 2) gcw = 2;
-  if (gch < 2) gch = 2;
 
-  // Render the jigsaw grid on the left (disk order — same as frame 7)
-  int *blk_cx = malloc(tb * sizeof(int));
-  int *blk_cy = malloc(tb * sizeof(int));
-
-  for (int i = 0; i < tb; i++) {
-    int row = i / gcols;
-    int col = i % gcols;
-    int bx = grid_left + col * gcw;
-    int by = grid_top + row * gch;
-    SDL_Rect dst = {bx, by, gcw, gch};
-    render_block(st, i, &dst);
-    blk_cx[i] = bx + gcw / 2;
-    blk_cy[i] = by + gch / 2;
-  }
-
-  // Overlay: colored border on EVERY file block to show the filesystem
-  // tracks all of them.  Use a 2px border in the file's type color.
+  // render the disk-order overview and its filesystem ownership borders.
   SDL_SetRenderDrawBlendMode(st->renderer, SDL_BLENDMODE_BLEND);
-  for (int i = 0; i < tb; i++) {
-    if (st->blocks[i].file_id < 0) continue;
-    SDL_Color c = type_colors[st->files[st->blocks[i].file_id].ftype];
-    SDL_SetRenderDrawColor(st->renderer, c.r, c.g, c.b, 220);
-    int row = i / gcols;
-    int col = i % gcols;
+  for (int slot = 0; slot < display_blocks; slot++) {
+    int64_t representative = (int64_t)(slot + 1) * block_step - 1;
+    int disk_block = representative < tb ? (int)representative : tb - 1;
+    int row = slot / gcols;
+    int col = slot % gcols;
     int bx = grid_left + col * gcw;
     int by = grid_top + row * gch;
     SDL_Rect dst = {bx, by, gcw, gch};
-    SDL_RenderDrawRect(st->renderer, &dst);
-    SDL_Rect inner = {bx + 1, by + 1, gcw - 2, gch - 2};
-    SDL_RenderDrawRect(st->renderer, &inner);
+    render_block(st, disk_block, &dst);
+
+    int file = st->blocks[disk_block].file_id;
+    if (file >= 0 && file < nfiles) {
+      SDL_Color color = type_colors[st->files[file].ftype];
+      SDL_SetRenderDrawColor(st->renderer, color.r, color.g, color.b, 220);
+      SDL_RenderDrawRect(st->renderer, &dst);
+      if (gcw > 2 && gch > 2) {
+        SDL_Rect inner = {bx + 1, by + 1, gcw - 2, gch - 2};
+        SDL_RenderDrawRect(st->renderer, &inner);
+      }
+    }
   }
 
   // Right panel: dark background with border
@@ -1736,46 +2012,60 @@ static void render_fs_grid(AppState *st) {
   int fs_label_h = 0;
   if (st->font_title) {
     SDL_Color dim = {180, 180, 200, 255};
-    SDL_Surface *ls = TTF_RenderText_Blended(st->font_title, "FILESYSTEM", dim);
-    if (ls) {
-      SDL_Texture *lt = SDL_CreateTextureFromSurface(st->renderer, ls);
-      if (lt) {
-        // scale down if wider than panel
-        int tw = ls->w, th = ls->h;
-        if (tw > panel_w - 12) { th = th * (panel_w - 12) / tw; tw = panel_w - 12; }
-        SDL_Rect lr = {panel_x + (panel_w - tw) / 2, grid_top + 8, tw, th};
-        SDL_RenderCopy(st->renderer, lt, NULL, &lr);
-        fs_label_h = th + 16;
-        SDL_DestroyTexture(lt);
+    if (ensure_text_texture(st, &st->filesystem_text, st->font_title,
+                            "FILESYSTEM", dim)) {
+      int tw = st->filesystem_text.width;
+      int th = st->filesystem_text.height;
+      if (tw > panel_w - 12) {
+        th = th * (panel_w - 12) / tw;
+        tw = panel_w - 12;
       }
-      SDL_FreeSurface(ls);
+      SDL_Rect label = {panel_x + (panel_w - tw) / 2, grid_top + 8, tw, th};
+      SDL_RenderCopy(st->renderer, st->filesystem_text.texture, NULL,
+                     &label);
+      fs_label_h = th + 16;
     }
   }
 
   // File cards inside the panel — evenly spaced with visible gaps
   int card_top = grid_top + fs_label_h + 4;
   int card_area_h = grid_h - fs_label_h - 8;
+  if (card_area_h < 24) {
+    card_area_h = 24;
+  }
   int card_side_pad = 8;
   int card_w = panel_w - card_side_pad * 2;
   // card height capped so there's always a gap
-  int card_h = (card_area_h * 2 / 3) / nfiles;
+  int card_h = (int)(((int64_t)card_area_h * 2 / 3) / nfiles);
   if (card_h > 80) card_h = 80;
   if (card_h < 24) card_h = 24;
   // distribute remaining space as gaps
-  int total_cards_h_raw = nfiles * card_h;
-  int total_gap = card_area_h - total_cards_h_raw;
-  int card_pad = (nfiles > 1) ? total_gap / (nfiles - 1) : 0;
+  int64_t total_cards_h_raw = (int64_t)nfiles * card_h;
+  int64_t total_gap = (int64_t)card_area_h - total_cards_h_raw;
+  int card_pad = (nfiles > 1 && total_gap > 0)
+                     ? (int)(total_gap / (nfiles - 1))
+                     : 0;
   if (card_pad < 4) card_pad = 4;
 
-  // center cards vertically if they don't fill the panel
-  int total_cards_h = nfiles * card_h + (nfiles - 1) * card_pad;
-  int card_start_y = card_top + (card_area_h - total_cards_h) / 2;
-  if (card_start_y < card_top) card_start_y = card_top;
+  // center cards when they fit and omit only cards that were already offscreen.
+  int64_t total_cards_h = total_cards_h_raw +
+                          (int64_t)(nfiles - 1) * card_pad;
+  int card_start_y = card_top;
+  int visible_files = nfiles;
+  if (total_cards_h <= card_area_h) {
+    card_start_y += (int)(card_area_h - total_cards_h) / 2;
+  }
+  else {
+    visible_files = (card_area_h + card_pad) / (card_h + card_pad);
+    if (visible_files < 1) {
+      visible_files = 1;
+    }
+    if (visible_files > nfiles) {
+      visible_files = nfiles;
+    }
+  }
 
-  int *card_lx = malloc(nfiles * sizeof(int));
-  int *card_cy = malloc(nfiles * sizeof(int));
-
-  for (int i = 0; i < nfiles; i++) {
+  for (int i = 0; i < visible_files; i++) {
     FileInfo *f = &st->files[i];
     int cx = panel_x + card_side_pad;
     int cy = card_start_y + i * (card_h + card_pad);
@@ -1819,16 +2109,13 @@ static void render_fs_grid(AppState *st) {
       // type label centered
       if (st->font_label) {
         SDL_Color black = {0, 0, 0, 255};
-        SDL_Surface *surf = TTF_RenderText_Blended(st->font_label, type_labels[f->ftype], black);
-        if (surf) {
-          SDL_Texture *tex = SDL_CreateTextureFromSurface(st->renderer, surf);
-          if (tex) {
-            int tw = surf->w, th = surf->h;
-            SDL_Rect tdst = {icon.x + (icon.w - tw) / 2, icon.y + (icon.h - th) / 2, tw, th};
-            SDL_RenderCopy(st->renderer, tex, NULL, &tdst);
-            SDL_DestroyTexture(tex);
-          }
-          SDL_FreeSurface(surf);
+        TextTexture *text = &st->type_text[f->ftype];
+        if (ensure_text_texture(st, text, st->font_label,
+                                type_labels[f->ftype], black)) {
+          SDL_Rect label = {icon.x + (icon.w - text->width) / 2,
+                            icon.y + (icon.h - text->height) / 2,
+                            text->width, text->height};
+          SDL_RenderCopy(st->renderer, text->texture, NULL, &label);
         }
       }
     }
@@ -1839,24 +2126,19 @@ static void render_fs_grid(AppState *st) {
       const char *fname = strrchr(f->path, '/');
       fname = fname ? fname + 1 : f->path;
       SDL_Color white = {220, 220, 230, 255};
-      SDL_Surface *ls = TTF_RenderText_Blended(name_font, fname, white);
-      if (ls) {
-        SDL_Texture *lt = SDL_CreateTextureFromSurface(st->renderer, ls);
-        if (lt) {
-          int tw = ls->w, th = ls->h;
-          int label_x = cx + img_pad + img_size + 8;
-          int max_tw = card_w - img_size - img_pad * 2 - 12;
-          if (tw > max_tw && max_tw > 0) { th = th * max_tw / tw; tw = max_tw; }
-          SDL_Rect lr = {label_x, cy + (card_h - th) / 2, tw, th};
-          SDL_RenderCopy(st->renderer, lt, NULL, &lr);
-          SDL_DestroyTexture(lt);
+      if (ensure_text_texture(st, &f->panel_name, name_font, fname, white)) {
+        int tw = f->panel_name.width;
+        int th = f->panel_name.height;
+        int label_x = cx + img_pad + img_size + 8;
+        int max_tw = card_w - img_size - img_pad * 2 - 12;
+        if (tw > max_tw && max_tw > 0) {
+          th = th * max_tw / tw;
+          tw = max_tw;
         }
-        SDL_FreeSurface(ls);
+        SDL_Rect label = {label_x, cy + (card_h - th) / 2, tw, th};
+        SDL_RenderCopy(st->renderer, f->panel_name.texture, NULL, &label);
       }
     }
-
-    card_lx[i] = panel_x;
-    card_cy[i] = cy + card_h / 2;
   }
 
   // Draw a line from the filesystem card to EVERY block belonging to that file.
@@ -1879,33 +2161,31 @@ static void render_fs_grid(AppState *st) {
   };
   int palette_size = (int)(sizeof(vivid_palette) / sizeof(vivid_palette[0]));
 
-  // Draw lines in random block order so no file consistently gets buried.
-  // Build a shuffled index array.
-  int *draw_order = malloc(tb * sizeof(int));
-  for (int i = 0; i < tb; i++) draw_order[i] = i;
-  for (int i = tb - 1; i > 0; i--) {
-    int j = rand() % (i + 1);
-    int tmp = draw_order[i]; draw_order[i] = draw_order[j]; draw_order[j] = tmp;
+  // use a stable permutation so redraws do not allocate, shuffle, or flicker.
+  int stride = permutation_stride(display_blocks, st->draw_seed);
+  int slot = (int)(st->draw_seed % (uint32_t)display_blocks);
+  for (int count = 0; count < display_blocks; count++) {
+    int64_t representative = (int64_t)(slot + 1) * block_step - 1;
+    int disk_block = representative < tb ? (int)representative : tb - 1;
+    int file = st->blocks[disk_block].file_id;
+    if (file >= 0 && file < visible_files) {
+      SDL_Color color = vivid_palette[file % palette_size];
+      SDL_SetRenderDrawColor(st->renderer, color.r, color.g, color.b,
+                             color.a);
+      int row = slot / gcols;
+      int col = slot % gcols;
+      int x1 = panel_x;
+      int y1 = card_start_y + file * (card_h + card_pad) + card_h / 2;
+      int x2 = grid_left + col * gcw + gcw / 2;
+      int y2 = grid_top + row * gch + gch / 2;
+      SDL_RenderDrawLine(st->renderer, x1, y1, x2, y2);
+      SDL_RenderDrawLine(st->renderer, x1, y1 + 1, x2, y2 + 1);
+    }
+    slot += stride;
+    if (slot >= display_blocks) {
+      slot -= display_blocks;
+    }
   }
-  for (int k = 0; k < tb; k++) {
-    int i = draw_order[k];
-    int fi = st->blocks[i].file_id;
-    if (fi < 0 || fi >= nfiles) continue;
-    SDL_Color c = vivid_palette[fi % palette_size];
-    SDL_SetRenderDrawColor(st->renderer, c.r, c.g, c.b, c.a);
-    int x1 = card_lx[fi];
-    int y1 = card_cy[fi];
-    int x2 = blk_cx[i];
-    int y2 = blk_cy[i];
-    SDL_RenderDrawLine(st->renderer, x1, y1, x2, y2);
-    SDL_RenderDrawLine(st->renderer, x1, y1 + 1, x2, y2 + 1);
-  }
-  free(draw_order);
-
-  free(blk_cx);
-  free(blk_cy);
-  free(card_lx);
-  free(card_cy);
 }
 
 
@@ -1914,104 +2194,39 @@ static void render_fs_grid(AppState *st) {
 // highlight_hf: bright borders on header/footer blocks (frame 7)
 // -------------------------------------------------------------------
 static void render_jigsaw(AppState *st, bool highlight_hf) {
-  int win_w, win_h;
-  SDL_GetRendererOutputSize(st->renderer, &win_w, &win_h);
-  (void)win_w;
-  (void)win_h;
-
   SDL_SetRenderDrawColor(st->renderer, 0, 0, 0, 255);
   SDL_RenderClear(st->renderer);
 
-  // find max file_block per file for footer detection
-  int *max_fb = NULL;
-  if (highlight_hf && st->num_files > 0) {
-    max_fb = malloc(st->num_files * sizeof(int));
-    if (max_fb) {
-      for (int i = 0; i < st->num_files; i++) {
-        max_fb[i] = -1;
+  int first;
+  int last;
+  visible_block_range(st, &first, &last);
+  for (int idx = first; idx < last; idx++) {
+    int row = idx / st->grid_cols;
+    int col = idx % st->grid_cols;
+
+    SDL_Rect dst = {st->grid_x + col * st->cell_w, st->grid_y + row * st->cell_h - st->scroll_y, st->cell_w, st->cell_h};
+    render_block(st, idx, &dst);
+
+    // highlight hovered block
+    if (idx == st->hover_block) {
+      SDL_SetRenderDrawColor(st->renderer, 255, 255, 0, 255);
+      SDL_RenderDrawRect(st->renderer, &dst);
+      SDL_Rect inner = {dst.x + 1, dst.y + 1, dst.w - 2, dst.h - 2};
+      SDL_RenderDrawRect(st->renderer, &inner);
+    }
+
+    // H/F highlighting
+    if (highlight_hf) {
+      DiskBlock *blk = &st->blocks[idx];
+      if (blk->type == BTYPE_HEADER) {
+        render_hf_marker(st, &dst, true);
       }
-      for (int b = 0; b < st->total_blocks; b++) {
-        DiskBlock *blk = &st->blocks[b];
-        if (blk->file_id >= 0 && blk->file_id < st->num_files) {
-          if (blk->file_block > max_fb[blk->file_id]) {
-            max_fb[blk->file_id] = blk->file_block;
-          }
-        }
+      else if (blk->file_id >= 0 && blk->file_id < st->num_files &&
+               blk->file_block ==
+                   st->index.max_file_block[blk->file_id]) {
+        render_hf_marker(st, &dst, false);
       }
     }
-  }
-
-  for (int row = 0; row < st->grid_rows; row++) {
-    for (int col = 0; col < st->grid_cols; col++) {
-      int idx = row * st->grid_cols + col;
-      if (idx >= st->total_blocks) {
-        break;
-      }
-
-      SDL_Rect dst = {st->grid_x + col * st->cell_w, st->grid_y + row * st->cell_h - st->scroll_y, st->cell_w, st->cell_h};
-      render_block(st, idx, &dst);
-
-      // highlight hovered block
-      if (idx == st->hover_block) {
-        SDL_SetRenderDrawColor(st->renderer, 255, 255, 0, 255);
-        SDL_RenderDrawRect(st->renderer, &dst);
-        SDL_Rect inner = {dst.x + 1, dst.y + 1, dst.w - 2, dst.h - 2};
-        SDL_RenderDrawRect(st->renderer, &inner);
-      }
-
-      // H/F highlighting
-      if (highlight_hf && max_fb) {
-        DiskBlock *blk = &st->blocks[idx];
-        if (blk->type == BTYPE_HEADER) {
-          // Header: thick green border + green "H"
-          SDL_SetRenderDrawColor(st->renderer, 30, 255, 30, 255);
-          for (int b = 0; b < 6; b++) {
-            SDL_Rect br = {dst.x + b, dst.y + b, dst.w - 2*b, dst.h - 2*b};
-            SDL_RenderDrawRect(st->renderer, &br);
-          }
-          if (st->font_label && st->cell_w >= 12 && st->cell_h >= 12) {
-            SDL_Color yclr = {30, 255, 30, 255};
-            SDL_Surface *hs = TTF_RenderText_Blended(st->font_label, "H", yclr);
-            if (hs) {
-              SDL_Texture *ht = SDL_CreateTextureFromSurface(st->renderer, hs);
-              if (ht) {
-                int hw = hs->w, hh = hs->h;
-                SDL_Rect hr = {dst.x + 6, dst.y + 6, hw, hh};
-                SDL_RenderCopy(st->renderer, ht, NULL, &hr);
-                SDL_DestroyTexture(ht);
-              }
-              SDL_FreeSurface(hs);
-            }
-          }
-        }
-        else if (blk->file_id >= 0 && blk->file_id < st->num_files && blk->file_block == max_fb[blk->file_id]) {
-          // Footer: thick red border + red "F"
-          SDL_SetRenderDrawColor(st->renderer, 255, 30, 30, 255);
-          for (int b = 0; b < 6; b++) {
-            SDL_Rect br = {dst.x + b, dst.y + b, dst.w - 2*b, dst.h - 2*b};
-            SDL_RenderDrawRect(st->renderer, &br);
-          }
-          if (st->font_label && st->cell_w >= 12 && st->cell_h >= 12) {
-            SDL_Color cclr = {255, 30, 30, 255};
-            SDL_Surface *fs = TTF_RenderText_Blended(st->font_label, "F", cclr);
-            if (fs) {
-              SDL_Texture *ft_tex = SDL_CreateTextureFromSurface(st->renderer, fs);
-              if (ft_tex) {
-                int fw = fs->w, fh = fs->h;
-                SDL_Rect fr = {dst.x + 6, dst.y + 6, fw, fh};
-                SDL_RenderCopy(st->renderer, ft_tex, NULL, &fr);
-                SDL_DestroyTexture(ft_tex);
-              }
-              SDL_FreeSurface(fs);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (max_fb) {
-    free(max_fb);
   }
 }
 
@@ -2114,6 +2329,7 @@ int main(int argc, char *argv[]) {
 
   AppState st = {0};
   st.hover_block = -1;
+  st.tooltip_block = -1;
   st.view_mode = 0;
   st.prev_view_mode = 0;
   st.transition_alpha = 1.0f;  // no transition at start
@@ -2121,17 +2337,42 @@ int main(int argc, char *argv[]) {
   st.basedir[0] = '\0';
   st.max_files = INITIAL_FILES;
   st.files = calloc(st.max_files, sizeof(FileInfo));
+  if (! st.files) {
+    fprintf(stderr, "%sERROR: Memory allocation failure.%s\n", RED, BLACK);
+    return 1;
+  }
+  for (int i = 0; i < BLOCK_LABEL_CACHE_SIZE; i++) {
+    st.block_label_cache[i].block_index = -1;
+  }
   init_file_hash(&st);
 
   const char *keyfile = argv[1];
-  for (int i = 2; i < argc - 1; i++) {
+  for (int i = 2; i < argc; i++) {
     if (! strcmp(argv[i], "-d")) {
-      strncpy(st.basedir, argv[i + 1], MAX_PATH_LEN - 1);
+      if (i + 1 >= argc) {
+        usage();
+        fprintf(stderr, "%sERROR: -d requires a base directory.%s\n", RED,
+                BLACK);
+        return 1;
+      }
+      snprintf(st.basedir, sizeof(st.basedir), "%s", argv[i + 1]);
       i++;
+    }
+    else {
+      usage();
+      fprintf(stderr, "%sERROR: Unknown option: %s%s\n", RED, argv[i],
+              BLACK);
+      return 1;
     }
   }
 
   if (! parse_keyfile(keyfile, &st)) {
+    return 1;
+  }
+  if (! diskviz_index_build(&st.index, st.blocks, st.total_blocks,
+                             st.num_files)) {
+    fprintf(stderr, "%sERROR: Can't build disk visualization index.%s\n",
+            RED, BLACK);
     return 1;
   }
 
@@ -2140,7 +2381,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "%sERROR: SDL_Init failed: %s%s\n", RED, SDL_GetError(), BLACK);
     return 1;
   }
-  if (IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG) == 0) {
+  int image_flags = IMG_INIT_PNG | IMG_INIT_JPG;
+  if ((IMG_Init(image_flags) & image_flags) != image_flags) {
     fprintf(stderr, "%sERROR: IMG_Init failed: %s%s\n", RED, IMG_GetError(), BLACK);
     return 1;
   }
@@ -2157,6 +2399,10 @@ int main(int argc, char *argv[]) {
   }
 
   st.renderer = SDL_CreateRenderer(st.window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+  if (! st.renderer) {
+    // fall back for headless sessions and systems without an accelerated driver.
+    st.renderer = SDL_CreateRenderer(st.window, -1, SDL_RENDERER_SOFTWARE);
+  }
   if (! st.renderer) {
     fprintf(stderr, "%sERROR: SDL_CreateRenderer failed: %s%s\n", RED, SDL_GetError(), BLACK);
     return 1;
@@ -2241,17 +2487,28 @@ int main(int argc, char *argv[]) {
           int rw, rh, ww, wh;
           SDL_GetRendererOutputSize(st.renderer, &rw, &rh);
           SDL_GetWindowSize(st.window, &ww, &wh);
-          float sx = (float)rw / ww, sy = (float)rh / wh;
-          int mx = (int)(ev.motion.x * sx) - st.grid_x;
-          int my = (int)(ev.motion.y * sy) - st.grid_y;
-          int col = mx / st.cell_w;
-          int row = (my + st.scroll_y) / st.cell_h;
-          int idx = row * st.grid_cols + col;
-          if (col >= 0 && col < st.grid_cols && idx >= 0 && idx < st.total_blocks) {
-            st.hover_block = idx;
+          if (ww <= 0 || wh <= 0) {
+            st.hover_block = -1;
           }
           else {
-            st.hover_block = -1;
+            float sx = (float)rw / ww;
+            float sy = (float)rh / wh;
+            int mx = (int)(ev.motion.x * sx) - st.grid_x;
+            int my = (int)(ev.motion.y * sy) - st.grid_y;
+            int col = mx >= 0 ? mx / st.cell_w : -1;
+            int64_t row_pixel = (int64_t)my + st.scroll_y;
+            int64_t row = row_pixel >= 0 ? row_pixel / st.cell_h : -1;
+            int64_t position = row * st.grid_cols + col;
+            if (col >= 0 && col < st.grid_cols && row >= 0 &&
+                position >= 0 && position < st.total_blocks) {
+              int idx = (int)position;
+              st.hover_block = (st.view_mode == 2 || st.view_mode == 3)
+                                   ? st.index.linear_map[idx]
+                                   : idx;
+            }
+            else {
+              st.hover_block = -1;
+            }
           }
         }
         else {
@@ -2267,14 +2524,16 @@ int main(int argc, char *argv[]) {
       case SDL_MOUSEWHEEL: {
         // scroll only active in block-grid views
         if (st.view_mode == 2 || st.view_mode == 3 || st.view_mode == 6 || st.view_mode == 7) {
-          int scroll_speed = st.cell_h * 3;
-          st.scroll_y -= ev.wheel.y * scroll_speed;
-          if (st.scroll_y < 0) {
-            st.scroll_y = 0;
+          int64_t scroll_speed = (int64_t)st.cell_h * 3;
+          int64_t scroll = (int64_t)st.scroll_y -
+                           (int64_t)ev.wheel.y * scroll_speed;
+          if (scroll < 0) {
+            scroll = 0;
           }
-          if (st.scroll_y > st.max_scroll_y) {
-            st.scroll_y = st.max_scroll_y;
+          if (scroll > st.max_scroll_y) {
+            scroll = st.max_scroll_y;
           }
+          st.scroll_y = (int)scroll;
           need_render = true;
         }
         break;
@@ -2400,7 +2659,9 @@ int main(int argc, char *argv[]) {
         int rw, rh, ww, wh;
         SDL_GetRendererOutputSize(st.renderer, &rw, &rh);
         SDL_GetWindowSize(st.window, &ww, &wh);
-        render_tooltip(&st, mx * rw / ww, my * rh / wh);
+        if (ww > 0 && wh > 0) {
+          render_tooltip(&st, mx * rw / ww, my * rh / wh);
+        }
       }
 
       SDL_RenderPresent(st.renderer);
@@ -2415,6 +2676,7 @@ int main(int argc, char *argv[]) {
   restore_terminal();
 
   // cleanup
+  destroy_text_caches(&st);
   for (int i = 0; i < st.num_files; i++) {
     if (st.files[i].texture) {
       SDL_DestroyTexture(st.files[i].texture);
@@ -2438,6 +2700,7 @@ int main(int argc, char *argv[]) {
   if (st.font_title) {
     TTF_CloseFont(st.font_title);
   }
+  diskviz_index_destroy(&st.index);
   free(st.blocks);
   free(st.files);
   oa_hash_free(&st.file_hash);

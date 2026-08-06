@@ -4,6 +4,7 @@
 //
 
 #include "prioque.h"
+#include <sys/stat.h>
 
 #define QUEUE_MAGIC 0xC0FFEEC0FFEE
 
@@ -903,7 +904,6 @@ bool serialize_queue(Queue *q,
   uint64_t num =
       (uint64_t)atomic_load_explicit(&q->queuelength, memory_order_acquire);
   if (fwrite(&num, sizeof(num), 1, fp) != 1) {
-    pthread_mutex_unlock(&q->lock);
     ok = false;
     goto done;
   }
@@ -960,6 +960,25 @@ bool serialize_queue_h(Queue *q,
 }
 
 
+// reject impossible element counts for regular files before invoking callbacks.
+// Non-regular streams cannot be preflighted and remain callback-validated.
+//
+static bool serialized_count_fits_regular_file(FILE *fp, uint64_t count) {
+
+  struct stat statbuf;
+  off_t position;
+  int handle = fileno(fp);
+
+  if (handle < 0 || fstat(handle, &statbuf) != 0 || ! S_ISREG(statbuf.st_mode)) {
+    return true;
+  }
+
+  position = ftello(fp);
+  return position >= 0 && statbuf.st_size >= position
+         && count <= (uint64_t)(statbuf.st_size - position);
+}
+
+
 bool deserialize_queue(Queue *q,
                        bool (*deserialize_element)(void **, int64_t *, FILE *,
                                                    StateSerialization),
@@ -992,6 +1011,12 @@ bool deserialize_queue(Queue *q,
   // read element count
   if (fread(&num_elements, sizeof(num_elements), 1, fp) != 1) {
     perror("couldn't deserialize number of elements");
+    ok = false;
+    goto done;
+  }
+  if (! serialized_count_fits_regular_file(fp, num_elements)) {
+    errno = EPROTO;
+    fprintf(stderr, "queue element count exceeds remaining input\n");
     ok = false;
     goto done;
   }

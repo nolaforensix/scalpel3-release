@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it
 // under the terms of the GNU General Public License as published by the Free
@@ -203,6 +203,7 @@ typedef char uuid_string_t[37];
 #include <openssl/hmac.h>
 #include <pcre2.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -231,11 +232,27 @@ typedef char uuid_string_t[37];
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include "hashv4.h"
+
+// type of CarveInfo candidate to write. This definition precedes filemirror.h because the shared
+// asynchronous publication interface uses the flavor to select write-once or replacement semantics.
+typedef enum CarveInfoFlavor {
+  NO_FLAVOR = 0,
+  VALIDATED = 1,
+  PROMISING = 2,
+  INPROGRESS = 3
+} CarveInfoFlavor;
+
 #if !defined(SCALPEL3_EXTERNAL)
 #include "dirname.h"
 #include "filemirror.h"
 #include "scalpelsimd.h"
-#include "exe_vision/unix/elf_onnx_global.h"
+#include "exe_vision/unix/elf_onnx.h"
+// NOTE: MoDiCo headers are intentionally NOT included here. modico.h pulls in
+// onnxruntime_c_api.h, and dragging that into every scalpel.h consumer would
+// force the ORT include path onto ORT-free tools (fragmentator, crblockmap,
+// ...). The ScalpelState MoDiCo fields below use only primitive types, so the
+// .c files that actually call MoDiCo (scalpel.c, carve.c) include the MoDiCo
+// headers directly.
 #endif
 
 // set default mutex type
@@ -244,6 +261,7 @@ typedef char uuid_string_t[37];
 // #define PTHREAD_MUTEX_TYPE PTHREAD_MUTEX_NORMAL
 
 #define CEILDIV(n, d) (((n) + (d) - 1) / (d))
+#define NANOSECONDS_PER_SECOND INT64_C(1000000000)
 
 // only 64-bit platforms are supported
 #define off64_t off_t
@@ -295,6 +313,13 @@ typedef enum SearchType {
 #define MAX_STRING_LENGTH (4096 + 1)
 #define MAX_MATCHES_PER_BUFFER 1000000
 
+// maximum number of file subtypes (e.g., csv-Ncol) that can be created during block
+// validation, beyond the base file types. The array is preallocated with this much slack so
+// add_file_subtype() can append a subtype in place instead of realloc()ing -- realloc would
+// relocate it (and its embedded mutexes and atomics) while validation threads read it
+// lock-free. Subtypes beyond this cap fold into their master type.
+#define MAX_FILE_SUBTYPES 1024
+
 // scalpel3 IPC commands and responses
 #define SOCKBUFSIZE (32 * 1024 * 1024)
 
@@ -335,7 +360,7 @@ typedef enum SearchType {
 #define CHECKPOINTEXIT_CMD "CHECKPOINTEXIT"
 #define CHECKPOINTEXIT_CMD_LEN (strlen(CHECKPOINTEXIT_CMD) + 1)
 #define CHECKPOINTEXIT_RESPONSE \
-  "Checkpoint and exit queued by scalpel3. Shutting down soon. Please be patient."
+  "Stop request queued. Checkpoint only if restartable state exists."
 #define CHECKPOINTEXIT_RESPONSE_LEN (strlen(CHECKPOINTEXIT_RESPONSE) + 1)
 
 #define PROGRESSCHECKPOINT_CMD "PROGRESS"
@@ -343,6 +368,10 @@ typedef enum SearchType {
 #define PROGRESSCHECKPOINT_RESPONSE_NACK \
   "A checkpointing operation is in progress. Please try again later."
 #define PROGRESSCHECKPOINT_RESPONSE_NACK_LEN (strlen(PROGRESSCHECKPOINT_RESPONSE_NACK) + 1)
+#define PROGRESSCHECKPOINT_RESPONSE_NOT_READY \
+  "Progress checkpoints are available only during fragmented recovery. Please try again later."
+#define PROGRESSCHECKPOINT_RESPONSE_NOT_READY_LEN \
+  (strlen(PROGRESSCHECKPOINT_RESPONSE_NOT_READY) + 1)
 #define PROGRESSCHECKPOINT_RESPONSE_ACK                                                 \
   "All current candidates written to INPROGRESS directories.\n"
 #define PROGRESSCHECKPOINT_RESPONSE_ACK_LEN (strlen(PROGRESSCHECKPOINT_RESPONSE_ACK) + 1)
@@ -358,6 +387,63 @@ typedef enum SearchType {
 #define CARVE_HASH_KEY_PRINTABLE_SIZE (2 * CARVE_HASH_KEY_SIZE + 1)
 #define BLOCK_HASH_KEY_SIZE (sizeof(int32_t) + sizeof(int64_t) + 1)
 #define BLOCK_HASH_KEY_PRINTABLE_SIZE (2 * BLOCK_HASH_KEY_SIZE + 1)
+
+// persistent block-classification database format
+#define BLOCKCLASSIFICATION_FILENAME "blockclassification.dat"
+#define BLOCKCLASSIFICATION_MAGIC "S3BCLASS"
+#define BLOCKCLASSIFICATION_MAGIC_SIZE 8
+#define BLOCKCLASSIFICATION_VERSION 1U
+
+// restartable checkpoints use two alternating slots. A new checkpoint is written completely to the
+// inactive slot before CHECKPOINT_CURRENT_FILENAME is atomically replaced, so the previously
+// published slot remains available if the update is interrupted.
+#define CHECKPOINT_SLOT_COUNT 2U
+#define CHECKPOINT_MANIFEST_FILE_COUNT 3U
+#define CHECKPOINT_MANIFEST_MUTABLE_FILE_COUNT 2U
+#define CHECKPOINT_FORMAT_VERSION 3U
+#define CHECKPOINT_MANIFEST_MAGIC "S3CPMAN3"
+#define CHECKPOINT_CURRENT_MAGIC "S3CPCUR3"
+#define CHECKPOINT_MAGIC_SIZE 8U
+#define CHECKPOINT_CURRENT_FILENAME "checkpoint_current.chk"
+#define CHECKPOINT_STATE_COMPONENT "scalpel_state"
+#define CHECKPOINT_QUEUE_COMPONENT "promising_queue"
+#define CHECKPOINT_MANIFEST_COMPONENT "checkpoint_manifest"
+
+typedef enum CheckpointComponent {
+  CHECKPOINT_COMPONENT_STATE = 0,
+  CHECKPOINT_COMPONENT_QUEUE = 1,
+  CHECKPOINT_COMPONENT_MANIFEST = 2,
+} CheckpointComponent;
+
+typedef struct CheckpointManifest {
+  char magic[CHECKPOINT_MAGIC_SIZE];
+  uint32_t version;
+  uint32_t num_files;
+  uint64_t sequence_number;
+  int64_t timestamp;
+  unsigned char scalpel_sha256[SHA256_DIGEST_LENGTH];
+  struct {
+    char filename[PATH_MAX];
+    unsigned char sha256[SHA256_DIGEST_LENGTH];
+  } files[CHECKPOINT_MANIFEST_FILE_COUNT];
+  unsigned char hmac[SHA256_DIGEST_LENGTH];
+} CheckpointManifest;
+
+typedef struct CheckpointCurrent {
+  char magic[CHECKPOINT_MAGIC_SIZE];
+  uint32_t version;
+  uint32_t slot;
+  uint64_t sequence_number;
+  unsigned char sha256[SHA256_DIGEST_LENGTH];
+} CheckpointCurrent;
+
+typedef struct CheckpointSelection {
+  uint32_t slot;
+  CheckpointManifest manifest;
+  char state_path[PATH_MAX];
+  char queue_path[PATH_MAX];
+  char manifest_path[PATH_MAX];
+} CheckpointSelection;
 
 // defines all scalpel error codes
 typedef enum ScalpelError {
@@ -399,6 +485,7 @@ typedef enum ScalpelError {
   SCALPEL_ERROR_SUBTYPE_ERROR,
   SCALPEL_ERROR_BLOCK_STATE_IS_READ_ONLY,
   SCALPEL_ERROR_BAD_START_END_BLOCKS,
+  SCALPEL_ERROR_OUTPUT_DIRECTORY_IN_USE,
 } ScalpelError;
 
 #define SCALPEL_WILDCARD_CHAR '?'
@@ -417,14 +504,42 @@ typedef union SearchState {
 } SearchState;
 
 
-// result of block evaluation for block validator functions--this value MUST be representable with 4
-// bits and BLOCK_CONFIDENCE_INVALID MUST BE ZERO.  The value indicates confidence that the block is
-// of a specific file type.
+// result of block evaluation for block validator functions--this value MUST be
+// representable within an unsigned char and BLOCK_CONFIDENCE_INVALID MUST BE
+// ZERO.  The value indicates confidence that the block is of a specific file
+// type.
 typedef enum BlockValidationDecision {
   BLOCK_CONFIDENCE_INVALID = 0,  // block ABSOLUTELY DOES NOT validate as type ** MUST BE ZERO **
   BLOCK_CONFIDENCE_LOW = 1,      // possibly validates as type with low confidence
-  BLOCK_CONFIDENCE_VALID = 15    // validates as type with highest possible confidence
+  BLOCK_CONFIDENCE_VALID = 100   // validates as type with highest possible confidence
 } BlockValidationDecision;
+
+
+// controls when a file type's block validator runs. BLOCK_VALIDATION_ALWAYS is deliberately zero
+// so omitted scalpelconf.c initializers retain the conservative behavior. Reassembly-only
+// validators are skipped under -c, while disabled validators are never run. Confidence not supplied
+// by MoDiCo or another classifier is defaulted to BLOCK_CONFIDENCE_VALID when a validator is skipped.
+typedef enum BlockValidationScope {
+  BLOCK_VALIDATION_ALWAYS = 0,
+  BLOCK_VALIDATION_REASSEMBLY_ONLY,
+  BLOCK_VALIDATION_DISABLED
+} BlockValidationScope;
+
+
+// optional terminal phase selected by -H
+typedef enum HaltAfterPhase {
+  HALT_AFTER_NONE = 0,
+  HALT_AFTER_BLOCK_VALIDATION,
+  HALT_AFTER_HEADER_FOOTER
+} HaltAfterPhase;
+
+
+// one (file type, decision) pair for filemirror_set_blocktype_batch(). Defined here rather than in
+// filemirror.h because it needs the complete BlockValidationDecision enum above.
+typedef struct BlocktypeAssignment {
+  uint32_t filetype;
+  BlockValidationDecision blocktype;
+} BlocktypeAssignment;
 
 
 // when file type prioritization is on, a complete set of file carving passes is
@@ -448,6 +563,7 @@ typedef struct ThreadWork {
   int id;
   atomic_bool thread_running;  // thread is alive?
   atomic_bool thread_stop;     // if true, should exit
+  uint64_t last_kill_generation_checked;  // runtime-only kill queue scan state
 } ThreadWork;
 
 
@@ -472,22 +588,15 @@ typedef struct BlockInfo {
 
   // block-validation callbacks copied from SearchSpec before queueing, since
   // scalpel_state.search_specs must be locked before access during block
-  // validation.
+  // validation. The decision pointer is an input/output value: validate_block()
+  // seeds it with the current stored block confidence before invoking the
+  // callback and stores the returned value afterward.
   uint32_t (*blockvalidator)(char *data, uint64_t length,
                              BlockValidationDecision *decision,
                              uint64_t *validates_to, uint32_t needleidx,
                              uint32_t blocksize, void *blockhashkey);
   void (*printblockstatefunc)(const void *state);  // optional block-state printer
 } BlockInfo;
-
-
-// type of CarveInfo candidate to write
-typedef enum CarveInfoFlavor {
-  NO_FLAVOR = 0,
-  VALIDATED = 1,
-  PROMISING = 2,
-  INPROGRESS = 3
-} CarveInfoFlavor;
 
 
 // tracks info about one file carving candidate.  Note that many of these fields are present to
@@ -501,7 +610,7 @@ typedef struct CarveInfo {
                                     // extending the candidate.  Storing the actual
                                     // blocknumber is necessary for the block number
                                     // to survive blockmap changes
-  int64_t block_choice_start;       // starting point for search for next apparent block number
+  int64_t block_choice_start;       // next-choice cursor; -1 requests a random start
   ValidateWorkload workload;        // type of validation work assigned to thread
   char *filetype;                   // quick access to file type
   SearchType searchtype;            // quick access to searchtype for file type
@@ -628,11 +737,27 @@ typedef struct SearchSpec {
   // block validation function
   uint32_t (*BLOCKVALIDATOR)(char *data,                         // pointer to block of data to evaluate
                              uint64_t length,                    // length of data block
-                             BlockValidationDecision *decision,  // decision regarding block data
+                             BlockValidationDecision *decision,  // input/output confidence for block data
                              uint64_t *validates_to,             // index at which certainty drops to zero
-                             uint32_t needleidx,                 // index into scalpel_state.search_specs() for file type
+                             uint32_t needleidx,                 // index into
+								 // scalpel_state.search_specs() for
+								 // file type
                              uint32_t blocksize,                 // block size of image file
                              void *blockhashkey);                // hash key for block validator global storage
+
+  // batched block validation function. Iterates the apparent blocks itself and records a decision
+  // for each via filemirror_set_blocktype(). MUTUALLY EXCLUSIVE with BLOCKVALIDATOR. May create
+  // subtypes with add_file_subtype(), like a single-block validator. Returns nothing: it records
+  // its own decisions rather than handing an index back to the framework. Validation backed by an
+  // ONNX model (or any GPU resource) must use this form, never BLOCKVALIDATOR: owning the iteration
+  // lets the validator initialize its model at the top of its body (via the onnx_providers.h
+  // accessors), batch its inference, and tear down at the bottom, entirely within its own .h file.
+  void (*BATCHEDBLOCKVALIDATOR)(uint32_t needleidx,             // index into
+								// scalpel_state.search_specs() for
+								// file type
+                                uint32_t blocksize);            // block size of image file
+
+  BlockValidationScope BLOCKVALIDATIONSCOPE;  // when block validation is required
 
   // file validation function
   void (*FILEVALIDATOR)(char *data,                              // pointer to buffer containing data to evaluate
@@ -643,6 +768,13 @@ typedef struct SearchSpec {
                         uint32_t needleidx,                      // index into scalpel_state.search_specs() for file type
                         uint32_t blocksize,                      // block size of image file
                         void *carvehashkey);                     // hash key for file validator global storage
+
+  // optional candidate-level validation function. Unlike FILEVALIDATOR, this callback can inspect
+  // the candidate's physical block mapping as well as its reconstructed bytes.
+  void (*CANDIDATEVALIDATOR)(CarveInfo *candidate,
+                             bool *validates,
+                             uint64_t *validates_to,
+                             bool *promising);
 
   // don't carve function
   bool (*DONTCARVE)(char *data,                                  // pointer to buffer containing data to evaluate
@@ -804,6 +936,7 @@ typedef struct ScalpelState {
   uint32_t num_specs;                     // number of file types                         (C)
   pthread_mutex_t search_specs_lock;      // lock for adding subtypes
   SearchSpec *search_specs;               // specifications of file types to carve        (C)
+  uint32_t search_specs_capacity;         // allocated search_specs slots (runtime only, not checkpointed)
   uint32_t longest_footer;                // length in bytes of longest footer            (C)
   uint64_t largest_maxfilesize;           // longest max file size in scalpelconf.h       (C)
   atomic_ulong files_written;             // total # of files written                     (C)
@@ -824,7 +957,7 @@ typedef struct ScalpelState {
   bool contig_header_reuse;               // reuse covered contiguous headers?             (C)
   bool no_defrag;                         // turns fragmented recovery off for all file
                                           // types                                        (C)
-  bool hf_only;                           // write header/footer database and exit?       (O)
+  HaltAfterPhase halt_after;              // terminal phase selected by -H               (O)
   bool backtrack;                         // backtracking during reassembly phases?       (C)
   uint64_t start_block;                   // if > 1, consider blocks before this block    (C)
                                           // number as covered and do not modify regions
@@ -856,10 +989,20 @@ typedef struct ScalpelState {
   bool contiguous_recovery_complete;      // has initial contiguous recovery completed?   (C)
   bool F1_initiated;                      // F1 reassembly yet for current priority?      (C)
   bool F2_initiated;                      // F2 reassembly yet for current priority?      (C)
+  int modico_requested;                   // -1 = auto, 0 = disabled, 1 = enabled         (C)
   // misc non-checkpointed state
   int neon;                               // shhhhhhhh.                                   (O)
   bool no_cp_validation;                  // allow checkpoint restart w/o checkpoint      (O)
                                           // validation
+
+  // MoDiCo block classifier (optional reassembly block prioritization).
+  // Rebuilt at startup every run (incl. resume); not checkpointed.
+  bool modico_enabled;                    // MoDiCo prioritization active this run?       (O)
+  int *modico_spec_to_class;              // [modico_num_specs] spec idx -> MoDiCo class
+                                          // index, or -1 if the type has no MoDiCo class.
+                                          // NULL when MoDiCo is disabled.                 (O)
+  uint32_t modico_num_specs;              // length of modico_spec_to_class (base specs
+                                          // captured at startup)                         (O)
 } ScalpelState;
 
 
@@ -886,6 +1029,8 @@ void portable_srandom(uint64_t seed);
 uint64_t portable_random(void);
 void check_memory_allocation(void *ptr, int line, const char *file,
                              const char *structure);
+bool copy_string_complete(char *destination, size_t destination_size,
+                          const char *source);
 bool read_essential_carveinfo_element(EssentialCarveInfo *element,
                                       FILE *fp);
 bool read_essential_carveinfo_queue(Queue *q, FILE *fp, bool init);
@@ -898,6 +1043,27 @@ int carveinfo_match_either_uuid(const void *c1, const void *c2);
 int essentialcarveinfo_match_both_uuids(const void *c1, const void *c2);
 void delete_files_recursive(const char *base_dir, const char *pattern);
 EssentialSearchSpecOffsets *deserialize_essential_offsets(char *filename, uint32_t *num_specs_out);
+bool checkpoint_slot_path(char *path, size_t path_size, const char *directory,
+                          CheckpointComponent component, uint32_t slot, bool temporary);
+bool checkpoint_hash_file(const char *filepath, unsigned char hash[SHA256_DIGEST_LENGTH]);
+bool checkpoint_durable_close(FILE *fp);
+bool checkpoint_atomic_replace(const char *temporary_path, const char *final_path,
+                               const char *directory);
+bool checkpoint_invalidate_slot(const char *directory, uint32_t slot);
+bool checkpoint_write_slot_manifest(const char *directory, uint32_t slot,
+                                    uint64_t sequence_number,
+                                    const unsigned char scalpel_sha256[SHA256_DIGEST_LENGTH]);
+bool checkpoint_publish_slot(const char *directory, uint32_t slot,
+                             uint64_t sequence_number);
+bool checkpoint_select_slot(const char *directory,
+                            const unsigned char expected_scalpel_sha256[SHA256_DIGEST_LENGTH],
+                            bool verify_integrity, CheckpointSelection *selection,
+                            FILE *diagnostics);
+bool checkpoint_select_slot_for_save(
+    const char *directory,
+    const unsigned char expected_scalpel_sha256[SHA256_DIGEST_LENGTH],
+    CheckpointSelection *selection, FILE *diagnostics);
+void checkpoint_test_crash_after(const char *stage);
 
 
 // prototypes for visible util.c functions
@@ -920,6 +1086,7 @@ void copy_search_spec(SearchSpec *d, SearchSpec *s);
 char *string_tolower(char *s);
 char *string_toupper(char *s);
 void ignore_nonprintable(char *s, uint64_t *len);
+void lock_output_directory(void);
 void init_output_directory(void);
 char *sprinthex(char *buf, char *s, int len, bool backslashes);
 bool is_regular_expression(char *s);
@@ -965,6 +1132,7 @@ char *displayable_block_hash_key(void *blockhashkey,
 char *displayable_carve_hash_key(void *carvehashkey,
                                  char output[CARVE_HASH_KEY_PRINTABLE_SIZE]);
 int num_physical_cores(void);
+int num_detected_physical_cores(void);
 int num_logical_cores(void);
 bool atomic_max_u64_pub(atomic_ullong *a, uint64_t b);
 void crash(void);
@@ -972,7 +1140,7 @@ noreturn void handle_error(ScalpelError error, char *str, int line, const char *
 
 // prototypes for visible reassembly.c functions
 void reassembly_share_work(int id, CarveInfo *candidate);
-bool reassembly_check_kill_queue(int id,
+bool reassembly_check_kill_queue(ThreadWork *work,
                                  CarveInfo **candidate,
                                  uuid_string_t uuidp,
                                  uuid_string_t uuidc);
@@ -1014,6 +1182,9 @@ extern atomic_bool TAKE_PERIODIC_CHECKPOINT;
 // controls progress checkpoints
 extern atomic_bool TAKE_PROGRESS_CHECKPOINT;
 
+// true only after scalpel3 has reached a restartable recovery boundary
+extern atomic_bool RESTARTABLE_CHECKPOINT_AVAILABLE;
+
 // flag that induces reassembly threads to flush work and go back into
 // idle state during a periodic or user-initiated checkpoint
 extern atomic_bool REASS_RETURN_TO_IDLE;
@@ -1026,6 +1197,7 @@ extern Queue reassembly_queue;
 
 // queue that holds UUIDs for candidates to be destroyed
 extern Queue kill_queue;
+extern atomic_ullong kill_queue_generation;
 
 // thread synchronization data
 extern atomic_bool carvelist_initialized;
@@ -1057,6 +1229,10 @@ extern uint32_t max_filemirror_threads_override;
 extern uint32_t max_reassembly_threads_override;
 extern uint32_t max_search_threads_override;
 extern uint32_t max_validation_threads_override;
+
+// CPU allocation shared by cursor-based and batched block validators.
+uint32_t block_validation_reserve_cpu_threads(uint32_t requested);
+void block_validation_release_cpu_threads(void);
 
 // perceived numbers of CPU cores
 extern int NC;

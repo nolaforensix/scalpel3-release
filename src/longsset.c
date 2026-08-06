@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and
 // contributors.
 //
 // This program is free software : you can redistribute it and / or modify it

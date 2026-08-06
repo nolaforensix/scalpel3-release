@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -33,6 +33,663 @@
 
 #include "scalpel.h"
 #include <fnmatch.h>
+#include <openssl/evp.h>
+
+
+// copy a string only when the complete value fits in the destination
+bool copy_string_complete(char *destination, size_t destination_size,
+                          const char *source) {
+
+  size_t length;
+
+  if (! destination || destination_size == 0 || ! source) {
+    errno = EINVAL;
+    return false;
+  }
+
+  length = strlen(source);
+  if (length >= destination_size) {
+    destination[0] = 0;
+    errno = ENAMETOOLONG;
+    return false;
+  }
+
+  memcpy(destination, source, length + 1);
+  return true;
+}
+
+
+static const char *checkpoint_component_name(CheckpointComponent component) {
+
+  switch (component) {
+  case CHECKPOINT_COMPONENT_STATE:
+    return CHECKPOINT_STATE_COMPONENT;
+  case CHECKPOINT_COMPONENT_QUEUE:
+    return CHECKPOINT_QUEUE_COMPONENT;
+  case CHECKPOINT_COMPONENT_MANIFEST:
+    return CHECKPOINT_MANIFEST_COMPONENT;
+  }
+
+  return NULL;
+}
+
+
+static bool checkpoint_slot_filename(char *filename, size_t filename_size,
+                                     CheckpointComponent component, uint32_t slot) {
+
+  const char *name = checkpoint_component_name(component);
+  int written;
+
+  if (! filename || filename_size == 0 || ! name || slot >= CHECKPOINT_SLOT_COUNT) {
+    errno = EINVAL;
+    return false;
+  }
+
+  written = snprintf(filename, filename_size, "%s.%" PRIu32 ".chk", name, slot);
+  if (written < 0 || (size_t)written >= filename_size) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+
+  return true;
+}
+
+
+bool checkpoint_slot_path(char *path, size_t path_size, const char *directory,
+                          CheckpointComponent component, uint32_t slot, bool temporary) {
+
+  char filename[PATH_MAX];
+  int written;
+
+  if (! path || path_size == 0 || ! directory
+      || ! checkpoint_slot_filename(filename, sizeof(filename), component, slot)) {
+    errno = EINVAL;
+    return false;
+  }
+
+  written = snprintf(path, path_size, "%s/%s%s", directory, filename,
+                     temporary ? "_" : "");
+  if (written < 0 || (size_t)written >= path_size) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+
+  return true;
+}
+
+
+static bool checkpoint_sync_fd(int fd) {
+
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+  if (fcntl(fd, F_FULLFSYNC) == 0) {
+    return true;
+  }
+
+  if (errno != EINVAL && errno != ENOTSUP && errno != ENOTTY) {
+    return false;
+  }
+#endif
+
+  return fsync(fd) == 0;
+}
+
+
+static bool checkpoint_sync_directory(const char *directory) {
+
+  int fd = open(directory, O_RDONLY);
+  int saved_errno = 0;
+
+  if (fd < 0) {
+    return false;
+  }
+
+  if (! checkpoint_sync_fd(fd)) {
+    saved_errno = errno;
+  }
+  if (close(fd) != 0 && saved_errno == 0) {
+    saved_errno = errno;
+  }
+
+  if (saved_errno != 0) {
+    errno = saved_errno;
+    return false;
+  }
+
+  return true;
+}
+
+
+bool checkpoint_durable_close(FILE *fp) {
+
+  int saved_errno = 0;
+
+  if (! fp) {
+    errno = EINVAL;
+    return false;
+  }
+
+  if (fflush(fp) != 0) {
+    saved_errno = errno;
+  }
+  if (! checkpoint_sync_fd(fileno(fp)) && saved_errno == 0) {
+    saved_errno = errno;
+  }
+  if (fclose(fp) != 0 && saved_errno == 0) {
+    saved_errno = errno;
+  }
+
+  if (saved_errno != 0) {
+    errno = saved_errno;
+    return false;
+  }
+
+  return true;
+}
+
+
+bool checkpoint_atomic_replace(const char *temporary_path, const char *final_path,
+                               const char *directory) {
+
+  if (! temporary_path || ! final_path || ! directory) {
+    errno = EINVAL;
+    return false;
+  }
+
+  if (rename(temporary_path, final_path) != 0) {
+    return false;
+  }
+
+  return checkpoint_sync_directory(directory);
+}
+
+
+bool checkpoint_hash_file(const char *filepath, unsigned char hash[SHA256_DIGEST_LENGTH]) {
+
+  unsigned char buffer[64 * 1024];
+  EVP_MD_CTX *context = NULL;
+  FILE *fp = NULL;
+  unsigned int hash_length = 0;
+  size_t count;
+  bool ok = false;
+
+  if (! filepath || ! hash) {
+    errno = EINVAL;
+    return false;
+  }
+
+  fp = fopen(filepath, "rb");
+  context = EVP_MD_CTX_new();
+  if (! fp || ! context || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
+    goto done;
+  }
+
+  while ((count = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+    if (EVP_DigestUpdate(context, buffer, count) != 1) {
+      goto done;
+    }
+  }
+
+  if (ferror(fp)
+      || EVP_DigestFinal_ex(context, hash, &hash_length) != 1
+      || hash_length != SHA256_DIGEST_LENGTH) {
+    goto done;
+  }
+
+  ok = true;
+
+done:
+  EVP_MD_CTX_free(context);
+  if (fp && fclose(fp) != 0) {
+    ok = false;
+  }
+  return ok;
+}
+
+
+void checkpoint_test_crash_after(const char *stage) {
+
+  const char *requested = getenv("SCALPEL3_TEST_CHECKPOINT_CRASH_AFTER");
+
+  if (requested && stage && strcmp(requested, stage) == 0) {
+    static const char message[] = "Checkpoint fault injection requested; terminating immediately.\n";
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(86);
+  }
+}
+
+
+bool checkpoint_invalidate_slot(const char *directory, uint32_t slot) {
+
+  char path[PATH_MAX];
+  char temporary_path[PATH_MAX];
+  bool changed = false;
+
+  if (! checkpoint_slot_path(path, sizeof(path), directory,
+                             CHECKPOINT_COMPONENT_MANIFEST, slot, false)
+      || ! checkpoint_slot_path(temporary_path, sizeof(temporary_path), directory,
+                                CHECKPOINT_COMPONENT_MANIFEST, slot, true)) {
+    return false;
+  }
+
+  if (unlink(path) == 0) {
+    changed = true;
+  }
+  else if (errno != ENOENT) {
+    return false;
+  }
+
+  if (unlink(temporary_path) == 0) {
+    changed = true;
+  }
+  else if (errno != ENOENT) {
+    return false;
+  }
+
+  return ! changed || checkpoint_sync_directory(directory);
+}
+
+
+bool checkpoint_write_slot_manifest(const char *directory, uint32_t slot,
+                                    uint64_t sequence_number,
+                                    const unsigned char scalpel_sha256[SHA256_DIGEST_LENGTH]) {
+
+  CheckpointManifest manifest = {0};
+  char path[PATH_MAX];
+  char temporary_path[PATH_MAX];
+  char filename[PATH_MAX];
+  FILE *fp;
+
+  if (! directory || ! scalpel_sha256 || slot >= CHECKPOINT_SLOT_COUNT) {
+    errno = EINVAL;
+    return false;
+  }
+
+  memcpy(manifest.magic, CHECKPOINT_MANIFEST_MAGIC, CHECKPOINT_MAGIC_SIZE);
+  manifest.version = CHECKPOINT_FORMAT_VERSION;
+  manifest.num_files = CHECKPOINT_MANIFEST_FILE_COUNT;
+  manifest.sequence_number = sequence_number;
+  manifest.timestamp = (int64_t)time(NULL);
+  memcpy(manifest.scalpel_sha256, scalpel_sha256, SHA256_DIGEST_LENGTH);
+
+  if (! checkpoint_slot_filename(filename, sizeof(filename), CHECKPOINT_COMPONENT_STATE, slot)
+      || ! checkpoint_slot_path(path, sizeof(path), directory,
+                                CHECKPOINT_COMPONENT_STATE, slot, false)) {
+    return false;
+  }
+  memcpy(manifest.files[0].filename, filename, strlen(filename) + 1);
+  if (! checkpoint_hash_file(path, manifest.files[0].sha256)) {
+    return false;
+  }
+
+  if (! checkpoint_slot_filename(filename, sizeof(filename), CHECKPOINT_COMPONENT_QUEUE, slot)
+      || ! checkpoint_slot_path(path, sizeof(path), directory,
+                                CHECKPOINT_COMPONENT_QUEUE, slot, false)) {
+    return false;
+  }
+  memcpy(manifest.files[1].filename, filename, strlen(filename) + 1);
+  if (! checkpoint_hash_file(path, manifest.files[1].sha256)) {
+    return false;
+  }
+
+  memcpy(manifest.files[2].filename, BLOCKCLASSIFICATION_FILENAME,
+         sizeof(BLOCKCLASSIFICATION_FILENAME));
+  int written = snprintf(path, sizeof(path), "%s/%s", directory,
+                         BLOCKCLASSIFICATION_FILENAME);
+  if (written < 0 || (size_t)written >= sizeof(path)
+      || ! checkpoint_hash_file(path, manifest.files[2].sha256)) {
+    return false;
+  }
+
+  if (! HMAC(EVP_sha256(), scalpel_sha256, SHA256_DIGEST_LENGTH,
+             (unsigned char *)&manifest, offsetof(CheckpointManifest, hmac),
+             manifest.hmac, NULL)) {
+    return false;
+  }
+
+  if (! checkpoint_slot_path(path, sizeof(path), directory,
+                             CHECKPOINT_COMPONENT_MANIFEST, slot, false)
+      || ! checkpoint_slot_path(temporary_path, sizeof(temporary_path), directory,
+                                CHECKPOINT_COMPONENT_MANIFEST, slot, true)) {
+    return false;
+  }
+
+  unlink(temporary_path);
+  fp = fopen(temporary_path, "wb");
+  if (! fp) {
+    return false;
+  }
+  bool write_ok = fwrite(&manifest, sizeof(manifest), 1, fp) == 1;
+  bool close_ok = checkpoint_durable_close(fp);
+  if (! write_ok || ! close_ok) {
+    unlink(temporary_path);
+    return false;
+  }
+
+  if (rename(temporary_path, path) != 0) {
+    return false;
+  }
+  checkpoint_test_crash_after("manifest-renamed");
+  return checkpoint_sync_directory(directory);
+}
+
+
+bool checkpoint_publish_slot(const char *directory, uint32_t slot,
+                             uint64_t sequence_number) {
+
+  CheckpointCurrent current = {0};
+  char path[PATH_MAX];
+  char temporary_path[PATH_MAX];
+  FILE *fp;
+  int written;
+
+  if (! directory || slot >= CHECKPOINT_SLOT_COUNT) {
+    errno = EINVAL;
+    return false;
+  }
+
+  memcpy(current.magic, CHECKPOINT_CURRENT_MAGIC, CHECKPOINT_MAGIC_SIZE);
+  current.version = CHECKPOINT_FORMAT_VERSION;
+  current.slot = slot;
+  current.sequence_number = sequence_number;
+  SHA256((unsigned char *)&current, offsetof(CheckpointCurrent, sha256),
+         current.sha256);
+
+  written = snprintf(path, sizeof(path), "%s/%s", directory,
+                     CHECKPOINT_CURRENT_FILENAME);
+  if (written < 0 || (size_t)written >= sizeof(path)) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+  written = snprintf(temporary_path, sizeof(temporary_path), "%s_", path);
+  if (written < 0 || (size_t)written >= sizeof(temporary_path)) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+
+  unlink(temporary_path);
+  fp = fopen(temporary_path, "wb");
+  if (! fp) {
+    return false;
+  }
+  bool write_ok = fwrite(&current, sizeof(current), 1, fp) == 1;
+  bool close_ok = checkpoint_durable_close(fp);
+  if (! write_ok || ! close_ok) {
+    unlink(temporary_path);
+    return false;
+  }
+
+  if (rename(temporary_path, path) != 0) {
+    return false;
+  }
+  checkpoint_test_crash_after("marker-renamed");
+  return checkpoint_sync_directory(directory);
+}
+
+
+static bool checkpoint_read_current(const char *directory, CheckpointCurrent *current) {
+
+  unsigned char hash[SHA256_DIGEST_LENGTH];
+  char path[PATH_MAX];
+  FILE *fp;
+  int written;
+  bool ok;
+
+  written = snprintf(path, sizeof(path), "%s/%s", directory,
+                     CHECKPOINT_CURRENT_FILENAME);
+  if (written < 0 || (size_t)written >= sizeof(path)) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+
+  fp = fopen(path, "rb");
+  if (! fp) {
+    return false;
+  }
+
+  ok = fread(current, sizeof(*current), 1, fp) == 1;
+  if (fclose(fp) != 0) {
+    ok = false;
+  }
+  if (! ok
+      || memcmp(current->magic, CHECKPOINT_CURRENT_MAGIC, CHECKPOINT_MAGIC_SIZE) != 0
+      || current->version != CHECKPOINT_FORMAT_VERSION
+      || current->slot >= CHECKPOINT_SLOT_COUNT) {
+    return false;
+  }
+
+  SHA256((unsigned char *)current, offsetof(CheckpointCurrent, sha256), hash);
+  return memcmp(hash, current->sha256, sizeof(hash)) == 0;
+}
+
+
+static bool checkpoint_verify_slot(const char *directory, uint32_t slot,
+                                   const unsigned char expected_scalpel_sha256[SHA256_DIGEST_LENGTH],
+                                   uint32_t integrity_file_count,
+                                   CheckpointSelection *selection,
+                                   char *reason, size_t reason_size) {
+
+  CheckpointManifest manifest;
+  unsigned char hmac[SHA256_DIGEST_LENGTH];
+  unsigned char hash[SHA256_DIGEST_LENGTH];
+  const unsigned char *key = expected_scalpel_sha256;
+  char expected_name[PATH_MAX];
+  char path[PATH_MAX];
+  FILE *fp;
+
+#define CHECKPOINT_REJECT(...)                         \
+  do {                                                 \
+    if (reason && reason_size > 0) {                   \
+      snprintf(reason, reason_size, __VA_ARGS__);      \
+    }                                                  \
+    return false;                                      \
+  } while (0)
+
+  if (! checkpoint_slot_path(path, sizeof(path), directory,
+                             CHECKPOINT_COMPONENT_MANIFEST, slot, false)) {
+    CHECKPOINT_REJECT("manifest path is too long");
+  }
+
+  fp = fopen(path, "rb");
+  if (! fp) {
+    CHECKPOINT_REJECT("manifest is missing");
+  }
+  bool read_ok = fread(&manifest, sizeof(manifest), 1, fp) == 1;
+  if (fclose(fp) != 0) {
+    read_ok = false;
+  }
+  if (! read_ok) {
+    CHECKPOINT_REJECT("manifest cannot be read");
+  }
+
+  if (memcmp(manifest.magic, CHECKPOINT_MANIFEST_MAGIC,
+             CHECKPOINT_MAGIC_SIZE) != 0
+      || manifest.version != CHECKPOINT_FORMAT_VERSION
+      || manifest.num_files != CHECKPOINT_MANIFEST_FILE_COUNT
+      || manifest.sequence_number == 0) {
+    CHECKPOINT_REJECT("manifest format is invalid");
+  }
+
+  if (! checkpoint_slot_filename(expected_name, sizeof(expected_name),
+                                  CHECKPOINT_COMPONENT_STATE, slot)
+      || ! memchr(manifest.files[0].filename, '\0', PATH_MAX)
+      || strcmp(manifest.files[0].filename, expected_name) != 0
+      || ! checkpoint_slot_filename(expected_name, sizeof(expected_name),
+                                    CHECKPOINT_COMPONENT_QUEUE, slot)
+      || ! memchr(manifest.files[1].filename, '\0', PATH_MAX)
+      || strcmp(manifest.files[1].filename, expected_name) != 0
+      || ! memchr(manifest.files[2].filename, '\0', PATH_MAX)
+      || strcmp(manifest.files[2].filename, BLOCKCLASSIFICATION_FILENAME) != 0) {
+    CHECKPOINT_REJECT("manifest file set is invalid");
+  }
+
+  for (uint32_t i = 0; i < manifest.num_files; i++) {
+    int written = snprintf(path, sizeof(path), "%s/%s", directory,
+                           manifest.files[i].filename);
+    if (written < 0 || (size_t)written >= sizeof(path)
+        || access(path, R_OK) != 0) {
+      CHECKPOINT_REJECT("%s is missing or unreadable",
+                        manifest.files[i].filename);
+    }
+  }
+
+  if (integrity_file_count > manifest.num_files) {
+    CHECKPOINT_REJECT("integrity file count is invalid");
+  }
+
+  if (integrity_file_count > 0) {
+    if (expected_scalpel_sha256
+        && memcmp(manifest.scalpel_sha256, expected_scalpel_sha256,
+                  SHA256_DIGEST_LENGTH) != 0) {
+      CHECKPOINT_REJECT("checkpoint was created by a different scalpel3 executable");
+    }
+    if (! key) {
+      key = manifest.scalpel_sha256;
+    }
+    if (! HMAC(EVP_sha256(), key, SHA256_DIGEST_LENGTH,
+               (unsigned char *)&manifest, offsetof(CheckpointManifest, hmac),
+               hmac, NULL)
+        || memcmp(hmac, manifest.hmac, sizeof(hmac)) != 0) {
+      CHECKPOINT_REJECT("manifest authentication failed");
+    }
+
+    for (uint32_t i = 0; i < integrity_file_count; i++) {
+      int written = snprintf(path, sizeof(path), "%s/%s", directory,
+                             manifest.files[i].filename);
+      if (written < 0 || (size_t)written >= sizeof(path)
+          || ! checkpoint_hash_file(path, hash)
+          || memcmp(hash, manifest.files[i].sha256, sizeof(hash)) != 0) {
+        CHECKPOINT_REJECT("%s failed its integrity check",
+                          manifest.files[i].filename);
+      }
+    }
+  }
+
+  memset(selection, 0, sizeof(*selection));
+  selection->slot = slot;
+  selection->manifest = manifest;
+  if (! checkpoint_slot_path(selection->state_path, sizeof(selection->state_path),
+                             directory, CHECKPOINT_COMPONENT_STATE, slot, false)
+      || ! checkpoint_slot_path(selection->queue_path, sizeof(selection->queue_path),
+                                directory, CHECKPOINT_COMPONENT_QUEUE, slot, false)
+      || ! checkpoint_slot_path(selection->manifest_path,
+                                sizeof(selection->manifest_path), directory,
+                                CHECKPOINT_COMPONENT_MANIFEST, slot, false)) {
+    CHECKPOINT_REJECT("checkpoint path is too long");
+  }
+
+  if (reason && reason_size > 0) {
+    reason[0] = '\0';
+  }
+  return true;
+
+#undef CHECKPOINT_REJECT
+}
+
+
+static bool checkpoint_select_slot_internal(
+    const char *directory,
+    const unsigned char expected_scalpel_sha256[SHA256_DIGEST_LENGTH],
+    uint32_t integrity_file_count, CheckpointSelection *selection,
+    FILE *diagnostics) {
+
+  CheckpointCurrent current;
+  CheckpointSelection candidates[CHECKPOINT_SLOT_COUNT];
+  bool valid[CHECKPOINT_SLOT_COUNT] = {false, false};
+  char reasons[CHECKPOINT_SLOT_COUNT][256] = {{0}};
+  bool have_current;
+  uint32_t chosen;
+
+  if (! directory || ! selection) {
+    errno = EINVAL;
+    return false;
+  }
+
+  have_current = checkpoint_read_current(directory, &current);
+  if (have_current) {
+    valid[current.slot] = checkpoint_verify_slot(
+        directory, current.slot, expected_scalpel_sha256,
+        integrity_file_count,
+        &candidates[current.slot], reasons[current.slot], sizeof(reasons[current.slot]));
+    if (valid[current.slot]
+        && candidates[current.slot].manifest.sequence_number
+               == current.sequence_number) {
+      *selection = candidates[current.slot];
+      if (diagnostics) {
+        fprintf(diagnostics, "Using checkpoint slot %" PRIu32
+                             " (sequence %" PRIu64 ").\n",
+                selection->slot, selection->manifest.sequence_number);
+      }
+      return true;
+    }
+    if (diagnostics) {
+      fprintf(diagnostics, "Published checkpoint slot %" PRIu32
+                           " is not usable%s%s; searching fallback slots.\n",
+              current.slot, reasons[current.slot][0] ? ": " : "",
+              reasons[current.slot]);
+    }
+  }
+
+  for (uint32_t slot = 0; slot < CHECKPOINT_SLOT_COUNT; slot++) {
+    if (! valid[slot]) {
+      valid[slot] = checkpoint_verify_slot(
+          directory, slot, expected_scalpel_sha256, integrity_file_count,
+          &candidates[slot], reasons[slot], sizeof(reasons[slot]));
+    }
+  }
+
+  if (! valid[0] && ! valid[1]) {
+    if (diagnostics) {
+      fprintf(diagnostics, "No valid checkpoint slot found in %s.\n", directory);
+      for (uint32_t slot = 0; slot < CHECKPOINT_SLOT_COUNT; slot++) {
+        fprintf(diagnostics, "  slot %" PRIu32 ": %s\n", slot,
+                reasons[slot][0] ? reasons[slot] : "invalid");
+      }
+    }
+    return false;
+  }
+
+  if (valid[0] && valid[1]) {
+    chosen = candidates[1].manifest.sequence_number
+                     > candidates[0].manifest.sequence_number
+                 ? 1U
+                 : 0U;
+  }
+  else {
+    chosen = valid[0] ? 0U : 1U;
+  }
+
+  *selection = candidates[chosen];
+  if (diagnostics) {
+    fprintf(diagnostics, "Using fallback checkpoint slot %" PRIu32
+                         " (sequence %" PRIu64 ").\n",
+            selection->slot, selection->manifest.sequence_number);
+  }
+  return true;
+}
+
+
+bool checkpoint_select_slot(const char *directory,
+                            const unsigned char expected_scalpel_sha256[SHA256_DIGEST_LENGTH],
+                            bool verify_integrity, CheckpointSelection *selection,
+                            FILE *diagnostics) {
+
+  return checkpoint_select_slot_internal(
+      directory, expected_scalpel_sha256,
+      verify_integrity ? CHECKPOINT_MANIFEST_FILE_COUNT : 0U,
+      selection, diagnostics);
+}
+
+
+// select a slot that is safe to preserve while the other slot is replaced
+bool checkpoint_select_slot_for_save(
+    const char *directory,
+    const unsigned char expected_scalpel_sha256[SHA256_DIGEST_LENGTH],
+    CheckpointSelection *selection, FILE *diagnostics) {
+
+  return checkpoint_select_slot_internal(
+      directory, expected_scalpel_sha256,
+      CHECKPOINT_MANIFEST_MUTABLE_FILE_COUNT, selection, diagnostics);
+}
 
 // serialize one element of the kill queue
 bool kill_queue_element_serialization(void **element, int64_t *priority, FILE *fp, StateSerialization mode) {
@@ -123,16 +780,19 @@ bool read_essential_carveinfo_queue_h(Queue *q, int handle, bool init) {
   int h;
 
   h = dup(handle);
-  fp = fdopen(h, "rb");
-
-  if (! fp) {
+  if (h < 0) {
     return false;
   }
-  else {
-    ret = read_essential_carveinfo_queue(q, fp, init);
-    fclose(fp);
-    return ret;
+
+  fp = fdopen(h, "rb");
+  if (! fp) {
+    close(h);
+    return false;
   }
+
+  ret = read_essential_carveinfo_queue(q, fp, init);
+  fclose(fp);
+  return ret;
 }
 
 
@@ -285,16 +945,13 @@ uint64_t portable_random(void) {
 // returns current width of terminal
 int get_terminal_width(void) {
 
-  struct winsize w;
+  struct winsize w = {0};
 
-  ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
-
-  if (w.ws_col == 0) {
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != 0 || w.ws_col == 0) {
     return 132;
   }
-  else {
-    return w.ws_col;
-  }
+
+  return w.ws_col;
 }
 
 
@@ -389,9 +1046,147 @@ void delete_files_recursive(const char *base_dir, const char *pattern) {
 }
 
 
+// report the unread byte count for a regular serialized file through 'remaining'.
+// Streams and other non-regular files are rejected because their length is not known.
+//
+static bool serialized_file_bytes_remaining(FILE *fp, uint64_t *remaining) {
+
+  struct stat statbuf;
+  off_t position;
+  int handle;
+
+  if (! fp || ! remaining) {
+    errno = EINVAL;
+    return false;
+  }
+
+  handle = fileno(fp);
+  position = ftello(fp);
+  if (handle < 0 || position < 0 || fstat(handle, &statbuf) != 0
+      || ! S_ISREG(statbuf.st_mode) || statbuf.st_size < position) {
+    errno = EPROTO;
+    return false;
+  }
+
+  *remaining = (uint64_t)(statbuf.st_size - position);
+  return true;
+}
+
+
+// calculate the byte count for 'count' fixed-size serialized items and verify
+// that the result fits both size_t and the unread portion of the input.
+//
+static bool serialized_item_bytes(uint64_t count, size_t item_size,
+                                  uint64_t remaining, size_t *bytes) {
+
+  if (! bytes || item_size == 0) {
+    errno = EINVAL;
+    return false;
+  }
+  if (count > SIZE_MAX / item_size) {
+    errno = EOVERFLOW;
+    return false;
+  }
+
+  *bytes = (size_t)count * item_size;
+  if ((uint64_t)*bytes > remaining) {
+    errno = EPROTO;
+    return false;
+  }
+
+  return true;
+}
+
+
+// read 'count' fixed-size serialized items and update the unread byte count.
+//
+static bool read_serialized_items(FILE *fp, void *destination, uint64_t count,
+                                  size_t item_size, uint64_t *remaining) {
+
+  size_t bytes;
+
+  if (! fp || ! remaining
+      || ! serialized_item_bytes(count, item_size, *remaining, &bytes)) {
+    return false;
+  }
+  if (count > 0
+      && fread(destination, item_size, (size_t)count, fp) != (size_t)count) {
+    if (errno == 0) {
+      errno = EPROTO;
+    }
+    return false;
+  }
+
+  *remaining -= bytes;
+  return true;
+}
+
+
+// deserialize paired offset and length arrays after validating their complete
+// payload against the unread byte count.
+//
+static bool deserialize_offset_values(FILE *fp, uint64_t count,
+                                      uint64_t **offsets, size_t **lengths,
+                                      uint64_t *remaining) {
+
+  uint64_t *new_offsets = NULL;
+  size_t *new_lengths = NULL;
+  size_t offset_bytes;
+  size_t length_bytes;
+
+  if (! offsets || ! lengths || ! remaining) {
+    errno = EINVAL;
+    return false;
+  }
+  if (count == 0) {
+    return true;
+  }
+  if (! serialized_item_bytes(count, sizeof(*new_offsets), *remaining,
+                              &offset_bytes)
+      || ! serialized_item_bytes(count, sizeof(*new_lengths),
+                                 *remaining - offset_bytes, &length_bytes)) {
+    return false;
+  }
+
+  new_offsets = (uint64_t *)malloc(offset_bytes);
+  new_lengths = (size_t *)malloc(length_bytes);
+  if (! new_offsets || ! new_lengths) {
+    free(new_offsets);
+    free(new_lengths);
+    errno = ENOMEM;
+    return false;
+  }
+
+  if (! read_serialized_items(fp, new_offsets, count, sizeof(*new_offsets),
+                              remaining)
+      || ! read_serialized_items(fp, new_lengths, count, sizeof(*new_lengths),
+                                 remaining)) {
+    free(new_offsets);
+    free(new_lengths);
+    return false;
+  }
+
+  *offsets = new_offsets;
+  *lengths = new_lengths;
+  return true;
+}
+
+
 // reads a file and returns a comprehensive array of EssentialSearchSpecOffsets. The caller is
 // responsible for a deep free of the returned array.
 EssentialSearchSpecOffsets* deserialize_essential_offsets(char *filename, uint32_t *num_specs_out) {
+
+  uint64_t remaining = 0;
+  size_t array_bytes;
+  uint32_t specs_to_free = 0;
+
+  if (num_specs_out) {
+    *num_specs_out = 0;
+  }
+  if (! filename) {
+    errno = EINVAL;
+    return NULL;
+  }
 
   FILE *fp = fopen(filename, "rb");
 
@@ -400,14 +1195,36 @@ EssentialSearchSpecOffsets* deserialize_essential_offsets(char *filename, uint32
     return NULL;
   }
 
+  if (! serialized_file_bytes_remaining(fp, &remaining)) {
+    fprintf(stderr, "Deserialization error: File %s is not a regular database file.\n",
+            filename);
+    fclose(fp);
+    return NULL;
+  }
+
   uint32_t num_specs = 0;
-  if (fread(&num_specs, sizeof(uint32_t), 1, fp) != 1) {
+  if (! read_serialized_items(fp, &num_specs, 1, sizeof(num_specs), &remaining)) {
     fprintf(stderr, "Deserialization error: Failed to read num_specs from file %s.\n", filename);
     fclose(fp);
     return NULL;
   }
 
-  EssentialSearchSpecOffsets *array = (EssentialSearchSpecOffsets *)calloc(num_specs, sizeof(EssentialSearchSpecOffsets));
+  if (! serialized_item_bytes(num_specs,
+                              sizeof(uint32_t) + 2 * sizeof(uint64_t),
+                              remaining, &array_bytes)) {
+    fprintf(stderr, "Deserialization error: Invalid num_specs in file %s.\n", filename);
+    fclose(fp);
+    return NULL;
+  }
+  if (! serialized_item_bytes(num_specs, sizeof(EssentialSearchSpecOffsets),
+                              UINT64_MAX, &array_bytes)) {
+    fprintf(stderr, "Deserialization error: num_specs is too large in file %s.\n", filename);
+    fclose(fp);
+    return NULL;
+  }
+
+  EssentialSearchSpecOffsets *array = (EssentialSearchSpecOffsets *)calloc(
+      1, num_specs ? array_bytes : sizeof(EssentialSearchSpecOffsets));
 
   if (! array) {
     perror("Failed to allocate EssentialSearchSpecOffsets array.");
@@ -418,71 +1235,63 @@ EssentialSearchSpecOffsets* deserialize_essential_offsets(char *filename, uint32
   for (uint32_t i = 0; i < num_specs; i++) {
 
     uint32_t suffix_len = 0;
-    if (fread(&suffix_len, sizeof(uint32_t), 1, fp) != 1) {
+    specs_to_free = i + 1;
+    if (! read_serialized_items(fp, &suffix_len, 1, sizeof(suffix_len),
+                                &remaining)) {
       fprintf(stderr, "Deserialization error: Failed to read suffix_len for spec %"PRIu32".\n", i);
       goto error_cleanup;
     }
 
     if (suffix_len > 0) {
-      array[i].filetype = (char *)malloc(suffix_len * sizeof(char));
+      size_t suffix_bytes;
+      if (! serialized_item_bytes(suffix_len, sizeof(char), remaining,
+                                  &suffix_bytes)) {
+        fprintf(stderr, "Deserialization error: Invalid filetype length for spec %"PRIu32".\n", i);
+        goto error_cleanup;
+      }
+
+      array[i].filetype = (char *)malloc(suffix_bytes);
       if (!array[i].filetype) {
         perror("Memory allocation failed for filetype.");
         goto error_cleanup;
       }
-      if (fread(array[i].filetype, sizeof(char), suffix_len, fp) != suffix_len) {
+      if (! read_serialized_items(fp, array[i].filetype, suffix_len,
+                                  sizeof(char), &remaining)) {
         fprintf(stderr, "Deserialization error: Failed to read filetype string for spec %"PRIu32".\n", i);
+        goto error_cleanup;
+      }
+      if (array[i].filetype[suffix_len - 1] != '\0') {
+        fprintf(stderr, "Deserialization error: Unterminated filetype for spec %"PRIu32".\n", i);
         goto error_cleanup;
       }
     }
 
     // --- headers ---
-    if (fread(&array[i].numheaders, sizeof(uint64_t), 1, fp) != 1) {
+    if (! read_serialized_items(fp, &array[i].numheaders, 1,
+                                sizeof(array[i].numheaders), &remaining)) {
       fprintf(stderr, "Deserialization Error: failed to read numheaders for spec %"PRIu32".\n", i);
       goto error_cleanup;
     }
 
-    if (array[i].numheaders > 0) {
-      array[i].headers = (uint64_t *)malloc(array[i].numheaders * sizeof(uint64_t));
-      array[i].headerlens = (size_t *)malloc(array[i].numheaders * sizeof(size_t));
-
-      if (!array[i].headers || !array[i].headerlens) {
-        perror("Memory allocation failed for headers.");
-        goto error_cleanup;
-      }
-
-      if (fread(array[i].headers, sizeof(uint64_t), array[i].numheaders, fp) != array[i].numheaders) {
-        fprintf(stderr, "Deserialization error: Failed to read headers array for spec %"PRIu32".\n", i);
-        goto error_cleanup;
-      }
-      if (fread(array[i].headerlens, sizeof(size_t), array[i].numheaders, fp) != array[i].numheaders) {
-        fprintf(stderr, "Deserialization error: Failed to read headerlens array for spec %"PRIu32".\n", i);
-        goto error_cleanup;
-      }
+    if (! deserialize_offset_values(fp, array[i].numheaders,
+                                    &array[i].headers, &array[i].headerlens,
+                                    &remaining)) {
+      fprintf(stderr, "Deserialization error: Invalid headers for spec %"PRIu32".\n", i);
+      goto error_cleanup;
     }
 
     // --- footers ---
-    if (fread(&array[i].numfooters, sizeof(uint64_t), 1, fp) != 1) {
+    if (! read_serialized_items(fp, &array[i].numfooters, 1,
+                                sizeof(array[i].numfooters), &remaining)) {
       fprintf(stderr, "Deserialization error: Failed to read numfooters for spec %"PRIu32".\n", i);
       goto error_cleanup;
     }
 
-    if (array[i].numfooters > 0) {
-      array[i].footers = (uint64_t *)malloc(array[i].numfooters * sizeof(uint64_t));
-      array[i].footerlens = (size_t *)malloc(array[i].numfooters * sizeof(size_t));
-
-      if (!array[i].footers || !array[i].footerlens) {
-        perror("Memory allocation failed for footers.");
-        goto error_cleanup;
-      }
-
-      if (fread(array[i].footers, sizeof(uint64_t), array[i].numfooters, fp) != array[i].numfooters) {
-        fprintf(stderr, "Deserialization error: Failed to read footers array for spec %"PRIu32".\n", i);
-        goto error_cleanup;
-      }
-      if (fread(array[i].footerlens, sizeof(size_t), array[i].numfooters, fp) != array[i].numfooters) {
-        fprintf(stderr, "Deserialization error: Failed to read footerlens array for spec %"PRIu32".\n", i);
-        goto error_cleanup;
-      }
+    if (! deserialize_offset_values(fp, array[i].numfooters,
+                                    &array[i].footers, &array[i].footerlens,
+                                    &remaining)) {
+      fprintf(stderr, "Deserialization error: Invalid footers for spec %"PRIu32".\n", i);
+      goto error_cleanup;
     }
   }
 
@@ -497,7 +1306,7 @@ EssentialSearchSpecOffsets* deserialize_essential_offsets(char *filename, uint32
  error_cleanup:
 
   if (array) {
-    for (uint32_t k = 0; k < num_specs; k++) {
+    for (uint32_t k = 0; k < specs_to_free; k++) {
       free(array[k].filetype);
       free(array[k].headers);
       free(array[k].headerlens);

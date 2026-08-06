@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -41,6 +41,8 @@ struct oa_bucket; /* forward */
 #define VAL_TY struct oa_bucket *
 
 #include "hashv4.h"
+#include <sys/stat.h>
+#include <unistd.h>
 #include "verstable.h"
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -372,6 +374,25 @@ fail:
 }
 
 
+// reject impossible entry counts for regular files before invoking callbacks.
+// Non-regular streams cannot be preflighted and remain callback-validated.
+//
+static bool serialized_count_fits_regular_file(FILE *fp, uint64_t count) {
+
+  struct stat statbuf;
+  off_t position;
+  int handle = fileno(fp);
+
+  if (handle < 0 || fstat(handle, &statbuf) != 0 || ! S_ISREG(statbuf.st_mode)) {
+    return true;
+  }
+
+  position = ftello(fp);
+  return position >= 0 && statbuf.st_size >= position
+         && count <= (uint64_t)(statbuf.st_size - position);
+}
+
+
 bool oa_hash_deserialize(oa_hash *h, FILE *fp) {
   if (! h || ! fp) {
     errno = EINVAL;
@@ -398,6 +419,11 @@ bool oa_hash_deserialize(oa_hash *h, FILE *fp) {
   if (hdr.magic != 0x48534833u || hdr.ver != 1 || hdr.shards != (uint32_t)OA_SHARDS) {
     errno = EPROTO;
     fprintf(stderr, "oa_hash_deserialize: header mismatch (magic=%08x ver=%u shards=%u)\n", hdr.magic, hdr.ver, hdr.shards);
+    return false;
+  }
+  if (! serialized_count_fits_regular_file(fp, hdr.total)) {
+    errno = EPROTO;
+    fprintf(stderr, "oa_hash_deserialize: entry count exceeds remaining input\n");
     return false;
   }
 

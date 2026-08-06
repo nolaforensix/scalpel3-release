@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -33,6 +33,8 @@
 
 #include "scalpel.h"
 
+#include <sys/file.h>
+
 #if defined(__linux__)
 // used in determining physical core count
 typedef struct {
@@ -46,15 +48,22 @@ typedef struct {
 // lock for lock_fprintf()
 pthread_mutex_t printf_is_available = PTHREAD_MUTEX_INITIALIZER;
 
+// lock for audit-file writes and lifetime
+static pthread_mutex_t audit_file_is_available = PTHREAD_MUTEX_INITIALIZER;
+
 // backtrace state
 struct backtrace_state *bt_state;
 
 // signal handling thread
 static pthread_t signal_handler_thread;
 
+// descriptor retained for the process lifetime to hold the base output directory lock
+static int output_directory_lock_fd = -1;
+
 
 // function prototypes for private util.c functions
 static void *sigint_handler_thread(void *arg);
+static void audit_vlog(const char *format, va_list argp);
 static unsigned char s3_fold_byte(unsigned char c, bool cs);
 static char *s3_bitap_wildcard_u64(char *needle, size_t m, char *hay, size_t n, bool casesensitive, size_t start_pos);
 static bool characters_match(char a, char b, bool casesensitive);
@@ -389,7 +398,7 @@ void lock_fprintf_argp(FILE *stream, const char *format, va_list argp) {
           }
 
           if ((isspace(BUF[i]) || i == length - 1) && len > 0) {
-            sprintf(say, "say %s", word);
+            snprintf(say, sizeof(say), "say %s", word);
             system(say);
             len = 0;
           }
@@ -425,8 +434,10 @@ void setup_sigint_handler(void) {
   // block SIGINT/SIGUSR1 in all threads
   pthread_sigmask(SIG_BLOCK, &sigset, NULL);
 
-  // create handler thread, which will unblock SIGINT/SIGUSR1
-  pthread_create(&signal_handler_thread, NULL, sigint_handler_thread, NULL);
+  // create the thread that waits synchronously for blocked SIGINT/SIGUSR1
+  if (pthread_create(&signal_handler_thread, NULL, sigint_handler_thread, NULL)) {
+    handle_error(SCALPEL_ERROR_PTHREAD_FAILURE, "setup_sigint_handler()", __LINE__, __FILE__);
+  }
 }
 
 
@@ -448,9 +459,6 @@ static void *sigint_handler_thread(void *arg) {
   sigaddset(&sigset, SIGINT);
   sigaddset(&sigset, SIGUSR1);
 
-  // construct path to scalpel3 Unix domain socket endpoint
-  snprintf(sockname, PATH_MAX, "%s/.scalpel3IPC", scalpel_state.base_output_directory);
-
   while (1) {
     // block until SIGINT or SIGUSR1 is received
     sigwait(&sigset, &sig);
@@ -458,9 +466,21 @@ static void *sigint_handler_thread(void *arg) {
     // temporarily block SIGINT / SIGUSR1
     pthread_sigmask(SIG_BLOCK, &sigset, NULL);
 
+    // construct the IPC socket endpoint path now rather than at thread start: this thread is
+    // spawned (setup_sigint_handler) before init_output_directory() populates
+    // base_output_directory, so caching it earlier would leave sockname pointing at an empty base.
+    snprintf(sockname, PATH_MAX, "%s/.scalpel3IPC", scalpel_state.base_output_directory);
+
     if (sig == SIGUSR1) {
       // non-interactive checkpoint and exit ASAP. Remove IPC endpoint file if it exists to stop IPC
       // then set checkpoint flag
+      unlink(sockname);
+      atomic_store(&TAKE_CHECKPOINT_AND_EXIT, true);
+    }
+    else if (! isatty(STDIN_FILENO)) {
+      // with a non-TTY stdin, the getchar() prompt below would block forever holding
+      // printf_is_available -- hanging every logging thread and this thread's own SIGUSR1
+      // handling, so default the non-interactive SIGINT to checkpoint-and-exit.
       unlink(sockname);
       atomic_store(&TAKE_CHECKPOINT_AND_EXIT, true);
     }
@@ -469,10 +489,10 @@ static void *sigint_handler_thread(void *arg) {
 
       fprintf(stderr, "%s", RED);
       fprintf(stderr,
-	      "\n\nREALLY quit? Type Y to quit immediately, N to continue, or C to checkpoint and quit at the next\n"
-	      "safe checkpoint boundary.  Checkpoints may be delayed during block validation, header/footer search, and\n"
-	      "contiguous recovery phases, so be patient.  Finally, only C will output end-of-execution stats.  Y will\n"
-	      "exit immediately without cleanup. Generally C is the best choice.\n\n"
+              "\n\nREALLY quit? Type Y to quit immediately, N to continue, or C to stop cleanly.\n"
+              "If restartable checkpoint state exists, C will write a checkpoint before exiting.\n"
+              "Otherwise, C exits without checkpoint state. Only C will output end-of-execution\n"
+              "stats. Y exits immediately without cleanup. Generally C is the best choice.\n\n"
                       "(Y[es] / N[o] / C[heckpoint]) ? ");
       fprintf(stderr, "%s", BLACK);
 
@@ -730,7 +750,10 @@ void copy_search_spec(SearchSpec *d, SearchSpec *s) {
   d->FOOTERFUNC = s->FOOTERFUNC;
   d->SEARCHTYPE = s->SEARCHTYPE;
   d->BLOCKVALIDATOR = s->BLOCKVALIDATOR;
+  d->BATCHEDBLOCKVALIDATOR = s->BATCHEDBLOCKVALIDATOR;
+  d->BLOCKVALIDATIONSCOPE = s->BLOCKVALIDATIONSCOPE;
   d->FILEVALIDATOR = s->FILEVALIDATOR;
+  d->CANDIDATEVALIDATOR = s->CANDIDATEVALIDATOR;
   d->DONTCARVE = s->DONTCARVE;
   d->REASSEMBLYFUNC = s->REASSEMBLYFUNC;
   d->SERIALIZECARVESTATEFUNC = s->SERIALIZECARVESTATEFUNC;
@@ -1098,6 +1121,20 @@ void set_program_name(char *s) {
 #endif /* ifndef __GLIBC__ */
 
 
+// write one message to the audit file while protecting its lifetime
+static void audit_vlog(const char *format, va_list argp) {
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&audit_file_is_available), __LINE__, __FILE__);
+
+  if (scalpel_state.audit_file) {
+    vfprintf(scalpel_state.audit_file, format, argp);
+    fflush(scalpel_state.audit_file);
+  }
+
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&audit_file_is_available), __LINE__, __FILE__);
+}
+
+
 void scalpel_log_err(const char *format, ...) {
 
   va_list argp;
@@ -1108,12 +1145,9 @@ void scalpel_log_err(const char *format, ...) {
   lock_fprintf(stderr, "%s", BLACK);
   va_end(argp);
 
-  if (scalpel_state.audit_file) {
-    va_start(argp, format);
-    vfprintf(scalpel_state.audit_file, format, argp);
-    fflush(scalpel_state.audit_file);
-    va_end(argp);
-  }
+  va_start(argp, format);
+  audit_vlog(format, argp);
+  va_end(argp);
 }
 
 
@@ -1125,12 +1159,9 @@ void scalpel_log(const char *format, ...) {
   lock_fprintf_argp(stdout, format, argp);
   va_end(argp);
 
-  if (scalpel_state.audit_file) {
-    va_start(argp, format);
-    vfprintf(scalpel_state.audit_file, format, argp);
-    fflush(scalpel_state.audit_file);
-    va_end(argp);
-  }
+  va_start(argp, format);
+  audit_vlog(format, argp);
+  va_end(argp);
 }
 
 
@@ -1339,72 +1370,148 @@ pcre2_match_data *find_regular_expression(pcre2_code *needle, char *haystack, si
 
 uint64_t translate(char *str, char *filetype, bool re) {
 
-  uint64_t len = 0;
+  char delimiter = re ? '/' : '|';
+  char *closing_delimiter;
+  uint64_t len;
   char errmsg[MAX_STRING_LENGTH];  // scratch for err msg generation
 
-  str++;
-  while (*str != (re ? '/' : '|')) {
-    str++;
-    len++;
-    if (len > scalpel_state.blocksize) {
-      // fatal: headers and footers cannot exceed block size
-      snprintf(errmsg, MAX_STRING_LENGTH, "string exceeds block size for file type \"%s\"", filetype);
-
-      handle_error(SCALPEL_ERROR_BAD_HEADER_OR_FOOTER, errmsg, __LINE__, __FILE__);
-    }
+  closing_delimiter = strchr(str + 1, delimiter);
+  if (! closing_delimiter) {
+    snprintf(errmsg, MAX_STRING_LENGTH,
+             "missing closing '%c' delimiter for file type \"%s\"", delimiter, filetype);
+    handle_error(SCALPEL_ERROR_BAD_HEADER_OR_FOOTER, errmsg, __LINE__, __FILE__);
   }
+
+  len = (uint64_t)(closing_delimiter - (str + 1));
+
+  if (len >= MAX_STRING_LENGTH) {
+    snprintf(errmsg, MAX_STRING_LENGTH,
+             "string exceeds internal header/footer capacity for file type \"%s\"", filetype);
+    handle_error(SCALPEL_ERROR_BAD_HEADER_OR_FOOTER, errmsg, __LINE__, __FILE__);
+  }
+
+  if (len > scalpel_state.blocksize) {
+    // fatal: headers and footers cannot exceed block size
+    snprintf(errmsg, MAX_STRING_LENGTH, "string exceeds block size for file type \"%s\"", filetype);
+    handle_error(SCALPEL_ERROR_BAD_HEADER_OR_FOOTER, errmsg, __LINE__, __FILE__);
+  }
+
   return len;
 }
 
 
-// try to set up the output directory. Because of the new checkpointing facility, scalpel3 no longer
-// requires that the output directory be empty, but timestamped directories corresponding to
-// individual invocations are created inside the main output directory.
+// acquire exclusive use of the base output directory for this scalpel3 process. The lock file is
+// deliberately persistent: the kernel lock, rather than file presence, records ownership and is
+// released automatically on every process exit, including crashes.
+void lock_output_directory(void) {
+
+  char lock_pathname[PATH_MAX];
+  int flags = O_RDWR | O_CREAT | O_CLOEXEC;
+  int lock_result;
+  int saved_errno;
+  int written;
+
+  if (mkdir(scalpel_state.output_directory, 0755) != 0 && errno != EEXIST) {
+    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+  }
+
+  written = snprintf(lock_pathname, sizeof(lock_pathname), "%s/.scalpel3.lock",
+                     scalpel_state.output_directory);
+  if (written < 0 || (size_t)written >= sizeof(lock_pathname)) {
+    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+  }
+
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+  do {
+    output_directory_lock_fd = open(lock_pathname, flags, 0600);
+  } while (output_directory_lock_fd < 0 && errno == EINTR);
+  if (output_directory_lock_fd < 0) {
+    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+  }
+
+  do {
+    lock_result = flock(output_directory_lock_fd, LOCK_EX | LOCK_NB);
+  } while (lock_result != 0 && errno == EINTR);
+  if (lock_result != 0) {
+    saved_errno = errno;
+    close(output_directory_lock_fd);
+    output_directory_lock_fd = -1;
+    errno = saved_errno;
+    if (saved_errno == EWOULDBLOCK || saved_errno == EAGAIN) {
+      handle_error(SCALPEL_ERROR_OUTPUT_DIRECTORY_IN_USE,
+                   scalpel_state.output_directory, __LINE__, __FILE__);
+    }
+    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+  }
+
+  written = snprintf(scalpel_state.base_output_directory,
+                     sizeof(scalpel_state.base_output_directory), "%s",
+                     scalpel_state.output_directory);
+  if (written < 0
+      || (size_t)written >= sizeof(scalpel_state.base_output_directory)) {
+    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+  }
+}
+
+
+// set up the timestamped output directory for this invocation. The caller must already hold the
+// base output directory lock.
 void init_output_directory(void) {
 
   char temp[PATH_MAX];
   time_t t;
   struct tm *lt;
   char current[PATH_MAX];
+  int written;
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-
-  // create directory--this will fail silently if it already exists, which is fine.
-  mkdir(scalpel_state.output_directory, 0755);
-
-  // create timestamped directory inside main directory
-  time(&t);
-  lt = localtime(&t);
-  if (! strftime(current, sizeof(current), "%H-%M-%S-%Z-%m-%d-%y", lt)) {
-    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
-  }
-  snprintf(temp, PATH_MAX, "%s/%s", scalpel_state.output_directory, current);
-  if (mkdir(temp, 0755)) {
-    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+  // create a timestamped directory inside the main directory. An immediate restart can select the
+  // same second as the prior invocation, so wait for a new timestamp rather than changing the
+  // established directory-name format.
+  for (;;) {
+    if (time(&t) == (time_t)-1 || ! (lt = localtime(&t))
+        || ! strftime(current, sizeof(current), "%H-%M-%S-%Z-%m-%d-%y", lt)) {
+      handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+    }
+    written = snprintf(temp, sizeof(temp), "%s/%s",
+                       scalpel_state.output_directory, current);
+    if (written < 0 || (size_t)written >= sizeof(temp)) {
+      handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+    }
+    if (mkdir(temp, 0755) == 0) {
+      break;
+    }
+    if (errno != EEXIST) {
+      handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+    }
+    sleep(1);
   }
 
   // now create PROMISING, INPROGRESS, AND VALIDATED subdirs
-  snprintf(temp, PATH_MAX, "%s/%s/PROMISING", scalpel_state.output_directory, current);
-  if (mkdir(temp, 0755)) {
+  written = snprintf(temp, sizeof(temp), "%s/%s/PROMISING",
+                     scalpel_state.output_directory, current);
+  if (written < 0 || (size_t)written >= sizeof(temp) || mkdir(temp, 0755)) {
     handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
   }
-  snprintf(temp, PATH_MAX, "%s/%s/INPROGRESS", scalpel_state.output_directory, current);
-  if (mkdir(temp, 0755)) {
+  written = snprintf(temp, sizeof(temp), "%s/%s/INPROGRESS",
+                     scalpel_state.output_directory, current);
+  if (written < 0 || (size_t)written >= sizeof(temp) || mkdir(temp, 0755)) {
     handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
   }
-  snprintf(temp, PATH_MAX, "%s/%s/VALIDATED", scalpel_state.output_directory, current);
-  if (mkdir(temp, 0755)) {
+  written = snprintf(temp, sizeof(temp), "%s/%s/VALIDATED",
+                     scalpel_state.output_directory, current);
+  if (written < 0 || (size_t)written >= sizeof(temp) || mkdir(temp, 0755)) {
     handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
   }
 
-  // update output directory to include timestamped subdir, but save a copy of the base dir for
-  // storage of non-timestamped state
-  strcpy(scalpel_state.base_output_directory, scalpel_state.output_directory);
-  snprintf(temp, PATH_MAX, "%s/%s/", scalpel_state.output_directory, current);
+  // update output directory to include the timestamped subdirectory
+  written = snprintf(temp, sizeof(temp), "%s/%s/",
+                     scalpel_state.output_directory, current);
+  if (written < 0 || (size_t)written >= sizeof(temp)) {
+    handle_error(SCALPEL_ERROR_BAD_OUTPUT_DIRECTORY, NULL, __LINE__, __FILE__);
+  }
   strcpy(scalpel_state.output_directory, temp);
-
-#pragma GCC diagnostic pop
 }
 
 
@@ -1414,6 +1521,7 @@ void open_audit_file(void) {
   time_t now = time(NULL);
   char *timestring = ctime(&now);
   char fn[PATH_MAX];
+  FILE *audit_file;
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
@@ -1424,16 +1532,21 @@ void open_audit_file(void) {
 
   snprintf(fn, PATH_MAX, "%s/audit.txt", scalpel_state.output_directory);
 
-  if (! (scalpel_state.audit_file = fopen(fn, "a"))) {
+  audit_file = fopen(fn, "a");
+  if (! audit_file) {
     // fatal
     handle_error(SCALPEL_ERROR_FILE_WRITE, "audit.txt", __LINE__, __FILE__);
   }
 
-  lock_fprintf(scalpel_state.audit_file,
-               "Scalpel version %s %sstarted on %s with the\n"
-               "following command line:\n",
-               SCALPEL_VERSION, scalpel_state.restore_from_checkpoint ? "re-" : "", timestring);
-  lock_fprintf(scalpel_state.audit_file, "%s\n", scalpel_state.invocation);
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&audit_file_is_available), __LINE__, __FILE__);
+  scalpel_state.audit_file = audit_file;
+  fprintf(audit_file,
+          "Scalpel version %s %sstarted on %s with the\n"
+          "following command line:\n",
+          SCALPEL_VERSION, scalpel_state.restore_from_checkpoint ? "re-" : "", timestring);
+  fprintf(audit_file, "%s\n", scalpel_state.invocation);
+  fflush(audit_file);
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&audit_file_is_available), __LINE__, __FILE__);
 
 #pragma GCC diagnostic pop
 }
@@ -1582,19 +1695,68 @@ void scalpel_logo(void) {
 
 // returns the number of *logical* CPU cores
 int num_logical_cores(void) {
- return sysconf(_SC_NPROCESSORS_ONLN);
+
+  long cores = sysconf(_SC_NPROCESSORS_ONLN);
+
+  return cores > 0 && cores <= INT_MAX ? (int)cores : -1;
 }
 
-// returns the number of *physical* CPU cores on Linux or Mac systems
-int num_physical_cores(void) {
+// returns the detected number of physical CPU cores without applying the -e override
+int num_detected_physical_cores(void) {
 
-  return NC > 0 ? NC :
+  static int detected_cores;
+  int physical_cores;
+  int logical_cores;
+  const char *test_failure;
+
+  if (detected_cores > 0) {
+    return detected_cores;
+  }
 
 #if defined(__APPLE__)
-                get_physical_cores_macos();
+  physical_cores = get_physical_cores_macos();
 #else
-                get_physical_cores_linux();
+  physical_cores = get_physical_cores_linux();
 #endif
+
+  // permit the failure paths to be exercised without depending on a particular host configuration
+  test_failure = getenv("SCALPEL3_TEST_CORE_DETECTION_FAILURE");
+  if (test_failure
+      && (! strcasecmp(test_failure, "physical") || ! strcasecmp(test_failure, "all"))) {
+    physical_cores = -1;
+  }
+
+  if (physical_cores > 0) {
+    detected_cores = physical_cores;
+    return detected_cores;
+  }
+
+  logical_cores = num_logical_cores();
+  if (test_failure && ! strcasecmp(test_failure, "all")) {
+    logical_cores = -1;
+  }
+
+  if (logical_cores > 0) {
+    detected_cores = logical_cores;
+    scalpel_log("Unable to detect physical CPU cores; using %d logical CPU cores.\n",
+                detected_cores);
+  }
+  else {
+    detected_cores = 1;
+    scalpel_log("Unable to detect physical or logical CPU cores; using one worker per thread pool.\n");
+  }
+
+  return detected_cores;
+}
+
+
+// returns the number of physical CPU cores, or the count explicitly supplied with -e
+int num_physical_cores(void) {
+
+  if (NC > 0) {
+    return NC;
+  }
+  return num_detected_physical_cores();
 }
 
 
@@ -1997,6 +2159,14 @@ void handle_error(ScalpelError error, char *str, int line, const char *file) {
 
     break;
 
+  case SCALPEL_ERROR_OUTPUT_DIRECTORY_IN_USE:
+    // fatal
+    scalpel_log_err("The output directory \"%s\" is already in use by another scalpel3 process. Aborting.\n",
+                    str);
+    goto fatal;
+
+    break;
+
   case SCALPEL_ERROR_FILE_WRITE:
     // fatal--unable to write files, which may mean that disk space is exhausted or that too many
     // files are open
@@ -2148,9 +2318,17 @@ fatal:
 // write final completion message and close the audit file, if it's open
 void close_audit_file(void) {
 
-  if (scalpel_state.audit_file) {
-    fclose(scalpel_state.audit_file);
+  FILE *audit_file;
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&audit_file_is_available), __LINE__, __FILE__);
+  audit_file = scalpel_state.audit_file;
+  scalpel_state.audit_file = NULL;
+
+  if (audit_file) {
+    fclose(audit_file);
   }
+
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&audit_file_is_available), __LINE__, __FILE__);
 }
 
 

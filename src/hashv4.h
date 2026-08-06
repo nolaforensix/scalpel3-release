@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -71,14 +71,16 @@ typedef struct {
   oa_cp_fn cp;
   oa_free_fn free;
   oa_eq_fn eq;
-  oa_serialize_fn serialize;  // optional serialization function
+  // optional serialization function; each serialized key must consume at least one byte
+  oa_serialize_fn serialize;
   oa_sizeof_fn size_of;       // optional sizeof function: <= HASH_KEY_INLINE_MAX enables inline allocation (keys)
 } oa_key_ops;
 
 typedef struct {
   oa_cp_fn cp;
   oa_free_fn free;
-  oa_serialize_fn serialize;  // optional serialization function
+  // optional serialization function; each serialized value must consume at least one byte
+  oa_serialize_fn serialize;
   oa_sizeof_fn size_of;       // optional sizeof function: <= HASH_VAL_INLINE_MAX enables inline allocation (values)
 } oa_val_ops;
 
@@ -112,20 +114,19 @@ _Static_assert((OA_SHARDS & (OA_SHARDS - 1)) == 0, "OA_SHARDS must be a power of
 typedef struct oa_hash_s oa_hash;
 
 
-// IMPORTANT: Ownership model:
+// ownership model:
 //
-// * - oa_hash_put(h, key, val) deep-copies key and value using key_ops.cp/val_ops.cp.
+// * oa_hash_put() deep-copies the key and value using key_ops.cp and val_ops.cp.
+//   the caller retains ownership of the inputs and may modify or free them immediately.
 //
-// The caller retains ownership of inputs and may free/modify them immediately.
+// * oa_hash_get_copy() returns a newly allocated copy using val_ops.cp.
+//   the caller owns the copy and is responsible for freeing it with val_ops.free.
 //
-// * - oa_hash_get_copy(h, key) returns a freshly allocated copy of the value using val_ops.cp.
-//
-// The caller may owns the copy and is responsible for freeing it.
-//
-// * - oa_hash_get() returns an internal pointer to allow in-place modifications.
-//
-// The hash table owns the copy and you must not call free on the pointer returned from
-// oa_hash_get().
+// * oa_hash_get() returns a non-owning pointer to the table's internal value.
+//   the caller must not free the pointer. It may be read or modified in place only when
+//   the caller guarantees that no concurrent operation can access or mutate that value.
+//   a subsequent put, delete, or table destruction may invalidate the pointer. Use
+//   oa_hash_get_copy() when the table may be accessed concurrently.
 //
 
 // public API

@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -32,6 +32,10 @@
 //
 
 #include "scalpel.h"
+#include "modico_onnx_global.h"  // MoDiCo session + mc_* inference API (carve.c uses it directly)
+#include "gpu_meminfo.h"         // central accelerator-memory query + batch planner
+#include "onnx_providers.h"      // resolved ONNX execution provider + GPU device list
+#include <poll.h>
 
 // track header/footer patterns that require thread-based searching
 typedef struct ThreadSearchPattern {
@@ -75,20 +79,6 @@ typedef struct SearchThreadWork {
 } SearchThreadWork;
 
 
-// types that support checkpoint integrity checks
-typedef struct {
-    uint64_t sequence_number;
-    time_t timestamp;
-    unsigned char scalpel_sha256[32];
-    struct {
-      char filename[PATH_MAX];
-      unsigned char sha256[32];
-    } files[16];
-    int num_files;
-    unsigned char hmac[32];
-} CheckpointManifest;
-
-
 ///////////////////////////////////// GLOBALS //////////////////////////////////////////////
 // These are deliberately left out of the global scalpel state because they don't need to be
 // checkpointed--they will be recreated every time scalpel3 starts
@@ -104,6 +94,10 @@ uint32_t num_thread_search_patterns = 0;
 // tracks last checkpoint and start time for current run
 struct timespec last_checkpoint;
 struct timespec starttime;
+
+// paths selected by restore_checkpointed_scalpel_state() and reused after the file mirror starts
+static CheckpointSelection restored_checkpoint;
+static bool restored_checkpoint_selected = false;
 
 // command line overrides for threadpool sizes and number of CPU cores
 uint32_t max_filemirror_threads_override = 0;
@@ -131,8 +125,15 @@ atomic_bool TAKE_PERIODIC_CHECKPOINT;
 
 // controls progress checkpoints, which update INPROGRESS
 atomic_bool TAKE_PROGRESS_CHECKPOINT;
+
+// true only after checkpoint-and-exit can write restartable state
+atomic_bool RESTARTABLE_CHECKPOINT_AVAILABLE;
+
 static atomic_ulong progress_checkpoint_requested;
 static atomic_ulong progress_checkpoint_completed;
+static atomic_ulong progress_checkpoint_response_finished;
+static pthread_mutex_t progress_checkpoint_gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool progress_checkpoint_gate_open = false;
 
 typedef enum CheckpointRequestMask {
   CHECKPOINT_REQUEST_EXIT = 1u << 0,
@@ -150,6 +151,30 @@ static atomic_uint checkpoint_servicing_mask;
 static Queue carvelist;
 atomic_bool carvelist_initialized;
 
+// block-validation cursor state. During the block validation phase the validation threads claim
+// apparent blocks with atomic_fetch_add on block_validation_cursor (replacing the old materialized
+// per-(block, spec) queue) and validate the single-block validators for each. block_validation_done
+// counts blocks finished (validated or exemplar-skipped) so validate_blocks() detects completion.
+// block_validation_active gates the phase; the num_blocks / num_non_subtypes values are published
+// before the phase begins and read by the workers. The counters mirror what the old queue-build
+// tracked for block_validation_memdiag_report(); queued_by_type is non-NULL only when memory
+// diagnostics are enabled.
+static atomic_ullong block_validation_cursor;
+static atomic_ullong block_validation_done;
+static uint64_t block_validation_num_blocks;
+static uint32_t *block_validation_single_validator_specs;
+static uint32_t block_validation_num_single_validators;
+static atomic_bool block_validation_active;
+static atomic_uint block_validation_cursor_workers;
+static atomic_uint block_validation_cursor_worker_limit;
+static atomic_ullong block_validation_skipped_non_exemplar;
+static atomic_ullong block_validation_default_valid;
+static struct timespec block_validation_start_time;
+
+// test-only handshake that forces a validation worker across the phase-publication boundary
+static atomic_bool block_validation_test_worker_at_handoff;
+static atomic_bool block_validation_test_release_worker;
+
 // contains promising carving candidates that were partially validated by validation threads and
 // processsed by reassembly threads
 Queue promising_queue;
@@ -161,6 +186,7 @@ Queue reassembly_queue;
 // contains UUIDs of candidates that should be abandoned
 Queue kill_queue;
 atomic_bool kill_queue_initialized;
+atomic_ullong kill_queue_generation;
 
 // contains UUIDs whose stale PROMISING/INPROGRESS output should be removed
 static Queue partial_cleanup_queue;
@@ -175,8 +201,7 @@ atomic_ullong header_footer_wait;
 
 //////// OPTIMIZED PATTERN SEARCH //////////
 // Pattern lists for SIMD-accelerated search
-static PatternList *header_pattern_list = NULL;
-static PatternList *footer_pattern_list = NULL;
+static PatternList *simple_pattern_list = NULL;
 
 ////////////// SEARCH THREADS //////////////
 // thread pool for header/footer searches
@@ -198,6 +223,7 @@ static ThreadWork *validationthreadargs;
 // global, shared work available synchronization for validation threads
 static pthread_mutex_t validation_work_is_available;
 static pthread_cond_t validation_check_work_available;
+static pthread_cond_t block_validation_check_complete;
 static atomic_uint num_idle_validation_threads;
 
 //////// REASSEMBLY THREADS //////////
@@ -213,25 +239,40 @@ pthread_cond_t reassembly_check_work_available;  // among all threads
 atomic_uint num_idle_reassembly_threads;
 
 //////// IPC THREAD //////////
+enum { IPC_POLL_TIMEOUT_MILLISECONDS = 100 };
 static pthread_t ipc;
+static pthread_mutex_t ipc_client_lock;
+static atomic_bool ipc_stop_requested;
+static int ipc_client_socket = -1;
+static bool ipc_started = false;
+static bool exit_checkpoint_committed = false;
 
 // prototypes for private carve.c functions
 static void start_threads(void);
 static void stop_threads(void);
+static void stop_ipc_thread(void);
 static int int_compare(const void *a, const void *b);
 static void search_for_headers_footers(void);
 static void search_for_headers_footers_buffer(BlockVector *b);
 static void prune_header_footer_database(void);
+static void serialize_blockclassification_database(void);
 static void validate_block(BlockInfo *blockinfo);
 static void validate_file(CarveInfo *candidate, unsigned int id);
 static void validate_blocks(void);
+static bool block_validation_runs_for_current_mode(const SearchSpec *spec);
+static void validate_one_apparent_block(uint64_t block);
+static void report_block_validation_progress(const char *label, uint64_t done, uint64_t total);
+static void modico_populate_blocktypes(void);
 static void add_file_validation_work(CarveInfo *candidate, int64_t priority);
 static uint32_t checkpoint_requested_mask(void);
 static void checkpoint_mark_serviced_requests(void);
 static const char *checkpoint_pending_status(void);
-static unsigned long checkpoint_request_progress_generation(void);
+static void checkpoint_open_progress_request_gate(void);
+static bool checkpoint_request_progress_generation(unsigned long *generation,
+                                                   bool *checkpoint_active);
 static bool checkpoint_progress_generation_complete(unsigned long generation);
 static void checkpoint_service_inprogress_requests(bool *write_inprogress, bool *inprogress_updated);
+static void checkpoint_close_progress_request_gate(void);
 static void print_reassembly_status(uint64_t q_length,
                                     long checkpoint_timer,
                                     long recovery_checkpoint_timer,
@@ -257,12 +298,14 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority);
 static void scalpel_state_serialization(StateSerialization mode, char *filename);
 static void insert_F2_reassembly_candidates(FILE_DEFRAG_PRIORITY priority);
 static void *ipc_thread(void *arg);
+static bool ipc_accept_error_is_transient(int error);
 static void *reassembly_thread(void *args);
 static bool get_reassembly_candidate(ThreadWork *work, CarveInfo **candidate);
 static void carve_free_state(void *carvehashkey);
 static void prune_uuid_from_promising_queue(uuid_t uuid);
 static void sync_promising_and_kill_queues(void);
 static bool primary_uuid_is_killed(uuid_t uuid);
+static bool queue_kill_uuid(uuid_t uuid);
 static void queue_partial_cleanup(uuid_t uuid);
 static void cleanup_partial_artifacts(uuid_t uuid);
 static void reconcile_partial_artifacts_on_restore(void);
@@ -276,7 +319,7 @@ static bool write_essential_carveinfo_queue_h(Queue *q, int handle);
 static void add_to_reassembly_queue(CarveInfo *c);
 static void init_optimized_pattern_search(void);
 static void free_pattern_list(PatternList *pl);
-static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs, bool headers);
+static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs);
 static void optimized_pattern_search(PatternList *pl, const unsigned char *buf, size_t len, BlockVector *b,
                                      uint64_t emit_len,
                                      void (*callback)(uint32_t, uint64_t, size_t, bool));
@@ -287,9 +330,6 @@ static uint64_t read_u64_unaligned(const void *ptr);
 static uint32_t read_u32_unaligned(const void *ptr);
 static uint16_t read_u16_unaligned(const void *ptr);
 static void update_inprogress_directories(void);
-static bool checkpoint_verify_manifest(void);
-static bool checkpoint_save_manifest(void);
-static bool checkpoint_hash_file(const char *filepath, unsigned char hash[32]);
 static uint64_t checkpoint_get_sequence(void);
 static void serialize_essential_offsets(char *filename);
 // these are used in various compile-time branches
@@ -493,6 +533,44 @@ static void serialize_essential_offsets(char *filename) {
 }
 
 
+// Persist the immutable block-classification table as a normal output artifact. Checkpoints depend
+// on this file, but do not own or rewrite it.
+static void serialize_blockclassification_database(void) {
+
+  char pathname[PATH_MAX];
+  char temporary_pathname[PATH_MAX];
+  int pathname_length;
+  int temporary_pathname_length;
+
+  pathname_length = snprintf(pathname, sizeof(pathname), "%s/%s",
+                             scalpel_state.base_output_directory,
+                             BLOCKCLASSIFICATION_FILENAME);
+  temporary_pathname_length = pathname_length < 0
+                                     || (size_t)pathname_length >= sizeof(pathname)
+                                 ? -1
+                                 : snprintf(temporary_pathname,
+                                            sizeof(temporary_pathname), "%s_",
+                                            pathname);
+  if (pathname_length < 0 || (size_t)pathname_length >= sizeof(pathname)
+      || temporary_pathname_length < 0
+      || (size_t)temporary_pathname_length >= sizeof(temporary_pathname)) {
+    handle_error(SCALPEL_ERROR_FILE_WRITE, BLOCKCLASSIFICATION_FILENAME,
+                 __LINE__, __FILE__);
+  }
+
+  frame_message("WRITING BLOCK CLASSIFICATION DATABASE");
+  if (! filemirror_serialize_blockclassification_data(
+          scalpel_state.filemirror, SERIALIZE, temporary_pathname)) {
+    handle_error(SCALPEL_ERROR_FILE_WRITE, pathname, __LINE__, __FILE__);
+  }
+  if (! checkpoint_atomic_replace(temporary_pathname, pathname,
+                                   scalpel_state.base_output_directory)) {
+    handle_error(SCALPEL_ERROR_FILE_WRITE, pathname, __LINE__, __FILE__);
+  }
+  frame_message("BLOCK CLASSIFICATION DATABASE WRITTEN");
+}
+
+
 // this function wipes all files from the INPROGRESS directory, leaving directory structure intact,
 // then writes each file in the promising_queue to INPROGRESS.
 static void update_inprogress_directories(void) {
@@ -515,6 +593,10 @@ static void update_inprogress_directories(void) {
     write_candidate(c, true);
     next_element(&promising_queue);
   }
+
+  // a progress checkpoint is complete only when every snapshot and optional blockvector has reached
+  // its public pathname. This also serializes successive generations of fixed INPROGRESS paths.
+  filemirror_wait_for_vector_operations(scalpel_state.filemirror);
 }
 
 
@@ -738,129 +820,6 @@ void destroy_candidate(CarveInfo **candidate) {
 }
 
 
-// hash one file in checkpoint set
-static bool checkpoint_hash_file(const char *filepath, unsigned char hash[32]) {
-
-  FILE *fp = fopen(filepath, "rb");
-  if (! fp) {
-    return false;
-  }
-
-  fseek(fp, 0, SEEK_END);
-  long size = ftell(fp);
-  fseek(fp, 0, SEEK_SET);
-  if (size <= 0) { fclose(fp); return false; }
-  unsigned char *data = malloc(size);
-  if (!data || fread(data, 1, size, fp) != (size_t)size) {
-        free(data); fclose(fp); return false;
-  }
-
-  fclose(fp);
-  SHA256(data, size, hash);
-  free(data);
-  return true;
-}
-
-
-// save checkpoint manifest to support checkpoint integrity checks
-static bool checkpoint_save_manifest(void) {
-
-  CheckpointManifest m = {0};
-  char path[PATH_MAX];
-  FILE *fp;
-  unsigned char key[32];
-  int idx = 0;
-
-  m.sequence_number = checkpoint_get_sequence();
-  m.timestamp = time(NULL);
-  memcpy(m.scalpel_sha256, scalpel_state.sha256, 32);
-
-  // hash all checkpoint files
-#define ADD_FILE(name) \
-        snprintf(path, sizeof(path), "%s/%s", scalpel_state.base_output_directory, name); \
-        if (checkpoint_hash_file(path, m.files[idx].sha256)) { \
-          strncpy(m.files[idx].filename, name, PATH_MAX - 1);\
-          idx++; \
-        }
-
-  // these live in the scalpel-output directory
-  ADD_FILE("scalpel_state.chk");
-  ADD_FILE("promising_queue.chk");
-  ADD_FILE("blocktypes.chk");
-
-  m.num_files = idx;
-  if (idx == 0) {
-    return false;
-  }
-
-  // sign with HMAC
-  memcpy(key, scalpel_state.sha256, 32);
-  HMAC(EVP_sha256(), key, 32, (unsigned char*)&m,
-       offsetof(CheckpointManifest, hmac), m.hmac, NULL);
-
-  // save
-  snprintf(path, sizeof(path), "%s/checkpoint_manifest.chk", scalpel_state.base_output_directory);
-  fp = fopen(path, "wb");
-  if (! fp || fwrite(&m, sizeof(m), 1, fp) != 1) {
-    if (fp) {
-      fclose(fp);
-    }
-    return false;
-  }
-
-  fclose(fp);
-  return true;
-}
-
-
-// verify checkpoint integrity
-static bool checkpoint_verify_manifest(void) {
-
-  CheckpointManifest m;
-  char path[PATH_MAX];
-  FILE *fp;
-  unsigned char key[32], hmac[32], hash[32];
-
-  snprintf(path, sizeof(path), "%s/checkpoint_manifest.chk", scalpel_state.base_output_directory);
-  fp = fopen(path, "rb");
-  if (! fp || fread(&m, sizeof(m), 1, fp) != 1) {
-    if (fp) {
-      fclose(fp);
-    }
-    lock_fprintf(stderr,"Couldn't read checkpoint manifest.\n");
-    return false;
-  }
-
-  fclose(fp);
-
-  lock_fprintf(stdout, "Verifying checkpoint...\n");
-
-  // verify HMAC
-  memcpy(key, scalpel_state.sha256, 32);
-  HMAC(EVP_sha256(), key, 32, (unsigned char*)&m,
-       offsetof(CheckpointManifest, hmac), hmac, NULL);
-  if (memcmp(hmac, m.hmac, 32) != 0) {
-    lock_fprintf(stderr, "Manifest HMAC verification failed.\n");
-    return false;
-  }
-
-  // verify all checkpoint files
-  for (int i = 0; i < m.num_files; i++) {
-    snprintf(path, sizeof(path), "%s/%s", scalpel_state.base_output_directory, m.files[i].filename);
-    lock_fprintf(stdout, "  %s... ", m.files[i].filename);
-    fflush(stdout);
-    if (! checkpoint_hash_file(path, hash) || memcmp(hash, m.files[i].sha256, 32) != 0) {
-      lock_fprintf(stdout, "FAILED.\n");
-      return false;
-    }
-    lock_fprintf(stdout, "OK.\n");
-  }
-
-  fprintf(stdout, "Done.\n");
-  return true;
-}
-
-
 // get sequence number for checkpoint
 static uint64_t checkpoint_get_sequence(void) {
 
@@ -869,7 +828,7 @@ static uint64_t checkpoint_get_sequence(void) {
     return 0;
   }
 
-  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  return (uint64_t)ts.tv_sec * NANOSECONDS_PER_SECOND + ts.tv_nsec;
 }
 
 
@@ -1177,6 +1136,22 @@ static bool primary_uuid_is_killed(uuid_t uuid) {
 }
 
 
+// add a non-null UUID to the kill queue and publish a new generation before releasing the queue
+static bool queue_kill_uuid(uuid_t uuid) {
+
+  if (uuid_is_null(uuid)) {
+    return false;
+  }
+
+  lock_queue(&kill_queue);
+  nolock_add_to_queue_priority_relaxed(&kill_queue, uuid, INT_MAX - time(NULL));
+  atomic_fetch_add_explicit(&kill_queue_generation, 1, memory_order_release);
+  unlock_queue(&kill_queue);
+
+  return true;
+}
+
+
 // return a bitmask describing currently requested checkpoint operations.
 static uint32_t checkpoint_requested_mask(void) {
 
@@ -1240,15 +1215,35 @@ static const char *checkpoint_pending_status(void) {
 }
 
 
-// record a progress checkpoint request and return the generation the IPC client should wait for.
-static unsigned long checkpoint_request_progress_generation(void) {
+// allow IPC progress requests while fragmented recovery can service them
+static void checkpoint_open_progress_request_gate(void) {
 
-  unsigned long generation;
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&progress_checkpoint_gate_lock), __LINE__, __FILE__);
+  progress_checkpoint_gate_open = true;
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&progress_checkpoint_gate_lock), __LINE__, __FILE__);
+}
 
-  generation = atomic_fetch_add_explicit(&progress_checkpoint_requested, 1, memory_order_acq_rel) + 1;
-  atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, true, memory_order_release);
 
-  return generation;
+// record a progress request only while fragmented recovery can service it
+static bool checkpoint_request_progress_generation(unsigned long *generation,
+                                                   bool *checkpoint_active) {
+
+  bool accepted = false;
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&progress_checkpoint_gate_lock), __LINE__, __FILE__);
+  if (progress_checkpoint_gate_open) {
+    *checkpoint_active = atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)
+                         || atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)
+                         || atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)
+                         || atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire);
+    *generation = atomic_fetch_add_explicit(&progress_checkpoint_requested, 1,
+                                            memory_order_acq_rel) + 1;
+    atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, true, memory_order_release);
+    accepted = true;
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&progress_checkpoint_gate_lock), __LINE__, __FILE__);
+
+  return accepted;
 }
 
 
@@ -1274,6 +1269,10 @@ static void checkpoint_service_inprogress_requests(bool *write_inprogress, bool 
     update_inprogress_directories();
     *inprogress_updated = true;
 
+    if (getenv("SCALPEL3_TEST_EXIT_AFTER_PROGRESS")) {
+      _exit(88);
+    }
+
     if (requested > completed) {
       atomic_store_explicit(&progress_checkpoint_completed, requested, memory_order_release);
     }
@@ -1285,6 +1284,33 @@ static void checkpoint_service_inprogress_requests(bool *write_inprogress, bool 
   }
   else {
     atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, true, memory_order_release);
+  }
+}
+
+
+// close the request gate and complete every progress request accepted before it closed
+static void checkpoint_close_progress_request_gate(void) {
+
+  unsigned long accepted_requests;
+  bool request_pending;
+  bool write_inprogress = false;
+  bool inprogress_updated = false;
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&progress_checkpoint_gate_lock), __LINE__, __FILE__);
+  progress_checkpoint_gate_open = false;
+  accepted_requests = atomic_load_explicit(&progress_checkpoint_requested, memory_order_acquire);
+  request_pending = accepted_requests
+                    > atomic_load_explicit(&progress_checkpoint_completed, memory_order_acquire);
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&progress_checkpoint_gate_lock), __LINE__, __FILE__);
+
+  if (request_pending) {
+    checkpoint_service_inprogress_requests(&write_inprogress, &inprogress_updated);
+  }
+
+  // do not let shutdown close an accepted request before the IPC thread attempts its response
+  while (atomic_load_explicit(&progress_checkpoint_response_finished, memory_order_acquire)
+         < accepted_requests) {
+    sched_yield();
   }
 }
 
@@ -1301,7 +1327,7 @@ static void print_reassembly_status(uint64_t q_length,
 
   now = time(NULL);
   clock_gettime(CLOCK_MONOTONIC, &endtime);
-  total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9
+  total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
                + (endtime.tv_nsec - starttime.tv_nsec);
   last_validation_gap = (endtime.tv_sec - last_validation->tv_sec)
                         + (endtime.tv_nsec - last_validation->tv_nsec)
@@ -1476,8 +1502,61 @@ static void restore_collect_validated_uuids(const char *current_path,
     }
     else if (S_ISREG(statbuf.st_mode)
              && strstr(path, "/VALIDATED/")
+             && ! strstr(entry->d_name, ".BLOCKVECTOR.txt")
              && restore_parse_primary_uuid(entry->d_name, uuid)) {
       restore_uuid_set_add(set, uuid);
+    }
+  }
+
+  closedir(dir);
+}
+
+
+static void restore_remove_orphaned_blockvectors(const char *current_path,
+                                                 uint64_t *deleted) {
+
+  static const char suffix[] = ".BLOCKVECTOR.txt";
+  DIR *dir;
+  struct dirent *entry;
+  char path[PATH_MAX];
+  char data_path[PATH_MAX];
+  struct stat statbuf;
+  size_t path_length;
+  size_t suffix_length = strlen(suffix);
+
+  if (! (dir = opendir(current_path))) {
+    return;
+  }
+
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+    if (snprintf(path, sizeof(path), "%s/%s", current_path,
+                 entry->d_name) >= PATH_MAX
+        || lstat(path, &statbuf) == -1) {
+      continue;
+    }
+
+    if (S_ISDIR(statbuf.st_mode)) {
+      restore_remove_orphaned_blockvectors(path, deleted);
+      continue;
+    }
+    if (! S_ISREG(statbuf.st_mode)) {
+      continue;
+    }
+
+    path_length = strlen(path);
+    if (path_length <= suffix_length
+        || strcmp(path + path_length - suffix_length, suffix)) {
+      continue;
+    }
+
+    memcpy(data_path, path, path_length - suffix_length);
+    data_path[path_length - suffix_length] = 0;
+    if (lstat(data_path, &statbuf) == -1 && errno == ENOENT
+        && unlink(path) == 0) {
+      (*deleted)++;
     }
   }
 
@@ -1533,7 +1612,15 @@ static void reconcile_partial_artifacts_on_restore(void) {
 
   RestoreUUIDSet set = {0};
   uint64_t deleted = 0;
+  uint64_t orphaned_blockvectors = 0;
   char buf[MAX_STRING_LENGTH];
+
+  // a staging pathname is never committed output. Removing abandoned reservations before scanning
+  // files in VALIDATED lets interrupted writes be retried from the restored checkpoint.
+  delete_files_recursive(scalpel_state.base_output_directory,
+                         FILEMIRROR_STAGING_PATTERN);
+  restore_remove_orphaned_blockvectors(scalpel_state.base_output_directory,
+                                       &orphaned_blockvectors);
 
   restore_collect_validated_uuids(scalpel_state.base_output_directory, &set);
   restore_uuid_set_sort_unique(&set);
@@ -1545,8 +1632,9 @@ static void reconcile_partial_artifacts_on_restore(void) {
 
   snprintf(buf, sizeof(buf),
            "RESTORE RECONCILIATION: %" PRIu64
-           " validated UUIDs, %" PRIu64 " stale PROMISING files removed",
-           set.count, deleted);
+           " validated UUIDs, %" PRIu64 " stale PROMISING files and %" PRIu64
+           " orphaned blockvectors removed",
+           set.count, deleted, orphaned_blockvectors);
   frame_message(buf);
 
   free(set.uuids);
@@ -1634,10 +1722,13 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
-  // correct allocation to deal with subtypes that will be read from checkpoint
+  // correct allocation to deal with subtypes that will be read from checkpoint. No subtypes
+  // are ever created after a restore (block validation is a fresh-run-only phase), so an exact
+  // fit is correct here and no MAX_FILE_SUBTYPES slack is needed.
   if (mode == DESERIALIZE) {
     scalpel_state.search_specs = realloc(scalpel_state.search_specs, sizeof(SearchSpec) * (scalpel_state.num_specs + 1));
     check_memory_allocation(scalpel_state.search_specs, __LINE__, __FILE__, "scalpel_state.search_specs");
+    scalpel_state.search_specs_capacity = scalpel_state.num_specs + 1;
     scalpel_state.search_specs[scalpel_state.num_specs].FILETYPE[0] = 0;
   }
 
@@ -1851,6 +1942,12 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
+  if (fb(&(scalpel_state.modico_requested), sizeof(scalpel_state.modico_requested), 1, fp) != 1) {
+    perror("scalpel_state modico_requested");
+    // fatal
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+
   // now serialize the scalpel_state.search_specs array, omitting MASTER file types from
   // serialization / deserialization, since MASTER file types will not be used to create new file
   // subtypes after the block validation phase
@@ -1962,13 +2059,36 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
 
-    // function pointers cannot be serialized--they are just copied from INITIAL_SEARCH_SPECS on
-    // checkpoint restore
+    if (fb(&(scalpel_state.search_specs[i].BLOCKVALIDATIONSCOPE),
+           sizeof(scalpel_state.search_specs[i].BLOCKVALIDATIONSCOPE), 1,
+           fp) != 1) {
+      perror("scalpel_state BLOCKVALIDATIONSCOPE");
+      // fatal
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (mode == DESERIALIZE
+        && scalpel_state.search_specs[i].BLOCKVALIDATIONSCOPE
+               != BLOCK_VALIDATION_ALWAYS
+        && scalpel_state.search_specs[i].BLOCKVALIDATIONSCOPE
+               != BLOCK_VALIDATION_REASSEMBLY_ONLY
+        && scalpel_state.search_specs[i].BLOCKVALIDATIONSCOPE
+               != BLOCK_VALIDATION_DISABLED) {
+      snprintf(errmsg, sizeof(errmsg),
+               "Checkpoint contains an invalid block validation disposition "
+               "for file type \"%s\".",
+               scalpel_state.search_specs[i].FILETYPE);
+      handle_error(SCALPEL_ERROR_CHECKPOINT, errmsg, __LINE__, __FILE__);
+    }
+
+    // function pointers are static configuration and cannot be checkpoint overrides, so they are
+    // copied from INITIAL_SEARCH_SPECS on checkpoint restore
 
     if (mode == DESERIALIZE) {
       scalpel_state.search_specs[i].HEADERFUNC = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].HEADERFUNC;
       scalpel_state.search_specs[i].FOOTERFUNC = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].FOOTERFUNC;
       scalpel_state.search_specs[i].BLOCKVALIDATOR = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].BLOCKVALIDATOR;
+      scalpel_state.search_specs[i].BATCHEDBLOCKVALIDATOR =
+          INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].BATCHEDBLOCKVALIDATOR;
       scalpel_state.search_specs[i].FILEVALIDATOR = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].FILEVALIDATOR;
       scalpel_state.search_specs[i].DONTCARVE = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].DONTCARVE;
       scalpel_state.search_specs[i].REASSEMBLYFUNC = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].REASSEMBLYFUNC;
@@ -2379,7 +2499,11 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
       }
     }
   }
-  fclose(fp);
+  if ((mode == SERIALIZE && ! checkpoint_durable_close(fp))
+      || (mode == DESERIALIZE && fclose(fp) != 0)) {
+    perror("closing scalpel checkpoint state");
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
 }
 
 
@@ -2392,30 +2516,78 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
 //
 // o serialized version of promising_queue, with all UUIDs in kill queue pruned
 //
-// o filemirror state, including blockmap and blocktype data, which is saved automatically when the
-// filemirror shuts down or here, if a periodic checkpoint is being taken
+// o the immutable blockclassification.dat database, written once when block validation completes
+// and included by reference in the checkpoint manifest.
 //
 // o a manifest file that is used to verify checkpoint integrity
+//
+// the blockmap is deliberately external to the checkpoint. It may be edited independently between
+// checkpoint creation and restore; queued candidates are reconciled with its current coverage state
+// after restoration.
 //
 // IMPORTANT: queue serialization functions depend on the filemirror for I/O, so it must *not* be
 // shut down before save_checkpoint() is complete.
 //
 void save_checkpoint(void) {
 
-  char fn[PATH_MAX];
-  char newfn[PATH_MAX];
+  CheckpointSelection current;
+  char temporary_path[PATH_MAX];
+  char final_path[PATH_MAX];
+  uint32_t slot;
+  uint64_t sequence_number;
+  bool checkpoint_and_exit;
+  bool have_current;
   FILE *fp;
+
+  // a restartable checkpoint must not contain candidates covered by kill orders accepted before
+  // its snapshot boundary. Checkpoint-and-exit closes IPC first so no later kill can be acknowledged.
+  checkpoint_and_exit =
+      atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire);
+  if (checkpoint_and_exit) {
+    stop_ipc_thread();
+  }
+  sync_promising_and_kill_queues();
+
+  // authenticate and hash the slot-specific state and queue before invalidating the other slot.
+  // blockclassification.dat is shared and immutable, so its hash cannot determine which slot is
+  // safe to preserve.
+  have_current = checkpoint_select_slot_for_save(
+      scalpel_state.base_output_directory, scalpel_state.sha256, &current, NULL);
+  slot = have_current ? (current.slot + 1U) % CHECKPOINT_SLOT_COUNT : 0U;
+  sequence_number = checkpoint_get_sequence();
+  if (have_current && sequence_number <= current.manifest.sequence_number) {
+    if (current.manifest.sequence_number == UINT64_MAX) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    sequence_number = current.manifest.sequence_number + 1U;
+  }
+  if (sequence_number == 0
+      || ! checkpoint_invalidate_slot(scalpel_state.base_output_directory, slot)) {
+    perror("preparing inactive checkpoint slot");
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  checkpoint_test_crash_after("slot-invalidated");
 
   // save current scalpel state
   if (scalpel_state.mode_verbose) {
-    lock_fprintf(stdout, "Serializing main scalpel state.\n");
+    lock_fprintf(stdout, "Serializing main scalpel state to checkpoint slot %" PRIu32 ".\n", slot);
   }
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-
-  snprintf(fn, PATH_MAX, "%s/scalpel_state.chk_", scalpel_state.base_output_directory);
-  scalpel_state_serialization(SERIALIZE, fn);  // will not return on error
+  if (! checkpoint_slot_path(temporary_path, sizeof(temporary_path),
+                             scalpel_state.base_output_directory,
+                             CHECKPOINT_COMPONENT_STATE, slot, true)
+      || ! checkpoint_slot_path(final_path, sizeof(final_path),
+                                scalpel_state.base_output_directory,
+                                CHECKPOINT_COMPONENT_STATE, slot, false)) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  scalpel_state_serialization(SERIALIZE, temporary_path);  // will not return on error
+  if (! checkpoint_atomic_replace(temporary_path, final_path,
+                                  scalpel_state.base_output_directory)) {
+    perror("publishing checkpoint state in inactive slot");
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  checkpoint_test_crash_after("state-renamed");
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Serialization of main scalpel state is complete.\n");
   }
@@ -2425,65 +2597,61 @@ void save_checkpoint(void) {
     lock_fprintf(stdout, "Serializing promising queue (%" PRIu64 " elements).\n", nolock_queue_length(&promising_queue));
   }
 
-  snprintf(fn, PATH_MAX, "%s/promising_queue.chk_", scalpel_state.base_output_directory);
-  if (! (fp = fopen(fn, "wb"))) {
-    perror("opening promising_queue.chk_");
+  if (! checkpoint_slot_path(temporary_path, sizeof(temporary_path),
+                             scalpel_state.base_output_directory,
+                             CHECKPOINT_COMPONENT_QUEUE, slot, true)
+      || ! checkpoint_slot_path(final_path, sizeof(final_path),
+                                scalpel_state.base_output_directory,
+                                CHECKPOINT_COMPONENT_QUEUE, slot, false)) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  unlink(temporary_path);
+  if (! (fp = fopen(temporary_path, "wb"))) {
+    perror("opening inactive promising queue checkpoint");
     // fatal
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
   if (! serialize_queue(&promising_queue, promising_queue_element_serialization, fp)) {
+    fclose(fp);
     // fatal
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
-  fclose(fp);
+  if (! checkpoint_durable_close(fp)
+      || ! checkpoint_atomic_replace(temporary_path, final_path,
+                                     scalpel_state.base_output_directory)) {
+    perror("publishing promising queue in inactive checkpoint slot");
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  checkpoint_test_crash_after("queue-renamed");
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Serialization of promising queue is complete.\n");
   }
 
-  // checkpoint and exit events will result in filemirror_stop() being called, which writes the
-  // blockmap and blocktype data, so write that data here only if scalpel won't exit after this
-  // checkpoint
+  // checkpoint and exit events will result in filemirror_stop() writing the blockmap, so write it
+  // here only if scalpel won't exit after this checkpoint
   if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
     // periodic checkpoint
 
-    // save blockmap and block types in file mirror
-    snprintf(fn, PATH_MAX, "%s_", scalpel_state.blockmap_pathname);
-    filemirror_write_blockmap(scalpel_state.filemirror, fn);
+    // the blockmap remains independently replaceable and is not part of either checkpoint slot
+    filemirror_publish_blockmap(scalpel_state.filemirror);
 
-    snprintf(fn, PATH_MAX, "%s/blocktypes.chk_", scalpel_state.base_output_directory);
-    if (! filemirror_serialize_blocktype_data(scalpel_state.filemirror, SERIALIZE, fn)) {
-      // fatal
-      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
-    }
-
-    // now overwrite old checkpoint data with new data, to minimize failure window
-    snprintf(fn, PATH_MAX, "%s_", scalpel_state.blockmap_pathname);
-    unlink(scalpel_state.blockmap_pathname);
-    rename(fn, scalpel_state.blockmap_pathname);
-
-    snprintf(fn, PATH_MAX, "%s/blocktypes.chk_", scalpel_state.base_output_directory);
-    snprintf(newfn, PATH_MAX, "%s/blocktypes.chk", scalpel_state.base_output_directory);
-    unlink(newfn);
-    rename(fn, newfn);
   }
 
-  snprintf(fn, PATH_MAX, "%s/promising_queue.chk_", scalpel_state.base_output_directory);
-  snprintf(newfn, PATH_MAX, "%s/promising_queue.chk", scalpel_state.base_output_directory);
-  unlink(newfn);
-  rename(fn, newfn);
-
-  snprintf(fn, PATH_MAX, "%s/scalpel_state.chk_", scalpel_state.base_output_directory);
-  snprintf(newfn, PATH_MAX, "%s/scalpel_state.chk", scalpel_state.base_output_directory);
-  unlink(newfn);
-  rename(fn, newfn);
-
-  if (! checkpoint_save_manifest()) {
-    // fatal
+  if (! checkpoint_write_slot_manifest(scalpel_state.base_output_directory, slot,
+                                       sequence_number, scalpel_state.sha256)
+      || ! checkpoint_publish_slot(scalpel_state.base_output_directory, slot,
+                                   sequence_number)) {
+    perror("publishing checkpoint slot");
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
-#pragma GCC diagnostic pop
+  if (checkpoint_and_exit) {
+    exit_checkpoint_committed = true;
+  }
+
+  lock_fprintf(stdout, "Checkpoint slot %" PRIu32 " committed (sequence %" PRIu64 ").\n",
+               slot, sequence_number);
 }
 
 
@@ -2493,24 +2661,21 @@ void save_checkpoint(void) {
 // restoration of carving candidates into the promising queue, as the file mirror must be up first.
 void restore_checkpointed_scalpel_state(void) {
 
-  char fn[PATH_MAX];
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-
-
-  if (! scalpel_state.no_cp_validation && ! checkpoint_verify_manifest()) {
+  if (! checkpoint_select_slot(scalpel_state.base_output_directory,
+                               scalpel_state.sha256,
+                               ! scalpel_state.no_cp_validation,
+                               &restored_checkpoint, stdout)) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
+  restored_checkpoint_selected = true;
 
   // read checkpointed scalpel state
-  snprintf(fn, PATH_MAX, "%s/scalpel_state.chk", scalpel_state.base_output_directory);
   if (scalpel_state.mode_verbose) {
-    lock_fprintf(stdout, "Deserializing scalpel state from \"%s\".\n", fn);
+    lock_fprintf(stdout, "Deserializing scalpel state from \"%s\".\n",
+                 restored_checkpoint.state_path);
   }
-  scalpel_state_serialization(DESERIALIZE, fn);  // will not return on error
-
-#pragma GCC diagnostic pop
+  scalpel_state_serialization(DESERIALIZE,
+                              restored_checkpoint.state_path);  // will not return on error
 }
 
 
@@ -2518,7 +2683,6 @@ void restore_checkpointed_scalpel_state(void) {
 // initialized.
 void restore_checkpointed_promising_queue(void) {
 
-  char fn[PATH_MAX];
   FILE *fp;
 
   // restore promising queue from checkpoint
@@ -2526,14 +2690,8 @@ void restore_checkpointed_promising_queue(void) {
     lock_fprintf(stdout, "Deserializing promising queue.\n");
   }
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-
-  snprintf(fn, PATH_MAX, "%s/promising_queue.chk", scalpel_state.base_output_directory);
-
-#pragma GCC diagnostic pop
-
-  if (! (fp = fopen(fn, "rb"))) {
+  if (! restored_checkpoint_selected
+      || ! (fp = fopen(restored_checkpoint.queue_path, "rb"))) {
     // fatal
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
@@ -2545,7 +2703,9 @@ void restore_checkpointed_promising_queue(void) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
-  fclose(fp);
+  if (fclose(fp) != 0) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Deserialized %" PRIu64 " elements into promising queue.\n", nolock_queue_length(&promising_queue));
@@ -2611,26 +2771,57 @@ uint32_t add_file_subtype(uint32_t masteridx, char *filetype) {
   }
 
   if (! found) {
-    // subtype is unique--add it (realloc() must also accomodate the "null" file type that
-    // terminates search_specs, thus the +1)
-    idx = scalpel_state.num_specs;
-    scalpel_state.num_specs++;
-    scalpel_state.search_specs = realloc(scalpel_state.search_specs, sizeof(SearchSpec) * (scalpel_state.num_specs + 1));
-    check_memory_allocation(scalpel_state.search_specs, __LINE__, __FILE__, "scalpel_state.search_specs");
+    if (scalpel_state.num_specs + 1 >= scalpel_state.search_specs_capacity) {
+      // reserved subtype slack is exhausted (the last slot is kept for the null-terminating
+      // file type, so the array is full when num_specs + 1 reaches capacity). Fold this
+      // subtype into its master type by leaving idx == masteridx. Warn once per run so the
+      // MAX_FILE_SUBTYPES ceiling in scalpel.h can be raised if this is legitimate.
+      static bool subtype_cap_warned = false;
+      if (! subtype_cap_warned) {
+        subtype_cap_warned = true;
+        lock_fprintf(stderr,
+                     "\nWARNING: file subtype capacity (%d) reached; further subtypes (e.g., "
+                     "\"%s\") will be categorized as their master type. Raise MAX_FILE_SUBTYPES "
+                     "in scalpel.h if this is expected.\n\n",
+                     MAX_FILE_SUBTYPES, filetype);
+      }
+    }
+    else {
+      // subtype is unique--append it into the preallocated slack. No realloc() is performed,
+      // so existing specs (and their embedded mutexes and atomics) never move while validation
+      // threads read search_specs lock-free.
+      idx = scalpel_state.num_specs;
 
-    // use the master as a template to create a new file type
-    copy_search_spec(&scalpel_state.search_specs[scalpel_state.num_specs - 1], &scalpel_state.search_specs[masteridx]);
+      // use the master as a template to create a new file type. The copy zeroes the destination
+      // slot first, including its mutexes, which are (re)initialized below.
+      copy_search_spec(&scalpel_state.search_specs[idx], &scalpel_state.search_specs[masteridx]);
 
-    // file subtypes aren't a master type and inherent function pointers of master type
-    scalpel_state.search_specs[scalpel_state.num_specs - 1].MASTER = false;
-    scalpel_state.search_specs[scalpel_state.num_specs - 1].mastertype = masteridx;
+      // file subtypes aren't a master type and retain the master's original configuration index,
+      // even when -U or -z moved the master within scalpel_state.search_specs
+      scalpel_state.search_specs[idx].MASTER = false;
+      scalpel_state.search_specs[idx].mastertype =
+          scalpel_state.search_specs[masteridx].mastertype;
 
-    // update the type
-    strcpy(scalpel_state.search_specs[scalpel_state.num_specs - 1].FILETYPE, filetype);
+      // update the type
+      strcpy(scalpel_state.search_specs[idx].FILETYPE, filetype);
 
-    // inform filemirror that another file type is present
+      // initialize this slot's mutexes (copy_search_spec() zeroed them)
+      if (pthread_mutex_init(&scalpel_state.search_specs[idx].filewritelock, NULL)
+          || pthread_mutex_init(&scalpel_state.search_specs[idx].offsets.headerlock, NULL)
+          || pthread_mutex_init(&scalpel_state.search_specs[idx].offsets.footerlock, NULL)) {
+        // fatal
+        handle_error(SCALPEL_ERROR_MUTEX_FAILURE, "add_file_subtype()", __LINE__, __FILE__);
+      }
 
-    filemirror_add_blocktype_slot(scalpel_state.filemirror);
+      // keep the null-terminator sentinel valid at the new tail, then publish the new count.
+      // The count is incremented last so a reader iterating search_specs[0 .. num_specs) never
+      // observes a partially initialized subtype slot.
+      scalpel_state.search_specs[idx + 1].FILETYPE[0] = 0;
+      scalpel_state.num_specs++;
+
+      // inform filemirror that another file type is present
+      filemirror_add_blocktype_slot(scalpel_state.filemirror);
+    }
   }
 
   // release the lock
@@ -2785,8 +2976,8 @@ static void ensure_candidate_blockvector(CarveInfo *candidate) {
 }
 
 
-// threads to support multithreaded header/footer searches. Search threads are NOT responsive to
-// pending checkpoint operations.
+// threads to support multithreaded header/footer searches. Search threads honor checkpoint-and-exit
+// between match attempts; active header/footer functions run to completion.
 static void *search_thread(void *args) {
 
   SearchThreadWork *work = (SearchThreadWork *)args;
@@ -2837,7 +3028,9 @@ static void *search_thread(void *args) {
     matchpos = (char *)1;
     startpos = blockvector_get_data_pointer(work->b);
     buflen = blockvector_get_data_length(work->b);
-    while (matchpos && startpos < bdata + blen - 1) {
+    while (matchpos && startpos < bdata + blen - 1
+           && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                                     memory_order_acquire)) {
       matchpos = NULL;
 
       // prefer validation function over binary string comparison
@@ -2961,6 +3154,13 @@ static void validate_file(CarveInfo *candidate, unsigned int id) {
                                                                  blockvector_get_data_length(candidate->b), &validates,
                                                                  &validates_to, &promising, candidate->needleidx,
                                                                  scalpel_state.blocksize, candidate->carvehashkey);
+
+  if (scalpel_state.search_specs[candidate->needleidx].CANDIDATEVALIDATOR) {
+    scalpel_state.search_specs[candidate->needleidx].CANDIDATEVALIDATOR(candidate,
+                                                                        &validates,
+                                                                        &validates_to,
+                                                                        &promising);
+  }
 
   if (scalpel_debug_trace_candidate(candidate)) {
     scalpel_debug_trace("[candbg] validate start=%" PRIu64
@@ -3148,7 +3348,12 @@ static void validate_block(BlockInfo *blockinfo) {
   data = filemirror_actual_block_data_pointer(scalpel_state.filemirror,
                                               blockinfo->actual_block,
                                               &length);
-  decision = BLOCK_CONFIDENCE_INVALID;
+  // BLOCKVALIDATOR receives the current stored confidence as an input/output
+  // value. This allows an earlier classifier, such as MoDiCo, to provide a
+  // prior that a structural block validator can preserve, refine, or reject.
+  decision = filemirror_get_blocktype(scalpel_state.filemirror,
+                                      blockinfo->actual_block,
+                                      blockinfo->needleidx);
   validates_to = 0;
   nidx = blockinfo->needleidx;
 
@@ -3186,13 +3391,10 @@ static void validate_block(BlockInfo *blockinfo) {
   }
 #endif
 
-  // update block type
-  if (filemirror_get_blocktype(scalpel_state.filemirror,
-                               blockinfo->actual_block, nidx)
-      == BLOCK_CONFIDENCE_INVALID) {
-    filemirror_set_blocktype(scalpel_state.filemirror,
-                             blockinfo->actual_block, nidx, decision);
-  }
+  // update block type. The validator received the current stored confidence as
+  // an input value and returns the confidence that should be stored.
+  filemirror_set_blocktype(scalpel_state.filemirror,
+                           blockinfo->actual_block, nidx, decision);
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout,
@@ -3264,10 +3466,85 @@ static void *partial_cleanup_thread(void *args) {
 }
 
 
+// report whether an active cursor phase still has an unclaimed apparent block
+static bool block_validation_cursor_has_work(void) {
+
+  return atomic_load_explicit(&block_validation_active, memory_order_acquire)
+         && atomic_load_explicit(&block_validation_cursor, memory_order_acquire)
+            < block_validation_num_blocks;
+}
+
+
+// Reserve CPU workers for a batched validator while the cursor is active. Cursor workers
+// retire between blocks until the two groups fit within the detected physical-core budget.
+// When both kinds of validator are active, at least one quarter of the physical cores remain
+// available to the cursor so neither path can starve the other.
+uint32_t block_validation_reserve_cpu_threads(uint32_t requested) {
+
+  uint32_t physical = (uint32_t)num_detected_physical_cores();
+  uint32_t maximum_batched;
+  uint32_t cursor_limit = 0;
+  uint32_t granted;
+
+  if (physical == 0) {
+    physical = 1;
+  }
+  if (requested == 0) {
+    requested = 1;
+  }
+
+  maximum_batched = physical;
+  if (block_validation_num_single_validators > 0 && physical > 1) {
+    uint32_t cursor_floor = (physical + 3) / 4;
+
+    maximum_batched = physical - cursor_floor;
+    if (maximum_batched == 0) {
+      maximum_batched = 1;
+    }
+  }
+  granted = requested < maximum_batched ? requested : maximum_batched;
+
+  if (block_validation_num_single_validators > 0) {
+    cursor_limit = physical - granted;
+    if (cursor_limit > (uint32_t)scalpel_state.max_validation_threads) {
+      cursor_limit = (uint32_t)scalpel_state.max_validation_threads;
+    }
+  }
+
+  atomic_store_explicit(&block_validation_cursor_worker_limit, cursor_limit,
+                        memory_order_release);
+  scalpel_log("Block-validation CPU allocation: %u batched, up to %u cursor "
+              "workers (%u physical cores).\n",
+              granted, cursor_limit, physical);
+  return granted;
+}
+
+
+// Restore the full cursor worker limit after a batched validator completes.
+void block_validation_release_cpu_threads(void) {
+
+  uint32_t cursor_limit = (uint32_t)scalpel_state.max_validation_threads;
+  uint32_t physical = (uint32_t)num_detected_physical_cores();
+
+  if (physical > 0 && cursor_limit > physical) {
+    cursor_limit = physical;
+  }
+  atomic_store_explicit(&block_validation_cursor_worker_limit,
+                        cursor_limit,
+                        memory_order_release);
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&validation_work_is_available),
+                    __LINE__, __FILE__);
+  pthread_cond_broadcast(&validation_check_work_available);
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&validation_work_is_available),
+                    __LINE__, __FILE__);
+}
+
+
 // threads that support asynchronous block and contiguous file validation. Block validation includes
 // discovery of new file subtypes based on master file types.
 //
-// Validation threads are NOT responsive to pending checkpoint operations.
+// Validation threads honor checkpoint-and-exit between work items. Active file and block validator
+// calls run to completion, but queued work is discarded during shutdown.
 static void *validation_thread(void *args) {
 
   ThreadWork *work = (ThreadWork *)args;
@@ -3275,6 +3552,7 @@ static void *validation_thread(void *args) {
   ValidationInfo validation_info;
   ValidationInfo *work_item;
   CarveInfo *candidate;
+  bool cursor_worker_active = false;
 
   atomic_store_explicit(&work->thread_running, true, memory_order_release);
 
@@ -3287,14 +3565,125 @@ static void *validation_thread(void *args) {
     work_item = NULL;
     while (! work_item && ! atomic_load_explicit(&work->thread_stop, memory_order_acquire)) {
       work_item = NULL;
+
+      // block-validation cursor phase: claim and validate apparent blocks lock-free, then loop for
+      // the next one. block_validation_done tracks completion; once the cursor is exhausted (or the
+      // phase is not active) fall through to the file-validation queue below.
+      if (block_validation_cursor_has_work()) {
+        if (cursor_worker_active) {
+          uint32_t workers =
+              atomic_load_explicit(&block_validation_cursor_workers,
+                                   memory_order_acquire);
+          uint32_t limit =
+              atomic_load_explicit(&block_validation_cursor_worker_limit,
+                                   memory_order_acquire);
+
+          while (workers > limit) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &block_validation_cursor_workers, &workers, workers - 1,
+                    memory_order_acq_rel, memory_order_acquire)) {
+              atomic_fetch_add_explicit(&num_idle_validation_threads, 1,
+                                        memory_order_acq_rel);
+              cursor_worker_active = false;
+              break;
+            }
+            limit = atomic_load_explicit(
+                &block_validation_cursor_worker_limit, memory_order_acquire);
+          }
+        }
+
+        if (! cursor_worker_active) {
+          uint32_t workers =
+              atomic_load_explicit(&block_validation_cursor_workers,
+                                   memory_order_acquire);
+          uint32_t limit =
+              atomic_load_explicit(&block_validation_cursor_worker_limit,
+                                   memory_order_acquire);
+
+          while (workers < limit) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &block_validation_cursor_workers, &workers, workers + 1,
+                    memory_order_acq_rel, memory_order_acquire)) {
+              atomic_fetch_sub_explicit(&num_idle_validation_threads, 1,
+                                        memory_order_acq_rel);
+              cursor_worker_active = true;
+              break;
+            }
+            limit = atomic_load_explicit(
+                &block_validation_cursor_worker_limit, memory_order_acquire);
+          }
+        }
+
+        if (cursor_worker_active) {
+          uint64_t claimed =
+              atomic_fetch_add_explicit(&block_validation_cursor, 1,
+                                        memory_order_acq_rel);
+
+          if (claimed < block_validation_num_blocks) {
+            validate_one_apparent_block(claimed);
+            uint64_t finished =
+                atomic_fetch_add_explicit(&block_validation_done, 1,
+                                          memory_order_acq_rel) + 1;
+
+            if (claimed % 100000 == 0) {
+              report_block_validation_progress("Status: block validation",
+                                               finished,
+                                               block_validation_num_blocks);
+            }
+            if (finished == block_validation_num_blocks) {
+              MUTEX_ERROR_CHECK(
+                  pthread_mutex_lock(&validation_work_is_available),
+                  __LINE__, __FILE__);
+              pthread_cond_signal(&block_validation_check_complete);
+              MUTEX_ERROR_CHECK(
+                  pthread_mutex_unlock(&validation_work_is_available),
+                  __LINE__, __FILE__);
+            }
+            continue;
+          }
+        }
+      }
+
+      if (cursor_worker_active) {
+        atomic_fetch_sub_explicit(&block_validation_cursor_workers, 1,
+                                  memory_order_acq_rel);
+        atomic_fetch_add_explicit(&num_idle_validation_threads, 1,
+                                  memory_order_acq_rel);
+        cursor_worker_active = false;
+      }
+
+      // the test handshake holds worker zero after its inactive-phase observation so
+      // validate_blocks() can publish and signal before the worker proceeds to the wait mutex.
+      if (work->id == 0
+          && getenv("SCALPEL3_TEST_BLOCK_VALIDATION_HANDOFF")
+          && ! atomic_load_explicit(&block_validation_active, memory_order_acquire)
+          && ! atomic_exchange_explicit(&block_validation_test_worker_at_handoff,
+                                        true, memory_order_acq_rel)) {
+        while (! atomic_load_explicit(&block_validation_test_release_worker,
+                                      memory_order_acquire)
+               && ! atomic_load_explicit(&work->thread_stop,
+                                         memory_order_acquire)) {
+          sched_yield();
+        }
+      }
+
       MUTEX_ERROR_CHECK(pthread_mutex_lock(&validation_work_is_available), __LINE__, __FILE__);
+      if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+          && empty_queue(&carvelist)) {
+        MUTEX_ERROR_CHECK(pthread_mutex_unlock(&validation_work_is_available),
+                          __LINE__, __FILE__);
+        goto done;
+      }
+
       if (atomic_load_explicit(&carvelist_initialized, memory_order_acquire)
           && atomic_load_explicit(&promising_initialized, memory_order_acquire)) {
         work_item = remove_from_front_sync(&carvelist, &validation_info,
                                            &num_idle_validation_threads, -1);
       }
 
-      if (! work_item && ! atomic_load_explicit(&work->thread_stop, memory_order_acquire)) {
+      if (! work_item
+          && ! block_validation_cursor_has_work()
+          && ! atomic_load_explicit(&work->thread_stop, memory_order_acquire)) {
         if (scalpel_state.mode_verbose) {
           lock_fprintf(stdout, "Validation thread # %1d waiting for work, sleeping.\n", work->id);
         }
@@ -3308,6 +3697,16 @@ static void *validation_thread(void *args) {
     if (atomic_load_explicit(&work->thread_stop, memory_order_acquire)) {
       // thread should exit
       goto done;
+    }
+
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      if (validation_info.workload == VALIDATE_FILE) {
+        candidate = validation_info.candidate;
+        destroy_candidate(&candidate);
+      }
+      atomic_fetch_add_explicit(&num_idle_validation_threads, 1,
+                                memory_order_acq_rel);
+      continue;
     }
 
     if (scalpel_state.mode_verbose) {
@@ -3349,6 +3748,13 @@ static void *validation_thread(void *args) {
 
 done:
 
+  if (cursor_worker_active) {
+    atomic_fetch_sub_explicit(&block_validation_cursor_workers, 1,
+                              memory_order_acq_rel);
+    atomic_fetch_add_explicit(&num_idle_validation_threads, 1,
+                              memory_order_acq_rel);
+  }
+
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Validation thread # %1d exiting.\n", work->id);
   }
@@ -3363,13 +3769,1186 @@ done:
 // discovered in this function. For duplicate blocks, validation is performed only for the exemplar
 // to increase performance.
 //
-// This function is NOT responsive to pending checkpoint operations.
+// MoDiCo population honors checkpoint-and-exit requests. Other checkpoint
+// types are deferred because block validation has no restartable checkpoint
+// state until the phase is complete.
+// Emergency upper bound for fragments classified per MoDiCo inference call.
+// The normal max is selected from block size and can be overridden by
+// SCALPEL3_MODICO_MAX_BATCH; this value prevents pathological requests.
+#define MODICO_EMERGENCY_MAX_BATCH 8192
+#define MODICO_DEFAULT_MAX_BATCH 128
+#define MODICO_CPU_DEFAULT_BATCH 8
+#define MODICO_MAX_GPU_DEVICES ONNX_MAX_GPU_DEVICES
+// Native-histogram CUDA throughput is highest when an inference covers about
+// this much raw block data; the environment overrides remain available.
+#define MODICO_NATIVE_HISTOGRAM_BATCH_BYTES (64ULL * 1024ULL)
+// MoDiCo expands each input byte into several wide feature tensors. This
+// working-set estimate includes allocator and execution-workspace headroom;
+// gpu_plan_batch() applies the current per-device VRAM budget to it.
+#define MODICO_GPU_WORKING_BYTES_PER_INPUT_BYTE (48ULL * 1024ULL)
+// Ceiling on how many apparent blocks a worker claims from the shared cursor
+// at a time; the actual claim size scales down on small images so every
+// worker gets several turns instead of one worker draining the whole image.
+#define MODICO_WORK_CHUNK_BLOCKS 4096
+
+// Margin-gated promotion to VALID(100): when a block's top predicted class beats
+// the runner-up by more than this softmax-probability margin, the spec on that
+// argmax class is marked VALID(100) instead of a [2,99] grade, so reassembly's
+// fast path tries that block first. A false 100 is cheap -- structural validators
+// still run after MoDiCo and override it, so a wrong promotion just costs one
+// reassembly attempt. Overridable via SCALPEL3_MODICO_PROMOTE_MARGIN. MoDiCo can
+// raise confidence to 100 but still NEVER emits 0 (never excludes a block).
+#define MODICO_PROMOTE_MARGIN 0.10
+
+typedef struct ModicoExitWatcher {
+  mc_session_t **sessions;
+  int num_sessions;
+  atomic_int *failure;
+  atomic_bool stop;
+  atomic_bool terminated;
+} ModicoExitWatcher;
+
+typedef struct ModicoPostTiming {
+  bool enabled;
+  double output_processing_seconds;
+  double table_write_seconds;
+  uint64_t batch_count;
+} ModicoPostTiming;
+
+typedef struct ModicoWorker {
+  FileMirror *fm;
+  mc_session_t *sess;
+  uint32_t blocksize;
+  int num_classes;
+  uint64_t num_blocks;
+  uint64_t claim_blocks;
+  uint32_t num_specs;
+  const int *spec_to_class;
+  double promote_margin;
+  int batch_size;
+  int worker_id;
+  int device_id;
+  atomic_ullong *next_apparent;
+  atomic_ullong *shared_classified;
+  atomic_int *shared_failure;
+  pthread_mutex_t *report_lock;
+  long *last_report;
+  uint64_t classified;
+  uint64_t graded_writes;
+  uint64_t promoted;
+  ModicoPostTiming post_timing;
+  int failure;
+  bool interrupted;
+} ModicoWorker;
+
+static void *modico_exit_watcher(void *arg);
+static int modico_max_batch_size(uint32_t blocksize);
+static int modico_cpu_batch_size(uint32_t blocksize);
+static bool modico_device_already_listed(const int *devices, int count,
+                                         int device);
+static void modico_add_device(int *devices, int *count, int max_devices,
+                              int device);
+static int modico_configured_devices(mc_session_t *primary, int *devices,
+                                     int max_devices);
+static int modico_session_batch_size(mc_session_t *sess, uint32_t blocksize);
+static BlockValidationDecision modico_grade(double prob);
+static int modico_apply_batch_once(FileMirror *fm, mc_session_t *sess,
+                                   const uint8_t *inbuf, float *logits,
+                                   const int64_t *batch_actual,
+                                   BlocktypeAssignment *assignments,
+                                   int batch_n, uint32_t blocksize,
+                                   int num_classes, uint32_t num_specs,
+                                   const int *spec_to_class,
+                                   double promote_margin,
+                                   uint64_t *graded_writes,
+                                   uint64_t *promoted,
+                                   uint64_t *processed,
+                                   ModicoPostTiming *timing);
+static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
+                              const uint8_t *inbuf, float *logits,
+                              const int64_t *batch_actual,
+                              BlocktypeAssignment *assignments, int batch_n,
+                              uint32_t blocksize, int num_classes,
+                              uint32_t num_specs, const int *spec_to_class,
+                              double promote_margin,
+                              uint64_t *graded_writes,
+                              uint64_t *promoted, uint64_t *processed,
+                              int *settled_batch, ModicoPostTiming *timing);
+static void modico_dump_decisions(FileMirror *fm, uint64_t num_blocks,
+                                  uint32_t num_specs,
+                                  const int *spec_to_class);
+static void modico_report_progress(ModicoWorker *worker, uint64_t done);
+static void *modico_worker_thread(void *arg);
+
+static void *modico_exit_watcher(void *arg) {
+  ModicoExitWatcher *watcher = (ModicoExitWatcher *)arg;
+  struct timespec pause = {0, 100000000};
+  bool termination_sent = false;
+
+  while (! atomic_load_explicit(&watcher->stop, memory_order_acquire)) {
+    bool exit_requested =
+        atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire);
+    bool failed = watcher->failure
+               && atomic_load_explicit(watcher->failure,
+                                       memory_order_acquire) != MC_INFERENCE_OK;
+
+    if (! termination_sent && (exit_requested || failed)) {
+      for (int i = 0; i < watcher->num_sessions; i++) {
+        if (watcher->sessions[i]
+            && mc_terminate_current_run(watcher->sessions[i]) == 0) {
+          if (exit_requested) {
+            atomic_store_explicit(&watcher->terminated, true,
+                                  memory_order_release);
+          }
+        }
+      }
+      termination_sent = true;
+    }
+    nanosleep(&pause, NULL);
+  }
+
+  return NULL;
+}
+
+static int modico_max_batch_size(uint32_t blocksize) {
+  int max_batch;
+
+  switch (blocksize) {
+  case 512:
+    max_batch = MODICO_DEFAULT_MAX_BATCH;
+    break;
+  case 4096:
+    max_batch = MODICO_DEFAULT_MAX_BATCH;
+    break;
+  case 8192:
+    max_batch = MODICO_DEFAULT_MAX_BATCH;
+    break;
+  case 16384:
+    max_batch = MODICO_DEFAULT_MAX_BATCH;
+    break;
+  case 0:
+    max_batch = MODICO_DEFAULT_MAX_BATCH;
+    break;
+  default:
+    max_batch = MODICO_DEFAULT_MAX_BATCH;
+    break;
+  }
+
+  const char *e = getenv("SCALPEL3_MODICO_MAX_BATCH");
+  if (e && *e) {
+    int forced_max = atoi(e);
+    if (forced_max > 0) {
+      max_batch = forced_max;
+    }
+  }
+
+  if (max_batch < 1) {
+    max_batch = 1;
+  }
+  if (max_batch > MODICO_EMERGENCY_MAX_BATCH) {
+    max_batch = MODICO_EMERGENCY_MAX_BATCH;
+  }
+
+  return max_batch;
+}
+
+static int modico_cpu_batch_size(uint32_t blocksize) {
+  int max_batch = modico_max_batch_size(blocksize);
+  int batch = MODICO_CPU_DEFAULT_BATCH;
+  const char *e = getenv("SCALPEL3_MODICO_BATCH");
+  if (e && *e) {
+    int forced = atoi(e);
+    if (forced > 0) {
+      batch = forced;
+    }
+  }
+  if (batch < 1) {
+    batch = 1;
+  }
+  if (batch > max_batch) {
+    batch = max_batch;
+  }
+
+  lock_fprintf(stdout,
+               "[gpu_batch:modico] backend=cpu blocksize=%u batch=%d "
+               "(max=%d)\n",
+               blocksize, batch, max_batch);
+  return batch;
+}
+
+static bool modico_device_already_listed(const int *devices, int count,
+                                         int device) {
+  for (int i = 0; i < count; i++) {
+    if (devices[i] == device) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void modico_add_device(int *devices, int *count, int max_devices,
+                              int device) {
+  if (device < 0 || *count >= max_devices
+      || modico_device_already_listed(devices, *count, device)) {
+    return;
+  }
+  devices[*count] = device;
+  (*count)++;
+}
+
+static int modico_configured_devices(mc_session_t *primary,
+                                     int *devices,
+                                     int max_devices) {
+  int count = 0;
+
+  if (! mc_uses_cuda(primary)) {
+    modico_add_device(devices, &count, max_devices, -1);
+    return count > 0 ? count : 1;
+  }
+
+  // GPU selection is unified under -Y: the resolved device list was validated at startup
+  // (see onnx_providers.h). The primary session's device leads so sessions[0] stays the
+  // shared global session; modico_add_device() deduplicates.
+  modico_add_device(devices, &count, max_devices, mc_cuda_device_id(primary));
+
+  const int *resolved = onnx_resolved_device_list();
+  int nresolved = onnx_resolved_num_devices();
+
+  for (int i = 0; i < nresolved; i++) {
+    modico_add_device(devices, &count, max_devices, resolved[i]);
+  }
+
+  return count;
+}
+
+static int modico_session_batch_size(mc_session_t *sess,
+                                     uint32_t blocksize) {
+  if (mc_uses_coreml(sess)) {
+    int batch = mc_static_batch_size(sess);
+    if (batch < 1) {
+      batch = 1;
+    }
+    lock_fprintf(stdout,
+                 "[gpu_batch:modico-coreml] backend=coreml batch=%d "
+                 "(static session batch)\n",
+                 batch);
+    return batch;
+  }
+
+  if (mc_uses_cuda(sess)) {
+    int max_batch = modico_max_batch_size(blocksize);
+
+    if (mc_uses_native_histograms(sess)) {
+      uint64_t target_batch =
+          blocksize > 0
+              ? MODICO_NATIVE_HISTOGRAM_BATCH_BYTES / (uint64_t)blocksize
+              : 1;
+      int batch = target_batch > 0 ? (int)target_batch : 1;
+      const char *e = getenv("SCALPEL3_MODICO_BATCH");
+
+      if (e && *e) {
+        int forced = atoi(e);
+        if (forced > 0) {
+          batch = forced;
+        }
+      }
+      if (batch > max_batch) {
+        batch = max_batch;
+      }
+      if (batch < 1) {
+        batch = 1;
+      }
+
+      lock_fprintf(stdout,
+                   "[gpu_batch:modico-gpu%d] backend=cuda blocksize=%u "
+                   "batch=%d (native histograms, max=%d)\n",
+                   mc_cuda_device_id(sess), blocksize, batch, max_batch);
+      return batch;
+    }
+
+    gpu_batch_spec_t mc_spec;
+    char label[64];
+
+    memset(&mc_spec, 0, sizeof(mc_spec));
+    snprintf(label, sizeof(label), "modico-gpu%d", mc_cuda_device_id(sess));
+    mc_spec.device_id        = onnx_cuda_physical_device(mc_cuda_device_id(sess));
+    mc_spec.bytes_per_sample =
+        (size_t)blocksize * MODICO_GPU_WORKING_BYTES_PER_INPUT_BYTE;
+    mc_spec.min_batch        = 1;
+    mc_spec.max_batch        = max_batch;
+    mc_spec.safety_fraction  = 0.0;
+    mc_spec.label            = label;
+    {
+      const char *e = getenv("SCALPEL3_MODICO_BATCH");
+      if (e && *e) {
+        mc_spec.force_batch = atoi(e);
+      }
+    }
+    return gpu_plan_batch(&mc_spec);
+  }
+
+  return modico_cpu_batch_size(blocksize);
+}
+
+// Map a MoDiCo probability in [0,1] to a graded block-type confidence byte in
+// [2,99]: strictly above BLOCK_CONFIDENCE_LOW (1) so a graded block outranks an
+// ungraded LOW one, and strictly below BLOCK_CONFIDENCE_VALID (100) so a
+// structural VALID always wins. Used only to ORDER candidates in reassembly;
+// never excludes (the value is always >= 2 > INVALID).
+static BlockValidationDecision modico_grade(double prob) {
+  long g = 2 + lround(prob * 97.0);
+  if (g < 2) {
+    g = 2;
+  }
+  if (g > 99) {
+    g = 99;
+  }
+  return (BlockValidationDecision)g;
+}
+
+static void modico_dump_decisions(FileMirror *fm, uint64_t num_blocks,
+                                  uint32_t num_specs,
+                                  const int *spec_to_class) {
+  const char *path = getenv("SCALPEL3_MODICO_DECISIONS");
+  uint64_t rows = 0;
+
+  if (! path || ! *path) {
+    return;
+  }
+
+  FILE *fp = fopen(path, "w");
+  if (! fp) {
+    lock_fprintf(stderr, "MoDiCo: cannot write decision dump %s: %s\n",
+                 path, strerror(errno));
+    return;
+  }
+
+  if (fprintf(fp, "actual_block,filetype,decision\n") < 0) {
+    fclose(fp);
+    return;
+  }
+  for (uint64_t apparent = 0; apparent < num_blocks; apparent++) {
+    int64_t actual = filemirror_actual_blocknumber(fm, (int64_t)apparent);
+
+    if (filemirror_get_exemplar(fm, actual) != actual) {
+      continue;
+    }
+    for (uint32_t spec = 0; spec < num_specs; spec++) {
+      if (spec_to_class[spec] < 0) {
+        continue;
+      }
+      BlockValidationDecision decision =
+          filemirror_get_blocktype(fm, actual, spec);
+      if (fprintf(fp, "%" PRIi64 ",%u,%d\n", actual, spec,
+                  (int)decision) < 0) {
+        fclose(fp);
+        return;
+      }
+      rows++;
+    }
+  }
+
+  if (fclose(fp) == 0) {
+    scalpel_log("MoDiCo decision dump: %s (%" PRIu64 " rows).\n",
+                path, rows);
+  }
+}
+
+// Run MoDiCo on one batch of fragments and write the predictions into the
+// block-type table as a prior. Returns the number of blocks processed.
+// 'graded_writes' counts blocktype entries written; 'promoted' counts blocks
+// promoted to VALID(100) by the margin gate.
+//
+// MoDiCo runs BEFORE structural validation and writes its prediction to every
+// mapped (block, spec) slot: normally a graded confidence in [2,99], but when the
+// top class is a confident argmax (top1 - top2 > promote_margin) it writes
+// VALID(100) so reassembly's fast path grabs that block first. Structural
+// validators run afterward and take precedence -- a confident VALID/INVALID
+// overrides the prior (including a promoted 100); see the guard in
+// validate_block(). MoDiCo NEVER emits INVALID(0): it can raise confidence to 100
+// but never excludes a block.
+static int modico_apply_batch_once(FileMirror *fm, mc_session_t *sess,
+                                   const uint8_t *inbuf, float *logits,
+                                   const int64_t *batch_actual,
+                                   BlocktypeAssignment *assignments,
+                                   int batch_n, uint32_t blocksize,
+                                   int num_classes, uint32_t num_specs,
+                                   const int *spec_to_class,
+                                   double promote_margin,
+                                   uint64_t *graded_writes,
+                                   uint64_t *promoted, uint64_t *processed,
+                                   ModicoPostTiming *timing) {
+  int result = mc_classify_batch(sess, inbuf, batch_n, (int)blocksize, logits);
+  struct timespec output_start = {0, 0};
+  struct timespec output_end = {0, 0};
+  double writes_before = timing ? timing->table_write_seconds : 0.0;
+
+  *processed = 0;
+  if (result != MC_INFERENCE_OK) {
+    return result;
+  }
+  if (timing && timing->enabled) {
+    clock_gettime(CLOCK_MONOTONIC, &output_start);
+  }
+
+  for (int b = 0; b < batch_n; b++) {
+    const float *lg = logits + (size_t)b * (size_t)num_classes;
+    int64_t actual = batch_actual[b];
+
+    // Numerically stable softmax: find the top-2 logits and the argmax class.
+    float maxl = lg[0], maxl2 = -HUGE_VALF;
+    int argmax = 0;
+    for (int k = 1; k < num_classes; k++) {
+      if (lg[k] > maxl) {
+        maxl2 = maxl;
+        maxl = lg[k];
+        argmax = k;
+      }
+      else if (lg[k] > maxl2) {
+        maxl2 = lg[k];
+      }
+    }
+    double sum = 0.0;
+    for (int k = 0; k < num_classes; k++) {
+      sum += exp((double)(lg[k] - maxl));
+    }
+    if (sum <= 0.0) {
+      continue;
+    }
+
+    // top1 = softmax of the argmax (= 1/sum); top2 = softmax of the runner-up.
+    // A confident, peaked prediction (large margin) is promoted to VALID(100).
+    double top1 = 1.0 / sum;
+    double top2 = (maxl2 > -HUGE_VALF) ? exp((double)(maxl2 - maxl)) / sum : 0.0;
+    bool confident = (top1 - top2) > promote_margin;
+    bool did_promote = false;
+    uint32_t nassign = 0;
+
+    for (uint32_t s = 0; s < num_specs; s++) {
+      int c = spec_to_class[s];
+      if (c < 0 || c >= num_classes) {
+        continue;  // this carved type has no corresponding MoDiCo class
+      }
+
+      // Margin-gated promotion: the spec on the confident argmax class gets
+      // VALID(100) (reassembly fast path); every other spec gets a [2,99] grade.
+      // Structural validators run after and override either (structural trumps).
+      BlockValidationDecision score;
+      if (c == argmax && confident) {
+        score = BLOCK_CONFIDENCE_VALID;
+        did_promote = true;
+      }
+      else {
+        double p = exp((double)(lg[c] - maxl)) / sum;
+        score = modico_grade(p);
+      }
+      assignments[nassign].filetype = s;
+      assignments[nassign].blocktype = score;
+      nassign++;
+    }
+    // one lock acquisition and one exemplar lookup per block (not per spec); assignments is
+    // per-worker scratch, reused across the batch.
+    struct timespec write_start = {0, 0};
+    struct timespec write_end = {0, 0};
+    if (timing && timing->enabled) {
+      clock_gettime(CLOCK_MONOTONIC, &write_start);
+    }
+    filemirror_set_blocktype_batch(fm, actual, assignments, nassign);
+    if (timing && timing->enabled) {
+      clock_gettime(CLOCK_MONOTONIC, &write_end);
+      timing->table_write_seconds +=
+          (double)(write_end.tv_sec - write_start.tv_sec)
+          + (double)(write_end.tv_nsec - write_start.tv_nsec) / 1e9;
+    }
+    *graded_writes += nassign;
+    if (did_promote) {
+      (*promoted)++;
+    }
+  }
+  if (timing && timing->enabled) {
+    double output_and_writes;
+    double batch_writes = timing->table_write_seconds - writes_before;
+
+    clock_gettime(CLOCK_MONOTONIC, &output_end);
+    output_and_writes = (double)(output_end.tv_sec - output_start.tv_sec)
+                      + (double)(output_end.tv_nsec - output_start.tv_nsec)
+                        / 1e9;
+    timing->output_processing_seconds += output_and_writes - batch_writes;
+    timing->batch_count++;
+  }
+  *processed = (uint64_t)batch_n;
+  return MC_INFERENCE_OK;
+}
+
+static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
+                              const uint8_t *inbuf, float *logits,
+                              const int64_t *batch_actual,
+                              BlocktypeAssignment *assignments, int batch_n,
+                              uint32_t blocksize, int num_classes,
+                              uint32_t num_specs, const int *spec_to_class,
+                              double promote_margin,
+                              uint64_t *graded_writes,
+                              uint64_t *promoted, uint64_t *processed,
+                              int *settled_batch, ModicoPostTiming *timing) {
+  uint64_t done = 0;
+  int result = modico_apply_batch_once(fm, sess, inbuf, logits,
+                                       batch_actual, assignments, batch_n,
+                                       blocksize, num_classes, num_specs,
+                                       spec_to_class, promote_margin,
+                                       graded_writes, promoted, &done, timing);
+  *processed = done;
+  if (result == MC_INFERENCE_OK) {
+    *settled_batch = batch_n;
+    return MC_INFERENCE_OK;
+  }
+  *settled_batch = 0;
+  if (result != MC_INFERENCE_RETRYABLE || batch_n <= 1) {
+    return result;
+  }
+
+  int first_n = batch_n / 2;
+  int second_n = batch_n - first_n;
+  lock_fprintf(stderr, "MoDiCo: retrying memory-limited batch=%d as %d + %d.\n",
+               batch_n, first_n, second_n);
+
+  uint64_t first = 0;
+  int first_settled = 0;
+  result = modico_apply_batch(fm, sess, inbuf, logits, batch_actual,
+                              assignments, first_n, blocksize, num_classes,
+                              num_specs, spec_to_class, promote_margin,
+                              graded_writes, promoted, &first,
+                              &first_settled, timing);
+  *processed += first;
+  if (result != MC_INFERENCE_OK) {
+    return result;
+  }
+
+  uint64_t second = 0;
+  int second_settled = 0;
+  result = modico_apply_batch(fm, sess,
+                              inbuf + (size_t)first_n * blocksize,
+                              logits, batch_actual + first_n, assignments,
+                              second_n, blocksize, num_classes, num_specs,
+                              spec_to_class, promote_margin, graded_writes,
+                              promoted, &second, &second_settled, timing);
+  *processed += second;
+  if (result == MC_INFERENCE_OK) {
+    *settled_batch = first_settled < second_settled
+                   ? first_settled : second_settled;
+  }
+  return result;
+}
+
+static void modico_report_progress(ModicoWorker *worker, uint64_t done) {
+  if (done == 0) {
+    return;
+  }
+
+  uint64_t aggregate =
+      atomic_fetch_add_explicit(worker->shared_classified, done,
+                                memory_order_acq_rel) + done;
+  long now = time(NULL);
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(worker->report_lock), __LINE__,
+                    __FILE__);
+  if (now - *(worker->last_report) >= 2) {
+    *(worker->last_report) = now;
+    lock_fprintf(stdout, "MoDiCo classified %" PRIu64
+                         " exemplar blocks...\n", aggregate);
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(worker->report_lock), __LINE__,
+                    __FILE__);
+}
+
+static void *modico_worker_thread(void *arg) {
+  ModicoWorker *worker = (ModicoWorker *)arg;
+  uint8_t *inbuf = (uint8_t *)malloc((size_t)worker->batch_size
+                                     * worker->blocksize);
+  float *logits = (float *)malloc((size_t)worker->batch_size
+                                  * (size_t)worker->num_classes
+                                  * sizeof(float));
+  int64_t *batch_actual = (int64_t *)malloc((size_t)worker->batch_size
+                                            * sizeof(int64_t));
+  // per-worker scratch for filemirror_set_blocktype_batch(), reused across every batch this worker
+  // records (one buffer per worker, not one per batch).
+  BlocktypeAssignment *assignments =
+      (BlocktypeAssignment *)malloc((size_t)worker->num_specs
+                                    * sizeof(*assignments));
+  check_memory_allocation(inbuf, __LINE__, __FILE__, "modico worker inbuf");
+  check_memory_allocation(logits, __LINE__, __FILE__, "modico worker logits");
+  check_memory_allocation(batch_actual, __LINE__, __FILE__,
+                          "modico worker batch_actual");
+  check_memory_allocation(assignments, __LINE__, __FILE__,
+                          "modico worker assignments");
+
+  int batch_n = 0;
+
+  while (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                                memory_order_acquire)
+         && atomic_load_explicit(worker->shared_failure,
+                                 memory_order_acquire) == MC_INFERENCE_OK) {
+    uint64_t start =
+        atomic_fetch_add_explicit(worker->next_apparent,
+                                  worker->claim_blocks,
+                                  memory_order_acq_rel);
+    if (start >= worker->num_blocks) {
+      break;
+    }
+
+    uint64_t end = start + worker->claim_blocks;
+    if (end > worker->num_blocks) {
+      end = worker->num_blocks;
+    }
+
+    for (uint64_t apparent = start; apparent < end; apparent++) {
+      if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                               memory_order_acquire)) {
+        worker->interrupted = true;
+        break;
+      }
+      if (atomic_load_explicit(worker->shared_failure,
+                               memory_order_acquire) != MC_INFERENCE_OK) {
+        break;
+      }
+
+      int64_t actual =
+          filemirror_actual_blocknumber(worker->fm, (int64_t)apparent);
+
+      // Exemplars only -- duplicate blocks share their exemplar's
+      // classification.
+      if (filemirror_get_exemplar(worker->fm, actual) != actual) {
+        continue;
+      }
+
+      uint64_t length = 0;
+      char *data = filemirror_actual_block_data_pointer(worker->fm, actual,
+                                                        &length);
+      if (! data || length < worker->blocksize) {
+        continue;
+      }
+
+      memcpy(inbuf + (size_t)batch_n * worker->blocksize, data,
+             worker->blocksize);
+      batch_actual[batch_n] = actual;
+      batch_n++;
+
+      if (batch_n == worker->batch_size) {
+        uint64_t done = 0;
+        int settled_batch = batch_n;
+        int result =
+            modico_apply_batch(worker->fm, worker->sess, inbuf, logits,
+                               batch_actual, assignments, batch_n,
+                               worker->blocksize, worker->num_classes,
+                               worker->num_specs, worker->spec_to_class,
+                               worker->promote_margin, &worker->graded_writes,
+                               &worker->promoted, &done, &settled_batch,
+                               &worker->post_timing);
+        worker->classified += done;
+        modico_report_progress(worker, done);
+        batch_n = 0;
+        if (result == MC_INFERENCE_OK && settled_batch > 0
+            && settled_batch < worker->batch_size) {
+          lock_fprintf(stdout,
+                       "MoDiCo worker %d settled at batch=%d after a "
+                       "memory-limited inference.\n",
+                       worker->worker_id, settled_batch);
+          worker->batch_size = settled_batch;
+        }
+        if (result != MC_INFERENCE_OK) {
+          int expected = MC_INFERENCE_OK;
+
+          atomic_compare_exchange_strong_explicit(worker->shared_failure,
+                                                   &expected, result,
+                                                   memory_order_acq_rel,
+                                                   memory_order_acquire);
+          worker->failure = result;
+          break;
+        }
+      }
+    }
+
+    if (worker->interrupted || worker->failure
+        || atomic_load_explicit(worker->shared_failure,
+                                memory_order_acquire) != MC_INFERENCE_OK) {
+      break;
+    }
+  }
+
+  if (! worker->interrupted
+      && ! worker->failure
+      && atomic_load_explicit(worker->shared_failure,
+                              memory_order_acquire) == MC_INFERENCE_OK
+      && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                                memory_order_acquire)
+      && batch_n > 0) {
+    uint64_t done = 0;
+    int settled_batch = batch_n;
+    int result =
+        modico_apply_batch(worker->fm, worker->sess, inbuf, logits,
+                           batch_actual, assignments, batch_n,
+                           worker->blocksize, worker->num_classes,
+                           worker->num_specs, worker->spec_to_class,
+                           worker->promote_margin, &worker->graded_writes,
+                           &worker->promoted, &done, &settled_batch,
+                           &worker->post_timing);
+    worker->classified += done;
+    modico_report_progress(worker, done);
+    if (result != MC_INFERENCE_OK) {
+      int expected = MC_INFERENCE_OK;
+
+      atomic_compare_exchange_strong_explicit(worker->shared_failure,
+                                               &expected, result,
+                                               memory_order_acq_rel,
+                                               memory_order_acquire);
+      worker->failure = result;
+    }
+  }
+
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    worker->interrupted = true;
+  }
+
+  free(inbuf);
+  free(logits);
+  free(batch_actual);
+  free(assignments);
+  return NULL;
+}
+
+// Classify every exemplar block with MoDiCo and write a confidence prior into
+// the block-type table to (a) prioritize block selection during fragmented
+// reassembly and (b) give structural validators a signal they can read. Called
+// from validate_blocks() FIRST -- before the structural validation queue is
+// built and drained -- so the prior exists when validators run and so confident
+// structural decisions can override it. Runs while block_validation_complete is
+// still false, so filemirror_set_blocktype() is legal. No-op when MoDiCo is
+// disabled.
+static void modico_populate_blocktypes(void) {
+  if (! scalpel_state.modico_enabled || ! scalpel_state.modico_spec_to_class) {
+    return;
+  }
+
+  mc_session_t *sess = modico_onnx_global_get();
+  if (! sess) {
+    return;
+  }
+  const bool accelerated_session = mc_uses_cuda(sess) || mc_uses_coreml(sess);
+
+  FileMirror *fm = scalpel_state.filemirror;
+  const uint32_t blocksize = scalpel_state.blocksize;
+  const int num_classes = mc_get_num_classes(sess);
+  const uint64_t num_blocks = filemirror_apparent_blocks(fm);
+  const uint32_t num_specs = scalpel_state.modico_num_specs;
+  const int *spec_to_class = scalpel_state.modico_spec_to_class;
+
+  if (num_classes <= 0 || num_specs == 0) {
+    modico_onnx_global_shutdown();
+    return;
+  }
+
+  // Count mapped specs so we can bail early if MoDiCo can inform nothing. MoDiCo
+  // now runs before structural validation and writes its prior unconditionally,
+  // so no has_validator bookkeeping is needed.
+  uint32_t mapped_specs = 0;
+  for (uint32_t s = 0; s < num_specs; s++) {
+    if (spec_to_class[s] >= 0) {
+      mapped_specs++;
+    }
+  }
+  if (mapped_specs == 0) {
+    modico_onnx_global_shutdown();
+    return;
+  }
+
+  // Margin for promoting a confident argmax block to VALID(100) instead of a
+  // [2,99] grade. Default MODICO_PROMOTE_MARGIN; SCALPEL3_MODICO_PROMOTE_MARGIN
+  // overrides (softmax-probability margin in [0,1]).
+  double promote_margin = MODICO_PROMOTE_MARGIN;
+  {
+    const char *e = getenv("SCALPEL3_MODICO_PROMOTE_MARGIN");
+    if (e && *e) {
+      double v = atof(e);
+      if (v >= 0.0 && v <= 1.0) {
+        promote_margin = v;
+      }
+    }
+  }
+
+  mc_session_t *sessions[MODICO_MAX_GPU_DEVICES];
+  bool destroy_session[MODICO_MAX_GPU_DEVICES];
+  int devices[MODICO_MAX_GPU_DEVICES];
+  int session_batches[MODICO_MAX_GPU_DEVICES];
+  pthread_t worker_threads[MODICO_MAX_GPU_DEVICES];
+  ModicoWorker workers[MODICO_MAX_GPU_DEVICES];
+  int session_count = 1;
+  int setup_failure_device = -1;
+
+  memset(sessions, 0, sizeof(sessions));
+  memset(destroy_session, 0, sizeof(destroy_session));
+  memset(devices, 0, sizeof(devices));
+  memset(session_batches, 0, sizeof(session_batches));
+  memset(worker_threads, 0, sizeof(worker_threads));
+  memset(workers, 0, sizeof(workers));
+
+  sessions[0] = sess;
+  devices[0] = mc_uses_cuda(sess) ? mc_cuda_device_id(sess) : -1;
+
+  if (mc_uses_cuda(sess)) {
+    int requested_devices =
+        modico_configured_devices(sess, devices, MODICO_MAX_GPU_DEVICES);
+    const char *model_path = modico_onnx_global_model_path();
+
+    for (int i = 0; i < requested_devices; i++) {
+      if (devices[i] == mc_cuda_device_id(sess)) {
+        continue;
+      }
+      if (! model_path || ! *model_path) {
+        continue;
+      }
+      if (session_count >= MODICO_MAX_GPU_DEVICES) {
+        break;
+      }
+      mc_session_t *extra =
+          mc_create_session_with_accelerator_device(model_path, 0, "cuda",
+                                                    devices[i]);
+      if (! extra) {
+        setup_failure_device = devices[i];
+        break;
+      }
+      sessions[session_count] = extra;
+      destroy_session[session_count] = true;
+      session_count++;
+    }
+  }
+
+  if (setup_failure_device < 0) {
+    for (int i = 0; i < session_count; i++) {
+      session_batches[i] =
+          modico_session_batch_size(sessions[i], blocksize);
+      if (session_batches[i] < 1) {
+        setup_failure_device = mc_cuda_device_id(sessions[i]);
+        break;
+      }
+    }
+  }
+
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                           memory_order_acquire)) {
+    for (int i = 1; i < session_count; i++) {
+      if (destroy_session[i]) {
+        mc_destroy_session(sessions[i]);
+      }
+    }
+    modico_onnx_global_shutdown();
+    scalpel_log("MoDiCo classification interrupted during batch setup.\n");
+    return;
+  }
+
+  if (setup_failure_device >= 0) {
+    for (int i = 1; i < session_count; i++) {
+      if (destroy_session[i]) {
+        mc_destroy_session(sessions[i]);
+      }
+    }
+
+    modico_onnx_global_shutdown();
+    char errmsg[384];
+    snprintf(errmsg, sizeof(errmsg),
+             "MoDiCo could not initialize and verify CUDA device %d. "
+             "Rerun init_scalpel3.sh to verify ONNX/CUDA support, or explicitly "
+             "select -Y cpu for an intentional CPU run.",
+             setup_failure_device);
+    handle_error(SCALPEL_GENERAL_ABORT, errmsg, __LINE__, __FILE__);
+  }
+
+  frame_message("MODICO BLOCK CLASSIFICATION STARTING");
+  if (mc_uses_cuda(sess) && session_count > 1) {
+    lock_fprintf(stdout, "MoDiCo execution provider: cuda devices=");
+    for (int i = 0; i < session_count; i++) {
+      lock_fprintf(stdout, "%s%d", i ? "," : "",
+                   mc_cuda_device_id(sessions[i]));
+    }
+  }
+  else {
+    lock_fprintf(stdout, "MoDiCo execution provider: %s",
+                 mc_execution_provider(sess));
+    if (mc_uses_cuda(sess)) {
+      lock_fprintf(stdout, " device=%d", mc_cuda_device_id(sess));
+    }
+  }
+  lock_fprintf(stdout, ".\n");
+
+  // Time the classification (populate) pass so it can be subtracted from the
+  // total to isolate reassembly time in A/B comparisons.
+  struct timespec mc_t0, mc_t1;
+  clock_gettime(CLOCK_MONOTONIC, &mc_t0);
+
+  atomic_ullong next_apparent;
+  atomic_ullong shared_classified;
+  atomic_int shared_failure;
+  atomic_init(&next_apparent, 0);
+  atomic_init(&shared_classified, 0);
+  atomic_init(&shared_failure, MC_INFERENCE_OK);
+
+  pthread_mutex_t report_lock;
+  MUTEX_ERROR_CHECK(pthread_mutex_init(&report_lock, NULL), __LINE__,
+                    __FILE__);
+  long last_report = time(NULL);
+
+  bool interrupted = false;
+  pthread_t watcher_thread;
+  bool watcher_started = false;
+  ModicoExitWatcher watcher;
+  memset(&watcher, 0, sizeof(watcher));
+  watcher.sessions = sessions;
+  watcher.num_sessions = session_count;
+  watcher.failure = &shared_failure;
+  atomic_init(&watcher.stop, false);
+  atomic_init(&watcher.terminated, false);
+  if (pthread_create(&watcher_thread, NULL, modico_exit_watcher, &watcher) != 0) {
+    handle_error(SCALPEL_ERROR_PTHREAD_FAILURE,
+                 "MoDiCo exit watcher thread creation", __LINE__, __FILE__);
+  }
+  watcher_started = true;
+
+  for (int i = 0; i < session_count; i++) {
+    workers[i].fm = fm;
+    workers[i].sess = sessions[i];
+    workers[i].blocksize = blocksize;
+    workers[i].num_classes = num_classes;
+    workers[i].num_blocks = num_blocks;
+    workers[i].num_specs = num_specs;
+    workers[i].spec_to_class = spec_to_class;
+    workers[i].promote_margin = promote_margin;
+    workers[i].batch_size = session_batches[i];
+    workers[i].post_timing.enabled = mc_timing_enabled(sessions[i]);
+
+    // Claim granularity: the full ceiling amortizes cursor traffic on large
+    // images, but on a small image a coarse claim can hand nearly all blocks
+    // to one worker while the other devices idle. Scale the claim so every
+    // worker gets several turns, with a floor of one inference batch.
+    uint64_t claim_blocks = MODICO_WORK_CHUNK_BLOCKS;
+    uint64_t fair_share = num_blocks / ((uint64_t)session_count * 4u);
+    uint64_t claim_floor = (uint64_t)workers[i].batch_size;
+
+    if (claim_floor == 0) {
+      claim_floor = 1;
+    }
+    if (claim_blocks > fair_share) {
+      claim_blocks = fair_share;
+    }
+    if (claim_blocks < claim_floor) {
+      claim_blocks = claim_floor;
+    }
+    workers[i].claim_blocks = claim_blocks;
+    workers[i].worker_id = i;
+    workers[i].device_id = mc_cuda_device_id(sessions[i]);
+    workers[i].next_apparent = &next_apparent;
+    workers[i].shared_classified = &shared_classified;
+    workers[i].shared_failure = &shared_failure;
+    workers[i].report_lock = &report_lock;
+    workers[i].last_report = &last_report;
+
+    int ret = pthread_create(&worker_threads[i], NULL, modico_worker_thread,
+                             &workers[i]);
+    if (ret != 0) {
+      handle_error(SCALPEL_GENERAL_ABORT, "modico worker thread creation",
+                   __LINE__, __FILE__);
+    }
+  }
+
+  uint64_t classified = 0;
+  uint64_t graded_writes = 0;
+  uint64_t promoted = 0;
+  for (int i = 0; i < session_count; i++) {
+    pthread_join(worker_threads[i], NULL);
+    if (workers[i].interrupted) {
+      interrupted = true;
+    }
+    classified += workers[i].classified;
+    graded_writes += workers[i].graded_writes;
+    promoted += workers[i].promoted;
+  }
+
+  if (watcher_started) {
+    atomic_store_explicit(&watcher.stop, true, memory_order_release);
+    pthread_join(watcher_thread, NULL);
+  }
+
+  MUTEX_ERROR_CHECK(pthread_mutex_destroy(&report_lock), __LINE__, __FILE__);
+
+  clock_gettime(CLOCK_MONOTONIC, &mc_t1);
+  double mc_secs = (mc_t1.tv_sec - mc_t0.tv_sec)
+                   + (mc_t1.tv_nsec - mc_t0.tv_nsec) / 1e9;
+  int failure = atomic_load_explicit(&shared_failure, memory_order_acquire);
+
+  for (int i = 0; i < session_count; i++) {
+    if (mc_timing_enabled(sessions[i])) {
+      mc_timing_t timing;
+      uint64_t subsequent_count;
+      double subsequent_average;
+
+      mc_get_timing(sessions[i], &timing);
+      subsequent_count = timing.run_count > 0 ? timing.run_count - 1 : 0;
+      subsequent_average = subsequent_count > 0
+          ? timing.subsequent_run_seconds / (double)subsequent_count : 0.0;
+      scalpel_log(
+          "MODICO_TIMING worker=%d provider=%s session_create_secs=%.6f "
+          "input_conversion_secs=%.6f first_ort_run_secs=%.6f "
+          "subsequent_ort_run_count=%" PRIu64 " "
+          "subsequent_ort_run_total_secs=%.6f "
+          "subsequent_ort_run_min_secs=%.6f "
+          "subsequent_ort_run_max_secs=%.6f "
+          "subsequent_ort_run_avg_secs=%.6f "
+          "output_processing_secs=%.6f table_write_secs=%.6f "
+          "postprocess_batch_count=%" PRIu64 ".\n",
+          i, mc_execution_provider(sessions[i]),
+          timing.session_create_seconds,
+          timing.input_conversion_seconds,
+          timing.first_run_seconds,
+          subsequent_count,
+          timing.subsequent_run_seconds,
+          timing.subsequent_run_min_seconds,
+          timing.subsequent_run_max_seconds,
+          subsequent_average,
+          workers[i].post_timing.output_processing_seconds,
+          workers[i].post_timing.table_write_seconds,
+          workers[i].post_timing.batch_count);
+    }
+  }
+  if (mc_timing_enabled(sess)) {
+    scalpel_log("MODICO_TIMING_SUMMARY classify_secs=%.6f classified=%" PRIu64
+                " throughput_blocks_per_sec=%.3f.\n",
+                mc_secs, classified,
+                mc_secs > 0.0 ? (double)classified / mc_secs : 0.0);
+  }
+
+  if (interrupted
+      || atomic_load_explicit(&watcher.terminated, memory_order_acquire)) {
+    scalpel_log("MoDiCo classification interrupted after %" PRIu64
+                " exemplar blocks in %.3f secs.\n",
+                classified, mc_secs);
+  }
+  else if (failure != MC_INFERENCE_OK) {
+    scalpel_log("MoDiCo classification failed after %" PRIu64
+                " exemplar blocks in %.3f secs; partial classification is not "
+                "accepted.\n", classified, mc_secs);
+
+    for (int i = 1; i < session_count; i++) {
+      if (destroy_session[i]) {
+        mc_destroy_session(sessions[i]);
+        sessions[i] = NULL;
+      }
+    }
+
+    modico_onnx_global_shutdown();
+    if (accelerated_session) {
+      handle_error(SCALPEL_GENERAL_ABORT,
+                   "MoDiCo inference failed on the selected accelerator; partial "
+                   "classifications were rejected. Rerun init_scalpel3.sh to "
+                   "verify ONNX support, or explicitly select -Y cpu for an "
+                   "intentional CPU run.", __LINE__, __FILE__);
+    }
+    handle_error(SCALPEL_GENERAL_ABORT,
+                 "MoDiCo inference failed on the CPU execution provider; "
+                 "partial classifications were rejected.",
+                 __LINE__, __FILE__);
+  }
+  else {
+    scalpel_log("MoDiCo classification complete: %" PRIu64 " exemplar blocks "
+                "(%" PRIu64 " promoted to VALID/100), %" PRIu64 " block-type "
+                "entries graded in %.3f secs (MODICO_CLASSIFY_SECS=%.3f).\n",
+                classified, promoted, graded_writes, mc_secs, mc_secs);
+
+    modico_dump_decisions(fm, num_blocks, num_specs, spec_to_class);
+  }
+
+  for (int i = 1; i < session_count; i++) {
+    if (destroy_session[i]) {
+      mc_destroy_session(sessions[i]);
+    }
+  }
+
+  // MoDiCo runs once and stores its results in the block-type table. Release the
+  // primary session before batched structural validators allocate their own models.
+  modico_onnx_global_shutdown();
+}
+
+// uniform progress line for the block validation phase, shared by the cursor workers and the
+// batched validators. A 'total' of 0 reports 100%.
+static void report_block_validation_progress(const char *label, uint64_t done, uint64_t total) {
+
+  struct timespec endtime;
+  double elapsed;
+
+  clock_gettime(CLOCK_MONOTONIC, &endtime);
+  elapsed = (double)(endtime.tv_sec - block_validation_start_time.tv_sec)
+          + (double)(endtime.tv_nsec - block_validation_start_time.tv_nsec) / 1e9;
+  lock_fprintf(stdout, "%s (%3.1lf%%), total elapsed time = %.2lf secs.\n",
+               label, total ? (double)done / (double)total * 100.0 : 100.0, elapsed);
+}
+
+
+// return true when a file type's block validator contributes to the requested recovery mode
+static bool block_validation_runs_for_current_mode(const SearchSpec *spec) {
+
+  switch (spec->BLOCKVALIDATIONSCOPE) {
+  case BLOCK_VALIDATION_ALWAYS:
+    return true;
+
+  case BLOCK_VALIDATION_REASSEMBLY_ONLY:
+    return ! scalpel_state.no_defrag;
+
+  case BLOCK_VALIDATION_DISABLED:
+    return false;
+  }
+
+  return false;
+}
+
+
+// validate a single apparent block for every single-block base validator. Called by the validation
+// threads as they claim blocks from block_validation_cursor. File types without a validator were
+// defaulted before this phase, and batched validators own their independent iteration.
+static void validate_one_apparent_block(uint64_t block) {
+
+  int64_t actual_block;
+  BlockInfo bi;
+
+  actual_block = filemirror_actual_blocknumber(scalpel_state.filemirror, (int64_t)block);
+
+  // validate only exemplars
+  if (filemirror_get_exemplar(scalpel_state.filemirror, actual_block) != actual_block) {
+    atomic_fetch_add_explicit(&block_validation_skipped_non_exemplar, 1, memory_order_acq_rel);
+    return;
+  }
+
+  for (uint32_t i = 0; i < block_validation_num_single_validators; i++) {
+    uint32_t needlenum = block_validation_single_validator_specs[i];
+
+    // single-block validator: build the BlockInfo and validate. validate_block() fetches the block
+    // data, seeds the decision from the stored blocktype, calls the validator, and records the
+    // result.
+    memset(&bi, 0, sizeof(bi));
+    bi.apparent_block = (int64_t)block;
+    bi.actual_block = actual_block;
+    bi.filetype = scalpel_state.search_specs[needlenum].FILETYPE;
+    bi.searchtype = scalpel_state.search_specs[needlenum].SEARCHTYPE;
+    bi.needleidx = (int32_t)needlenum;
+    gen_block_hash_key(bi.blockhashkey, bi.needleidx, actual_block);
+    bi.blockvalidator = scalpel_state.search_specs[needlenum].BLOCKVALIDATOR;
+    if (scalpel_state.search_specs[needlenum].PRINTBLOCKSTATEFUNC
+        && scalpel_state.search_specs[needlenum].SERIALIZEBLOCKSTATEFUNC) {
+      bi.printblockstatefunc = scalpel_state.search_specs[needlenum].PRINTBLOCKSTATEFUNC;
+    }
+    validate_block(&bi);
+  }
+}
+
+
 static void validate_blocks(void) {
 
-  int64_t block;
-  int64_t actual_block;
   uint32_t needlenum;
-  ValidationInfo validation_info;
   uint64_t num_blocks;
   uint64_t q_length;
   uint64_t f_load;
@@ -3384,124 +4963,177 @@ static void validate_blocks(void) {
   uint64_t skipped_non_exemplar = 0;
   uint64_t default_valid = 0;
   uint64_t *queued_by_type = NULL;
+  uint32_t *default_filetypes = NULL;
+  uint32_t default_filetype_count = 0;
+  uint32_t single_validator_count = 0;
   bool memdiag;
+  bool test_handoff;
 
   if (scalpel_state.memory_profiling) {
     memory_footprint("block validation start");
   }
 
   frame_message("BLOCK VALIDATION PHASE STARTING");
-  frame_message("CREATING QUEUE OF BLOCKS TO VALIDATE");
+
+  // Populate MoDiCo's confidence prior BEFORE structural validation runs, so
+  // (a) confident structural decisions override the prior and (b) structural
+  // validators can read it as a signal. No-op when MoDiCo is disabled. Must run
+  // before the queue is built/drained and while block_validation_complete is
+  // still false.
+  modico_populate_blocktypes();
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    frame_message("BLOCK VALIDATION INTERRUPTED BY CHECKPOINT AND EXIT");
+    return;
+  }
 
   num_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
 
   // scalpel_state.num_specs may increase during block validation because of new file subtypes being
   // created, but we don't want to iterate over subtypes here anyway
   num_non_subtypes = scalpel_state.num_specs;
+  default_filetypes =
+      (uint32_t *)malloc(num_non_subtypes * sizeof(*default_filetypes));
+  block_validation_single_validator_specs =
+      (uint32_t *)malloc(num_non_subtypes
+                         * sizeof(*block_validation_single_validator_specs));
+  check_memory_allocation(default_filetypes, __LINE__, __FILE__,
+                          "block validation default filetypes");
+  check_memory_allocation(block_validation_single_validator_specs,
+                          __LINE__, __FILE__,
+                          "block validation single validator specs");
+  for (needlenum = 0; needlenum < num_non_subtypes; needlenum++) {
+    SearchSpec *spec = &scalpel_state.search_specs[needlenum];
+
+    if (! block_validation_runs_for_current_mode(spec)) {
+      default_filetypes[default_filetype_count++] = needlenum;
+      if (spec->BLOCKVALIDATIONSCOPE == BLOCK_VALIDATION_DISABLED) {
+        lock_fprintf(stdout,
+                     "Block validation is disabled for file type \"%s\".\n",
+                     spec->FILETYPE);
+        scalpel_log("Block validation is disabled for file type \"%s\".\n",
+                    spec->FILETYPE);
+      }
+      else {
+        lock_fprintf(
+            stdout,
+            "Skipping reassembly-only block validation for file type \"%s\" under -c.\n",
+            spec->FILETYPE);
+        scalpel_log(
+            "Skipped reassembly-only block validation for file type \"%s\" under -c.\n",
+            spec->FILETYPE);
+      }
+    }
+    else if (spec->BLOCKVALIDATOR) {
+      block_validation_single_validator_specs[single_validator_count++] =
+          needlenum;
+    }
+    else if (! spec->BATCHEDBLOCKVALIDATOR) {
+      default_filetypes[default_filetype_count++] = needlenum;
+    }
+  }
+  block_validation_num_single_validators = single_validator_count;
   memdiag = block_validation_memdiag_enabled();
+  test_handoff = getenv("SCALPEL3_TEST_BLOCK_VALIDATION_HANDOFF") != NULL;
   if (memdiag) {
     queued_by_type = (uint64_t *)calloc(num_non_subtypes, sizeof(*queued_by_type));
     check_memory_allocation(queued_by_type, __LINE__, __FILE__, "queued_by_type");
-    block_validation_memdiag_report("block validation queue build start",
+    block_validation_memdiag_report("block validation start",
                                     num_blocks, queued_total,
                                     skipped_non_exemplar, default_valid,
                                     queued_by_type, num_non_subtypes);
   }
 
-  for (block = num_blocks - 1; block >= 0; block--) {
-    // progress display
-    if (block % 100000 == 0) {
-      clock_gettime(CLOCK_MONOTONIC, &endtime);
-      total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
-
-      lock_fprintf(stdout,
-                   "Queueing blocks for validation (%3.1lf%%), total elapsed "
-                   "time = %.2lf secs.\n",
-                   100.0 - (double)block / (double)num_blocks * 100.0, (double)total_wait / 1e9);
-    }
-
-    actual_block = filemirror_actual_blocknumber(scalpel_state.filemirror,
-                                                 block);
-
-    // validate block only for exemplars
-    if (filemirror_get_exemplar(scalpel_state.filemirror, actual_block)
-        != actual_block) {
-      // not an exemplar--skip
-      skipped_non_exemplar++;
-      continue;
-    }
-
-    for (needlenum = 0; needlenum < num_non_subtypes; needlenum++) {
-      // validate block only if there's a block validation function for this file type--otherwise,
-      // mark the block as valid
-      if (! scalpel_state.search_specs[needlenum].BLOCKVALIDATOR) {
-        filemirror_set_blocktype(scalpel_state.filemirror, actual_block,
-                                 needlenum, BLOCK_CONFIDENCE_VALID);
-        default_valid++;
-        continue;
-      }
-
-      memset(&validation_info, 0, sizeof(validation_info));
-      validation_info.workload = VALIDATE_BLOCK;
-      validation_info.block.apparent_block = block;
-      validation_info.block.actual_block = actual_block;
-      validation_info.block.filetype = scalpel_state.search_specs[needlenum].FILETYPE;
-      validation_info.block.searchtype = scalpel_state.search_specs[needlenum].SEARCHTYPE;
-      validation_info.block.needleidx = needlenum;
-      gen_block_hash_key(validation_info.block.blockhashkey,
-                         validation_info.block.needleidx, actual_block);
-      validation_info.block.blockvalidator =
-          scalpel_state.search_specs[needlenum].BLOCKVALIDATOR;
-
-      if (scalpel_state.search_specs[needlenum].PRINTBLOCKSTATEFUNC
-          && scalpel_state.search_specs[needlenum].SERIALIZEBLOCKSTATEFUNC) {
-        validation_info.block.printblockstatefunc =
-            scalpel_state.search_specs[needlenum].PRINTBLOCKSTATEFUNC;
-      }
-
-      add_to_queue_priority_relaxed(&carvelist, &validation_info, 0);
-      queued_total++;
-      if (queued_by_type) {
-        queued_by_type[needlenum]++;
-      }
-
-      if (memdiag && (queued_total % 500000 == 0)) {
-        block_validation_memdiag_report("block validation queue build progress",
-                                        num_blocks, queued_total,
-                                        skipped_non_exemplar, default_valid,
-                                        queued_by_type, num_non_subtypes);
-      }
-
-      if (scalpel_state.mode_verbose) {
-        lock_fprintf(stdout, "Adding block %" PRId64 " to queue.\n",
-                     actual_block);
-      }
+  // the deterministic handoff test parks worker zero between its inactive-phase observation and
+  // the wait mutex. Publishing the phase before releasing it reproduces the old lost-wakeup window.
+  if (test_handoff) {
+    while (! atomic_load_explicit(&block_validation_test_worker_at_handoff,
+                                  memory_order_acquire)) {
+      sched_yield();
     }
   }
 
-  // broadcast to let validation threads know that work has been inserted into the queue. pthreads
-  // requires that an associated lock be held to avoid lost signals. Threads are not activated until
-  // after the queue is populated, because access to scalpel_state.search_specs requires a lock
-  // during block validation!
+  clock_gettime(CLOCK_MONOTONIC, &block_validation_start_time);
+  atomic_store_explicit(&block_validation_skipped_non_exemplar, 0, memory_order_release);
+  atomic_store_explicit(&block_validation_cursor_workers, 0, memory_order_release);
+  {
+    uint32_t cursor_limit = (uint32_t)scalpel_state.max_validation_threads;
+    uint32_t physical = (uint32_t)num_detected_physical_cores();
+
+    if (physical > 0 && cursor_limit > physical) {
+      cursor_limit = physical;
+    }
+    atomic_store_explicit(&block_validation_cursor_worker_limit,
+                          cursor_limit, memory_order_release);
+  }
+  default_valid = filemirror_default_unclassified_blocktypes(
+      scalpel_state.filemirror, default_filetypes, default_filetype_count,
+      BLOCK_CONFIDENCE_VALID);
+  atomic_store_explicit(&block_validation_default_valid, default_valid,
+                        memory_order_release);
+  free(default_filetypes);
+  default_filetypes = NULL;
+
+  // publish the complete cursor state while holding the same mutex workers use before sleeping.
+  // A worker either observes cursor work during its mutex-protected recheck or is already asleep
+  // when the broadcast occurs, so an active phase cannot be stranded by a lost notification.
   MUTEX_ERROR_CHECK(pthread_mutex_lock(&validation_work_is_available), __LINE__, __FILE__);
-  pthread_cond_broadcast(&validation_check_work_available);
+  atomic_store_explicit(&block_validation_cursor, 0, memory_order_release);
+  atomic_store_explicit(&block_validation_done, 0, memory_order_release);
+  block_validation_num_blocks = num_blocks;
+  atomic_store_explicit(&block_validation_active,
+                        single_validator_count > 0, memory_order_release);
+  if (single_validator_count > 0) {
+    pthread_cond_broadcast(&validation_check_work_available);
+  }
+  if (test_handoff) {
+    atomic_store_explicit(&block_validation_test_release_worker, true,
+                          memory_order_release);
+  }
   MUTEX_ERROR_CHECK(pthread_mutex_unlock(&validation_work_is_available), __LINE__, __FILE__);
 
-  clock_gettime(CLOCK_MONOTONIC, &endtime);
-  total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
-
-  lock_fprintf(stdout,
-               "Queueing blocks for validation (%3.1lf%%), total elapsed time "
-               "= %.2lf secs.\n",
-               100.0, (double)total_wait / 1e9);
-
-  frame_message("QUEUE OF BLOCKS TO VALIDATE CREATED");
-  if (memdiag) {
-    block_validation_memdiag_report("block validation queue build complete",
-                                    num_blocks, queued_total,
-                                    skipped_non_exemplar, default_valid,
-                                    queued_by_type, num_non_subtypes);
+  // run the batched validators on this (main) thread, in parallel with the validation threads that
+  // service the single-block validators via the cursor. Each BATCHEDBLOCKVALIDATOR iterates the
+  // apparent blocks itself, records its own decisions, and may create subtypes.
+  for (needlenum = 0; needlenum < num_non_subtypes; needlenum++) {
+    if (block_validation_runs_for_current_mode(
+            &scalpel_state.search_specs[needlenum])
+        && scalpel_state.search_specs[needlenum].BATCHEDBLOCKVALIDATOR) {
+      scalpel_state.search_specs[needlenum].BATCHEDBLOCKVALIDATOR(needlenum, scalpel_state.blocksize);
+    }
   }
+
+  // wait without spinning until the cursor pass finishes every apparent block. Block validation
+  // runs to completion once started; a checkpoint-and-exit requested mid-pass is honored afterward
+  // in the recovery phase (an exit requested before the pass is handled by the check above).
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&validation_work_is_available), __LINE__, __FILE__);
+  while (single_validator_count > 0
+         && atomic_load_explicit(&block_validation_done, memory_order_acquire)
+            < num_blocks) {
+    pthread_cond_wait(&block_validation_check_complete,
+                      &validation_work_is_available);
+  }
+  atomic_store_explicit(&block_validation_active, false, memory_order_release);
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&validation_work_is_available), __LINE__, __FILE__);
+
+  if (single_validator_count > 0
+      && atomic_load_explicit(&block_validation_done, memory_order_acquire)
+         != num_blocks) {
+    handle_error(SCALPEL_GENERAL_ABORT, "Invalid block-validation cursor accounting.",
+                 __LINE__, __FILE__);
+  }
+  skipped_non_exemplar = atomic_load_explicit(&block_validation_skipped_non_exemplar, memory_order_acquire);
+  default_valid = atomic_load_explicit(&block_validation_default_valid, memory_order_acquire);
+  queued_total = single_validator_count > 0
+                     ? atomic_load_explicit(&block_validation_done,
+                                            memory_order_acquire)
+                     : 0;
+
+  if (single_validator_count > 0) {
+    frame_message("BLOCK VALIDATION CURSOR PASS COMPLETE");
+  }
+  free(block_validation_single_validator_specs);
+  block_validation_single_validator_specs = NULL;
+  block_validation_num_single_validators = 0;
 
   // ---------- thread group synchronization point ----------- //
   // ---------- thread group synchronization point ----------- //
@@ -3529,7 +5161,8 @@ static void validate_blocks(void) {
     if (now - then >= 2) {
       then = now;
       clock_gettime(CLOCK_MONOTONIC, &endtime);
-      total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
+      total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                   + (endtime.tv_nsec - starttime.tv_nsec);
 
       lock_fprintf(stdout,
                    "\nStatus: Blocks queued for validation: %" PRIu64
@@ -3540,7 +5173,9 @@ static void validate_blocks(void) {
     }
   }
 
-  // block global state is now locked and no more subtypes will be created
+  // block global state is now locked and no more subtypes will be created.
+  // (MoDiCo already populated its confidence prior at the start of this
+  // function, before structural validation ran.)
   scalpel_state.block_validation_complete = true;
 
   frame_message("BLOCK VALIDATION PHASE COMPLETE");
@@ -3667,23 +5302,25 @@ static void prune_header_footer_database(void) {
 // NOCARVE function can override the carving operation to avoid writing files that are, e.g., known
 // to be uninteresting.
 //
-// NOTE: The same candidate may be encountered more than once due to work sharing. An fopen("wx")
-// check on the UUID-based filename prevents the same candidate from being written twice. For
-// suppressed duplicates, the shadow blockmap is still updated so covered blocks are not reused.
-// This can result in blockmap updates that do not correspond to carved files.
+// note: the same candidate may be encountered more than once due to work sharing. A hidden staging
+// reservation associated with the UUID-based filename prevents the same candidate from being written
+// twice without exposing an empty final file. For suppressed duplicates, the shadow blockmap is still
+// updated so covered blocks are not reused. This can result in blockmap updates that do not correspond
+// to carved files.
 //
 // IMPORTANT: THIS FUNCTION DESTROYS THE 'candidate' unless preserve == true.
 void write_candidate(CarveInfo **candidatep, bool preserve) {
 
   CarveInfo *candidate = *candidatep;
   char file_pathname[PATH_MAX];
+  char file_staging_pathname[PATH_MAX];
   char blockvector_pathname[PATH_MAX];
   unsigned char sha256[32];
   BlockVector *cloneb;
 
   char sha256hex[32 * 2 + sizeof("-CHOPPED")];
 
-  FILE *check;
+  FilePublicationReservation reservation;
   bool dont_carve = false;
   bool too_small = false;
   uuid_string_t uuidp;
@@ -3720,7 +5357,9 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
   if (candidate->flavor == VALIDATED
       && (candidate->partial_artifact_written || candidate->clone || candidate->cloned)
       && atomic_load_explicit(&kill_queue_initialized, memory_order_acquire)) {
-    add_to_queue(&kill_queue, candidate->binuuid, INT_MAX - time(NULL));
+    if (! queue_kill_uuid(candidate->binuuid)) {
+      handle_error(SCALPEL_GENERAL_ABORT, "null candidate UUID", __LINE__, __FILE__);
+    }
     queue_partial_cleanup(candidate->binuuid);
   }
 
@@ -3769,6 +5408,7 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
 
     // one more file to write
     file_pathname[0] = 0;
+    file_staging_pathname[0] = 0;
     blockvector_pathname[0] = 0;
 
     // get pathname for carved file and associated blockvector
@@ -3816,11 +5456,11 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
                scalpel_state.search_specs[candidate->needleidx].v_current_subdir, uuidp, uuidc, sha256hex,
                scalpel_state.search_specs[candidate->needleidx].FILETYPE);
 
-      // UNIQUENESS CHECK (needed because work sharing can cause the same candidate to validate
-      // more than once)
-      if ((check = fopen(file_pathname, "wx"))) {
-        // file didn't exist, now it does
-        fclose(check);
+      // reserve a hidden staging pathname. The final pathname remains absent until the asynchronous
+      // writer has completed and atomically publishes the recovered file.
+      reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
+                                               file_staging_pathname);
+      if (reservation == FILE_PUBLICATION_RESERVED) {
         // one more validated file
         scalpel_state.search_specs[candidate->needleidx].validated_in_subdir++;
         atomic_fetch_add_explicit(&scalpel_state.validated_files, 1, memory_order_acq_rel);
@@ -3835,8 +5475,14 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
           scalpel_state.search_specs[candidate->needleidx].validated_in_subdir = 0;
         }
       }
-      else {
+      else if (reservation == FILE_PUBLICATION_COMMITTED
+               || reservation == FILE_PUBLICATION_IN_PROGRESS) {
+        // genuine duplicate--work sharing can validate the same candidate twice
         dont_carve = true;
+      }
+      else {
+        // a non-recoverable write error has occurred
+        handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
       }
       break;
 
@@ -3851,10 +5497,10 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
                scalpel_state.search_specs[candidate->needleidx].p_current_subdir, uuidp, uuidc, sha256hex,
                scalpel_state.search_specs[candidate->needleidx].FILETYPE);
 
-      // UNIQUENESS CHECK (needed because of reassembly thread work sharing)
-      if ((check = fopen(file_pathname, "wx"))) {
-        // file didn't exist, now it does
-        fclose(check);
+      // reserve a hidden staging pathname for write-once publication.
+      reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
+                                               file_staging_pathname);
+      if (reservation == FILE_PUBLICATION_RESERVED) {
         scalpel_state.search_specs[candidate->needleidx].promising_in_subdir++;
 
         // only a reasonable number of files in each subdir
@@ -3866,8 +5512,14 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
           scalpel_state.search_specs[candidate->needleidx].promising_in_subdir = 0;
         }
       }
-      else {
+      else if (reservation == FILE_PUBLICATION_COMMITTED
+               || reservation == FILE_PUBLICATION_IN_PROGRESS) {
+        // genuine duplicate--work sharing can validate the same candidate twice
         dont_carve = true;
+      }
+      else {
+        // a non-recoverable write error has occurred
+        handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
       }
       break;
 
@@ -3895,6 +5547,12 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
       }
       else {
         strcpy(file_pathname, candidate->inprogress_pathname);
+      }
+
+      reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
+                                               file_staging_pathname);
+      if (reservation != FILE_PUBLICATION_RESERVED) {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
       }
       break;
 
@@ -3931,10 +5589,9 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
     carve_free_state(candidate->carvehashkey);
   }
 
-  // write only if the file is unique and the DONTCARVE function is allowing the file to be written.
-  // For VALIDATED files, always update the blockmap, since there could be duplicate files. Passing
-  // NULL for both filenames causes write_blockvector() to update the shadow blockmap but not write
-  // any data to disk. The blockvector is freed by write_blockvector().
+  // write only if the staging reservation succeeded and the DONTCARVE function allows it. Suppressed
+  // candidates in VALIDATED still update the shadow blockmap below, since work sharing can produce
+  // duplicates. The asynchronous write owns and frees the blockvector when publication is queued.
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "\n%s %s candidate with UUIDs\n%s / %s.\n.", dont_carve ? "Not writing" : "Writing",
@@ -3965,8 +5622,11 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
       cloneb = NULL;
     }
 
-    write_blockvector(cloneb ? cloneb : candidate->b, dont_carve ? NULL : file_pathname,
+    write_blockvector(cloneb ? cloneb : candidate->b,
+                      dont_carve ? NULL : file_pathname,
+                      dont_carve ? NULL : file_staging_pathname,
                       (dont_carve || ! scalpel_state.write_blockvectors) ? NULL : blockvector_pathname,
+                      candidate->flavor,
                       candidate->flavor == VALIDATED);  // blockmap updates only for validated files
 
     if (candidate->flavor == PROMISING || candidate->flavor == INPROGRESS) {
@@ -4117,6 +5777,7 @@ static void start_threads(void) {
     reassemblythreadargs[i].id = i;
     atomic_init(&reassemblythreadargs[i].thread_running, false);
     atomic_init(&reassemblythreadargs[i].thread_stop, false);
+    reassemblythreadargs[i].last_kill_generation_checked = 0;
 
     if (pthread_create(&reassemblythreads[i], NULL, reassembly_thread, &reassemblythreadargs[i])) {
       // fatal
@@ -4141,6 +5802,11 @@ static void start_threads(void) {
     handle_error(SCALPEL_ERROR_MUTEX_FAILURE, "init_threads()", __LINE__, __FILE__);
   }
 
+  if (pthread_cond_init(&block_validation_check_complete, NULL)) {
+    // fatal
+    handle_error(SCALPEL_ERROR_MUTEX_FAILURE, "init_threads()", __LINE__, __FILE__);
+  }
+
   for (i = 0; i < scalpel_state.max_validation_threads; i++) {
     validationthreadargs[i].id = i;
     atomic_init(&validationthreadargs[i].thread_running, false);
@@ -4155,11 +5821,21 @@ static void start_threads(void) {
   // create IPC thread that supports status reports, checkpoint initiation, etc. unless IPC is off
 
   if (! no_IPC) {
+    atomic_init(&ipc_stop_requested, false);
+    ipc_client_socket = -1;
+    ipc_started = false;
+
+    if (pthread_mutex_init(&ipc_client_lock, &mutextype)) {
+      // fatal
+      handle_error(SCALPEL_ERROR_MUTEX_FAILURE, "start_threads()", __LINE__, __FILE__);
+    }
+
     // start IPC thread
     if (pthread_create(&ipc, NULL, ipc_thread, NULL) != 0) {
       // fatal
       handle_error(SCALPEL_ERROR_PTHREAD_FAILURE, "create_ipc_thread()", __LINE__, __FILE__);
     }
+    ipc_started = true;
   }
   else {
     frame_message("IPC IS OFF BECAUSE OF COMMAND LINE OPTION");
@@ -4171,11 +5847,34 @@ static void start_threads(void) {
 }
 
 
+// classify errors for which the listener remains usable and accept can be retried
+static bool ipc_accept_error_is_transient(int error) {
+
+  if (error == EAGAIN || error == EWOULDBLOCK || error == EINTR || error == ECONNABORTED) {
+    return true;
+  }
+
+#ifdef EPROTO
+  if (error == EPROTO) {
+    return true;
+  }
+#endif
+
+  return false;
+}
+
+
 // thread that supports "human in the loop" IPC with scalpel3-ctl through a Unix domain socket.
 static void *ipc_thread(void *arg) {
 
+  int accept_error;
   int clientsock;
+  int client_flags;
   int len;
+  int listener_flags;
+  int poll_result;
+  ssize_t response_result;
+  struct pollfd listener;
   struct sockaddr_un server;
   char sockname[PATH_MAX];
   static char buf[SOCKBUFSIZE + 1];
@@ -4184,9 +5883,22 @@ static void *ipc_thread(void *arg) {
   uuid_string_t textuuid;
   struct timeval tv;
   unsigned long progress_generation;
+  bool checkpoint_active;
   static struct timespec brief_wait = {.tv_sec = 0, .tv_nsec = 100 * 1000};
+  const char *test_accept_error;
+  int test_accept_errno = 0;
 
   (void)arg;
+
+  test_accept_error = getenv("SCALPEL3_TEST_IPC_ACCEPT_ERROR");
+  if (test_accept_error != NULL) {
+    if (! strcmp(test_accept_error, "ECONNABORTED")) {
+      test_accept_errno = ECONNABORTED;
+    }
+    else if (! strcmp(test_accept_error, "EBADF")) {
+      test_accept_errno = EBADF;
+    }
+  }
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
@@ -4217,29 +5929,106 @@ static void *ipc_thread(void *arg) {
     handle_error(SCALPEL_ERROR_IPC, "ipc_thread()", __LINE__, __FILE__);
   }
 
-  listen(ipcsocket, 15);
+  if (listen(ipcsocket, 15)) {
+    handle_error(SCALPEL_ERROR_IPC, "ipc_thread()", __LINE__, __FILE__);
+  }
+
+  // a nonblocking listener ensures that accept cannot strand shutdown after poll reports readiness
+  listener_flags = fcntl(ipcsocket, F_GETFL, 0);
+  if (listener_flags < 0 || fcntl(ipcsocket, F_SETFL, listener_flags | O_NONBLOCK) < 0) {
+    handle_error(SCALPEL_ERROR_IPC, "ipc_thread()", __LINE__, __FILE__);
+  }
+
+  listener.fd = ipcsocket;
+  listener.events = POLLIN;
 
   lock_fprintf(stdout, "\nIPC thread is awake and listening on Unix domain socket \"%s\".\n", sockname);
 
   // repeatedly accept one request from an IPC client, process, close connection
-  while (1) {
-    clientsock = accept(ipcsocket, 0, 0);
-    if (clientsock < 0) {
+  while (! atomic_load_explicit(&ipc_stop_requested, memory_order_acquire)) {
+    listener.revents = 0;
+    poll_result = poll(&listener, 1, IPC_POLL_TIMEOUT_MILLISECONDS);
+    if (poll_result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       handle_error(SCALPEL_ERROR_IPC, "ipc_thread()", __LINE__, __FILE__);
+    }
+    if (atomic_load_explicit(&ipc_stop_requested, memory_order_acquire)) {
+      break;
+    }
+    if (poll_result == 0) {
+      continue;
+    }
+    if (listener.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+      handle_error(SCALPEL_ERROR_IPC, "ipc_thread()", __LINE__, __FILE__);
+    }
+    if (! (listener.revents & POLLIN)) {
+      continue;
+    }
+
+    // inject one accept failure for deterministic regression coverage
+    if (test_accept_errno != 0) {
+      errno = test_accept_errno;
+      test_accept_errno = 0;
+      clientsock = -1;
+    }
+    else {
+      clientsock = accept(ipcsocket, 0, 0);
+    }
+
+    if (clientsock < 0) {
+      accept_error = errno;
+      if (ipc_accept_error_is_transient(accept_error)) {
+        continue;
+      }
+      lock_fprintf(stderr,
+                   "\nNon-fatal error: IPC accept failed (%s); IPC is now disabled, "
+                   "but carving will continue.\n",
+                   strerror(accept_error));
+      break;
+    }
+
+    // publish the connected descriptor under the same lock shutdown uses to interrupt it
+    MUTEX_ERROR_CHECK(pthread_mutex_lock(&ipc_client_lock), __LINE__, __FILE__);
+    if (atomic_load_explicit(&ipc_stop_requested, memory_order_acquire)) {
+      MUTEX_ERROR_CHECK(pthread_mutex_unlock(&ipc_client_lock), __LINE__, __FILE__);
+      close(clientsock);
+      break;
+    }
+    ipc_client_socket = clientsock;
+    MUTEX_ERROR_CHECK(pthread_mutex_unlock(&ipc_client_lock), __LINE__, __FILE__);
+
+    // accepted sockets are explicitly blocking because inheritance of O_NONBLOCK differs by platform
+    client_flags = fcntl(clientsock, F_GETFL, 0);
+    if (client_flags < 0 || fcntl(clientsock, F_SETFL, client_flags & ~O_NONBLOCK) < 0) {
+      lock_fprintf(stderr, "\nNon-fatal error: couldn't configure IPC client socket.\n");
+      goto endclient;
     }
 
     // timeouts on read and write prevent the IPC thread from hanging because of a misbehaving
     // client, without the need for multithreading (since all scalpel3 IPC interactions are brief).
     tv.tv_sec = 10;
     tv.tv_usec = 0;
-    setsockopt(clientsock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
-    setsockopt(clientsock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+    if (setsockopt(clientsock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv))
+        || setsockopt(clientsock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv))) {
+      lock_fprintf(stderr, "\nNon-fatal error: couldn't configure IPC client timeouts.\n");
+      goto endclient;
+    }
 
     lock_fprintf(stdout, "\nIPC connection accepted.\n");
 
-    while (1) {
+    while (! atomic_load_explicit(&ipc_stop_requested, memory_order_acquire)) {
       memset(buf, 0, sizeof(buf));
       if ((len = read(clientsock, buf, SOCKBUFSIZE)) <= 0) {
+        goto endclient;
+      }
+
+      // use the client lock as the command-start gate so shutdown and dispatch cannot cross
+      MUTEX_ERROR_CHECK(pthread_mutex_lock(&ipc_client_lock), __LINE__, __FILE__);
+      bool stop_requested = atomic_load_explicit(&ipc_stop_requested, memory_order_acquire);
+      MUTEX_ERROR_CHECK(pthread_mutex_unlock(&ipc_client_lock), __LINE__, __FILE__);
+      if (stop_requested) {
         goto endclient;
       }
 
@@ -4267,7 +6056,7 @@ static void *ipc_thread(void *arg) {
           }
           buf[KILL_CMD_LEN + 37] = 0;
           memcpy(textuuid, buf + KILL_CMD_LEN, 37);
-          if (uuid_parse(textuuid, killuuid) < 0) {
+          if (uuid_parse(textuuid, killuuid) < 0 || uuid_is_null(killuuid)) {
             snprintf(buf, SOCKBUFSIZE, "IPC KILL COMMAND HAD INVALID UUID \"%s\", REJECTING", textuuid);
             frame_message(buf);
             if (write(clientsock, BAD_KILL_RESPONSE, BAD_KILL_RESPONSE_LEN) != BAD_KILL_RESPONSE_LEN) {
@@ -4280,12 +6069,23 @@ static void *ipc_thread(void *arg) {
             snprintf(buf, SOCKBUFSIZE, "QUEUEING IPC KILL COMMAND FOR UUID \"%s\"", textuuid);
             frame_message(buf);
 
-            // add kill command to kill queue so active threads will destroy associated carving
-            // candidate(s)
-            add_to_queue(&kill_queue, killuuid, INT_MAX - time(NULL));
-
-            // ...and also immediately remove any matching candidates from the promising queue
-            prune_uuid_from_promising_queue(killuuid);
+            // add the kill to the kill queue only. Do NOT prune the promising queue from
+            // this (IPC) thread: it shares a single sequential cursor with the reassembly
+            // thread's sync_and_validate_queues() walk, so pruning here races that walk
+            // (cursor corruption / use-after-free on a candidate being validated). The kill
+            // still takes effect -- writers suppress output for killed UUIDs via
+            // primary_uuid_is_killed(), and sync_promising_and_kill_queues() removes the
+            // candidates on the reassembly thread's next validate pass.
+            if (! queue_kill_uuid(killuuid)) {
+              snprintf(buf, SOCKBUFSIZE, "IPC KILL COMMAND HAD INVALID UUID \"%s\", REJECTING", textuuid);
+              frame_message(buf);
+              if (write(clientsock, BAD_KILL_RESPONSE, BAD_KILL_RESPONSE_LEN) != BAD_KILL_RESPONSE_LEN) {
+                lock_fprintf(stderr, "\nNon-fatal error: couldn't send response "
+                                     "to IPC instance.\n");
+                goto endclient;
+              }
+              continue;
+            }
 
             if (write(clientsock, KILL_RESPONSE, KILL_RESPONSE_LEN) != KILL_RESPONSE_LEN) {
               lock_fprintf(stderr, "\nNon-fatal error: couldn't send response "
@@ -4302,7 +6102,8 @@ static void *ipc_thread(void *arg) {
         struct timespec endtime;
 
         clock_gettime(CLOCK_MONOTONIC, &endtime);
-        total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
+        total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                     + (endtime.tv_nsec - starttime.tv_nsec);
 
         buf2[0] = 0;
 
@@ -4395,7 +6196,11 @@ static void *ipc_thread(void *arg) {
         }
       }
       else if (! strcmp(buf, CHECKPOINTEXIT_CMD)) {
-        frame_message("IPC CHECKPOINT AND EXIT COMMAND QUEUED. SHUTTING DOWN SOON");
+        frame_message("IPC CHECKPOINT AND EXIT COMMAND QUEUED. SCALPEL3 WILL CHECKPOINT ONLY IF RESTARTABLE STATE EXISTS");
+
+        // publish the exit request while holding the command gate so shutdown cannot interrupt the
+        // acknowledgement that caused it
+        MUTEX_ERROR_CHECK(pthread_mutex_lock(&ipc_client_lock), __LINE__, __FILE__);
         atomic_store_explicit(&TAKE_CHECKPOINT_AND_EXIT, true, memory_order_release);
 
 #pragma GCC diagnostic push
@@ -4407,7 +6212,9 @@ static void *ipc_thread(void *arg) {
 
 #pragma GCC diagnostic pop
 
-        if (write(clientsock, CHECKPOINTEXIT_RESPONSE, CHECKPOINTEXIT_RESPONSE_LEN) != CHECKPOINTEXIT_RESPONSE_LEN) {
+        response_result = write(clientsock, CHECKPOINTEXIT_RESPONSE, CHECKPOINTEXIT_RESPONSE_LEN);
+        MUTEX_ERROR_CHECK(pthread_mutex_unlock(&ipc_client_lock), __LINE__, __FILE__);
+        if (response_result != CHECKPOINTEXIT_RESPONSE_LEN) {
           lock_fprintf(stderr, "Non-fatal error: couldn't send response to IPC instance.\n");
           goto endclient;
         }
@@ -4421,27 +6228,40 @@ static void *ipc_thread(void *arg) {
             goto endclient;
           }
         }
+        else if (! checkpoint_request_progress_generation(&progress_generation,
+                                                           &checkpoint_active)) {
+          frame_message("IPC PROGRESS CHECKPOINT NOT AVAILABLE OUTSIDE FRAGMENTED RECOVERY");
+          if (write(clientsock, PROGRESSCHECKPOINT_RESPONSE_NOT_READY,
+                    PROGRESSCHECKPOINT_RESPONSE_NOT_READY_LEN)
+              != PROGRESSCHECKPOINT_RESPONSE_NOT_READY_LEN) {
+            lock_fprintf(stderr, "\nNon-fatal error: couldn't send response to IPC instance.\n");
+            goto endclient;
+          }
+        }
         else {
-          if (atomic_load_explicit(&TAKE_RECOVERY_CHECKPOINT, memory_order_acquire)
-              || atomic_load_explicit(&TAKE_PERIODIC_CHECKPOINT, memory_order_acquire)
-              || atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)
-              || atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+          if (checkpoint_active) {
             frame_message("IPC PROGRESS CHECKPOINT QUEUED ON ACTIVE CHECKPOINT");
           }
           else {
             frame_message("INITIATING NEW IPC PROGRESS CHECKPOINT OPERATION");
           }
 
-          progress_generation = checkpoint_request_progress_generation();
-
           // wait for progress checkpoint to complete before sending response, so client knows when update
           // is complete
           while (! checkpoint_progress_generation_complete(progress_generation)) {
+            if (atomic_load_explicit(&ipc_stop_requested, memory_order_acquire)) {
+              atomic_store_explicit(&progress_checkpoint_response_finished,
+                                    progress_generation, memory_order_release);
+              goto endclient;
+            }
             nanosleep(&brief_wait, NULL);
           }
 
-          if (write(clientsock, PROGRESSCHECKPOINT_RESPONSE_ACK, PROGRESSCHECKPOINT_RESPONSE_ACK_LEN)
-              != PROGRESSCHECKPOINT_RESPONSE_ACK_LEN) {
+          response_result = write(clientsock, PROGRESSCHECKPOINT_RESPONSE_ACK,
+                                  PROGRESSCHECKPOINT_RESPONSE_ACK_LEN);
+          atomic_store_explicit(&progress_checkpoint_response_finished,
+                                progress_generation, memory_order_release);
+          if (response_result != PROGRESSCHECKPOINT_RESPONSE_ACK_LEN) {
             lock_fprintf(stderr, "\nNon-fatal error: couldn't send response to IPC instance.\n");
             goto endclient;
           }
@@ -4525,12 +6345,51 @@ static void *ipc_thread(void *arg) {
 
   endclient:
     lock_fprintf(stdout, "\nClosing IPC connection.\n");
+    MUTEX_ERROR_CHECK(pthread_mutex_lock(&ipc_client_lock), __LINE__, __FILE__);
     close(clientsock);
+    ipc_client_socket = -1;
+    MUTEX_ERROR_CHECK(pthread_mutex_unlock(&ipc_client_lock), __LINE__, __FILE__);
   }
 
   close(ipcsocket);
+  ipcsocket = -1;
   unlink(sockname);
   return 0;
+}
+
+
+// stop accepting IPC, interrupt any connected client, and wait for the IPC thread to exit
+static void stop_ipc_thread(void) {
+
+  char sockname[PATH_MAX];
+
+  if (! ipc_started) {
+    return;
+  }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+
+  snprintf(sockname, sizeof(sockname), "%s/.scalpel3IPC", scalpel_state.base_output_directory);
+
+#pragma GCC diagnostic pop
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&ipc_client_lock), __LINE__, __FILE__);
+  atomic_store_explicit(&ipc_stop_requested, true, memory_order_release);
+  if (ipc_client_socket >= 0) {
+    shutdown(ipc_client_socket, SHUT_RDWR);
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&ipc_client_lock), __LINE__, __FILE__);
+
+  // remove the endpoint after closing the command gate so new connections are refused or rejected
+  unlink(sockname);
+
+  if (pthread_join(ipc, NULL)) {
+    handle_error(SCALPEL_ERROR_PTHREAD_FAILURE, "stop_ipc_thread()", __LINE__, __FILE__);
+  }
+  ipc_started = false;
+
+  MUTEX_ERROR_CHECK(pthread_mutex_destroy(&ipc_client_lock), __LINE__, __FILE__);
 }
 
 
@@ -4539,6 +6398,9 @@ static void *ipc_thread(void *arg) {
 void stop_threads(void) {
 
   int32_t i;
+
+  // stop IPC before any shared carving or filemirror state begins shutting down
+  stop_ipc_thread();
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Signaling all threads to stop.\n");
@@ -4842,85 +6704,93 @@ static int add_or_alternatives(PatternList *pl, uint32_t *idx, const char *patte
 }
 
 
-// build a pattern list for a header or footer
-static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs, bool headers) {
+// build a combined pattern list for simple headers and footers
+static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
 
   uint32_t pattern_count = 0;
 
-  lock_fprintf(stdout, "\nBuilding %s pattern list...\n", headers ? "HEADER" : "FOOTER");
+  for (uint32_t direction = 0; direction < 2; direction++) {
+    bool headers = direction == 0;
 
-  for (uint32_t i = 0; i < num_specs; i++) {
-    if (specs[i].MASTER) {
-      continue;
-    }
+    lock_fprintf(stdout, "\nBuilding %s pattern list...\n",
+                 headers ? "HEADER" : "FOOTER");
 
-    const char *pattern = headers ? specs[i].begin : specs[i].end;
-    size_t pattern_len = headers ? specs[i].beginlength : specs[i].endlength;
-    bool has_func = headers ? (specs[i].HEADERFUNC != NULL) : (specs[i].FOOTERFUNC != NULL);
-    bool is_regex = headers ? specs[i].begin_is_RE : specs[i].end_is_RE;
-
-    lock_fprintf(stdout, "  %s: len=%zu regex=%d func=%d\n", specs[i].FILETYPE, pattern_len, is_regex, has_func);
-
-    if (pattern_len > 0 && pattern_len < 20) {
-      for (size_t j = 0; j < pattern_len; j++) {
-        if (pattern[j] >= 32 && pattern[j] <= 126) {
-          lock_fprintf(stdout, "'%c' ", pattern[j]);
-        }
-        else {
-          lock_fprintf(stdout, "0x%02x ", (unsigned char)pattern[j]);
-        }
-      }
-      lock_fprintf(stdout, "\n");
-    }
-
-    if (! pattern_len || has_func) {
-      continue;
-    }
-
-    if (is_regex) {
-      bool has_or = false;
-      for (size_t j = 0; j < pattern_len; j++) {
-        if (pattern[j] == '|') {
-          has_or = true;
-          break;
-        }
+    for (uint32_t i = 0; i < num_specs; i++) {
+      if (specs[i].MASTER) {
+        continue;
       }
 
-      if (has_or) {
-        int num_alts = count_or_alternatives(pattern, pattern_len);
+      const char *pattern = headers ? specs[i].begin : specs[i].end;
+      size_t pattern_len = headers ? specs[i].beginlength : specs[i].endlength;
+      bool has_func = headers ? (specs[i].HEADERFUNC != NULL) : (specs[i].FOOTERFUNC != NULL);
+      bool is_regex = headers ? specs[i].begin_is_RE : specs[i].end_is_RE;
 
-        // check if all alternatives are simple
-        bool all_simple = true;
-        size_t alt_start = 0;
-        for (size_t j = 0; j <= pattern_len; j++) {
-          if (j == pattern_len || pattern[j] == '|') {
-            size_t alt_len = j - alt_start;
+      lock_fprintf(stdout, "  %s: len=%zu regex=%d func=%d\n",
+                   specs[i].FILETYPE, pattern_len, is_regex, has_func);
 
-            if (alt_len > 0) {
-              if (! is_simple_alternative(pattern + alt_start, alt_len)) {
-                all_simple = false;
-                break;
-              }
-            }
-            alt_start = j + 1;
+      if (pattern_len > 0 && pattern_len < 20) {
+        for (size_t j = 0; j < pattern_len; j++) {
+          if (pattern[j] >= 32 && pattern[j] <= 126) {
+            lock_fprintf(stdout, "'%c' ", pattern[j]);
+          }
+          else {
+            lock_fprintf(stdout, "0x%02x ", (unsigned char)pattern[j]);
           }
         }
-        if (all_simple) {
-          pattern_count += num_alts;
-          lock_fprintf(stdout, "    -> OR pattern: %d alternatives (simple)\n", num_alts);
+        lock_fprintf(stdout, "\n");
+      }
+
+      if (! pattern_len || has_func) {
+        continue;
+      }
+
+      if (is_regex) {
+        bool has_or = false;
+        for (size_t j = 0; j < pattern_len; j++) {
+          if (pattern[j] == '|') {
+            has_or = true;
+            break;
+          }
+        }
+
+        if (has_or) {
+          int num_alts = count_or_alternatives(pattern, pattern_len);
+
+          // check if all alternatives are simple
+          bool all_simple = true;
+          size_t alt_start = 0;
+          for (size_t j = 0; j <= pattern_len; j++) {
+            if (j == pattern_len || pattern[j] == '|') {
+              size_t alt_len = j - alt_start;
+
+              if (alt_len > 0) {
+                if (! is_simple_alternative(pattern + alt_start, alt_len)) {
+                  all_simple = false;
+                  break;
+                }
+              }
+              alt_start = j + 1;
+            }
+          }
+          if (all_simple) {
+            pattern_count += num_alts;
+            lock_fprintf(stdout,
+                         "    -> OR pattern: %d alternatives (simple)\n",
+                         num_alts);
+          }
+          else {
+            lock_fprintf(stdout, "    -> OR pattern: complex, using PCRE2\n");
+          }
         }
         else {
-          lock_fprintf(stdout, "    -> OR pattern: complex, using PCRE2\n");
+          if (is_simple_alternative(pattern, pattern_len)) {
+            pattern_count++;
+          }
         }
       }
       else {
-        if (is_simple_alternative(pattern, pattern_len)) {
-          pattern_count++;
-        }
+        pattern_count++;
       }
-    }
-    else {
-      pattern_count++;
     }
   }
 
@@ -4946,94 +6816,106 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs, bo
 
   uint32_t idx = 0;
 
-  for (uint32_t i = 0; i < num_specs; i++) {
-    if (specs[i].MASTER) {
-      continue;
-    }
+  for (uint32_t direction = 0; direction < 2; direction++) {
+    bool headers = direction == 0;
 
-    const char *pattern = headers ? specs[i].begin : specs[i].end;
-    size_t pattern_len = headers ? specs[i].beginlength : specs[i].endlength;
-    bool has_func = headers ? (specs[i].HEADERFUNC != NULL) : (specs[i].FOOTERFUNC != NULL);
-    bool is_regex = headers ? specs[i].begin_is_RE : specs[i].end_is_RE;
-
-    if (! pattern_len || has_func) {
-      continue;
-    }
-
-    if (is_regex) {
-      bool has_or = false;
-      for (size_t j = 0; j < pattern_len; j++) {
-        if (pattern[j] == '|') {
-          has_or = true;
-          break;
-        }
+    for (uint32_t i = 0; i < num_specs; i++) {
+      if (specs[i].MASTER) {
+        continue;
       }
 
-      if (has_or) {
-        int num_added = add_or_alternatives(pl, &idx, pattern, pattern_len, i, headers);
+      const char *pattern = headers ? specs[i].begin : specs[i].end;
+      size_t pattern_len = headers ? specs[i].beginlength : specs[i].endlength;
+      bool has_func = headers ? (specs[i].HEADERFUNC != NULL) : (specs[i].FOOTERFUNC != NULL);
+      bool is_regex = headers ? specs[i].begin_is_RE : specs[i].end_is_RE;
 
-        if (num_added < 0) {
-          lock_fprintf(stdout, "  -> OR pattern too complex, skipping\n");
+      if (! pattern_len || has_func) {
+        continue;
+      }
+
+      if (is_regex) {
+        bool has_or = false;
+        for (size_t j = 0; j < pattern_len; j++) {
+          if (pattern[j] == '|') {
+            has_or = true;
+            break;
+          }
+        }
+
+        if (has_or) {
+          int num_added =
+              add_or_alternatives(pl, &idx, pattern, pattern_len, i, headers);
+
+          if (num_added < 0) {
+            lock_fprintf(stdout, "  -> OR pattern too complex, skipping\n");
+          }
+        }
+        else {
+          if (is_simple_alternative(pattern, pattern_len)) {
+            char *parsed = malloc(256);
+            size_t parsed_len =
+                parse_simple_escapes(pattern, pattern_len, parsed, 256);
+
+            if (parsed_len == 0) {
+              free(parsed);
+              parsed = malloc(pattern_len);
+              memcpy(parsed, pattern, pattern_len);
+              parsed_len = pattern_len;
+            }
+
+            bool has_wildcards = false;
+            for (size_t j = 0; j < parsed_len; j++) {
+              if (parsed[j] == '.') {
+                parsed[j] = SCALPEL_WILDCARD_CHAR;
+                has_wildcards = true;
+              }
+            }
+
+            bool *mask = NULL;
+            if (has_wildcards) {
+              mask = calloc(parsed_len, sizeof(bool));
+              for (size_t j = 0; j < parsed_len; j++) {
+                mask[j] = (parsed[j] == SCALPEL_WILDCARD_CHAR);
+              }
+            }
+
+            populate_pattern_entry(pl, idx, parsed, parsed_len, has_wildcards,
+                                   mask, i, headers);
+
+            if (scalpel_state.mode_verbose) {
+              lock_fprintf(
+                  stdout,
+                  "  -> Added regex pattern idx=%u for %s "
+                  "(first_byte=0x%02x)\n",
+                  idx, specs[i].FILETYPE, (unsigned char)parsed[0]);
+            }
+            idx++;
+          }
         }
       }
       else {
-        if (is_simple_alternative(pattern, pattern_len)) {
-          char *parsed = malloc(256);
-          size_t parsed_len = parse_simple_escapes(pattern, pattern_len, parsed, 256);
+        bool has_wc = has_wildcard(pattern, pattern_len);
+        bool *mask = NULL;
 
-          if (parsed_len == 0) {
-            free(parsed);
-            parsed = malloc(pattern_len);
-            memcpy(parsed, pattern, pattern_len);
-            parsed_len = pattern_len;
+        if (has_wc) {
+          mask = calloc(pattern_len, sizeof(bool));
+          for (size_t j = 0; j < pattern_len; j++) {
+            mask[j] = (pattern[j] == SCALPEL_WILDCARD_CHAR);
           }
-
-          bool has_wildcards = false;
-          for (size_t j = 0; j < parsed_len; j++) {
-            if (parsed[j] == '.') {
-              parsed[j] = SCALPEL_WILDCARD_CHAR;
-              has_wildcards = true;
-            }
-          }
-
-          bool *mask = NULL;
-          if (has_wildcards) {
-            mask = calloc(parsed_len, sizeof(bool));
-            for (size_t j = 0; j < parsed_len; j++) {
-              mask[j] = (parsed[j] == SCALPEL_WILDCARD_CHAR);
-            }
-          }
-
-          populate_pattern_entry(pl, idx, parsed, parsed_len, has_wildcards, mask, i, headers);
-
-          if (scalpel_state.mode_verbose) {
-            lock_fprintf(stdout, "  -> Added regex pattern idx=%u for %s (first_byte=0x%02x)\n", idx, specs[i].FILETYPE,
-                         (unsigned char)parsed[0]);
-          }
-          idx++;
         }
-      }
-    }
-    else {
-      bool has_wc = has_wildcard(pattern, pattern_len);
-      bool *mask = NULL;
 
-      if (has_wc) {
-        mask = calloc(pattern_len, sizeof(bool));
-        for (size_t j = 0; j < pattern_len; j++) {
-          mask[j] = (pattern[j] == SCALPEL_WILDCARD_CHAR);
+        populate_pattern_entry(pl, idx, pattern, pattern_len, has_wc, mask, i,
+                               headers);
+
+        if (scalpel_state.mode_verbose) {
+          lock_fprintf(stdout,
+                       "  -> Added string pattern idx=%u for %s "
+                       "(first_byte=0x%02x, has_wc=%d)\n",
+                       idx, specs[i].FILETYPE, (unsigned char)pattern[0],
+                       has_wc);
         }
+        idx++;
       }
-
-      populate_pattern_entry(pl, idx, pattern, pattern_len, has_wc, mask, i, headers);
-
-      if (scalpel_state.mode_verbose) {
-        lock_fprintf(stdout,
-                     "  -> Added string pattern idx=%u for %s "
-                     "(first_byte=0x%02x, has_wc=%d)\n",
-                     idx, specs[i].FILETYPE, (unsigned char)pattern[0], has_wc);
-      }
-      idx++;
     }
   }
 
@@ -5163,7 +7045,9 @@ static void optimized_pattern_search(PatternList *pl, const unsigned char *buf, 
   const size_t CHUNK_SIZE = 64;
 
   // 1. SIMD-accelerated 64-byte chunk loop
-  while (pos + CHUNK_SIZE <= len) {
+  while (pos + CHUNK_SIZE <= len
+         && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                                   memory_order_acquire)) {
     uint64_t mask = 0;
 
     simd_get_match_mask_64(buf + pos, pl, &mask);
@@ -5205,7 +7089,9 @@ static void optimized_pattern_search(PatternList *pl, const unsigned char *buf, 
   }
 
   // 2. Scalar tail loop (for the remaining < 64 bytes)
-  for (; pos < len; pos++) {
+  for (; pos < len
+       && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                                 memory_order_acquire); pos++) {
     if (fbs_contains(&pl->first_bytes, buf[pos])) {
       const unsigned char *match_ptr = buf + pos;
 
@@ -5298,21 +7184,15 @@ static void record_pattern_match(uint32_t needleidx, uint64_t position, size_t m
 
 static void init_optimized_pattern_search(void) {
 
-  // build SIMD pattern lists
-  header_pattern_list = build_pattern_list(scalpel_state.search_specs, scalpel_state.num_specs, true);
-  footer_pattern_list = build_pattern_list(scalpel_state.search_specs, scalpel_state.num_specs, false);
+  // build the combined SIMD pattern list
+  simple_pattern_list =
+      build_pattern_list(scalpel_state.search_specs, scalpel_state.num_specs);
 
-  if (header_pattern_list) {
+  if (simple_pattern_list) {
     lock_fprintf(stdout,
-                 "Built optimized search for %u simple header patterns "
+                 "Built optimized search for %u simple header/footer patterns "
                  "(SIMD-accelerated)\n",
-                 header_pattern_list->num_patterns);
-  }
-  if (footer_pattern_list) {
-    lock_fprintf(stdout,
-                 "Built optimized search for %u simple footer patterns "
-                 "(SIMD-accelerated)\n",
-                 footer_pattern_list->num_patterns);
+                 simple_pattern_list->num_patterns);
   }
 
   // build list of patterns that need thread-based searching
@@ -5324,10 +7204,14 @@ static void init_optimized_pattern_search(void) {
       continue;
     }
 
-    if (spec->HEADERFUNC || (spec->HEADER[0] && ! pattern_in_simd_list(header_pattern_list, i, true))) {
+    if (spec->HEADERFUNC
+        || (spec->HEADER[0]
+            && ! pattern_in_simd_list(simple_pattern_list, i, true))) {
       thread_count++;
     }
-    if (spec->FOOTERFUNC || (spec->FOOTER[0] && ! pattern_in_simd_list(footer_pattern_list, i, false))) {
+    if (spec->FOOTERFUNC
+        || (spec->FOOTER[0]
+            && ! pattern_in_simd_list(simple_pattern_list, i, false))) {
       thread_count++;
     }
   }
@@ -5343,14 +7227,18 @@ static void init_optimized_pattern_search(void) {
         continue;
       }
 
-      if (spec->HEADERFUNC || (spec->HEADER[0] && ! pattern_in_simd_list(header_pattern_list, i, true))) {
+      if (spec->HEADERFUNC
+          || (spec->HEADER[0]
+              && ! pattern_in_simd_list(simple_pattern_list, i, true))) {
         thread_search_patterns[idx].spec_idx = i;
         thread_search_patterns[idx].is_header = true;
         lock_fprintf(stdout, "  %s header: thread-based search\n", spec->FILETYPE);
         idx++;
       }
 
-      if (spec->FOOTERFUNC || (spec->FOOTER[0] && ! pattern_in_simd_list(footer_pattern_list, i, false))) {
+      if (spec->FOOTERFUNC
+          || (spec->FOOTER[0]
+              && ! pattern_in_simd_list(simple_pattern_list, i, false))) {
         thread_search_patterns[idx].spec_idx = i;
         thread_search_patterns[idx].is_header = false;
         lock_fprintf(stdout, "  %s footer: thread-based search\n", spec->FILETYPE);
@@ -5361,8 +7249,7 @@ static void init_optimized_pattern_search(void) {
   }
 
   lock_fprintf(stdout, "Pattern categorization: %u SIMD, %u thread-based\n",
-               (header_pattern_list ? header_pattern_list->num_patterns : 0)
-                   + (footer_pattern_list ? footer_pattern_list->num_patterns : 0),
+               simple_pattern_list ? simple_pattern_list->num_patterns : 0,
                num_thread_search_patterns);
 }
 
@@ -5390,6 +7277,11 @@ static void search_for_headers_footers_buffer(BlockVector *b) {
 
   // dispatch thread-based patterns
   for (uint32_t i = 0; i < num_thread_search_patterns; i++) {
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                             memory_order_acquire)) {
+      break;
+    }
+
     uint32_t spec_idx = thread_search_patterns[i].spec_idx;
     bool is_header = thread_search_patterns[i].is_header;
     SearchSpec *spec = &scalpel_state.search_specs[spec_idx];
@@ -5397,14 +7289,23 @@ static void search_for_headers_footers_buffer(BlockVector *b) {
     // wait for free thread
     freethread = -1;
     while (freethread < 0) {
-      while (atomic_load_explicit(&num_idle_search_threads, memory_order_acquire) == 0) {
+      while (atomic_load_explicit(&num_idle_search_threads, memory_order_acquire) == 0
+             && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                                       memory_order_acquire)) {
 	sched_yield();
+      }
+      if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                               memory_order_acquire)) {
+        break;
       }
       for (int j = 0; j < scalpel_state.max_search_threads && freethread < 0; j++) {
         if (atomic_load_explicit(&searchthreadargs[j].thread_ready, memory_order_acquire)) {
           freethread = j;
         }
       }
+    }
+    if (freethread < 0) {
+      break;
     }
 
     // assign work to free thread
@@ -5434,19 +7335,14 @@ static void search_for_headers_footers_buffer(BlockVector *b) {
   }
 
   // run SIMD patterns while threads work
-  if (header_pattern_list || footer_pattern_list) {
+  if (simple_pattern_list) {
     struct timespec search_start, search_end;
 
     clock_gettime(CLOCK_MONOTONIC, &search_start);
 
-    if (header_pattern_list) {
-      optimized_pattern_search(header_pattern_list, (const unsigned char *)data, len, b,
-                               blockvector_get_non_peekahead_data_length(b), record_pattern_match);
-    }
-    if (footer_pattern_list) {
-      optimized_pattern_search(footer_pattern_list, (const unsigned char *)data, len, b,
-                               blockvector_get_non_peekahead_data_length(b), record_pattern_match);
-    }
+    optimized_pattern_search(
+        simple_pattern_list, (const unsigned char *)data, len, b,
+        blockvector_get_non_peekahead_data_length(b), record_pattern_match);
 
     clock_gettime(CLOCK_MONOTONIC, &search_end);
     double search_time = (search_end.tv_sec - search_start.tv_sec) + (search_end.tv_nsec - search_start.tv_nsec) / 1e9;
@@ -5480,19 +7376,23 @@ static void search_for_headers_footers(void) {
   init_optimized_pattern_search();
 
   // process entire image file
-  while ((b = filemirror_read(scalpel_state.filemirror))) {
+  while (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+         && (b = filemirror_read(scalpel_state.filemirror))) {
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     search_for_headers_footers_buffer(b);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
-    atomic_fetch_add_explicit(&header_footer_wait, (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec),
+    atomic_fetch_add_explicit(&header_footer_wait,
+                              (end.tv_sec - start.tv_sec) * NANOSECONDS_PER_SECOND
+                                + (end.tv_nsec - start.tv_nsec),
                               memory_order_acq_rel);
 
     if (time(NULL) - rightnow > 2) {
       rightnow = time(NULL);
       clock_gettime(CLOCK_MONOTONIC, &endtime);
-      total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
+      total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                   + (endtime.tv_nsec - starttime.tv_nsec);
       lock_fprintf(stdout,
                    "\nStatus: Header/footer search position %" PRIu64 " / %" PRIu64 " bytes (%3.1lf%%)%s,\n"
                    "total elapsed time: %.2lf secs.\n",
@@ -5505,15 +7405,29 @@ static void search_for_headers_footers(void) {
   }
 
   clock_gettime(CLOCK_MONOTONIC, &endtime);
-  total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
+  total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
+               + (endtime.tv_nsec - starttime.tv_nsec);
 
-  lock_fprintf(stdout,
-               "\nStatus: Header/footer search position %" PRIu64 " / %" PRIu64 " bytes (%3.1lf%%)%s,\n"
-               "total elapsed time: %.2lf secs.\n",
-               filemirror_apparent_filesize(scalpel_state.filemirror), filemirror_apparent_filesize(scalpel_state.filemirror),
-               100.0, checkpoint_pending_status(), (double)total_wait / 1e9);
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    lock_fprintf(stdout,
+                 "\nStatus: Header/footer search interrupted at %" PRIu64
+                 " / %" PRIu64 " bytes (%3.1lf%%)%s,\n"
+                 "total elapsed time: %.2lf secs.\n",
+                 filemirror_ftello(scalpel_state.filemirror),
+                 filemirror_apparent_filesize(scalpel_state.filemirror),
+                 (double)filemirror_ftello(scalpel_state.filemirror)
+                     / (double)filemirror_apparent_filesize(scalpel_state.filemirror) * 100.0,
+                 checkpoint_pending_status(), (double)total_wait / 1e9);
+  }
+  else {
+    lock_fprintf(stdout,
+                 "\nStatus: Header/footer search position %" PRIu64 " / %" PRIu64 " bytes (%3.1lf%%)%s,\n"
+                 "total elapsed time: %.2lf secs.\n",
+                 filemirror_apparent_filesize(scalpel_state.filemirror), filemirror_apparent_filesize(scalpel_state.filemirror),
+                 100.0, checkpoint_pending_status(), (double)total_wait / 1e9);
 
-  prune_header_footer_database();
+    prune_header_footer_database();
+  }
 
   // cleanup threads
   for (i = 0; i < (uint32_t)scalpel_state.max_search_threads; i++) {
@@ -5530,13 +7444,9 @@ static void search_for_headers_footers(void) {
   }
 
   // cleanup pattern lists
-  if (header_pattern_list) {
-    free_pattern_list(header_pattern_list);
-    header_pattern_list = NULL;
-  }
-  if (footer_pattern_list) {
-    free_pattern_list(footer_pattern_list);
-    footer_pattern_list = NULL;
+  if (simple_pattern_list) {
+    free_pattern_list(simple_pattern_list);
+    simple_pattern_list = NULL;
   }
   if (thread_search_patterns) {
     free(thread_search_patterns);
@@ -5544,13 +7454,18 @@ static void search_for_headers_footers(void) {
     num_thread_search_patterns = 0;
   }
 
-  frame_message("HEADER/FOOTER DETECTION PHASE COMPLETE");
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    frame_message("HEADER/FOOTER DETECTION INTERRUPTED BY CHECKPOINT AND EXIT");
+  }
+  else {
+    frame_message("HEADER/FOOTER DETECTION PHASE COMPLETE");
+  }
 }
 
 
 // top level file carving function, which supports prioritization and handles both fragmented and
-// unfragmented file recovery. Only the fragmented recovery phase (which is by far the most resource
-// intensive) is responsive to checkpointing operations.
+// unfragmented file recovery. Checkpoint-and-exit is honored cooperatively in all phases. Restartable
+// checkpoint data is written only after a valid recovery boundary exists.
 //
 // Basic idea for file recovery for each priority class:
 //
@@ -5646,6 +7561,10 @@ void carve_files(void) {
 
   if (scalpel_state.restore_from_checkpoint) {
     reconcile_partial_artifacts_on_restore();
+    if (scalpel_state.contiguous_recovery_complete) {
+      atomic_store_explicit(&RESTARTABLE_CHECKPOINT_AVAILABLE, true,
+                            memory_order_release);
+    }
   }
 
   // create thread pools
@@ -5670,8 +7589,24 @@ void carve_files(void) {
     // o discover the locations of headers and footers
     //
 
-    // determine block types
+    // determine block types and freeze the final subtype list
     validate_blocks();
+
+    // Block classifications are immutable after validate_blocks() completes. Persist them before
+    // any early exit and before header/footer searching begins.
+    if (scalpel_state.block_validation_complete) {
+      serialize_blockclassification_database();
+    }
+
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      frame_message("STOPPING BEFORE CHECKPOINTABLE RECOVERY STATE EXISTS");
+      goto done;
+    }
+
+    if (scalpel_state.halt_after == HALT_AFTER_BLOCK_VALIDATION) {
+      frame_message("EXITING AFTER BLOCK VALIDATION BECAUSE OF -H block-validation");
+      goto done;
+    }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////
     // ** IMPORTANT **: since no file subtypes are added after validate_blocks is complete, there //
@@ -5683,13 +7618,22 @@ void carve_files(void) {
     // build header/footer database...
     search_for_headers_footers();
 
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      frame_message("STOPPING BEFORE CHECKPOINTABLE RECOVERY STATE EXISTS");
+      goto done;
+    }
+
     // ... and serialize to scalpel output directory
     snprintf(hf_pathname, PATH_MAX, "%s/headersfooters.dat", scalpel_state.base_output_directory);
     serialize_essential_offsets(hf_pathname);
 
-    // if ONLY generating and writing header/footer database, we're done
-    if (scalpel_state.hf_only) {
-      frame_message("EXITING AFTER HEADER/FOOTER DB CREATION BECAUSE OF -H FLAG");
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      frame_message("STOPPING BEFORE CHECKPOINTABLE RECOVERY STATE EXISTS");
+      goto done;
+    }
+
+    if (scalpel_state.halt_after == HALT_AFTER_HEADER_FOOTER) {
+      frame_message("EXITING AFTER HEADER/FOOTER DB CREATION BECAUSE OF -H header-footer");
       goto done;
     }
   }
@@ -5712,10 +7656,16 @@ void carve_files(void) {
       carve_logically_contiguous_files(PRIORITY_FLOOR);
       if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
         scalpel_state.contiguous_recovery_complete = true;
+        atomic_store_explicit(&RESTARTABLE_CHECKPOINT_AVAILABLE, true,
+                              memory_order_release);
       }
     }
 
     first = false;
+
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      goto done;
+    }
 
     if (! scalpel_state.no_defrag) {
       // ...then try to recover fragmented files
@@ -5764,10 +7714,16 @@ void carve_files(void) {
         carve_logically_contiguous_files(PRIORITY_FLOOR);
         if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
           scalpel_state.contiguous_recovery_complete = true;
+          atomic_store_explicit(&RESTARTABLE_CHECKPOINT_AVAILABLE, true,
+                                memory_order_release);
         }
       }
 
       first = false;
+
+      if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+        goto done;
+      }
 
       if (! scalpel_state.no_defrag) {
         // ...then try to recover fragmented files for current priority
@@ -5792,6 +7748,16 @@ void carve_files(void) {
 
  done:
 
+  // close IPC before the final decision so every acknowledged stop request is either already
+  // checkpointed or included in one last snapshot while shared carving state is still available.
+  stop_ipc_thread();
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+      && atomic_load_explicit(&RESTARTABLE_CHECKPOINT_AVAILABLE,
+                              memory_order_acquire)
+      && ! exit_checkpoint_committed) {
+    save_checkpoint();
+  }
+
   // kill threads and clean up
   lock_fprintf(stdout, "Beginning shutdown.\n");
 
@@ -5814,6 +7780,9 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
   CarveInfo *candidate;         // carving candidate
   uint64_t headerindex;         // index of header for candidate
   uint64_t start, stop;         // temp begin/end bytes for file to carve
+  uint64_t actual_start;        // absolute image offset of the current header
+  uint64_t apparent_footer_limit;  // maximum footer start in the apparent image
+  uint64_t actual_footer_limit;    // corresponding absolute image offset
   uint64_t prevstopindex;       // tracks index of next 'reasonable'
   // footer
   uint64_t firstcandidatefooter;  // tracks index of first 'reasonable'
@@ -5905,8 +7874,10 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
         fflush(stdout);
       }
 
-      // evaluate header and footer positions using apparent image file positions
-      start = filemirror_apparent_location(scalpel_state.filemirror, currentfilespec->offsets.headers[headerindex]);
+      // evaluate candidate positions in the apparent image while retaining the absolute header
+      // offset used by the header/footer database
+      actual_start = currentfilespec->offsets.headers[headerindex];
+      start = filemirror_apparent_location(scalpel_state.filemirror, actual_start);
 
       // The scalpel3 architecture currently supports *only* block-aligned headers.
       //
@@ -5935,6 +7906,17 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
       else {
         stop = start;
 
+        // footer offsets are absolute, so convert the apparent maximum-size boundary before
+        // searching the footer database. Clamp first to avoid overflow and an out-of-range map.
+        if (currentfilespec->MAXIMUMSIZE > filesize - start) {
+          apparent_footer_limit = filesize - 1;
+        }
+        else {
+          apparent_footer_limit = start + currentfilespec->MAXIMUMSIZE - 1;
+        }
+        actual_footer_limit = filemirror_actual_location(scalpel_state.filemirror,
+                                                         apparent_footer_limit);
+
         if (prevstopindex > (size_t)currentfilespec->offsets.numfooters) {
           prevstopindex = (size_t)currentfilespec->offsets.numfooters;
         }
@@ -5947,9 +7929,10 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
 
         prevstopindex += upper_bound_u64(currentfilespec->offsets.footers + prevstopindex,
                                          (size_t)currentfilespec->offsets.numfooters - prevstopindex,
-                                         start + currentfilespec->MAXIMUMSIZE - 1);
+                                         actual_footer_limit);
 
-        if (prevstopindex > 0 && currentfilespec->offsets.footers[prevstopindex - 1] > start) {
+        if (prevstopindex > 0
+            && currentfilespec->offsets.footers[prevstopindex - 1] > actual_start) {
           stop = filemirror_apparent_location(scalpel_state.filemirror, currentfilespec->offsets.footers[prevstopindex - 1])
                  + currentfilespec->offsets.footerlens[prevstopindex - 1] - 1;
 
@@ -5961,10 +7944,11 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
         // this file type will be used. The length will be adjusted later during file validation.
 
         prevstopindex += lower_bound_u64(currentfilespec->offsets.footers + prevstopindex,
-                                         (size_t)currentfilespec->offsets.numfooters - prevstopindex, start + 1);
+                                         (size_t)currentfilespec->offsets.numfooters - prevstopindex,
+                                         actual_start + 1);
 
         if (prevstopindex < (size_t)currentfilespec->offsets.numfooters
-            && currentfilespec->offsets.footers[prevstopindex] <= start + currentfilespec->MAXIMUMSIZE - 1) {
+            && currentfilespec->offsets.footers[prevstopindex] <= actual_footer_limit) {
           stop = filemirror_apparent_location(scalpel_state.filemirror, currentfilespec->offsets.footers[prevstopindex])
                  + currentfilespec->offsets.footerlens[prevstopindex] - 1;
         }
@@ -6103,7 +8087,8 @@ uint64_t carve_logically_contiguous_single_pass(FILE_DEFRAG_PRIORITY priority) {
     if (now - then >= 2) {
       then = now;
       clock_gettime(CLOCK_MONOTONIC, &endtime);
-      total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
+      total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                   + (endtime.tv_nsec - starttime.tv_nsec);
 
       lock_fprintf(stdout,
                    "\nStatus: Files queued for validation: %" PRIu64 ", %d idle file validation threads of %d%s,\n"
@@ -6137,7 +8122,7 @@ done:
 // repeatedly performs carving of logically contiguous files until a carving phase results in no
 // additional verified files.
 //
-// This function is NOT responsive to pending checkpoint events.
+// This function honors checkpoint-and-exit between contiguous carving passes.
 static void carve_logically_contiguous_files(FILE_DEFRAG_PRIORITY priority) {
 
   uint64_t verified_files;
@@ -6244,7 +8229,6 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
   bool write_checkpoint_data;
   bool write_inprogress;
   bool swap_blockmaps;
-  bool checkpoint_saved;
   bool inprogress_updated;
   uint64_t num_initial_checkpoints = 0;
 
@@ -6275,12 +8259,47 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
   // not taking a periodic checkpoint
   atomic_store_explicit(&REASS_RETURN_TO_IDLE, false, memory_order_release);
 
+  // keep transaction tests deterministic without relying on reassembly lasting a minimum time.
+  if (getenv("SCALPEL3_TEST_CHECKPOINT_ON_REASSEMBLY_ENTRY")) {
+    atomic_store_explicit(&TAKE_CHECKPOINT_AND_EXIT, true,
+                          memory_order_release);
+  }
+  if (getenv("SCALPEL3_TEST_RECOVERY_CHECKPOINT_ON_REASSEMBLY_ENTRY")) {
+    atomic_store_explicit(&TAKE_RECOVERY_CHECKPOINT, true,
+                          memory_order_release);
+  }
+  if (getenv("SCALPEL3_TEST_PROGRESS_ON_REASSEMBLY_ENTRY")) {
+    atomic_store_explicit(&TAKE_PROGRESS_CHECKPOINT, true,
+                          memory_order_release);
+  }
+
+  if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    checkpoint_open_progress_request_gate();
+
+    // hold the serviceable phase open until the IPC regression test submits its request
+    if (getenv("SCALPEL3_TEST_WAIT_FOR_PROGRESS_REQUEST")) {
+      while (! atomic_load_explicit(&TAKE_PROGRESS_CHECKPOINT, memory_order_acquire)
+             && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+        sched_yield();
+      }
+    }
+
+  }
+
+  // check again after opening the request gate so a stop received while it was opening is handled
+  // before workers are awakened.
   if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
-    // checkpoint-and-exit may have been requested before fragmented reassembly was entered. Do
-    // not wake reassembly threads; save the current queue and exit at this safe boundary.
     atomic_store_explicit(&REASS_RETURN_TO_IDLE, true, memory_order_release);
-    frame_message("REASSEMBLY PHASE PAUSED BECAUSE OF CHECKPOINT AND EXIT EVENT");
-    save_checkpoint();
+    if (atomic_load_explicit(&RESTARTABLE_CHECKPOINT_AVAILABLE,
+                             memory_order_acquire)) {
+      // checkpoint-and-exit may have been requested before fragmented reassembly was entered. Do
+      // not wake reassembly threads; save the current queue and exit at this safe boundary.
+      frame_message("REASSEMBLY PHASE PAUSED BECAUSE OF CHECKPOINT AND EXIT EVENT");
+      save_checkpoint();
+    }
+    else {
+      frame_message("STOPPING BEFORE CHECKPOINTABLE RECOVERY STATE EXISTS");
+    }
   }
   else {
     // broadcast to let reassembly threads know that work is available. pthreads requires that an
@@ -6313,7 +8332,8 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
     // initial status report
     now = time(NULL);
     clock_gettime(CLOCK_MONOTONIC, &endtime);
-    total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
+    total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                 + (endtime.tv_nsec - starttime.tv_nsec);
     last_validation_gap = (endtime.tv_sec - last_validation.tv_sec) + (endtime.tv_nsec - last_validation.tv_nsec) / 1000000000.0;
     lock_fprintf(stdout,
                  "\nStatus: promising queue: %" PRIu64 " elements, %d idle reassembly threads of %d, "
@@ -6397,7 +8417,8 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
       if (now - then > 1) {
         then = now;
         clock_gettime(CLOCK_MONOTONIC, &endtime);
-        total_wait = (endtime.tv_sec - starttime.tv_sec) * 1e9 + (endtime.tv_nsec - starttime.tv_nsec);
+        total_wait = (endtime.tv_sec - starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                     + (endtime.tv_nsec - starttime.tv_nsec);
         last_validation_gap = (endtime.tv_sec - last_validation.tv_sec)
                               + (endtime.tv_nsec - last_validation.tv_nsec) / 1000000000.0;
         lock_fprintf(stdout,
@@ -6503,7 +8524,6 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
         write_checkpoint_data = false;
         write_inprogress = false;
         swap_blockmaps = false;
-        checkpoint_saved = false;
         inprogress_updated = false;
         checkpoint_synced_validated = validated;
         atomic_store_explicit(&checkpoint_servicing_mask, 0, memory_order_release);
@@ -6670,10 +8690,11 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
           validated = checkpoint_synced_validated;
         }
 
-        // write checkpoint data if this is a recovery or checkpoint-and-exit checkpoint
-        if (write_checkpoint_data) {
+        // recovery checkpoints can be written here; checkpoint-and-exit is written after the final
+        // request refresh below so IPC is closed before its last snapshot
+        if (write_checkpoint_data
+            && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
           save_checkpoint();
-          checkpoint_saved = true;
         }
 
         // update INPROGRESS data if appropriate
@@ -6699,15 +8720,13 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
 
             checkpoint_synced_validated = atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire);
             validated = checkpoint_synced_validated;
-            checkpoint_saved = false;
             inprogress_updated = false;
           }
 
           checkpoint_service_inprogress_requests(&write_inprogress, &inprogress_updated);
 
-          if (write_checkpoint_data && ! checkpoint_saved) {
+          if (write_checkpoint_data && ! exit_checkpoint_committed) {
             save_checkpoint();
-            checkpoint_saved = true;
           }
 
           // threads won't be resumed since we are exiting
@@ -6807,6 +8826,8 @@ static void carve_fragmented_files(FILE_DEFRAG_PRIORITY priority) {
       reassembly_complete = atomic_load_explicit(&scalpel_state.validated_files, memory_order_acquire) == validated;
     }
   }
+
+  checkpoint_close_progress_request_gate();
 
   // time to exit?
   if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
@@ -7022,6 +9043,7 @@ static void *reassembly_thread(void *args) {
       // thread was signaled to exit
       goto done;
     }
+    work->last_kill_generation_checked = 0;
 
     // track runtime of on this candidate--updated runtime is used to prioritize selection of
     // candidates with the least runtime to date

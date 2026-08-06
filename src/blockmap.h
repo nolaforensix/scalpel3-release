@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -51,7 +51,7 @@
 // Given C / D / E bits for block j:
 //
 // 0 / 0 / 0:  UNCOVERED block that is either not a duplicate of any
-//             other block or dedup is off. R[j] is undefined.
+//             other block or dedup is off. R[j] is 1.
 //
 // 0 / 1 / 0:  UNCOVERED dedup non-exemplar block with associated
 //             reference count in R[R[j]].  Non-exemplar duplicates
@@ -65,7 +65,7 @@
 //             reassembly threads.
 //
 // 1 / 0 / 0:  COVERED block that is either not a duplicate of any
-//             other block or dedup is off. R[j] is undefined.
+//             other block or dedup is off. R[j] is 0.
 //
 // 1 / 1 / 0:  COVERED dedup non-exemplar block with associated
 //             reference count in R[R[j]].
@@ -131,7 +131,7 @@ void set_blockmap_window(Blockmap *blockmap, uint64_t start_block, uint64_t end_
 bool dedup_blockmap(Blockmap *blockmap, FILE *imgfile, uint64_t *deduped, uint64_t *zeroblocks, bool progress);
 bool clone_blockmap(Blockmap *src, Blockmap **dest);
 bool write_blockmap(Blockmap *blockmap, FILE *blockmapfile);
-bool read_blockmap(Blockmap **blockmap, FILE *blockmapfile, bool sanity_check);
+bool read_blockmap(Blockmap **blockmap, FILE *blockmapfile);
 bool write_blockmap_h(Blockmap *blockmap, int handle);
 bool read_blockmap_h(Blockmap **blockmap, int handle);
 bool is_zero_block(Blockmap *blockmap, int64_t j);

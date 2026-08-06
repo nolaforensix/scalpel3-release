@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -163,7 +163,7 @@ void LR_reassembly(ThreadWork *work, CarveInfo **c, uuid_string_t uuidp, uuid_st
       // ****** CHECK KILL QUEUE TO SEE IF PROCESSING ON CANDIDATE SHOULD STOP ******
       // ****************************************************************************
 
-      if (reassembly_check_kill_queue(work->id, &candidate, uuidp, uuidc)) {
+      if (reassembly_check_kill_queue(work, &candidate, uuidp, uuidc)) {
         goto done_do_not_write_candidate;
       }
 
@@ -465,43 +465,58 @@ bool reassembly_check_max_size(int id, CarveInfo *candidate, uuid_string_t uuidp
 
 // check kill queue to see if current candidate being processed by reassembly thread should be
 // destroyed. Returns true if the candidate should be destroyed, otherwise false.
-bool reassembly_check_kill_queue(int id, CarveInfo **candidate, uuid_string_t uuidp, uuid_string_t uuidc) {
+bool reassembly_check_kill_queue(ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp, uuid_string_t uuidc) {
 
   char buf[MAX_STRING_LENGTH];
+  unsigned char *killuuid;
+  uint64_t generation;
+  bool clone_killed = false;
+  bool primary_killed = false;
+  bool has_clone;
 
-  (void)id;
-
-  // check kill queue to see if processing for this candidate should be terminated
-  if (nolock_queue_length(&kill_queue)) {
-    if (element_in_queue(&kill_queue, (*candidate)->binuuid)) {
-      // primary UUIDs may be associated with a primary candidate and with clones, so these kill
-      // orders aren't deleted immediately from the kill queue, but rather aged out, which allows
-      // other threads to see the kill order.
-
-      snprintf(buf, MAX_STRING_LENGTH, "DESTROYING CANDIDATE WITH PRIMARY UUID \"%s\"", uuidp);
-      frame_message(buf);
-
-      // destroy and abandon work on this candidate without writing. Any block reservations are
-      // released by destroy_candidate().
-      destroy_candidate(candidate);
-      return true;
-    }
+  generation = atomic_load_explicit(&kill_queue_generation, memory_order_acquire);
+  if (work->last_kill_generation_checked == generation) {
+    return false;
   }
 
-  if (nolock_queue_length(&kill_queue)) {
-    if (element_in_queue(&kill_queue, (*candidate)->clone_binuuid)) {
-      // candidates with clone UUIDs matching a kill order are always deleted immediately, since
-      // clone UUIDs are always unique
+  has_clone = ! uuid_is_null((*candidate)->clone_binuuid);
 
-      delete_from_queue(&kill_queue, (*candidate)->clone_binuuid);
-      snprintf(buf, MAX_STRING_LENGTH, "DESTROYING CANDIDATE WITH CLONE UUID \"%s\"", uuidc);
-      frame_message(buf);
-
-      // destroy and abandon work on this candidate without writing. Any block reservations are
-      // released by destroy_candidate().`
-      destroy_candidate(candidate);
-      return true;
+  lock_queue(&kill_queue);
+  generation = atomic_load_explicit(&kill_queue_generation, memory_order_acquire);
+  nolock_rewind_queue(&kill_queue);
+  while (! nolock_end_of_queue(&kill_queue)) {
+    killuuid = nolock_pointer_to_current(&kill_queue);
+    if (uuid_compare((*candidate)->binuuid, killuuid) == 0) {
+      primary_killed = true;
+      break;
     }
+    if (has_clone && uuid_compare((*candidate)->clone_binuuid, killuuid) == 0) {
+      clone_killed = true;
+      nolock_delete_current(&kill_queue);
+      break;
+    }
+    nolock_next_element(&kill_queue);
+  }
+
+  if (! primary_killed && ! clone_killed) {
+    work->last_kill_generation_checked = generation;
+  }
+  unlock_queue(&kill_queue);
+
+  if (primary_killed) {
+    // primary UUIDs may identify both a primary candidate and clones, so retain the order for aging
+    snprintf(buf, MAX_STRING_LENGTH, "DESTROYING CANDIDATE WITH PRIMARY UUID \"%s\"", uuidp);
+    frame_message(buf);
+    destroy_candidate(candidate);
+    return true;
+  }
+
+  if (clone_killed) {
+    // clone UUIDs are unique, so their kill orders are consumed with the matching candidate
+    snprintf(buf, MAX_STRING_LENGTH, "DESTROYING CANDIDATE WITH CLONE UUID \"%s\"", uuidc);
+    frame_message(buf);
+    destroy_candidate(candidate);
+    return true;
   }
 
   return false;
@@ -528,7 +543,9 @@ bool reassembly_time_to_checkpoint(int id, CarveInfo *candidate, uuid_string_t u
     delete_from_reassembly_queue(candidate);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
-    candidate->qposition -= (end.tv_sec - candidate->last_start.tv_sec) * 1e9 + (end.tv_nsec - candidate->last_start.tv_nsec);
+    candidate->qposition -= (end.tv_sec - candidate->last_start.tv_sec)
+                              * NANOSECONDS_PER_SECOND
+                            + (end.tv_nsec - candidate->last_start.tv_nsec);
 
     if (scalpel_state.reduce_aggressive_allocation) {
       deflate_blockvector(candidate->b);
@@ -578,6 +595,9 @@ void reassembly_share_work(int id, CarveInfo *candidate) {
     clone->clone = true;
     clone->cloned = true;
     clone->no_initial_block_extension = false;
+    // randomize only the clone's first extension so it diverges from the parent without
+    // sacrificing locality for the remainder of its path. This cursor is checkpointed.
+    clone->block_choice_start = -1;
 
     // clone gets a new UUID, but also keeps the original "parent" UUID for association
     uuid_generate_random(clone->clone_binuuid);
@@ -706,7 +726,8 @@ bool reassembly_check_validation(int id, CarveInfo *candidate, uint64_t *validat
 #if VALIDATOR_PERFORMANCE_STATS > 0
   // update file validator performance stats
   clock_gettime(CLOCK_MONOTONIC, &FV_endtime);
-  uint64_t FV_elapsed = (FV_endtime.tv_sec - FV_starttime.tv_sec) * 1e9 + (FV_endtime.tv_nsec - FV_starttime.tv_nsec);
+  uint64_t FV_elapsed = (FV_endtime.tv_sec - FV_starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                        + (FV_endtime.tv_nsec - FV_starttime.tv_nsec);
 
   atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].FV_calls, 1, memory_order_acq_rel);
   atomic_max_u64_pub(&scalpel_state.search_specs[candidate->needleidx].FV_longest, FV_elapsed);
@@ -804,9 +825,10 @@ static void LR_reassembly_init_candidate(int id, CarveInfo *candidate, uuid_stri
 }
 
 
-// set up reassembly candidate length and block choice start. If candidate->block_choice_start is
-// -1, then a random next block is chosen to extend the candidate. If it's -2, then the block two
-// beyond the terminal block in the blockvector is chosen.
+// set up reassembly candidate length and block choice start. A newly shared clone carries -1 so its
+// first extension begins randomly. After that choice advances the cursor, clone identity remains
+// intact but later extensions resume from the apparent block following the current tail. If the
+// cursor is -2, the block two beyond the terminal block is chosen.
 static void LR_reassembly_prepare_for_extension(int id, CarveInfo *candidate) {
   (void)id;
 
@@ -829,15 +851,12 @@ static void LR_reassembly_prepare_for_extension(int id, CarveInfo *candidate) {
   }
 
   // figure out where to start searching for a block to extend this candidate
-  if (! candidate->clone) {
+  // leave the one-shot random-start sentinel in place for a clone's first extension
+  if (! candidate->clone || candidate->block_choice_start != -1) {
     // this works because it's guaranteed that the current length is at least 2 blocks--the header
     // block is never swapped out for another block
     candidate->block_choice_start = blockvector_get_apparent_blocknumber(candidate->b, blockvector_get_num_blocks(candidate->b) - 2)
                                     + (candidate->block_choice_start == -2 ? 2 : 1);
-  }
-  else {
-    // work-sharing clones require a random start point to probabilistically avoid duplicating work
-    candidate->block_choice_start = -1;
   }
 }
 
@@ -850,15 +869,22 @@ static void LR_reassembly_prepare_for_extension(int id, CarveInfo *candidate) {
 //
 static int64_t LR_reassembly_get_block_choice(CarveInfo *candidate) {
 
-  int64_t reserved;
-  int64_t reserved_choice = -1;
-  int64_t reserved_choice_count = INT64_MAX;
   int64_t block_choice = -1;
+  int64_t best_choice = -1;
+  int64_t adjacent_choice = -1;
   int64_t actualblocknumber;
+  int64_t reserved;
   int64_t count;
+  uint64_t slot;
   uint64_t evaluated;
-  bool viable = false;
-  bool consecutive = false;
+  bool viable;
+  bool adjacent;
+  bool terminal_choice = false;
+  BlockValidationDecision confidence;
+  BlockValidationDecision best_confidence = BLOCK_CONFIDENCE_INVALID;
+  BlockValidationDecision adjacent_confidence = BLOCK_CONFIDENCE_INVALID;
+  int64_t best_reserved = INT64_MAX;
+  int64_t adjacent_reserved = INT64_MAX;
 
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
   struct timespec BLK_starttime;
@@ -870,11 +896,21 @@ static int64_t LR_reassembly_get_block_choice(CarveInfo *candidate) {
 
   // maximum # of blocks that must be evaluated as choices
   count = filemirror_apparent_blocks(scalpel_state.filemirror);
+  slot = blockvector_get_num_blocks(candidate->b) - 1;
+
+  // calculate the only apparent-adjacent choice once. The scan cursor advances below and is not a
+  // reliable indication of adjacency after the first lookup.
+  if (slot > 0) {
+    int64_t previous = blockvector_get_apparent_blocknumber(candidate->b, slot - 1);
+    if (previous >= 0 && previous + 1 < count) {
+      adjacent_choice = previous + 1;
+    }
+  }
 
   // make at most one pass through all choices to find a good block choice
   while (count > 0) {
     // get a potential block choice from the filemirror
-    block_choice = blockvector_get_choice(candidate->b, blockvector_get_num_blocks(candidate->b) - 1, candidate->block_choice_start,
+    block_choice = blockvector_get_choice(candidate->b, slot, candidate->block_choice_start,
                                           count, &evaluated);
 
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
@@ -883,10 +919,10 @@ static int64_t LR_reassembly_get_block_choice(CarveInfo *candidate) {
 
     if (block_choice == -1) {
       // no more choices
-      goto done;
+      break;
     }
 
-    consecutive = candidate->block_choice_start >= 0 && block_choice == candidate->block_choice_start;
+    adjacent = block_choice == adjacent_choice;
 
     candidate->block_choice_start = (block_choice + 1) % filemirror_apparent_blocks(scalpel_state.filemirror);
 
@@ -895,50 +931,76 @@ static int64_t LR_reassembly_get_block_choice(CarveInfo *candidate) {
 
     actualblocknumber = filemirror_actual_blocknumber(scalpel_state.filemirror, block_choice);
 
+    confidence = filemirror_get_blocktype(scalpel_state.filemirror, actualblocknumber, candidate->needleidx);
+
     // see if the choice is a viable candidate--the filemirror API block choices API doesn't verify
     // block types or duplication of blocks--must explicitly check for blocks that are already in
     // use for this candidate and for correct type
-    viable = filemirror_get_blocktype(scalpel_state.filemirror, actualblocknumber, candidate->needleidx) != BLOCK_CONFIDENCE_INVALID
+    viable = confidence != BLOCK_CONFIDENCE_INVALID
              && ! apparent_block_in_blockvector(candidate->b, block_choice);
 
     // see how many reservations are associated with the potential choice if reservation system is
     // active
     reserved = scalpel_state.reservations ? filemirror_actual_block_reserved(scalpel_state.filemirror, actualblocknumber) : 0;
 
-    // always prefer contiguous choice or no reservations
-    if (viable && (consecutive || reserved == 0)) {
-      goto done;
-    }
-    else if (reserved && viable && reserved < reserved_choice_count) {
-      // replace reserved choice with one with fewer reservations
-      reserved_choice = block_choice;
-      reserved_choice_count = reserved;
-    }
-
     if (! viable) {
       // non-viable blocks are always removed as future choices
-      blockvector_remove_choice(candidate->b, blockvector_get_num_blocks(candidate->b) - 1, block_choice);
-      block_choice = -1;
+      blockvector_remove_choice(candidate->b, slot, block_choice);
+      continue;
+    }
+
+    // accept an unbeatable choice immediately. Confidence cannot exceed VALID and reservation
+    // pressure cannot be lower than zero, so no later choice can rank above this one.
+    if (confidence == BLOCK_CONFIDENCE_VALID && reserved == 0) {
+      best_choice = block_choice;
+      best_confidence = confidence;
+      best_reserved = reserved;
+      terminal_choice = true;
+      break;
+    }
+
+    // keep the apparent-adjacent candidate separately so locality is evaluated against a stable
+    // target rather than the moving scan cursor.
+    if (adjacent) {
+      adjacent_confidence = confidence;
+      adjacent_reserved = reserved;
+    }
+
+    // Track the best viable candidate by type confidence first, then reservation count.
+    // Reservations are advisory: they break ties or penalize weaker options, but do not hard-reject
+    // a viable block.
+    if (best_choice == -1
+        || confidence > best_confidence
+        || (confidence == best_confidence && reserved < best_reserved)) {
+      best_choice = block_choice;
+      best_confidence = confidence;
+      best_reserved = reserved;
     }
   }
 
-done:
-
-  // fallback to choice with lowest number of reservations if no block with 0 reservations was found
-  if (reserved_choice != -1 && block_choice == -1) {
-    // use reserved choice, since no better one was found
-    block_choice = reserved_choice;
+  // allow apparent adjacency to make up one confidence point when it does not add reservation
+  // pressure. An exact VALID/zero-reservation choice above remains terminal.
+  if (! terminal_choice && adjacent_confidence != BLOCK_CONFIDENCE_INVALID
+      && best_choice != -1 && best_choice != adjacent_choice) {
+    int best_conf = (int)best_confidence;
+    int adjacent_conf = (int)adjacent_confidence;
+    if (best_conf <= adjacent_conf + 1 && adjacent_reserved <= best_reserved) {
+      best_choice = adjacent_choice;
+      best_confidence = adjacent_confidence;
+      best_reserved = adjacent_reserved;
+    }
   }
 
-  if (block_choice != -1) {
+  if (best_choice != -1) {
     // advance block choice
-    blockvector_remove_choice(candidate->b, blockvector_get_num_blocks(candidate->b) - 1, block_choice);
+    blockvector_remove_choice(candidate->b, slot, best_choice);
   }
 
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
   // update block selection performance stats
   clock_gettime(CLOCK_MONOTONIC, &BLK_endtime);
-  uint64_t BLK_elapsed = (BLK_endtime.tv_sec - BLK_starttime.tv_sec) * 1e9 + (BLK_endtime.tv_nsec - BLK_starttime.tv_nsec);
+  uint64_t BLK_elapsed = (BLK_endtime.tv_sec - BLK_starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                         + (BLK_endtime.tv_nsec - BLK_starttime.tv_nsec);
 
   atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].BLK_calls, 1, memory_order_acq_rel);
   atomic_max_u64_pub(&scalpel_state.search_specs[candidate->needleidx].BLK_longest, BLK_elapsed);
@@ -946,7 +1008,7 @@ done:
   atomic_max_u64_pub(&scalpel_state.search_specs[candidate->needleidx].BLK_most_blocks, BLK_examined);
 #endif
 
-  return block_choice;
+  return best_choice;
 }
 
 

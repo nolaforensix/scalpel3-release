@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the GNU General Public
 // License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
@@ -142,10 +142,15 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  strncpy(fn1, argv[1], PATH_MAX / 2 - 1);
-  fn1[PATH_MAX / 2 - 1] = 0;
-  strncpy(fn2, argv[2], PATH_MAX / 2 - 1);
-  fn2[PATH_MAX / 2 - 1] = 0;
+  if (! copy_string_complete(fn1, sizeof(fn1), argv[1])
+      || ! copy_string_complete(fn2, sizeof(fn2), argv[2])) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr,
+            "Blockmap pathname is too long (maximum %zu characters).\n",
+            sizeof(fn1) - 1);
+    fprintf(stderr, "%s", BLACK);
+    return -1;
+  }
 
   f1 = fopen(fn1, "rb");
   if (! f1) {
@@ -163,14 +168,14 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  if (! read_blockmap(&blockmap1, f1, true)) {
+  if (! read_blockmap(&blockmap1, f1)) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Couldn't read blockmap from file \"%s\".\n", fn1);
     fprintf(stderr, "%s", BLACK);
     return -1;
   }
 
-  if (! read_blockmap(&blockmap2, f2, true)) {
+  if (! read_blockmap(&blockmap2, f2)) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Couldn't read blockmap from file \"%s\".\n", fn2);
     fprintf(stderr, "%s", BLACK);

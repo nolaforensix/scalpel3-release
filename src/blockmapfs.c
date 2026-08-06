@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and
 // contributors.
 //
 // This program is free software : you can redistribute it and / or modify it
@@ -35,42 +35,32 @@
 //
 //
 // scalpel3's read-only, blockmap-aware FUSE filesystem.
-// (c) Golden G. Richard III (@nolaforensix), 2021-5.
 //
-// Updated 4/2024 to handle scalpel3's new blockmap format, documented
+// updated 4/2024 to handle scalpel3's new blockmap format, documented
 // in "blockmap.h".
 //
-// Updated 2/2025 to use hashv2.
+// updated 2/2025 to use hashv2.
 //
-// Updated 9/2025 to use hashv4.
+// updated 9/2025 to use hashv4.
 //
-// Requirements:
+// updated 7/2026 for FUSE 3, multithreaded dispatch, compact immutable
+// blockmap caching, and independent per-open file handles.
 //
-// FUSE (Linux) or macFUSE (Intel or Apple Silicon Macs) must be
-// installed before using blockmapfs.
+// install FUSE 3 on Linux or macFUSE with FUSE 3 support on macOS before
+// using blockmapfs. The init_scalpel3.sh script installs and verifies the
+// platform development files.
 //
-// Compile with:
+// build with the platform Makefile selected by init_scalpel3.sh.
 //
-//  gcc -O2 -D_FILE_OFFSET_BITS=64 -Wall blockmapfs.c blockmap.c hashv2.c `pkg-config fuse --cflags --libs` -o blockmapfs -lm
+// regular files are exposed only when an adjacent regular file named
+// <filename>.blockmap exists. Blockmaps, unmapped files, and symbolic links
+// are hidden from the mounted view.
 //
-// If you see any error messages, it's likely that you don't have a recent version of FUSE installed
-// or there's a FUSE configuration problem.  On Macs using macFUSE, it's common to accidentally omit
-// the necessary configuration of PKG_CONFIG_PATH.  Be sure the following line is in ~/.bashrc:
+// source files and blockmaps must not be modified while blockmapfs is mounted.
+// immutable effective coverage and offset indexes are cached after first
+// access. Unmount, make changes, and remount to publish a new view.
 //
-// export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/local/lib/pkgconfig/"
-//
-// To use:
-//
-// o Each file in the ROOT directory MUST have an associated, valid blockmap, following the naming
-// convention <filename>.blockmap. These blockmap files can be created with the crblockmap utility.
-//
-// o Files in the ROOT directory being sourced for blockmapfs, including the blockmaps, MUST NOT be
-// modified while the blockmapfs filesystem is mounted!  Blockmap data is cached for performance
-// reasons and blockmap changes while the filesystem is mounted will not be handled correctly.  The
-// blockmapfs filesystem must be unmounted, changes made, and then remounted after changes to files
-// are made.
-//
-// Copyright message for FUSE:
+// copyright notice for FUSE:
 //
 /*
   FUSE: Filesystem in Userspace
@@ -83,14 +73,19 @@
 //
 
 // set VERBOSE_BLOCKMAPFS to:
-// 0 for silence and background mode
-// 1 to enable foreground mode with limited debugging info
-// 2 to enable foreground mode with standard debugging info
-// 3 to enable foreground mode with extended debugging info
+// 0 for normal background operation
+// 1 or 2 for foreground operation with blockmapfs diagnostics
+// 3 or greater for foreground operation with libfuse debugging
 
+#ifndef VERBOSE_BLOCKMAPFS
 #define VERBOSE_BLOCKMAPFS 0
+#endif
 
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 31
+
+#ifdef __APPLE__
+#define FUSE_DARWIN_ENABLE_EXTENSIONS 0
+#endif
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
@@ -99,101 +94,122 @@
 #define _GNU_SOURCE 1
 #include <fuse.h>
 
-#ifdef HAVE_LIBULOCKMGR
-#include <ulockmgr.h>
+#if FUSE_MAJOR_VERSION < 3
+#error "blockmapfs requires FUSE 3"
 #endif
 
-#include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/time.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
-#ifdef HAVE_SETXATTR
-#include <sys/xattr.h>
-#endif
 #define SCALPEL3_EXTERNAL 1
 #include "scalpel.h"
 #include "blockmap.h"
+#include "blockmapfs_index.h"
 #include "colors.h"
 #include "hashv4.h"
 #include "scalpelv.h"
-#include <math.h>
-#include <sys/file.h> /* flock(2) */
-#include <sys/ioctl.h>
+#define BLOCKMAPFS_BANNER_STRING \
+  "blockmapfs v%s -- Written by Golden G. Richard III (@nolaforensix)."
 
-#define BLOCKMAPFS_BANNER_STRING                       \
-  "blockmapfs v%s -- "                                 \
-  "Written by Golden G. Richard III (@nolaforensix).", \
-      SCALPEL_VERSION
+#define BLOCKMAP_SUFFIX ".blockmap"
 
-#define MAX_STRING_LENGTH (4096 + 1)
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
 
-// private info per file
+// immutable metadata cached for a mapped source file
+typedef struct CachedFile {
+  atomic_uint_fast64_t references;
+  unsigned char *coverage;
+  BmfsOffsetIndex offset_index;
+  struct stat source_identity;
+  struct stat blockmap_identity;
+} CachedFile;
 
-typedef struct File {
-  Blockmap *blockmap;       // tracks covered blocks
-  int64_t filesize;         // size of file reflected by
-                            // ...*uncovered* blocks
-  char pathname[PATH_MAX];  // pathname of file in root dir
-  int handle;               // file handle for file
-} File;
+// private state for one successful FUSE open operation
+typedef struct OpenFile {
+  atomic_bool ready;
+  CachedFile *cached;
+  int fd;
+} OpenFile;
 
-// GLOBALS
+// source and companion blockmap opened relative to the configured root
+typedef struct OpenedMappedFile {
+  int source_fd;
+  int blockmap_fd;
+  struct stat source_stat;
+  struct stat blockmap_stat;
+} OpenedMappedFile;
 
-char ROOTDIR[PATH_MAX];  // source directory containing files that
-                         // will be accessed through the mount point
+// state owned for the complete lifetime of one mounted filesystem
+typedef struct BmfsState {
+  char *root_path;
+  char *mount_path;
+  int root_fd;
+  oa_hash *cache;
+  pthread_mutex_t cache_load_lock;
+} BmfsState;
 
-char MOUNTDIR[PATH_MAX];  // mount point
-
-oa_hash *HASHTABLE = NULL;  // hash table to work around gettattr() et al not
-                            // not passing the fuse_file_info struct (grrrr)
-
-// END OF GLOBALS
+// private state for one successful FUSE opendir operation
+typedef struct BmfsDirectory {
+  atomic_bool ready;
+  DIR *dp;
+  struct dirent *entry;
+  off_t offset;
+  pthread_mutex_t lock;
+} BmfsDirectory;
 
 // blockmapfs FUSE callback functions
-static void *bmfs_init(struct fuse_conn_info *conn);
-static int bmfs_getattr(const char *path, struct stat *stbuf);
-static int bmfs_fgetattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi);
+static void *bmfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg);
+static int bmfs_getattr(const char *path, struct stat *stbuf,
+                        struct fuse_file_info *fi);
 static int bmfs_open(const char *path, struct fuse_file_info *fi);
+static OpenFile *bmfs_get_open_file(struct fuse_file_info *fi);
 static int bmfs_read(const char *path, char *buf, size_t size, off_t seekpos,
                      struct fuse_file_info *fi);
 static int bmfs_release(const char *path, struct fuse_file_info *fi);
-static int bmfs_access(const char *path, int mask);
+static int bmfs_statfs(const char *path, struct statvfs *stbuf);
 static int bmfs_opendir(const char *path, struct fuse_file_info *fi);
-static inline struct bmfs_dirp *get_dirp(struct fuse_file_info *fi);
+static BmfsDirectory *bmfs_get_directory(struct fuse_file_info *fi);
 static int bmfs_readdir(const char *p, void *buf, fuse_fill_dir_t filler,
-                        off_t offset, struct fuse_file_info *fi);
+                        off_t offset, struct fuse_file_info *fi,
+                        enum fuse_readdir_flags flags);
 static int bmfs_releasedir(const char *path, struct fuse_file_info *fi);
 
 // other function prototypes
-static void *oa_File_cp(const void *data);
 static void blockmapfs_logo(void);
-static void *oa_File_cp(const void *data);
-static void oa_File_free(void **data);
+static void *oa_cached_file_cp(const void *data);
+static void oa_cached_file_free(void **data);
+static bool bmfs_block_covered(void *context, uint64_t blocknumber);
+static bool bmfs_capture_block_coverage(void *context, uint64_t blocknumber);
+static int bmfs_directory_contains(int ancestor_fd, int directory_fd,
+                                   bool *contains);
 
 
 // operations for *read-only* blockmapfs filesystem
 static const struct fuse_operations bmfs_operations = {
     .init = bmfs_init,
     .getattr = bmfs_getattr,
-    .fgetattr = bmfs_fgetattr,
-    .access = bmfs_access,
     .opendir = bmfs_opendir,
     .readdir = bmfs_readdir,
     .releasedir = bmfs_releasedir,
     .open = bmfs_open,
     .read = bmfs_read,
     .release = bmfs_release,
+    .statfs = bmfs_statfs,
     //	.lseek		= bmfs_lseek,   // GGRIII:  Trying to not need this
 };
 
@@ -246,732 +262,1046 @@ static void blockmapfs_logo(void) {
 }
 
 
-// functions to accomodate storage of File structures in hash tables
+// cache and path helpers
 
-// copy a File structure
-static void *oa_File_cp(const void *data) {
-  File *f = (File *)data;
-  File *result = malloc(sizeof(File));
+typedef struct CoverageCapture {
+  Blockmap *blockmap;
+  CachedFile *cached;
+} CoverageCapture;
 
-  if (result) {
-    strcpy(result->pathname, f->pathname);
-    result->handle = f->handle;
-    result->filesize = f->filesize;
-    result->blockmap = NULL;
-    clone_blockmap(f->blockmap, &result->blockmap);
+
+// return the mount-owned state associated with the current FUSE request.
+static BmfsState *bmfs_get_state(void) {
+  struct fuse_context *context = fuse_get_context();
+
+  return context ? (BmfsState *)context->private_data : NULL;
+}
+
+
+// determine whether a directory entry has the reserved blockmap suffix.
+static bool bmfs_has_blockmap_suffix(const char *name) {
+  size_t length;
+  size_t suffix_length = strlen(BLOCKMAP_SUFFIX);
+
+  if (! name) {
+    return false;
+  }
+  length = strlen(name);
+  return length >= suffix_length
+         && ! strcmp(name + length - suffix_length, BLOCKMAP_SUFFIX);
+}
+
+
+// compare the identity and modification state of two open filesystem objects.
+static bool bmfs_same_file(const struct stat *left, const struct stat *right) {
+  if (! left || ! right
+      || left->st_dev != right->st_dev
+      || left->st_ino != right->st_ino
+      || left->st_mode != right->st_mode
+      || left->st_size != right->st_size) {
+    return false;
   }
 
+#if defined(__APPLE__)
+  return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec
+         && left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec
+         && left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec
+         && left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#elif defined(__linux__)
+  return left->st_mtim.tv_sec == right->st_mtim.tv_sec
+         && left->st_mtim.tv_nsec == right->st_mtim.tv_nsec
+         && left->st_ctim.tv_sec == right->st_ctim.tv_sec
+         && left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#else
+  return true;
+#endif
+}
+
+
+// determine directory ancestry from open descriptors rather than path spelling.
+static int bmfs_directory_contains(int ancestor_fd, int directory_fd,
+                                   bool *contains) {
+  struct stat ancestor_stat;
+  int current_fd = -1;
+  int result = 0;
+
+  if (ancestor_fd < 0 || directory_fd < 0 || ! contains) {
+    return -EINVAL;
+  }
+  *contains = false;
+
+  if (fstat(ancestor_fd, &ancestor_stat)) {
+    return -errno;
+  }
+  current_fd = openat(directory_fd, ".",
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (current_fd < 0) {
+    return -errno;
+  }
+
+  while (1) {
+    struct stat current_stat;
+    struct stat parent_stat;
+    int parent_fd;
+
+    if (fstat(current_fd, &current_stat)) {
+      result = -errno;
+      break;
+    }
+    if (ancestor_stat.st_dev == current_stat.st_dev
+        && ancestor_stat.st_ino == current_stat.st_ino) {
+      *contains = true;
+      break;
+    }
+
+    parent_fd = openat(current_fd, "..",
+                       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (parent_fd < 0) {
+      result = -errno;
+      break;
+    }
+    if (fstat(parent_fd, &parent_stat)) {
+      result = -errno;
+      close(parent_fd);
+      break;
+    }
+    if (parent_stat.st_dev == current_stat.st_dev
+        && parent_stat.st_ino == current_stat.st_ino) {
+      close(parent_fd);
+      break;
+    }
+
+    close(current_fd);
+    current_fd = parent_fd;
+  }
+
+  close(current_fd);
   return result;
 }
 
 
-// free a File structure
-static void oa_File_free(void **data) {
-  File **f = (File **)data;
+// resolve every parent component without following symbolic links.
+static int bmfs_resolve_parent(const BmfsState *state, const char *path,
+                               int *parent_fd, char name[NAME_MAX + 1]) {
+  const char *cursor;
+  int current_fd;
 
-  free_blockmap(&((*f)->blockmap));
-  free(*f);
-  *f = NULL;
+  if (! state || state->root_fd < 0 || ! path || path[0] != '/'
+      || ! parent_fd || ! name) {
+    return -EINVAL;
+  }
+
+  *parent_fd = -1;
+  name[0] = '\0';
+  current_fd = openat(state->root_fd, ".",
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (current_fd < 0) {
+    return -errno;
+  }
+
+  cursor = path + 1;
+  while (*cursor == '/') {
+    cursor++;
+  }
+  if (! *cursor) {
+    *parent_fd = current_fd;
+    return 0;
+  }
+
+  while (*cursor) {
+    const char *start = cursor;
+    const char *next;
+    char component[NAME_MAX + 1];
+    size_t length;
+    int next_fd;
+
+    while (*cursor && *cursor != '/') {
+      cursor++;
+    }
+    length = (size_t)(cursor - start);
+    if (! length || length > NAME_MAX) {
+      close(current_fd);
+      return -ENAMETOOLONG;
+    }
+    memcpy(component, start, length);
+    component[length] = '\0';
+    if (! strcmp(component, ".") || ! strcmp(component, "..")) {
+      close(current_fd);
+      return -EINVAL;
+    }
+
+    next = cursor;
+    while (*next == '/') {
+      next++;
+    }
+    if (! *next) {
+      memcpy(name, component, length + 1);
+      *parent_fd = current_fd;
+      return 0;
+    }
+
+    next_fd = openat(current_fd, component,
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (next_fd < 0) {
+      int saved_errno = errno;
+
+      close(current_fd);
+      return -saved_errno;
+    }
+    close(current_fd);
+    current_fd = next_fd;
+    cursor = next;
+  }
+
+  close(current_fd);
+  return -EINVAL;
+}
+
+
+// read attributes without following a final symbolic link.
+static int bmfs_stat_path(const BmfsState *state, const char *path,
+                          struct stat *stbuf) {
+  char name[NAME_MAX + 1];
+  int parent_fd;
+  int result;
+
+  result = bmfs_resolve_parent(state, path, &parent_fd, name);
+  if (result) {
+    return result;
+  }
+
+  if (! name[0]) {
+    result = fstat(parent_fd, stbuf);
+  }
+  else {
+    result = fstatat(parent_fd, name, stbuf, AT_SYMLINK_NOFOLLOW);
+  }
+  if (result) {
+    result = -errno;
+  }
+  close(parent_fd);
+  return result;
+}
+
+
+// open a directory below the root without following symbolic links.
+static int bmfs_open_directory(const BmfsState *state, const char *path) {
+  char name[NAME_MAX + 1];
+  int parent_fd;
+  int result;
+  int fd;
+
+  result = bmfs_resolve_parent(state, path, &parent_fd, name);
+  if (result) {
+    return result;
+  }
+  if (! name[0]) {
+    return parent_fd;
+  }
+
+  fd = openat(parent_fd, name,
+              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    result = -errno;
+  }
+  close(parent_fd);
+  return fd < 0 ? result : fd;
+}
+
+
+// close every descriptor owned by a mapped-file pair.
+static void bmfs_close_mapped_file(OpenedMappedFile *opened) {
+  if (! opened) {
+    return;
+  }
+  if (opened->source_fd >= 0) {
+    close(opened->source_fd);
+  }
+  if (opened->blockmap_fd >= 0) {
+    close(opened->blockmap_fd);
+  }
+  memset(opened, 0, sizeof(*opened));
+  opened->source_fd = -1;
+  opened->blockmap_fd = -1;
+}
+
+
+// open a regular source and its adjacent regular blockmap without following links.
+static int bmfs_open_mapped_file(const BmfsState *state, const char *path,
+                                 OpenedMappedFile *opened) {
+  char blockmap_name[NAME_MAX + 1];
+  char name[NAME_MAX + 1];
+  struct stat source_lstat;
+  struct stat blockmap_lstat;
+  size_t name_length;
+  size_t suffix_length = strlen(BLOCKMAP_SUFFIX);
+  int parent_fd = -1;
+  int result;
+
+  if (! opened) {
+    return -EINVAL;
+  }
+  memset(opened, 0, sizeof(*opened));
+  opened->source_fd = -1;
+  opened->blockmap_fd = -1;
+
+  result = bmfs_resolve_parent(state, path, &parent_fd, name);
+  if (result) {
+    return result;
+  }
+  if (! name[0] || bmfs_has_blockmap_suffix(name)) {
+    result = -ENOENT;
+    goto done;
+  }
+
+  if (fstatat(parent_fd, name, &source_lstat, AT_SYMLINK_NOFOLLOW)) {
+    result = -errno;
+    goto done;
+  }
+  if (! S_ISREG(source_lstat.st_mode)) {
+    result = -ENOENT;
+    goto done;
+  }
+
+  opened->source_fd =
+      openat(parent_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (opened->source_fd < 0) {
+    result = -errno;
+    goto done;
+  }
+  if (fstat(opened->source_fd, &opened->source_stat)) {
+    result = -errno;
+    goto done;
+  }
+  if (! bmfs_same_file(&source_lstat, &opened->source_stat)) {
+    result = -ESTALE;
+    goto done;
+  }
+
+  name_length = strlen(name);
+  if (name_length > NAME_MAX - suffix_length) {
+    result = -ENAMETOOLONG;
+    goto done;
+  }
+  memcpy(blockmap_name, name, name_length);
+  memcpy(blockmap_name + name_length, BLOCKMAP_SUFFIX, suffix_length + 1);
+
+  if (fstatat(parent_fd, blockmap_name, &blockmap_lstat,
+              AT_SYMLINK_NOFOLLOW)) {
+    result = -errno;
+    goto done;
+  }
+  if (! S_ISREG(blockmap_lstat.st_mode)) {
+    result = -ENOENT;
+    goto done;
+  }
+
+  opened->blockmap_fd =
+      openat(parent_fd, blockmap_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (opened->blockmap_fd < 0) {
+    result = -errno;
+    goto done;
+  }
+  if (fstat(opened->blockmap_fd, &opened->blockmap_stat)) {
+    result = -errno;
+    goto done;
+  }
+  if (! bmfs_same_file(&blockmap_lstat, &opened->blockmap_stat)) {
+    result = -ESTALE;
+    goto done;
+  }
+
+  result = 0;
+
+done:
+  if (parent_fd >= 0) {
+    close(parent_fd);
+  }
+  if (result) {
+    bmfs_close_mapped_file(opened);
+  }
+  return result;
+}
+
+
+// retain one reference to immutable cached metadata.
+static void bmfs_cached_file_retain(CachedFile *cached) {
+  if (cached) {
+    atomic_fetch_add_explicit(&cached->references, 1, memory_order_relaxed);
+  }
+}
+
+
+// release one reference and destroy unreferenced cached metadata.
+static void bmfs_cached_file_release(CachedFile **cached_ptr) {
+  CachedFile *cached;
+
+  if (! cached_ptr || ! *cached_ptr) {
+    return;
+  }
+  cached = *cached_ptr;
+  *cached_ptr = NULL;
+  if (atomic_fetch_sub_explicit(&cached->references, 1,
+                                memory_order_acq_rel) != 1) {
+    return;
+  }
+
+  free(cached->coverage);
+  bmfs_offset_index_destroy(&cached->offset_index);
+  free(cached);
+}
+
+
+// retain immutable metadata when hashv4 copies a cache value.
+static void *oa_cached_file_cp(const void *data) {
+  CachedFile *cached = (CachedFile *)data;
+
+  bmfs_cached_file_retain(cached);
+  return cached;
+}
+
+
+// release immutable metadata when hashv4 destroys a cache value.
+static void oa_cached_file_free(void **data) {
+  CachedFile *cached = data ? (CachedFile *)*data : NULL;
+
+  bmfs_cached_file_release(&cached);
+  if (data) {
+    *data = NULL;
+  }
+}
+
+
+// report immutable effective coverage through the offset-index interface.
+static bool bmfs_block_covered(void *context, uint64_t blocknumber) {
+  CachedFile *cached = (CachedFile *)context;
+
+  return ! cached || blocknumber >= cached->offset_index.numblocks
+         || (cached->coverage[blocknumber / 8]
+             & (unsigned char)(1U << (blocknumber % 8)));
+}
+
+
+// capture final deduplication-aware coverage while the full blockmap is private.
+static bool bmfs_capture_block_coverage(void *context, uint64_t blocknumber) {
+  CoverageCapture *capture = (CoverageCapture *)context;
+  bool covered;
+
+  covered = blocknumber >= capture->blockmap->numblocks
+            || is_block_covered(capture->blockmap,
+                                (int64_t)blocknumber);
+  if (covered && blocknumber < capture->blockmap->numblocks) {
+    capture->cached->coverage[blocknumber / 8] |=
+        (unsigned char)(1U << (blocknumber % 8));
+  }
+  return covered;
+}
+
+
+// verify that cached metadata still describes the opened backing objects.
+static bool bmfs_cached_file_matches(const CachedFile *cached,
+                                     const OpenedMappedFile *opened) {
+  return cached && opened
+         && bmfs_same_file(&cached->source_identity, &opened->source_stat)
+         && bmfs_same_file(&cached->blockmap_identity,
+                           &opened->blockmap_stat);
+}
+
+
+// parse a blockmap and convert it to immutable compact cache metadata.
+static int bmfs_load_cached_file(const char *path,
+                                 const OpenedMappedFile *opened,
+                                 CachedFile **cached_ptr) {
+  Blockmap *blockmap = NULL;
+  CachedFile *cached = NULL;
+  CoverageCapture capture;
+  struct stat final_blockmap_stat;
+  struct stat final_source_stat;
+  uint64_t coverage_length;
+  uint64_t expected_blocks;
+  int result = -EIO;
+
+  if (! path || ! opened || opened->source_fd < 0
+      || opened->blockmap_fd < 0 || opened->source_stat.st_size < 0
+      || ! cached_ptr) {
+    return -EINVAL;
+  }
+  *cached_ptr = NULL;
+
+  cached = (CachedFile *)calloc(1, sizeof(*cached));
+  if (! cached) {
+    return -ENOMEM;
+  }
+  atomic_init(&cached->references, 1);
+
+  errno = 0;
+  if (! read_blockmap_h(&blockmap, opened->blockmap_fd)) {
+    result = errno == ENOMEM ? -ENOMEM : -EIO;
+    goto done;
+  }
+
+  expected_blocks = opened->source_stat.st_size
+                        ? 1 + ((uint64_t)opened->source_stat.st_size - 1)
+                                  / blockmap->blocksize
+                        : 0;
+  if (expected_blocks != blockmap->numblocks) {
+    if (VERBOSE_BLOCKMAPFS) {
+      fprintf(stderr,
+              "Blockmap for \"%s\" contains %" PRIu64
+              " blocks; source requires %" PRIu64 ".\n",
+              path, blockmap->numblocks, expected_blocks);
+    }
+    goto done;
+  }
+
+  coverage_length =
+      blockmap->numblocks / 8 + (blockmap->numblocks % 8 != 0);
+  if (coverage_length != (size_t)coverage_length) {
+    result = -EOVERFLOW;
+    goto done;
+  }
+  cached->coverage = (unsigned char *)calloc(
+      coverage_length ? (size_t)coverage_length : 1, 1);
+  if (! cached->coverage) {
+    result = -ENOMEM;
+    goto done;
+  }
+
+  capture.blockmap = blockmap;
+  capture.cached = cached;
+  errno = 0;
+  if (! bmfs_offset_index_build(&cached->offset_index,
+                                blockmap->numblocks,
+                                blockmap->blocksize,
+                                (uint64_t)opened->source_stat.st_size,
+                                bmfs_capture_block_coverage,
+                                &capture)) {
+    result = errno == ENOMEM ? -ENOMEM : -EIO;
+    goto done;
+  }
+
+  if (fstat(opened->source_fd, &final_source_stat)
+      || fstat(opened->blockmap_fd, &final_blockmap_stat)) {
+    result = -errno;
+    goto done;
+  }
+  if (! bmfs_same_file(&opened->source_stat, &final_source_stat)
+      || ! bmfs_same_file(&opened->blockmap_stat,
+                          &final_blockmap_stat)) {
+    result = -ESTALE;
+    goto done;
+  }
+
+  cached->source_identity = opened->source_stat;
+  cached->blockmap_identity = opened->blockmap_stat;
+  *cached_ptr = cached;
+  cached = NULL;
+  result = 0;
+
+done:
+  free_blockmap(&blockmap);
+  bmfs_cached_file_release(&cached);
+  return result;
+}
+
+
+// retrieve or atomically publish one immutable cache entry for a pathname.
+static int bmfs_get_cached_file(BmfsState *state, const char *path,
+                                const OpenedMappedFile *opened,
+                                CachedFile **cached_ptr) {
+  CachedFile *cached;
+  int lock_result;
+  int result;
+
+  if (! state || ! path || ! opened || ! cached_ptr) {
+    return -EINVAL;
+  }
+  *cached_ptr = NULL;
+
+  cached = (CachedFile *)oa_hash_get_copy(state->cache, path);
+  if (cached) {
+    if (! bmfs_cached_file_matches(cached, opened)) {
+      bmfs_cached_file_release(&cached);
+      return -ESTALE;
+    }
+    *cached_ptr = cached;
+    return 0;
+  }
+
+  lock_result = pthread_mutex_lock(&state->cache_load_lock);
+  if (lock_result) {
+    return -lock_result;
+  }
+
+  cached = (CachedFile *)oa_hash_get_copy(state->cache, path);
+  if (cached) {
+    if (! bmfs_cached_file_matches(cached, opened)) {
+      bmfs_cached_file_release(&cached);
+      result = -ESTALE;
+      goto done;
+    }
+    *cached_ptr = cached;
+    result = 0;
+    goto done;
+  }
+
+  result = bmfs_load_cached_file(path, opened, &cached);
+  if (result) {
+    goto done;
+  }
+  if (! oa_hash_put(state->cache, path, cached)) {
+    result = -ENOMEM;
+    bmfs_cached_file_release(&cached);
+    goto done;
+  }
+
+  *cached_ptr = cached;
+  result = 0;
+
+done:
+  pthread_mutex_unlock(&state->cache_load_lock);
+  return result;
+}
+
+
+// replace source size fields with their compacted visible values.
+static void bmfs_set_visible_stat(struct stat *stbuf,
+                                  const CachedFile *cached) {
+  uint64_t visible_size = cached->offset_index.visible_size;
+
+  stbuf->st_size = (off_t)visible_size;
+  stbuf->st_blocks =
+      (blkcnt_t)(visible_size / 512 + (visible_size % 512 != 0));
 }
 
 
 // blockmapfs FUSE callback functions
 
-static void *bmfs_init(struct fuse_conn_info *conn
-                       /*struct fuse_config *cfg*/) {
+// enable stable kernel caching for the documented immutable backing view.
+static void *bmfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+  struct fuse_context *context = fuse_get_context();
+
   (void)conn;
-
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_init() entry.\n");
-  }
-
-  // only for fuse3
-  //  cfg->use_ino = 1;
-  //  cfg->nullpath_ok = 1;
-  //  cfg->attr_timeout = 99999999;
-  //  cfg->entry_timeout = 99999999;
-  //  cfg->negative_timeout = 99999999;
-  //  cfg->auto_cache = 1;
-
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_init() exit.\n");
-  }
-  return NULL;
+  cfg->kernel_cache = 1;
+  return context ? context->private_data : NULL;
 }
 
 
-// simply calls bmfs_getattr()
-static int bmfs_fgetattr(const char *path, struct stat *stbuf,
-                         struct fuse_file_info *fi) {
-  (void)fi;
-  return bmfs_getattr(path, stbuf);
+// return source attributes with the blockmap-compacted visible size.
+static int bmfs_getattr(const char *path, struct stat *stbuf,
+                        struct fuse_file_info *fi) {
+  BmfsState *state = bmfs_get_state();
+  OpenedMappedFile opened;
+  CachedFile *cached = NULL;
+  struct stat source_stat;
+  const char *name;
+  int result;
+
+  if (! state || ! path || ! stbuf) {
+    return -EINVAL;
+  }
+  memset(stbuf, 0, sizeof(*stbuf));
+
+  if (fi && fi->fh) {
+    OpenFile *open_file = bmfs_get_open_file(fi);
+
+    if (! open_file) {
+      return -EIO;
+    }
+    if (fstat(open_file->fd, &source_stat)) {
+      return -errno;
+    }
+    if (! bmfs_same_file(&open_file->cached->source_identity,
+                         &source_stat)) {
+      return -ESTALE;
+    }
+    *stbuf = source_stat;
+    bmfs_set_visible_stat(stbuf, open_file->cached);
+    return 0;
+  }
+
+  result = bmfs_stat_path(state, path, &source_stat);
+  if (result) {
+    return result;
+  }
+  if (S_ISDIR(source_stat.st_mode)) {
+    *stbuf = source_stat;
+    return 0;
+  }
+  name = strrchr(path, '/');
+  name = name ? name + 1 : path;
+  if (! S_ISREG(source_stat.st_mode)
+      || bmfs_has_blockmap_suffix(name)) {
+    return -ENOENT;
+  }
+
+  result = bmfs_open_mapped_file(state, path, &opened);
+  if (result) {
+    return result;
+  }
+  result = bmfs_get_cached_file(state, path, &opened, &cached);
+  if (! result) {
+    *stbuf = opened.source_stat;
+    bmfs_set_visible_stat(stbuf, cached);
+  }
+
+  bmfs_cached_file_release(&cached);
+  bmfs_close_mapped_file(&opened);
+  return result;
 }
 
 
-// bmfs_getattr() is more expensive than typical getattr calls,
-// because it's necessary to open files to get access to the coverage
-// blockmap so we can lie appropriately about the apparent file size.
-// We can't use the fuse_file_info structure, because (grrrr) this
-// isn't passed to the getattr callback in fuse2, so we have to resort
-// to using a global hashtable as a conduit to and from open().
-static int bmfs_getattr(const char *path, struct stat *stbuf
-                        /*struct fuse_file_info *fi*/) {
-  char pathname[PATH_MAX];  // pathname of file in root dir
-  char bm[PATH_MAX];        // pathname for associated blockmap file
-  int res = 0;
-  File *f = NULL;
-  FILE *fp;
-  char *dot;
-
-  bzero(stbuf, sizeof(struct stat));
-  if (snprintf(pathname, sizeof(pathname), "%s%s", ROOTDIR, path) >= (int)sizeof(pathname)) {
-    res = -ENAMETOOLONG;
-    goto done;
-  }
-
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_getattr() entry for \"%s\".\n", pathname);
-  }
-
-  // start with a regular stat
-  res = stat(pathname, stbuf);
-
-  if (res) {
-    // stat() failed, done
-    goto done;
-  }
-
-  // if the filename name ends in ".blockmap" or the file isn't a
-  // regular file then no blockmap processing is required, so the
-  // plain stat() suffices
-
-  dot = strrchr(pathname, '.');
-  if ((dot && ! strcmp(dot, ".blockmap")) || ! S_ISREG(stbuf->st_mode)) {
-    // not a regular file or ends in ".blockmap", so done
-    goto done;
-  }
-
-  // there's one more elimination check--if the filename doesn't sit
-  // next to an associated file with the extension ".blockmap", then
-  // the regular stat() suffices.  Files in the blockmapfs mount
-  // directory only require a blockmap if they are opened.
-
-  if (snprintf(bm, sizeof(bm), "%s.blockmap", pathname) >= (int)sizeof(bm)) {
-    goto done;
-  }
-
-  fp = fopen(bm, "r");
-  if (! fp) {
-    // no associated blockmap, done
-    goto done;
-  }
-  fclose(fp);
-
-  // here: regular file that doesn't end in ".blockmap" and has an
-  // associated ".blockmap" friend
-
-  // see if the File structure corresponding to this file is already
-  // in the global hashtable
-  f = oa_hash_get(HASHTABLE, pathname);
-
-  if (! f) {
-    // file is not already open.  This requires a bunch of overhead,
-    // as the file must be opened first so the blockmap can be
-    // processed.  But the blockmap processing is cached, so if the
-    // file is opened in the future, that's all done.
-    if (VERBOSE_BLOCKMAPFS > 1) {
-      fprintf(stdout, "bmfs_getattr() calling open() to process the blockmap for %s.\n",
-              pathname);
-    }
-
-    // call open, but we don't have a fuse_file_info to pass
-    // (otherwise all this effort wouldn't be necessary in the first
-    // place :)
-    res = bmfs_open(path, NULL);
-
-    if (res) {
-      goto done;
-    }
-
-    // now use the hash table and try once again to get access to the
-    // file info
-    f = oa_hash_get(HASHTABLE, pathname);
-  }
-
-  if (! f) {
-    if (VERBOSE_BLOCKMAPFS > 1) {
-      fprintf(stdout, "bmfs_getattr(): \"%s\" doesn't exist.\n", pathname);
-    }
-    res = -ENOENT;
-    goto done;
-  }
-
-  // override file size returned by stat() with size not that doesn't
-  // count covered blocks
-  stbuf->st_size = f->filesize;
-
-done:
-
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_getattr() exit for \"%s\".\n", pathname);
-  }
-
-  return res;
-}
-
-
-// implements open callback for FUSE.  If fi is NULL, an internal call
-// to open() with the intention of processing the blockmap is assumed,
-// otherwise it's a real file open operation.
+// create one independent read-only handle for each successful FUSE open.
 static int bmfs_open(const char *path, struct fuse_file_info *fi) {
-  int64_t i;
-  int fd;                   // temporary file handle, allows file not
-                            // found failure before memory allocation
-                            // for File structure
-  char pathname[PATH_MAX];  // temp full pathname for files
-  File *f = NULL;           // private info for file stored in
-                            // fuse_file_info struct and in hashtable
-  bool empty;               // blockmap file missing?
-  int64_t expected_size;    // expected size of blockmap
-  FILE *fn;                 // used to open blockmap
-  int res = 0;              // return value for function
-  struct stat s;            // used to evaluate size of source file
-                            // for comparision with blockmap size
+  BmfsState *state = bmfs_get_state();
+  OpenedMappedFile opened;
+  CachedFile *cached = NULL;
+  OpenFile *open_file = NULL;
+  int result;
 
-  // all files in blockmapfs are contained in the root directory
-  // as specified using a command line option
-  if (snprintf(pathname, sizeof(pathname), "%s%s", ROOTDIR, path) >= (int)sizeof(pathname)) {
-    res = -ENAMETOOLONG;
+  if (! state || ! path || ! fi) {
+    return -EINVAL;
+  }
+  if ((fi->flags & O_ACCMODE) != O_RDONLY
+      || (fi->flags & (O_APPEND | O_TRUNC))) {
+    return -EROFS;
+  }
+
+  result = bmfs_open_mapped_file(state, path, &opened);
+  if (result) {
+    return result;
+  }
+  result = bmfs_get_cached_file(state, path, &opened, &cached);
+  if (result) {
     goto done;
   }
 
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_open() entry for \"%s\".\n", pathname);
+  open_file = (OpenFile *)calloc(1, sizeof(*open_file));
+  if (! open_file) {
+    result = -ENOMEM;
+    goto done;
   }
+  atomic_init(&open_file->ready, false);
+  open_file->fd = opened.source_fd;
+  opened.source_fd = -1;
+  open_file->cached = cached;
+  cached = NULL;
 
-  if (! (f = oa_hash_get(HASHTABLE, pathname))) {
-    // file is not already open--try to open the corresponding file
-    // and process the blockmap.  blockmapfs is read-only, so we
-    // ignore the flags provided by FUSE
-    fd = open(pathname, O_RDONLY /*fi->flags*/);
-    if (fd == -1) {
-      res = -errno;
-      if (VERBOSE_BLOCKMAPFS) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Couldn't open \"%s\" in bmfs_open().\n", pathname);
-        fprintf(stderr, "%s", BLACK);
-      }
-      goto done;
-    }
-
-    f = malloc(sizeof(File));
-    f->handle = fd;
-    f->blockmap = NULL;
-    // this is for debugging, so we can see which file is being
-    // manipulated in other functions
-    strcpy(f->pathname, pathname);
-
-    // the open callback is also called by getattr() to process the
-    // blockmap--in that case, there is no valid fuse_info structure,
-    // so we can't stash the File structure there, so it's necessary to check
-    // for a valid fuse_info pointer.
-    if (fi) {
-      fi->fh = (uint64_t)f;
-    }
-
-    // now handle blockmap for file.  We insist that there be a
-    // blockmap, or an error is returned.  This may seem annoying, but
-    // a blockmap can't be created automatically, because there's no
-    // way to know the associated blocksize and defaults don't really
-    // make sense.
-
-    // the name of the blockmap is just pathname + ".blockmap"
-    if (snprintf(pathname, sizeof(pathname), "%s.blockmap", f->pathname) >= (int)sizeof(pathname)) {
-      if (VERBOSE_BLOCKMAPFS) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Pathname too long in bmfs_open().\n");
-        fprintf(stderr, "%s", BLACK);
-      }
-      res = -ENAMETOOLONG;
-      goto done;
-    }
-
-    // stat() to get actual file size
-    res = fstat(f->handle, &s);
-    if (res) {
-      res = -errno;
-      if (VERBOSE_BLOCKMAPFS) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Couldn't stat blockmap for file \"%s\".\n"
-                        "Blockmaps are required for every file in blockmapfs.\n",
-                f->pathname);
-        fprintf(stderr, "%s", BLACK);
-      }
-      goto done;
-    }
-
-    // initially *apparent* filesize is the *actual* size of the file
-    f->filesize = s.st_size;
-
-    empty = ((fn = fopen(pathname, "rb")) == NULL);
-
-    if (empty) {
-      if (VERBOSE_BLOCKMAPFS) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Couldn't open blockmap for file \"%s\".\n"
-                        "Blockmaps are required for every file in blockmapfs.\n",
-                f->pathname);
-        fprintf(stderr, "%s", BLACK);
-      }
-      res = -EIO;
-      goto done;
-    }
-
-    if (! read_blockmap(&f->blockmap, fn, true)) {
-      if (VERBOSE_BLOCKMAPFS) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Couldn't read blockmap for file \"%s\".\n",
-                f->pathname);
-        fprintf(stderr, "%s", BLACK);
-      }
-      res = -EIO;
-      goto done;
-    }
-
-    if (VERBOSE_BLOCKMAPFS) {
-      fprintf(stdout, "# of blocks represented by blockmap \"%s\" is %" PRIu64 ".\n",
-              pathname, f->blockmap->numblocks);
-      fprintf(stdout, "Blocksize for blockmap is %u.\n", f->blockmap->blocksize);
-    }
-
-    // sanity check--source file size must be fully represented by size
-    // of blockmap
-    expected_size = CEILDIV(f->filesize, f->blockmap->blocksize);
-
-    if (expected_size != (int64_t)f->blockmap->numblocks) {
-      if (VERBOSE_BLOCKMAPFS) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr,
-                "Size of blockmap %" PRIu64 " does not match expected size of %" PRId64 " for source file for \"%s\".\n",
-                f->blockmap->numblocks,
-                expected_size,
-                f->pathname);
-        fprintf(stderr, "%s", BLACK);
-      }
-      res = -EIO;
-      goto done;
-    }
-
-    // now reduce apparent file size by # of blocks that are
-    // covered. Only the last block is a special case, as it may not
-    // be completely full of valid data
-
-    if (VERBOSE_BLOCKMAPFS) {
-      fprintf(stdout, "Adjusting filesize (= %" PRId64 ") for \"%s\".\n", f->filesize, f->pathname);
-    }
-
-    for (i = 0; i < (int64_t)f->blockmap->numblocks - 1; i++) {
-      if (is_block_covered(f->blockmap, i)) {
-        f->filesize -= f->blockmap->blocksize;
-      }
-    }
-
-    // last block
-    if (is_block_covered(f->blockmap, f->blockmap->numblocks - 1)) {
-      if (! (f->filesize % f->blockmap->blocksize)) {
-        f->filesize -= f->blockmap->blocksize;
-      }
-      else {
-        f->filesize -= (f->filesize % f->blockmap->blocksize);
-      }
-    }
-
-    if (VERBOSE_BLOCKMAPFS) {
-      fprintf(stdout, "Finished adjusting filesize (= %" PRId64 ") for \"%s\".\n",
-              f->filesize, f->pathname);
-    }
-
-    fclose(fn);
-
-    if (VERBOSE_BLOCKMAPFS > 1) {
-      fprintf(stdout, "Finished setting up blockmap for \"%s\".\n", f->pathname);
-      fprintf(stdout, "bmfs_open() exit for \"%s\".\n", pathname);
-    }
-
-    // remember File struct in hashtable
-    oa_hash_put(HASHTABLE, f->pathname, f);
-  }
-  else {
-    // file is already open (possibly because of getattr() call)--be
-    // sure File struct is stashed in fuse_file_info structure
-    if (fi) {
-      fi->fh = (uint64_t)f;
-    }
-    if (VERBOSE_BLOCKMAPFS > 1) {
-      fprintf(stdout, "bmfs_open() exit. \"%s\" is already open.\n", pathname);
-    }
-  }
+  atomic_store_explicit(&open_file->ready, true, memory_order_release);
+  fi->fh = (uint64_t)(uintptr_t)open_file;
+  fi->keep_cache = 1;
+  result = 0;
 
 done:
-  // prevent memory leakage on errors
-  if (res && f) {
-    free_blockmap(&f->blockmap);
-    free(f);
+  bmfs_cached_file_release(&cached);
+  bmfs_close_mapped_file(&opened);
+  if (result) {
+    free(open_file);
   }
-  return res;
+  return result;
 }
 
 
-// the read callback silently skips covered blocks (blocks with their
-// corresponding bit set in the coverage blockmap), but otherwise
-// behaves like the standard C read() function.
+// acquire initialization published by the FUSE open callback.
+static OpenFile *bmfs_get_open_file(struct fuse_file_info *fi) {
+  OpenFile *open_file;
+
+  if (! fi || ! fi->fh) {
+    return NULL;
+  }
+  open_file = (OpenFile *)(uintptr_t)fi->fh;
+  return atomic_load_explicit(&open_file->ready, memory_order_acquire)
+             ? open_file
+             : NULL;
+}
+
+
+// read the compacted view using immutable metadata and a per-open descriptor.
 static int bmfs_read(const char *path, char *buf, size_t size, off_t seekpos,
                      struct fuse_file_info *fi) {
+  OpenFile *open_file;
+  ssize_t bytesread;
+  int saved_errno;
+
   (void)path;
 
-  int64_t curblock, neededbytes = size, bytestoskip, bytestoread,
-                    bytesread, totalbytesread = 0;
-  off_t curpos;
-  bool shortread;
-  File *f = (File *)fi->fh;
-
-  curblock = 0;
-  shortread = false;
-  bytestoskip = 0;
-
-  // there's no notion of "current file position" for FUSE
-  // filesystems--an absolute offset is provided for every read.
-
-  curpos = seekpos;
-
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_read() entry for \"%s\", size = %lu, seekpos = %" PRId64 ".\n",
-            f->pathname, size, (int64_t)seekpos);
+  if (! buf) {
+    return -EINVAL;
+  }
+  if (seekpos < 0) {
+    return -EINVAL;
+  }
+  if (size > INT_MAX) {
+    size = INT_MAX;
   }
 
-  while (curblock < (int64_t)f->blockmap->numblocks && curpos >= 0) {
-    // block is covered?
-    if (is_block_covered(f->blockmap, curblock)) {
-      // yes, block doesn't count toward seek position
-      bytestoskip += f->blockmap->blocksize;
-    }
-    else {
-      // no, this block counts in the offset
-      bytestoskip += f->blockmap->blocksize;
-      curpos -= f->blockmap->blocksize;
-    }
-
-    curblock++;
+  open_file = bmfs_get_open_file(fi);
+  if (! open_file) {
+    return -EIO;
   }
-
-  if (curblock == (int64_t)f->blockmap->numblocks &&
-      is_block_covered(f->blockmap, f->blockmap->numblocks - 1)) {
-    // seekpos is outside uncovered data in the source file, so nothing to read
-    shortread = true;
+  bytesread =
+      bmfs_offset_index_pread(&open_file->cached->offset_index,
+                              open_file->fd, buf, size,
+                              (uint64_t)seekpos,
+                              bmfs_block_covered,
+                              open_file->cached);
+  if (bytesread < 0) {
+    saved_errno = errno ? errno : EIO;
+    return -saved_errno;
   }
-  else {
-    curblock--;
-    bytestoskip -= (f->blockmap->blocksize - seekpos % f->blockmap->blocksize);
-    // establish valid current position
-    lseek(f->handle, bytestoskip, SEEK_SET);
-  }
-
-  while (totalbytesread < neededbytes &&
-         curblock < (int64_t)f->blockmap->numblocks && ! shortread) {
-    bytestoread = 0;
-    bytestoskip = 0;
-
-    // accumulate uncovered blocks for read
-    while (curblock < (int64_t)f->blockmap->numblocks &&
-           ! is_block_covered(f->blockmap, curblock) &&
-           totalbytesread + bytestoread <= neededbytes) {
-      bytestoread += f->blockmap->blocksize;
-      curblock++;
-    }
-
-    // cap read size, because we increased bytestoread in blocksize increments
-    if (totalbytesread + bytestoread > neededbytes) {
-      bytestoread = neededbytes - totalbytesread;
-    }
-
-    while (bytestoread > 0 && ! shortread) {
-      bytesread = read(f->handle, ((char *)buf) + totalbytesread, bytestoread);
-      if (bytesread < 0) {
-        if (VERBOSE_BLOCKMAPFS) {
-          fprintf(stderr, "%s", RED);
-          fprintf(stderr, "Read failed in bmfs_read().\n");
-          fprintf(stderr, "%s", BLACK);
-        }
-        return -EIO;  // something really bad happened
-      }
-      else if (bytesread == 0) {
-        shortread = true;
-      }
-      else {
-        bytestoread -= bytesread;
-        totalbytesread += bytesread;
-      }
-    }
-
-    if (! shortread) {
-      // skip covered blocks to establish position for next read
-      bytestoskip = 0;
-      while (curblock < (int64_t)f->blockmap->numblocks &&
-             is_block_covered(f->blockmap, curblock)) {
-        bytestoskip += f->blockmap->blocksize;
-        curblock++;
-      }
-
-      if (curblock == (int64_t)f->blockmap->numblocks) {
-        // ran out of blocks before finding an uncovered block
-        shortread = true;
-      }
-      else {
-        // establish new valid current position
-        lseek(f->handle, bytestoskip, SEEK_CUR);
-      }
-    }
-  }
-
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_read() exit for \"%s\".\n", f->pathname);
-  }
-
-  return (int)totalbytesread;
+  return (int)bytesread;
 }
 
 
-// the release callback implements close file.  Since blockmapfs
-// doesn't close files, this function does nothing.
+// close and release exactly the resources allocated by one open callback.
 static int bmfs_release(const char *path, struct fuse_file_info *fi) {
-  char pathname[PATH_MAX];
+  OpenFile *open_file;
+  int result = 0;
 
-  if (snprintf(pathname, sizeof(pathname), "%s%s", ROOTDIR, path) >= (int)sizeof(pathname)) {
-    return -ENAMETOOLONG;
+  (void)path;
+
+  if (! fi || ! fi->fh) {
+    return 0;
   }
-
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_release() entry for \"%s\".\n",
-            ((File *)fi->fh)->pathname);
+  open_file = bmfs_get_open_file(fi);
+  if (! open_file) {
+    return -EIO;
   }
+  fi->fh = 0;
 
-  if (VERBOSE_BLOCKMAPFS > 1) {
-    fprintf(stdout, "bmfs_release() exit.\n");
+  if (close(open_file->fd)) {
+    result = -errno;
   }
-
-  return 0;
+  bmfs_cached_file_release(&open_file->cached);
+  free(open_file);
+  return result;
 }
 
 
-// implements the access callback by calling access() on the file
-// outside the FUSE filesystem.
-static int bmfs_access(const char *path, int mask) {
-  char pathname[PATH_MAX];  // pathname of file in root dir
-  int res;
+// report the backing filesystem capacity while preserving read-only semantics.
+static int bmfs_statfs(const char *path, struct statvfs *stbuf) {
+  BmfsState *state = bmfs_get_state();
 
-  if (snprintf(pathname, sizeof(pathname), "%s%s", ROOTDIR, path) >= (int)sizeof(pathname)) {
-    if (VERBOSE_BLOCKMAPFS) {
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Pathname too long in bmfs_access().\n");
-      fprintf(stderr, "%s", BLACK);
-    }
-    return -ENAMETOOLONG;
+  (void)path;
+
+  if (! state || ! stbuf) {
+    return -EINVAL;
   }
-
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_access() entry for \"%s\".\n", pathname);
-  }
-
-  res = access(pathname, mask);
-  if (res == -1) {
-    if (VERBOSE_BLOCKMAPFS > 2) {
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Couldn't access() for \"%s\" in bmfs_access().\n", pathname);
-      fprintf(stderr, "%s", BLACK);
-      perror("");
-    }
+  if (fstatvfs(state->root_fd, stbuf)) {
     return -errno;
   }
-
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_access() exit for \"%s\".\n", pathname);
-  }
-
+#ifdef ST_RDONLY
+  stbuf->f_flag |= ST_RDONLY;
+#endif
   return 0;
 }
 
-//
-// essential but complex directory handling functions follow
-//
 
-struct bmfs_dirp {
-  DIR *dp;
-  struct dirent *entry;
-  off_t offset;
-};
-
+// allocate an independent directory stream for one FUSE directory handle.
 static int bmfs_opendir(const char *path, struct fuse_file_info *fi) {
-  int res;
-  char pathname[PATH_MAX];  // pathname of file in root dir
+  BmfsState *state = bmfs_get_state();
+  BmfsDirectory *directory = NULL;
+  int lock_result;
+  int fd;
 
-  if (snprintf(pathname, sizeof(pathname), "%s%s", ROOTDIR, path) >= (int)sizeof(pathname)) {
-    if (VERBOSE_BLOCKMAPFS) {
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Pathname too long in bmfs_access().\n");
-      fprintf(stderr, "%s", BLACK);
-    }
-    return -ENAMETOOLONG;
+  if (! state || ! path || ! fi) {
+    return -EINVAL;
+  }
+  fd = bmfs_open_directory(state, path);
+  if (fd < 0) {
+    return fd;
   }
 
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_opendir() entry for \"%s\".\n", pathname);
-  }
-
-  struct bmfs_dirp *d = malloc(sizeof(struct bmfs_dirp));
-  if (d == NULL) {
+  directory = (BmfsDirectory *)calloc(1, sizeof(*directory));
+  if (! directory) {
+    close(fd);
     return -ENOMEM;
   }
-
-  d->dp = opendir(pathname);
-  if (d->dp == NULL) {
-    perror("Error in bmfs_opendir:");
-    res = -errno;
-    free(d);
-    return res;
+  atomic_init(&directory->ready, false);
+  lock_result = pthread_mutex_init(&directory->lock, NULL);
+  if (lock_result) {
+    close(fd);
+    free(directory);
+    return -lock_result;
   }
-  d->offset = 0;
-  d->entry = NULL;
+  directory->dp = fdopendir(fd);
+  if (! directory->dp) {
+    int saved_errno = errno;
 
-  fi->fh = (uint64_t)d;
-
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_opendir() exit for \"%s\".\n", pathname);
+    close(fd);
+    pthread_mutex_destroy(&directory->lock);
+    free(directory);
+    return -saved_errno;
   }
 
+  atomic_store_explicit(&directory->ready, true, memory_order_release);
+  fi->fh = (uint64_t)(uintptr_t)directory;
   return 0;
 }
 
 
-static inline struct bmfs_dirp *get_dirp(struct fuse_file_info *fi) {
-  return (struct bmfs_dirp *)(uintptr_t)fi->fh;
+// return the private directory state associated with a FUSE handle.
+static BmfsDirectory *bmfs_get_directory(struct fuse_file_info *fi) {
+  BmfsDirectory *directory;
+
+  if (! fi || ! fi->fh) {
+    return NULL;
+  }
+  directory = (BmfsDirectory *)(uintptr_t)fi->fh;
+  return atomic_load_explicit(&directory->ready, memory_order_acquire)
+             ? directory
+             : NULL;
 }
 
 
+// determine whether a directory entry belongs in the mounted view.
+static int bmfs_directory_entry_visible(int directory_fd, const char *name,
+                                        struct stat *entry_stat) {
+  char blockmap_name[NAME_MAX + 1];
+  struct stat blockmap_stat;
+  size_t length;
+  size_t suffix_length = strlen(BLOCKMAP_SUFFIX);
+
+  if (fstatat(directory_fd, name, entry_stat, AT_SYMLINK_NOFOLLOW)) {
+    return -errno;
+  }
+  if (S_ISDIR(entry_stat->st_mode)) {
+    return 1;
+  }
+  if (! S_ISREG(entry_stat->st_mode) || bmfs_has_blockmap_suffix(name)) {
+    return 0;
+  }
+
+  length = strlen(name);
+  if (length > NAME_MAX - suffix_length) {
+    return 0;
+  }
+  memcpy(blockmap_name, name, length);
+  memcpy(blockmap_name + length, BLOCKMAP_SUFFIX, suffix_length + 1);
+  if (fstatat(directory_fd, blockmap_name, &blockmap_stat,
+              AT_SYMLINK_NOFOLLOW)) {
+    return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
+  }
+  return S_ISREG(blockmap_stat.st_mode) ? 1 : 0;
+}
+
+
+// enumerate visible directory entries with a serialized per-handle cursor.
 static int bmfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                        off_t offset, struct fuse_file_info *fi
-                        /*enum fuse_readdir_flags flags*/) {
-  struct bmfs_dirp *d = get_dirp(fi);
-  char pathname[PATH_MAX];  // pathname of file in root dir
+                        off_t offset, struct fuse_file_info *fi,
+                        enum fuse_readdir_flags flags) {
+  BmfsDirectory *directory = bmfs_get_directory(fi);
+  int lock_result;
+  int result = 0;
 
-  if (snprintf(pathname, sizeof(pathname), "%s%s", ROOTDIR, path) >= (int)sizeof(pathname)) {
-    if (VERBOSE_BLOCKMAPFS) {
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Pathname too long in bmfs_access().\n");
-      fprintf(stderr, "%s", BLACK);
-    }
-    return -ENAMETOOLONG;
+  (void)path;
+  (void)flags;
+
+  if (! directory || ! buf || ! filler) {
+    return -EINVAL;
+  }
+  lock_result = pthread_mutex_lock(&directory->lock);
+  if (lock_result) {
+    return -lock_result;
   }
 
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_readdir() entry for \"%s\".\n", pathname);
-  }
-
-  if (offset != d->offset) {
+  if (offset != directory->offset) {
 #ifndef __FreeBSD__
-    seekdir(d->dp, offset);
+    seekdir(directory->dp, offset);
 #else
-    /* Subtract the one that we add when calling
-       telldir() below */
-    seekdir(d->dp, offset - 1);
+    // subtract the offset adjustment applied after telldir() below.
+    seekdir(directory->dp, offset - 1);
 #endif
-    d->entry = NULL;
-    d->offset = offset;
+    directory->entry = NULL;
+    directory->offset = offset;
   }
-  while (1) {
-    struct stat st;
-    off_t nextoff;
-    //    enum fuse_fill_dir_flags fill_flags = 0;
 
-    if (! d->entry) {
-      d->entry = readdir(d->dp);
-      if (! d->entry) {
+  while (1) {
+    struct stat entry_stat;
+    struct stat filler_stat;
+    off_t next_offset;
+    int visible;
+
+    if (! directory->entry) {
+      errno = 0;
+      directory->entry = readdir(directory->dp);
+      if (! directory->entry) {
+        result = errno ? -errno : 0;
         break;
       }
     }
-    /*
-#ifdef HAVE_FSTATAT
-    if (flags & FUSE_READDIR_PLUS) {
-      int res;
 
-      res = fstatat(dirfd(d->dp), d->entry->d_name, &st,
-                    AT_SYMLINK_NOFOLLOW);
-      if (res != -1)
-        fill_flags |= FUSE_FILL_DIR_PLUS;
+    errno = 0;
+    next_offset = telldir(directory->dp);
+    if (next_offset == (off_t)-1 && errno) {
+      result = -errno;
+      break;
     }
-#endif
-    */
-    //    if (!(fill_flags & FUSE_FILL_DIR_PLUS)) {
-    memset(&st, 0, sizeof(st));
-    st.st_ino = d->entry->d_ino;
-    st.st_mode = d->entry->d_type << 12;
-    //    }
-    nextoff = telldir(d->dp);
 #ifdef __FreeBSD__
-    /* Under FreeBSD, telldir() may return 0 the first time
-       it is called. But for libfuse, an offset of zero
-       means that offsets are not supported, so we shift
-       everything by one. */
-    nextoff++;
+    // reserve zero to mean that directory offsets are unsupported.
+    next_offset++;
 #endif
-    if (filler(buf, d->entry->d_name, &st, nextoff)) {
+
+    visible = bmfs_directory_entry_visible(
+        dirfd(directory->dp), directory->entry->d_name, &entry_stat);
+    if (visible < 0) {
+      result = visible;
+      break;
+    }
+    if (! visible) {
+      directory->entry = NULL;
+      directory->offset = next_offset;
+      continue;
+    }
+
+    memset(&filler_stat, 0, sizeof(filler_stat));
+    filler_stat.st_ino = entry_stat.st_ino;
+    filler_stat.st_mode = entry_stat.st_mode;
+    if (filler(buf, directory->entry->d_name, &filler_stat, next_offset,
+               (enum fuse_fill_dir_flags)0)) {
       break;
     }
 
-    d->entry = NULL;
-    d->offset = nextoff;
+    directory->entry = NULL;
+    directory->offset = next_offset;
   }
 
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_readdir() exit for \"%s\".\n", pathname);
-  }
-
-  return 0;
+  pthread_mutex_unlock(&directory->lock);
+  return result;
 }
 
 
+// close and release exactly the resources allocated by one opendir callback.
 static int bmfs_releasedir(const char *path, struct fuse_file_info *fi) {
-  char pathname[PATH_MAX];  // pathname of file in root dir
+  BmfsDirectory *directory = bmfs_get_directory(fi);
+  int result = 0;
 
-  if (snprintf(pathname, sizeof(pathname), "%s%s", ROOTDIR, path) >= (int)sizeof(pathname)) {
-    if (VERBOSE_BLOCKMAPFS) {
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Pathname too long in bmfs_access().\n");
-      fprintf(stderr, "%s", BLACK);
-    }
-    return -ENAMETOOLONG;
+  (void)path;
+
+  if (! directory) {
+    return 0;
   }
-
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_releasedir() exit for \"%s\".\n", pathname);
+  fi->fh = 0;
+  if (closedir(directory->dp)) {
+    result = -errno;
   }
-
-  struct bmfs_dirp *d = get_dirp(fi);
-  closedir(d->dp);
-  free(d);
-
-  if (VERBOSE_BLOCKMAPFS > 2) {
-    fprintf(stdout, "bmfs_releasedir() exit for \"%s\".\n", pathname);
-  }
-
-  return 0;
+  pthread_mutex_destroy(&directory->lock);
+  free(directory);
+  return result;
 }
 
 
 int main(int argc, char *argv[]) {
-  umask(0);
-  char **newargv;
-  char *mnt;
-  char *root;
+  BmfsState state = {
+      .root_fd = -1,
+  };
+  char *fuse_argv[6];
+  bool contains;
+  int check_result;
+  int fuse_argc = 0;
+  int lock_result;
+  int mount_fd = -1;
+  int result = EXIT_FAILURE;
 
 #if DISABLE_COLOR > 0
   DISABLE_ALL_COLOR;
@@ -984,50 +1314,62 @@ int main(int argc, char *argv[]) {
 
   blockmapfs_logo();
   fprintf(stderr, "%s", BLUE);
-  fprintf(stderr, BLOCKMAPFS_BANNER_STRING);
+  fprintf(stderr, BLOCKMAPFS_BANNER_STRING, SCALPEL_VERSION);
   fprintf(stderr, "%s", BLACK);
   fprintf(stderr, "\n\n");
 
-  if ((argc != 3) || (argv[argc - 2][0] == '-') || (argv[argc - 1][0] == '-')) {
+  if (argc != 3 || argv[1][0] == '-' || argv[2][0] == '-') {
     fprintf(stderr, "%s", BLUE);
     fprintf(stderr, "Usage: blockmapfs mnt root\n\n");
     fprintf(stderr, "%s", BLACK);
-    return -1;
-  }
-  else {
-    mnt = realpath(argv[argc - 2], NULL);
-    root = realpath(argv[argc - 1], NULL);
-    if (! mnt) {
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Specified mount point not found, aborting.\n");
-      fprintf(stderr, "%s", BLACK);
-      return -1;
-    }
-    else if (! root) {
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Specified root directory not found, aborting.\n");
-      fprintf(stderr, "%s", BLACK);
-      return -1;
-    }
-    else {
-      if (snprintf(MOUNTDIR, sizeof(MOUNTDIR), "%s/", mnt) >= (int)sizeof(MOUNTDIR) ||
-          snprintf(ROOTDIR, sizeof(ROOTDIR), "%s/", root) >= (int)sizeof(ROOTDIR)) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Resolved paths too long, aborting.\n");
-        fprintf(stderr, "%s", BLACK);
-        free(mnt);
-        free(root);
-        return -1;
-      }
-      free(mnt);
-      free(root);
-    }
+    return EXIT_FAILURE;
   }
 
-  // initialize global hash table that maps pathnames to File
-  // structures. This is required for FUSE callbacks that don't pass
-  // the struct fuse_file_info argument, which is used to maintain
-  // info about open files.
+  state.mount_path = realpath(argv[1], NULL);
+  if (! state.mount_path) {
+    fprintf(stderr, "%sSpecified mount point is unavailable: %s.%s\n",
+            RED, strerror(errno), BLACK);
+    goto done;
+  }
+  state.root_path = realpath(argv[2], NULL);
+  if (! state.root_path) {
+    fprintf(stderr, "%sSpecified root directory is unavailable: %s.%s\n",
+            RED, strerror(errno), BLACK);
+    goto done;
+  }
+  mount_fd = open(state.mount_path,
+                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (mount_fd < 0) {
+    fprintf(stderr, "%sCould not open the mount point: %s.%s\n",
+            RED, strerror(errno), BLACK);
+    goto done;
+  }
+  state.root_fd = open(state.root_path,
+                       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (state.root_fd < 0) {
+    fprintf(stderr, "%sCould not open the root directory: %s.%s\n",
+            RED, strerror(errno), BLACK);
+    goto done;
+  }
+
+  check_result = bmfs_directory_contains(state.root_fd, mount_fd, &contains);
+  if (! check_result && ! contains) {
+    check_result =
+        bmfs_directory_contains(mount_fd, state.root_fd, &contains);
+  }
+  if (check_result) {
+    fprintf(stderr, "%sCould not validate directory ancestry: %s.%s\n",
+            RED, strerror(-check_result), BLACK);
+    goto done;
+  }
+  if (contains) {
+    fprintf(stderr,
+            "%sMount point and root directory must not overlap.%s\n",
+            RED, BLACK);
+    goto done;
+  }
+  close(mount_fd);
+  mount_fd = -1;
 
   oa_key_ops oa_key_ops_file = {
       .hash = oa_string_hash,
@@ -1038,42 +1380,55 @@ int main(int argc, char *argv[]) {
       .size_of = oa_string_sizeof};
 
   oa_val_ops oa_val_ops_file = {
-      .cp = oa_File_cp,
-      .free = oa_File_free,
+      .cp = oa_cached_file_cp,
+      .free = oa_cached_file_free,
       .serialize = NULL,
       .size_of = NULL};
 
-  HASHTABLE = oa_hash_new(oa_key_ops_file, oa_val_ops_file);
-
-  // construct new argv[] for fuse_main that turns off multithreading
-  // and provides mount point.
-  //
-  // Multithreading likely won't result in much improvement for the
-  // typical use cases for blockmapfs, and would require locks to
-  // protect hash table and blockmap updates, which would tremendously
-  // complicate the design.  Thus: DO NOT remove the "-s" or very bad
-  // things will happen, as the current FUSE callback functions and
-  // hash table implementation are NOT thread-safe.
+  state.cache = oa_hash_new(oa_key_ops_file, oa_val_ops_file);
+  if (! state.cache) {
+    fprintf(stderr, "%sCould not allocate the blockmap cache.%s\n",
+            RED, BLACK);
+    goto done;
+  }
+  lock_result = pthread_mutex_init(&state.cache_load_lock, NULL);
+  if (lock_result) {
+    fprintf(stderr, "%sCould not initialize the blockmap cache: %s.%s\n",
+            RED, strerror(lock_result), BLACK);
+    goto done;
+  }
 
   fprintf(stdout, "%s", BLUE);
-  fprintf(stdout, "Greetings from the blockmapfs filesystem on mount point \n\"%s\" with source \n\"%s\".\n",
-          MOUNTDIR, ROOTDIR);
+  fprintf(stdout,
+          "Greetings from the blockmapfs filesystem on mount point\n"
+          "\"%s\" with source\n\"%s\".\n",
+          state.mount_path, state.root_path);
   fprintf(stdout, "%s", BLACK);
 
-  newargv = malloc(sizeof(char *) * (VERBOSE_BLOCKMAPFS ? 4 : 3));
-  newargv[0] = argv[0];
-  newargv[1] = "-s";
-
-  if (! VERBOSE_BLOCKMAPFS) {
-    newargv[2] = MOUNTDIR;
+  // mount read-only and let FUSE use its normal multithreaded dispatcher.
+  fuse_argv[fuse_argc++] = argv[0];
+  fuse_argv[fuse_argc++] = "-o";
+  fuse_argv[fuse_argc++] = "ro,default_permissions";
+  if (VERBOSE_BLOCKMAPFS) {
+    fuse_argv[fuse_argc++] = VERBOSE_BLOCKMAPFS < 3 ? "-f" : "-d";
   }
-  else {
-    newargv[2] = VERBOSE_BLOCKMAPFS < 3 ? "-f" : "-d";
-    newargv[3] = MOUNTDIR;
+  fuse_argv[fuse_argc++] = state.mount_path;
+  fuse_argv[fuse_argc] = NULL;
+
+  fflush(NULL);
+  result = fuse_main(fuse_argc, fuse_argv, &bmfs_operations, &state);
+
+  pthread_mutex_destroy(&state.cache_load_lock);
+done:
+  oa_hash_free(&state.cache);
+  if (mount_fd >= 0) {
+    close(mount_fd);
   }
-
-  return fuse_main(VERBOSE_BLOCKMAPFS ? 4 : 3 /*argc*/, newargv, &bmfs_operations, NULL);
-
-  oa_hash_free(&HASHTABLE);
+  if (state.root_fd >= 0) {
+    close(state.root_fd);
+  }
+  free(state.root_path);
+  free(state.mount_path);
+  return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 

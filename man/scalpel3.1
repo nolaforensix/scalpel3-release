@@ -12,12 +12,13 @@ scalpel3 \- Recover contiguous or fragmented data from an image file
 [\fB-c\fR]
 [\fB-C\fR]
 [\fB-d\fR]
+[\fB-D\fR \fIdisposition:filetype[,filetype]...\fR]
 [\fB-e\fR \fI#\fR]
 [\fB-F\fR \fIsecs\fR]
 [\fB-g\fR \fI#\fR]
 [\fB-G\fR \fI#\fR]
 [\fB-h\fR]
-[\fB-H\fR]
+[\fB-H\fR \fIphase\fR]
 [\fB-i\fR \fI#\fR]
 [\fB-I\fR \fIsecs\fR]
 [\fB-j\fR \fI#\fR]
@@ -42,6 +43,8 @@ scalpel3 \- Recover contiguous or fragmented data from an image file
 [\fB-V\fR]
 [\fB-w\fR]
 [\fB-x\fR]
+[\fB-y\fR \fItrue|false\fR]
+[\fB-Y\fR \fIprovider[:devicelist]\fR]
 [\fB-z\fR \fIfiletype[,filetype]...\fR]
 img_filename
 blockmap_filename
@@ -54,6 +57,9 @@ storage device), based on file type-specific configurations.
 .SH OPTIONS
 .PP
 The following options are available:
+Numeric arguments must be unsigned base-10 integers containing digits only;
+signs, whitespace, suffixes, and values outside the documented range are
+rejected.
 
 .TP
 .B -a
@@ -76,8 +82,10 @@ Don't backtrack.  Default is backtracking on.  Useful only for debugging.
 
 .TP
 .B -c
-Don't attempt fragmented recovery for any supported file type. This essentially sets NO_DEFRAG to true for all
-file types.
+Don't attempt fragmented recovery for any supported file type. This essentially
+sets NO_DEFRAG to true for all file types. Block validators declared to support
+only reassembly are skipped. MoDiCo remains independently controlled by
+\fB-y\fR.
 
 .TP
 .B -C
@@ -88,6 +96,19 @@ don't support Unix domain sockets. Default is on.
 .B -d
 Turn off header reuse for contiguous files.  Default is on and you should
 generally leave this on.
+
+.TP
+.BI -D " disposition:filetype[,filetype]..."
+Override when block validation runs for one or more file types.
+\fBalways\fR runs the configured validator in all recovery modes,
+\fBreassembly\fR skips it under \fB-c\fR, and \fBdisabled\fR never runs it.
+For example, use \fB-D disabled:ELF\fR or
+\fB-D reassembly:PNG,GIF\fR. This option may be specified more than once.
+Repeating the same assignment is harmless, but conflicting assignments for
+the same file type are rejected. The settings are checkpointed and cannot be
+changed during checkpoint restore. When a validator does not run, confidence
+values supplied by MoDiCo are preserved and any remaining unclassified
+values default to valid.
 
 .TP
 .BI -e " #"
@@ -118,8 +139,14 @@ Set reassembly gallop limit.
 Print this help message and then exit.
 
 .TP
-.B -H
-Write header/footer database and then exit.
+.BI -H " phase"
+Stop after the required phase.  The supported phases are
+\fBblock-validation\fR and \fBheader-footer\fR.
+\fB-H block-validation\fR runs MoDiCo and all regular block validators,
+writes \fIblockclassification.dat\fR, and exits before header/footer
+searching.  \fB-H header-footer\fR performs the same block-validation phase,
+then writes \fIheadersfooters.dat\fR and exits.  The latter mode therefore
+produces both databases.  This option is not compatible with \fB-c\fR.
 
 .TP
 .BI -i " #"
@@ -164,7 +191,14 @@ should generally be left on.
 
 .TP
 .BI -o " scalpel_output_dir"
-Set output directory for carved files.
+Set output directory for carved files. Only one active scalpel3 process may
+use an output directory at a time. Scalpel3 enforces this with a persistent
+\fI.scalpel3.lock\fR file in the base output directory. The file may remain
+after Scalpel3 exits; only its operating-system lock, not its presence,
+indicates that an invocation is active. Newly created Scalpel3 directories
+and files are accessible only to the invoking user (modes 0700 and 0600,
+respectively). Permissions may be changed externally when output must be
+shared.
 
 .TP
 .B -O
@@ -182,7 +216,8 @@ primarily for debugging, as it adds substantial overhead.
 
 .TP
 .BI -q " clustersize"
-Specify block/cluster size. Default is 512 bytes. Must be a multiple of 512.
+Specify block/cluster size. Default is 512 bytes. Must be between 512 and
+1073741824 bytes, inclusive, and a multiple of 512.
 
 .TP
 .B -R
@@ -234,16 +269,81 @@ Override checkpoint integrity checks. Use this only if you know what you're doin
 
 
 .TP
+.BI -y " true|false"
+Explicitly enable or disable MoDiCo block prioritization. MoDiCo is enabled by
+default; use \fB-y false\fR to disable it. This option is checkpointed and
+cannot be changed during checkpoint restore.
+
+.TP
+.BI -Y " provider[:devicelist]"
+Select the ONNX execution provider (and GPUs) used by all AI components for
+this run: \fBcpu\fR, \fBcuda\fR, \fBcoreml\fR, or \fBauto\fR, with an optional
+CUDA device list, e.g. \fB-Y cuda:0,2\fR. The default (\fBauto\fR) uses all
+healthy NVIDIA GPUs, CoreML on Apple Silicon, and CPU when no accelerator is
+present. A requested or detected accelerator that cannot be initialized is a
+fatal error rather than a silent CPU run; use \fB-Y cpu\fR to intentionally
+select CPU inference. When the \fBCUDA_VISIBLE_DEVICES\fR environment variable is set, it
+filters and reorders the CUDA devices as usual, and \fB-Y\fR device ids name
+the visible devices. When \fB-Y\fR selects a proper subset of the GPUs,
+scalpel3 confines the whole process to those devices, so excluded GPUs are
+never touched, not even by runtime bookkeeping allocations.
+.sp
+On Apple Silicon, \fBcoreml\fR uses the matching graph-cut MoDiCo model by
+default.  \fBcoreml-legacy\fR selects the original MoDiCo model for comparison
+or rollback, and \fBcoreml-graphcut\fR explicitly requires the graph-cut model.
+These two selectors still use the normal CoreML provider for other AI
+components; they only change which MoDiCo artifact is loaded.
+
+
+.TP
 .BI -z " filetype[,filetype]..."
 Carve only one or more specified file types, e.g., \fB-z JPG\fR or
 \fB-z JPG,PNG\fR. This option may be specified more than once. Not compatible
 with \fB-U\fR.
+
+.SH OUTPUT DATABASES
+After block validation completes, scalpel3 atomically writes
+\fIblockclassification.dat\fR in the output directory.  It contains a
+versioned header, the block size and block count, the final file-type and
+subtype mapping, and the column-major block confidence table produced by
+MoDiCo and the regular block validators.  Duplicate blocks are represented by
+their exemplars in the associated blockmap.
+.PP
+The classification database is a persistent output artifact even when
+checkpointing is disabled.  Restartable checkpoints depend on this file and
+include it in checkpoint integrity verification; it must be retained with the
+checkpoint files for a later \fB-R\fR restore.
+.PP
+Restartable state is stored in two alternating checkpoint slots.  A new slot
+is written and verified completely before it is atomically published, and the
+previously published slot is retained as a fallback.  If publication is
+interrupted or the published slot fails verification, \fB-R\fR selects the
+newest valid slot.  The image blockmap is deliberately external to the
+checkpoint transaction so it may be updated independently; restored
+candidates are reconciled with the blockmap supplied to the resumed run.
+.PP
+After header/footer searching completes, scalpel3 writes
+\fIheadersfooters.dat\fR in the output directory.
 
 .SH CONFIGURATION FILE
 Unlike previous versions of scalpel, scalpel3 requires recompilation
 (and commonly, custom code) to support new file types.  The file
 "scalpelconf.c" contains configurations for the file types that are supported
 by scalpel3.  Please see this source file for more information.
+
+.SH ENVIRONMENT
+.TP
+.B SCALPEL3_HOME
+Set this to the base scalpel3 directory so runtime resources, including AI
+models, can be located.  It does not select the executable: checkpoint
+compatibility uses the hash of the scalpel3 binary that is actually running.
+This variable is not required for the informational \fB-h\fR, \fB-L\fR, and
+\fB-V\fR options.
+
+.SH EXIT STATUS
+Returns zero after successful carving and for the informational \fB-h\fR,
+\fB-L\fR, and \fB-V\fR options.  Returns nonzero when an error prevents or
+terminates execution.
 
 .SH AUTHORS
 The scalpel3 backend and toolchain as well as some of the block/file validators were written by

@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -1180,16 +1180,14 @@ static int64_t file_123_reassembly_get_block_choice(CarveInfo *candidate,
   initial_start = start;
 
   while (!done) {
-
+    block_choice = blockvector_get_choice(candidate->b, logical_slot_index, start,
+                                          filemirror_apparent_blocks(scalpel_state.filemirror), &evaluated);
 
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
     BLK_examined += evaluated;
 #endif
 
-
-    if ((block_choice =
-         blockvector_get_choice(candidate->b,
-                                logical_slot_index, start,  filemirror_apparent_blocks(scalpel_state.filemirror), &evaluated)) == -1) {
+    if (block_choice == -1) {
       if (!wrapped && initial_start > 0) {
         wrapped = true;
         start = 0;
@@ -1254,7 +1252,8 @@ static int64_t file_123_reassembly_get_block_choice(CarveInfo *candidate,
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
   // update block selection performance stats
   clock_gettime(CLOCK_MONOTONIC, &BLK_endtime);
-  uint64_t BLK_elapsed = (BLK_endtime.tv_sec - BLK_starttime.tv_sec) * 1e9 + (BLK_endtime.tv_nsec - BLK_starttime.tv_nsec);
+  uint64_t BLK_elapsed = (BLK_endtime.tv_sec - BLK_starttime.tv_sec) * NANOSECONDS_PER_SECOND
+                         + (BLK_endtime.tv_nsec - BLK_starttime.tv_nsec);
 
 
   atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].BLK_calls, 1, memory_order_acq_rel);

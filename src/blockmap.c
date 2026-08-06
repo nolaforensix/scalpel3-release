@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the GNU General Public
 // License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
@@ -683,7 +683,12 @@ bool write_blockmap(Blockmap *blockmap, FILE *blockmapfile) {
     goto done;
   }
 
-  fflush(blockmapfile);
+  if (fflush(blockmapfile) != 0) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Failed to flush blockmap file.\n");
+    fprintf(stderr, "%s", BLACK);
+    ret = false;
+  }
 
 done:
   return ret;
@@ -733,6 +738,12 @@ done:
     int h = -1;
     bool ret = false;
 
+    if (! blockmap) {
+      return false;
+    }
+
+    *blockmap = NULL;
+
     // use a duplicate so fclose(fp) does not close the caller's handle
     h = dup(handle);
     if (h < 0) {
@@ -745,10 +756,11 @@ done:
       goto done;
     }
 
-    ret = read_blockmap(blockmap, fp, false);
+    ret = read_blockmap(blockmap, fp);
 
     // always close stream to release stdio buffers/descriptors
     if (fclose(fp) != 0) {
+      free_blockmap(blockmap);
       ret = false;
     }
     fp = NULL;
@@ -758,19 +770,162 @@ done:
   }
 
 
-// allocate a new blockmap and read blockmap data from open file descriptor 'blockmapfile'. If 'sanity_check' is set,
-// the size of the blockmap file is scrutized for consistency.
+static bool checked_add_u64(uint64_t left, uint64_t right, uint64_t *result) {
+
+  if (left > UINT64_MAX - right) {
+    return false;
+  }
+
+  *result = left + right;
+  return true;
+}
+
+
+static bool checked_multiply_u64(uint64_t left, uint64_t right, uint64_t *result) {
+
+  if (left && right > UINT64_MAX / left) {
+    return false;
+  }
+
+  *result = left * right;
+  return true;
+}
+
+
+static bool calculate_blockmap_layout(uint64_t numblocks, uint64_t *bitmap_length, uint64_t *serialized_size) {
+
+  uint64_t component_size;
+  uint64_t size = sizeof(uint32_t) + 3 * sizeof(uint64_t);
+
+  if (! numblocks) {
+    return false;
+  }
+
+  *bitmap_length = numblocks / 8 + (numblocks % 8 != 0);
+
+  // reject dimensions that cannot be represented by the allocation or serialization APIs
+  if (numblocks > SIZE_MAX / sizeof(atomic_llong) ||
+      *bitmap_length > SIZE_MAX / sizeof(atomic_uchar)) {
+    return false;
+  }
+
+  if (! checked_multiply_u64(*bitmap_length, 4 * sizeof(atomic_uchar), &component_size) ||
+      ! checked_add_u64(size, component_size, &size) ||
+      ! checked_multiply_u64(numblocks, sizeof(int64_t), &component_size) ||
+      ! checked_add_u64(size, component_size, &size) ||
+      ! checked_add_u64(size, component_size, &size)) {
+    return false;
+  }
+
+  *serialized_size = size;
+  return true;
+}
+
+
+static bool validate_blockmap_contents(Blockmap *blockmap) {
+
+  int64_t reference;
+
+  for (uint64_t i = 0; i < blockmap->numblocks; i++) {
+    bool deduplicated = is_bit_set(blockmap->dedupmap, i);
+    bool exemplar = is_bit_set(blockmap->exemplarmap, i);
+    int64_t reservation = atomic_load_explicit(&blockmap->reservations[i], memory_order_acquire);
+
+    if (exemplar && ! deduplicated) {
+      fprintf(stderr, "%s", RED);
+      fprintf(stderr,
+              "Invalid deduplication state for block %" PRIu64
+              " in blockmap file--an exemplar must also be marked deduplicated.\n",
+              i);
+      fprintf(stderr, "%s", BLACK);
+      return false;
+    }
+
+    if (reservation < 0) {
+      fprintf(stderr, "%s", RED);
+      fprintf(stderr, "Invalid negative reservation count for block %" PRIu64 " in blockmap file.\n", i);
+      fprintf(stderr, "%s", BLACK);
+      return false;
+    }
+
+    if (! deduplicated) {
+      continue;
+    }
+
+    reference = atomic_load_explicit(&blockmap->refcounts[i], memory_order_acquire);
+
+    if (exemplar) {
+      if (reference < 0 || (uint64_t)reference > blockmap->numblocks) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr, "Invalid reference count for exemplar block %" PRIu64 " in blockmap file.\n", i);
+        fprintf(stderr, "%s", BLACK);
+        return false;
+      }
+    }
+    else {
+      if (reference < 0 || (uint64_t)reference >= blockmap->numblocks) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr, "Invalid exemplar reference for block %" PRIu64 " in blockmap file.\n", i);
+        fprintf(stderr, "%s", BLACK);
+        return false;
+      }
+
+      if (! is_bit_set(blockmap->dedupmap, (uint64_t)reference) ||
+          ! is_bit_set(blockmap->exemplarmap, (uint64_t)reference)) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr,
+                "Invalid exemplar reference for block %" PRIu64
+                " in blockmap file--block %" PRId64 " is not an exemplar.\n",
+                i, reference);
+        fprintf(stderr, "%s", BLACK);
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+
+// allocate a new blockmap and read blockmap data from 'blockmapfile'. Exact serialized size is enforced for regular files;
+// streams receive the same header and content validation without a file-size check.
 //
 // THIS FUNCTION IS NOT THREAD-SAFE.
-bool read_blockmap(Blockmap **blockmap, FILE *blockmapfile, bool sanity_check) {
+bool read_blockmap(Blockmap **blockmap, FILE *blockmapfile) {
 
   uint64_t numblocks;
+  uint64_t start_block;
+  uint64_t end_block;
+  uint64_t bitmap_length;
+  uint64_t serialized_size;
   uint32_t blocksize;
-
   struct stat s;
-  bool ret = true;
+  bool regular_file;
+  bool ret = false;
 
-  fseek(blockmapfile, 0, SEEK_SET);
+  if (! blockmap || ! blockmapfile) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Invalid blockmap input.\n");
+    fprintf(stderr, "%s", BLACK);
+    return false;
+  }
+
+  *blockmap = NULL;
+
+  if (fstat(fileno(blockmapfile), &s)) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Failed to fstat() on blockmap input.\n");
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
+
+  regular_file = S_ISREG(s.st_mode);
+  if (regular_file && fseek(blockmapfile, 0, SEEK_SET)) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Failed to seek to the beginning of blockmap file.\n");
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
 
   // get blocksize from blockmap file
   if (fread(&blocksize, sizeof(uint32_t), 1, blockmapfile) != 1) {
@@ -781,11 +936,10 @@ bool read_blockmap(Blockmap **blockmap, FILE *blockmapfile, bool sanity_check) {
     goto done;
   }
 
-  if (blocksize % 512) {
+  if (blocksize < 512 || blocksize % 512) {
     fprintf(stderr, "%s", RED);
-    fprintf(stderr, "Invalid blocksize in blockmap file--file may be corrupted.\n");
+    fprintf(stderr, "Invalid blocksize in blockmap file--it must be at least 512 and a multiple of 512.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
@@ -794,137 +948,128 @@ bool read_blockmap(Blockmap **blockmap, FILE *blockmapfile, bool sanity_check) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read numblocks from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
-    goto done;
-  }
-
-  // stat() blockmap file to get length
-  if (fstat(fileno(blockmapfile), &s)) {
-    fprintf(stderr, "%s", RED);
-    fprintf(stderr, "Failed to fstat() on blockmap file.\n");
-    fprintf(stderr, "%s", BLACK);
-    ret = false;
-    goto done;
-  }
-
-  // allocate new blockmap
-  if (! allocate_blockmap(blockmap, blocksize, numblocks)) {
-    fprintf(stderr, "%s", RED);
-    fprintf(stderr, "Memory exhausted while allocating blockmap.\n");
-    fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
   // get window start block
-  if (fread(&((*blockmap)->start_block), sizeof(uint64_t), 1, blockmapfile) != 1) {
+  if (fread(&start_block, sizeof(uint64_t), 1, blockmapfile) != 1) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read start block from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
   // get window end block
-  if (fread(&((*blockmap)->end_block), sizeof(uint64_t), 1, blockmapfile) != 1) {
+  if (fread(&end_block, sizeof(uint64_t), 1, blockmapfile) != 1) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read end block from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
-  if (sanity_check) {
-    // blockmap file contains blocksize + numblocks + start_block + end_block + coveragemap + dedupmap + exemplarmap +
-    // zeromap + refcounts table--do sanity check on size before proceeding
-    if (s.st_size != (off_t)(sizeof(uint32_t) +                            // blocksize
-                             sizeof(uint64_t) +                            // number of blocks
-                             sizeof(uint64_t) +                            // start block
-                             sizeof(uint64_t) +                            // end block
-                             (*blockmap)->bitmap_length * 4 +              // C, D, E, Z
-                             (*blockmap)->numblocks * sizeof(int64_t) +    // T
-                             (*blockmap)->numblocks * sizeof(int64_t))) {  // refcount
-      fprintf(stderr, "%s", RED);
-      fprintf(stderr,
-              "Something is wrong with the blockmap file! "
-              "File size should be %" PRIu64 ", not %" PRIu64 ".\n",
-              (uint64_t)(sizeof(uint32_t) +
-                         sizeof(uint64_t) +
-                         sizeof(uint64_t) +
-                         sizeof(uint64_t) +
-                         (*blockmap)->bitmap_length * 4 +
-                         (*blockmap)->numblocks * sizeof(int64_t) +
-                         (*blockmap)->numblocks * sizeof(int64_t)),
-              (uint64_t)s.st_size);
-      fprintf(stderr, "%s", BLACK);
-      free_blockmap(blockmap);
-      ret = false;
-      goto done;
-    }
+  if (! numblocks) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Invalid number of blocks in blockmap file--it must be greater than zero.\n");
+    fprintf(stderr, "%s", BLACK);
+    goto done;
   }
+
+  if (! calculate_blockmap_layout(numblocks, &bitmap_length, &serialized_size)) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Blockmap dimensions are too large to represent safely.\n");
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
+
+  if (start_block > end_block || end_block >= numblocks) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr,
+            "Invalid active carve window %" PRIu64 "-%" PRIu64 " for a blockmap containing %" PRIu64 " blocks.\n",
+            start_block, end_block, numblocks);
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
+
+  // compare the complete serialized length before allocating any blockmap arrays
+  if (regular_file && (s.st_size < 0 || (uintmax_t)s.st_size != serialized_size)) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr,
+            "Something is wrong with the blockmap file! File size should be %" PRIu64 ", not %" PRIdMAX ".\n",
+            serialized_size, (intmax_t)s.st_size);
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
+
+  // allocate new blockmap only after its complete layout has been validated
+  if (! allocate_blockmap(blockmap, blocksize, numblocks)) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Memory exhausted while allocating blockmap.\n");
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
+
+  (*blockmap)->start_block = start_block;
+  (*blockmap)->end_block = end_block;
 
   // get coveragemap, dedup map, exemplarmap, zeromap, and reference counts
   if (fread((*blockmap)->coveragemap, sizeof(atomic_uchar), (*blockmap)->bitmap_length, blockmapfile) !=
       (size_t)(*blockmap)->bitmap_length) {
-    free_blockmap(blockmap);
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read coverage map from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
   if (fread((*blockmap)->dedupmap, sizeof(atomic_uchar), (*blockmap)->bitmap_length, blockmapfile) !=
       (size_t)(*blockmap)->bitmap_length) {
-    free_blockmap(blockmap);
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read dedup map from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
   if (fread((*blockmap)->exemplarmap, sizeof(atomic_uchar), (*blockmap)->bitmap_length, blockmapfile) !=
       (size_t)(*blockmap)->bitmap_length) {
-    free_blockmap(blockmap);
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read exemplar map from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
   if (fread((*blockmap)->zeromap, sizeof(atomic_uchar), (*blockmap)->bitmap_length, blockmapfile) !=
       (size_t)(*blockmap)->bitmap_length) {
-    free_blockmap(blockmap);
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read zero map from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
   if (fread((*blockmap)->reservations, sizeof(int64_t), (*blockmap)->numblocks, blockmapfile) !=
       (size_t)(*blockmap)->numblocks) {
-    free_blockmap(blockmap);
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read reservations map from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
   if (fread((*blockmap)->refcounts, sizeof(int64_t), (*blockmap)->numblocks, blockmapfile) !=
       (size_t)(*blockmap)->numblocks) {
-    free_blockmap(blockmap);
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to read refcounts map from blockmap file.\n");
     fprintf(stderr, "%s", BLACK);
-    ret = false;
     goto done;
   }
 
+  if (! validate_blockmap_contents(*blockmap)) {
+    goto done;
+  }
+
+  ret = true;
+
 done:
+  if (! ret) {
+    free_blockmap(blockmap);
+  }
   return ret;
 }
 
@@ -935,6 +1080,19 @@ done:
 bool allocate_blockmap(Blockmap **blockmap, uint32_t blocksize, uint64_t numblocks) {
 
   uint64_t i;
+  uint64_t bitmap_length;
+  uint64_t serialized_size;
+
+  if (! blockmap) {
+    return false;
+  }
+
+  *blockmap = NULL;
+
+  if (blocksize < 512 || blocksize % 512 ||
+      ! calculate_blockmap_layout(numblocks, &bitmap_length, &serialized_size)) {
+    return false;
+  }
 
   *blockmap = calloc(1, sizeof(Blockmap));
 
@@ -942,13 +1100,9 @@ bool allocate_blockmap(Blockmap **blockmap, uint32_t blocksize, uint64_t numbloc
     return false;
   }
 
-  if (numblocks == 0) {
-    goto die;
-  }
-
   (*blockmap)->numblocks = numblocks;
   (*blockmap)->blocksize = blocksize;
-  (*blockmap)->bitmap_length = ((*blockmap)->numblocks + 7) / 8;
+  (*blockmap)->bitmap_length = bitmap_length;
   (*blockmap)->start_block = 0;
   (*blockmap)->end_block = numblocks - 1;
 
@@ -1045,17 +1199,21 @@ bool clone_blockmap(Blockmap *src, Blockmap **dest) {
     d = *dest;
   }
 
-  *dest = d;
-  (*dest)->start_block = src->start_block;
-  (*dest)->end_block = src->end_block;
-  memcpy((*dest)->coveragemap, src->coveragemap, src->bitmap_length * sizeof(atomic_uchar));
-  memcpy((*dest)->dedupmap, src->dedupmap, src->bitmap_length * sizeof(atomic_uchar));
-  memcpy((*dest)->exemplarmap, src->exemplarmap, src->bitmap_length * sizeof(atomic_uchar));
-  memcpy((*dest)->zeromap, src->zeromap, src->bitmap_length * sizeof(atomic_uchar));
+  d->start_block = src->start_block;
+  d->end_block = src->end_block;
+  memcpy(d->coveragemap, src->coveragemap, src->bitmap_length * sizeof(atomic_uchar));
+  memcpy(d->dedupmap, src->dedupmap, src->bitmap_length * sizeof(atomic_uchar));
+  memcpy(d->exemplarmap, src->exemplarmap, src->bitmap_length * sizeof(atomic_uchar));
+  memcpy(d->zeromap, src->zeromap, src->bitmap_length * sizeof(atomic_uchar));
   if (! keep_dest_reservations) {
-    memcpy((*dest)->reservations, src->reservations, src->numblocks * sizeof(atomic_llong));
+    memcpy(d->reservations, src->reservations, src->numblocks * sizeof(atomic_llong));
   }
-  memcpy((*dest)->refcounts, src->refcounts, src->numblocks * sizeof(atomic_llong));
+  memcpy(d->refcounts, src->refcounts, src->numblocks * sizeof(atomic_llong));
+
+  // publish the fully-populated blockmap only after every field is copied, so a
+  // lock-free reader of a shadow blockmap never observes a half-initialized map
+  atomic_thread_fence(memory_order_release);
+  *dest = d;
 
 done:
   return ret;

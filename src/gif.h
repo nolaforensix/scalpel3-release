@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -84,13 +84,15 @@
 #define GIF_REASSEMBLY_VALIDATE_SLACK 16
 #define GIF_REASSEMBLY_WEAK_VALIDATION_BYTES 4
 #define GIF_REASSEMBLY_STRONG_WIN_BYTES 1024
-#define GIF_REASSEMBLY_SHARE_MIN_BLOCKS 8
 #define GIF_REASSEMBLY_LOCAL_DISTANCE_MAX 16
 #define GIF_REASSEMBLY_PRESTART_DISTANCE_MAX GIF_REASSEMBLY_LOCAL_DISTANCE_MAX
 #define GIF_REASSEMBLY_GAP_SCAN_WINDOW GIF_REASSEMBLY_LOCAL_DISTANCE_MAX
 #define GIF_REASSEMBLY_RETURN_SCAN_WINDOW 64
+#define GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS 4
 #define GIF_REASSEMBLY_LOOKAHEAD_LIMIT 64
-#define GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS 3
+#define GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS 8
+#define GIF_REASSEMBLY_PHASE_ANCHOR_BACKFILL \
+  (GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS - 1)
 #define GIF_REASSEMBLY_VALID_ANCHOR_BACKFILL 2
 #define GIF_REASSEMBLY_PREFIX_ANCHORS_BEFORE_BACKSCAN 512
 #define GIF_REASSEMBLY_ACTUAL_BACKSCAN_WINDOW 1048576
@@ -189,6 +191,7 @@ typedef struct GIFLZWState {
   uint8_t  sb_buf[256];         // buffered sub-block data (max 255 bytes)
   uint8_t  sb_buf_len;          // total bytes in buffer
   uint8_t  sb_buf_pos;          // next byte to read from buffer
+  bool     sb_truncated;        // candidate ended inside this sub-block
 
   // Output stack for decoding multi-pixel codes
   uint8_t  out_stack[GIF_LZW_MAX_CODES];
@@ -198,6 +201,37 @@ typedef struct GIFLZWState {
   bool     eof_reached;         // true after stream stop
   bool     saw_eoi;             // true only after a real EOI code
 } GIFLZWState;
+
+// Bound on the previous-scanline pixels stored inside a resume snapshot so the
+// carve state stays fixed-size. MAD-active snapshots after the first row are
+// retained only when the preceding row fits in this buffer.
+#define GIF_SNAP_PREV_ROW_MAX 4096
+
+// Ring of pending resume snapshots collected during one validation call, one
+// per block boundary crossed by the row decoder. Captured BEFORE a row
+// decodes, so each entry is exactly resumable at its row. done: persists the
+// newest entry at or below the block-aligned checkpoint position.
+#define GIF_SNAP_RING 4
+typedef struct GIFSnapPending {
+  bool     valid;
+  bool     mad_active;
+  bool     prev_row_present;
+  uint32_t next_row;
+  uint32_t frame_index;
+  uint64_t pos;
+  uint64_t record_pos;
+  uint64_t last_good_mad_pos;
+  uint64_t last_normal_pos;
+  double   running_mad_sum;
+  uint32_t mad_count;
+  int32_t  bad_mad_streak;
+  double   running_bpr_sum;
+  double   running_bpr_sq;
+  uint32_t bpr_count;
+  uint32_t prev_row_len;
+  GIFLZWState lzw;
+  uint8_t  prev_row[GIF_SNAP_PREV_ROW_MAX];
+} GIFSnapPending;
 
 // Carve state for GIF validation checkpointing. This struct is fixed-size with no pointers,
 // so memcpy() suffices for cloning. On each validator call, the saved prefix is verified via
@@ -241,16 +275,32 @@ typedef struct GIFCarveState {
   // palette-index fallback state
   int low_similarity_count;
   int first_low_row;
-  // LZW decoder state for intra-frame checkpointing.
-  // Work-sharing watermark for custom GIF reassembly. Sharing is only
-  // re-enabled after the candidate makes meaningful semantic progress.
-  bool share_score_valid;
-  uint32_t share_completed_frames;
-  uint64_t share_checkpoint_curpos;
-  uint64_t share_last_good_row_pos;
-  uint64_t share_last_normal_pos;
-  uint64_t share_data_length;
-  bool share_disabled;
+  // LZW decoder state for intra-frame checkpointing. A later validation
+  // call restores the decoder at snap_pos inside the frame whose image
+  // descriptor record starts at snap_record_pos, instead of re-decoding the
+  // frame's LZW stream from its first byte. Validity is guarded by an XXH3
+  // hash over data[0..snap_pos), independently of the frame-skip replay gate,
+  // so a snapshot survives even when later prefix bytes changed. All fields
+  // are fixed-size: the struct stays memcpy-clonable and raw-serializable.
+  bool     snap_valid;
+  bool     snap_mad_active;       // snapshot requires previous-row MAD state
+  bool     snap_prev_row_present;  // prev_row holds the row before snap_next_row
+  uint32_t snap_next_row;          // row index the resumed decode starts at
+  uint32_t snap_frame_index;       // ImageNum on entry to the snapshot frame
+  uint64_t snap_pos;               // decoder position (start of snap_next_row)
+  uint64_t snap_record_pos;        // position of the frame's 0x2C record byte
+  uint64_t snap_prefix_hash;       // XXH3 of data[0..snap_pos)
+  uint64_t snap_last_good_mad_pos; // per-frame detector anchors at snap_pos
+  uint64_t snap_last_normal_pos;
+  double   snap_running_mad_sum;
+  uint32_t snap_mad_count;
+  int32_t  snap_bad_mad_streak;
+  double   snap_running_bpr_sum;
+  double   snap_running_bpr_sq;
+  uint32_t snap_bpr_count;
+  uint32_t snap_prev_row_len;
+  GIFLZWState snap_lzw;
+  uint8_t  snap_prev_row[GIF_SNAP_PREV_ROW_MAX];
   bool reassembly_return_pending;
   int64_t reassembly_return_start;
   bool reassembly_return_actual_valid;
@@ -292,8 +342,7 @@ static inline void gif_validate_core(char *data, uint64_t length,
                                      uint32_t needleidx,
                                      uint32_t blocksize,
                                      void *carvehashkey,
-                                     GIFCarveState *direct_state,
-                                     bool save_checkpoint_hash);
+                                     GIFCarveState *direct_state);
 
 // the following structure is used to support reading GIF data for gif_lib from a memory buffer.
 typedef struct GIFMemIO {
@@ -380,6 +429,8 @@ static inline bool gif_reassembly_subblock_phase_from_data(
 static inline bool gif_reassembly_get_phase_hint(
     CarveInfo *candidate, GIFCarveState *state, uint32_t *offset_out,
     uint8_t *threshold_out);
+static inline bool gif_reassembly_block_matches_phase_transition(
+    int64_t apparentblocknumber, uint32_t offset);
 static inline bool gif_reassembly_block_matches_phase_hint(
     int64_t apparentblocknumber, uint32_t offset, uint8_t threshold);
 static inline bool gif_reassembly_block_matches_phase_probe_hint(
@@ -488,7 +539,7 @@ static inline bool gif_reassembly_normalize_candidate(int id,
                       blockvector_get_data_length(candidate->b),
                       &cold_validates, &cold_validates_to, &cold_promising,
                       candidate->needleidx, scalpel_state.blocksize, NULL,
-                      &cold_state, false);
+                      &cold_state);
 
     validates = cold_validates;
     validates_to = cold_validates_to;
@@ -580,8 +631,6 @@ typedef struct GIFReassemblyFollowCache {
   bool has_followon;
 } GIFReassemblyFollowCache;
 
-#define GIF_REASSEMBLY_SHARE_PROGRESS_BYTES 512
-
 static inline void gif_reassembly_capture_score(CarveInfo *candidate,
                                                 GIFReassemblyScore *score);
 static inline void gif_reassembly_capture_score_from_state(
@@ -596,13 +645,6 @@ static inline uint64_t gif_reassembly_score_covered_length(
     const GIFReassemblyScore *score);
 static inline void gif_reassembly_clamp_nonvalidated_summary(
     uint64_t oldlength, GIFValidationSummary *summary);
-static inline bool gif_reassembly_should_share(CarveInfo *candidate,
-                                               uint64_t data_length);
-static inline void gif_reassembly_mark_shared(CarveInfo *candidate,
-                                              const GIFReassemblyScore *score,
-                                              uint64_t data_length);
-static inline bool gif_reassembly_share_disabled(CarveInfo *candidate);
-static inline void gif_reassembly_disable_share(CarveInfo *candidate);
 static inline void gif_reassembly_load_state_raw(CarveInfo *candidate,
                                                  GIFCarveState *state);
 static inline void gif_reassembly_load_state(CarveInfo *candidate,
@@ -613,7 +655,6 @@ static inline void gif_reassembly_store_state_impl(
     CarveInfo *candidate, const GIFCarveState *state, int caller_line);
 #define gif_reassembly_store_state(candidate, state) \
   gif_reassembly_store_state_impl((candidate), (state), __LINE__)
-static inline void gif_reassembly_maybe_share(int id, CarveInfo *candidate);
 static inline void gif_reassembly_validate_local(
     CarveInfo *candidate, GIFCarveState *state,
     GIFValidationSummary *summary);
@@ -951,13 +992,6 @@ static inline void gif_reassembly_copy_runtime_fields(
     return;
   }
 
-  dst->share_score_valid = src->share_score_valid;
-  dst->share_completed_frames = src->share_completed_frames;
-  dst->share_checkpoint_curpos = src->share_checkpoint_curpos;
-  dst->share_last_good_row_pos = src->share_last_good_row_pos;
-  dst->share_last_normal_pos = src->share_last_normal_pos;
-  dst->share_data_length = src->share_data_length;
-  dst->share_disabled = src->share_disabled;
   dst->reassembly_return_pending = src->reassembly_return_pending;
   dst->reassembly_return_start = src->reassembly_return_start;
   dst->reassembly_return_actual_valid =
@@ -1333,20 +1367,6 @@ static inline void gif_reassembly_clamp_state_to_length(
     state->probe_last_normal_pos = data_length;
   }
 
-  if (state->share_checkpoint_curpos > data_length) {
-    state->share_checkpoint_curpos = data_length;
-    state->share_score_valid = false;
-  }
-  if (state->share_last_good_row_pos > data_length) {
-    state->share_last_good_row_pos = data_length;
-  }
-  if (state->share_last_normal_pos > data_length) {
-    state->share_last_normal_pos = data_length;
-  }
-  if (state->share_data_length > data_length) {
-    state->share_data_length = data_length;
-  }
-
   if (state->last_good_row_pos < state->checkpoint_curpos) {
     state->last_good_row_pos = state->checkpoint_curpos;
   }
@@ -1358,12 +1378,6 @@ static inline void gif_reassembly_clamp_state_to_length(
   }
   if (state->probe_last_normal_pos < state->probe_checkpoint_curpos) {
     state->probe_last_normal_pos = state->probe_checkpoint_curpos;
-  }
-  if (state->share_last_good_row_pos < state->share_checkpoint_curpos) {
-    state->share_last_good_row_pos = state->share_checkpoint_curpos;
-  }
-  if (state->share_last_normal_pos < state->share_checkpoint_curpos) {
-    state->share_last_normal_pos = state->share_checkpoint_curpos;
   }
 }
 
@@ -1444,36 +1458,109 @@ static inline bool gif_reassembly_debug_candidate(CarveInfo *candidate) {
 
 static inline void gif_reassembly_validate_local_impl(
     CarveInfo *candidate, GIFCarveState *state,
-    GIFValidationSummary *summary, bool save_checkpoint_hash) {
+    GIFValidationSummary *summary) {
   GIFCarveState preserved = {0};
+  char *data = blockvector_get_data_pointer(candidate->b);
+  uint64_t data_length = blockvector_get_data_length(candidate->b);
+  bool snapshot_changed = false;
 
   memset(summary, 0, sizeof(*summary));
   if (state) {
     preserved = *state;
   }
 
-  gif_validate_core(blockvector_get_data_pointer(candidate->b),
-                    blockvector_get_data_length(candidate->b),
+  gif_validate_core(data, data_length,
                     &summary->validates, &summary->validates_to,
                     &summary->promising, candidate->needleidx,
-                    scalpel_state.blocksize, NULL, state,
-                    save_checkpoint_hash);
+                    scalpel_state.blocksize, NULL, state);
   if (state) {
     gif_reassembly_copy_runtime_fields(state, &preserved);
   }
   gif_reassembly_capture_score_from_state(state, &summary->score);
+
+  // Persist decoder snapshots independently of a trial's validation result.
+  // Only snapshot fields are merged:
+  //  - Checkpoint fields must NOT be persisted from failed trials. A trial
+  //    can advance reliable_pos into its own (wrong) trial block, and a
+  //    persisted checkpoint there lets the frame-skip replay structurally
+  //    skip re-validating that content on a later call, a false accept.
+  //    Checkpoints continue to persist only through the post-validate store.
+  //  - Snapshot reuse requires an exact prefix-hash match and complete
+  //    detector context. Every byte past snap_pos is still decoded and
+  //    detector-checked.
+  //  - Runtime scan/exhaustion bookkeeping is never touched here: overwriting
+  //    it with a trial's stale copy would re-open completed scans.
+  snapshot_changed = state && state->snap_valid
+      && (! preserved.snap_valid
+          || state->snap_pos != preserved.snap_pos
+          || state->snap_prefix_hash != preserved.snap_prefix_hash);
+  if (snapshot_changed) {
+    GIFCarveState *stored =
+        (GIFCarveState *)carve_get_state(candidate->carvehashkey);
+    GIFCarveState merged;
+    bool incoming_matches = false;
+    bool stored_matches = false;
+    bool put_needed = false;
+
+    if (stored) {
+      merged = *stored;
+    }
+    else {
+      memset(&merged, 0, sizeof(merged));
+    }
+    incoming_matches = state->snap_pos > 0
+        && state->snap_pos <= data_length
+        && XXH3_64bits(data, state->snap_pos) == state->snap_prefix_hash;
+    stored_matches = merged.snap_valid
+        && merged.snap_pos > 0
+        && merged.snap_pos <= data_length
+        && XXH3_64bits(data, merged.snap_pos) == merged.snap_prefix_hash;
+
+    // Prefer the furthest snapshot on the current branch. A farther snapshot
+    // from a different trial is not useful here, so replace it when its hash
+    // does not match this candidate even if the replacement is earlier.
+    if (incoming_matches
+        && (! stored_matches || state->snap_pos > merged.snap_pos)) {
+      merged.valid = true;
+      merged.snap_valid = true;
+      merged.snap_mad_active = state->snap_mad_active;
+      merged.snap_prev_row_present = state->snap_prev_row_present;
+      merged.snap_next_row = state->snap_next_row;
+      merged.snap_frame_index = state->snap_frame_index;
+      merged.snap_pos = state->snap_pos;
+      merged.snap_record_pos = state->snap_record_pos;
+      merged.snap_prefix_hash = state->snap_prefix_hash;
+      merged.snap_last_good_mad_pos = state->snap_last_good_mad_pos;
+      merged.snap_last_normal_pos = state->snap_last_normal_pos;
+      merged.snap_running_mad_sum = state->snap_running_mad_sum;
+      merged.snap_mad_count = state->snap_mad_count;
+      merged.snap_bad_mad_streak = state->snap_bad_mad_streak;
+      merged.snap_running_bpr_sum = state->snap_running_bpr_sum;
+      merged.snap_running_bpr_sq = state->snap_running_bpr_sq;
+      merged.snap_bpr_count = state->snap_bpr_count;
+      merged.snap_prev_row_len = state->snap_prev_row_len;
+      merged.snap_lzw = state->snap_lzw;
+      memcpy(merged.snap_prev_row, state->snap_prev_row,
+             sizeof(merged.snap_prev_row));
+      put_needed = true;
+    }
+    if (put_needed) {
+      carve_put_state(candidate->carvehashkey, &merged);
+    }
+    gif_free_carve_state((void **)&stored);
+  }
 }
 
 static inline void gif_reassembly_validate_local(
     CarveInfo *candidate, GIFCarveState *state,
     GIFValidationSummary *summary) {
-  gif_reassembly_validate_local_impl(candidate, state, summary, true);
+  gif_reassembly_validate_local_impl(candidate, state, summary);
 }
 
 static inline void gif_reassembly_validate_local_probe(
     CarveInfo *candidate, GIFCarveState *state,
     GIFValidationSummary *summary) {
-  gif_reassembly_validate_local_impl(candidate, state, summary, false);
+  gif_reassembly_validate_local_impl(candidate, state, summary);
 }
 
 static inline void gif_reassembly_refresh_candidate_state(
@@ -1671,45 +1758,6 @@ static inline bool gif_reassembly_promote_current_blocks(
 
   blockvector_set_data_length(candidate->b, saved_length);
   return false;
-}
-
-static inline void gif_reassembly_maybe_share(int id, CarveInfo *candidate) {
-  GIFReassemblyScore score = {0};
-  uint64_t data_length = blockvector_get_data_length(candidate->b);
-  int64_t saved_newblock;
-  uint64_t saved_best_validates_to;
-  int64_t saved_block_choice_start;
-  bool saved_fastpath;
-  bool saved_no_initial_block_extension;
-
-  if (! scalpel_state.share_reassembly
-      || gif_reassembly_share_disabled(candidate)
-      || ! gif_reassembly_should_share(candidate, data_length)) {
-    return;
-  }
-
-  gif_reassembly_capture_score(candidate, &score);
-  gif_reassembly_mark_shared(candidate, &score, data_length);
-  // GIF sharing should hand off only the committed frontier. The generic
-  // cloning path memcpy()s CarveInfo, so scrub transient tail-scan state
-  // before sharing and restore it afterward for the source candidate.
-  saved_newblock = candidate->newblock;
-  saved_best_validates_to = candidate->best_validates_to;
-  saved_block_choice_start = candidate->block_choice_start;
-  saved_fastpath = candidate->fastpath;
-  saved_no_initial_block_extension = candidate->no_initial_block_extension;
-
-  candidate->newblock = -1;
-  candidate->best_validates_to = data_length > 0 ? data_length - 1 : 0;
-  candidate->block_choice_start = 0;
-  candidate->fastpath = false;
-  candidate->no_initial_block_extension = false;
-  reassembly_share_work(id, candidate);
-  candidate->newblock = saved_newblock;
-  candidate->best_validates_to = saved_best_validates_to;
-  candidate->block_choice_start = saved_block_choice_start;
-  candidate->fastpath = saved_fastpath;
-  candidate->no_initial_block_extension = saved_no_initial_block_extension;
 }
 
 static inline int gif_reassembly_compare_score(const GIFReassemblyScore *lhs,
@@ -2347,7 +2395,6 @@ static inline int64_t gif_reassembly_giflike_run_start_choice(
     scan_start += apparent_blocks;
   }
   original_scan_start = scan_start;
-
   toconsider = scan_count > 0 ? scan_count : apparent_blocks;
   if (toconsider > apparent_blocks) {
     toconsider = apparent_blocks;
@@ -2479,7 +2526,7 @@ static inline int64_t gif_reassembly_valid_anchor_choice(
       }
 
       if (previous_apparentblocknumber >= 0
-          && apparentblocknumber >= original_scan_start
+          && apparentblocknumber > previous_apparentblocknumber
           && apparentblocknumber <= local_forward_cutoff) {
         continue;
       }
@@ -2516,7 +2563,7 @@ static inline int64_t gif_reassembly_valid_anchor_choice(
         }
 
         if (previous_apparentblocknumber >= 0
-            && candidate_apparent >= original_scan_start
+            && candidate_apparent > previous_apparentblocknumber
             && candidate_apparent <= local_forward_cutoff) {
           continue;
         }
@@ -2746,11 +2793,11 @@ static inline bool gif_reassembly_finalize_phase_hint(
 
 static inline bool gif_reassembly_scan_subblocks_for_phase(
     const unsigned char *data, uint64_t length, uint64_t *pos,
+    uint8_t *max_subblock_len, uint32_t *headers_seen,
     uint32_t *offset_out, uint8_t *threshold_out) {
-  uint8_t max_subblock_len = 0;
-  uint32_t headers_seen = 0;
 
-  if (!data || !pos || !offset_out || !threshold_out) {
+  if (!data || !pos || !max_subblock_len || !headers_seen
+      || !offset_out || !threshold_out) {
     return false;
   }
 
@@ -2763,11 +2810,11 @@ static inline bool gif_reassembly_scan_subblocks_for_phase(
       return false;
     }
 
-    if (subblock_len > max_subblock_len) {
-      max_subblock_len = subblock_len;
+    if (subblock_len > *max_subblock_len) {
+      *max_subblock_len = subblock_len;
     }
-    if (headers_seen < UINT32_MAX) {
-      headers_seen++;
+    if (*headers_seen < UINT32_MAX) {
+      (*headers_seen)++;
     }
 
     if (*pos > UINT64_MAX - 1U - (uint64_t)subblock_len) {
@@ -2777,7 +2824,7 @@ static inline bool gif_reassembly_scan_subblocks_for_phase(
 
     if (payload_end >= length) {
       return gif_reassembly_finalize_phase_hint(
-          payload_end - length, max_subblock_len, headers_seen,
+          payload_end - length, *max_subblock_len, *headers_seen,
           offset_out, threshold_out);
     }
 
@@ -2785,7 +2832,7 @@ static inline bool gif_reassembly_scan_subblocks_for_phase(
   }
 
   return gif_reassembly_finalize_phase_hint(
-      0, max_subblock_len, headers_seen, offset_out, threshold_out);
+      0, *max_subblock_len, *headers_seen, offset_out, threshold_out);
 }
 
 static inline bool gif_reassembly_subblock_phase_from_data(
@@ -2793,6 +2840,8 @@ static inline bool gif_reassembly_subblock_phase_from_data(
     uint8_t *threshold_out) {
   uint64_t pos = 13;
   uint64_t table_size;
+  uint8_t image_max_subblock_len = 0;
+  uint32_t image_headers_seen = 0;
 
   if (!data || !offset_out || !threshold_out || length < 13
       || data[0] != 'G' || data[1] != 'I' || data[2] != 'F') {
@@ -2815,12 +2864,16 @@ static inline bool gif_reassembly_subblock_phase_from_data(
     }
 
     if (marker == 0x21) {
+      uint8_t extension_max_subblock_len = 0;
+      uint32_t extension_headers_seen = 0;
+
       if (pos > UINT64_MAX - 2U || pos + 2U > length) {
         return false;
       }
       pos += 2U;
       if (gif_reassembly_scan_subblocks_for_phase(
-              data, length, &pos, offset_out, threshold_out)) {
+              data, length, &pos, &extension_max_subblock_len,
+              &extension_headers_seen, offset_out, threshold_out)) {
         return true;
       }
       continue;
@@ -2837,17 +2890,26 @@ static inline bool gif_reassembly_subblock_phase_from_data(
       if (packed & 0x80) {
         table_size = 3U * (1ULL << ((packed & 0x07) + 1));
         if (pos > UINT64_MAX - table_size || pos + table_size > length) {
-          return false;
+          if (pos > UINT64_MAX - table_size - 1U) {
+            return false;
+          }
+          return gif_reassembly_finalize_phase_hint(
+              pos + table_size + 1U - length,
+              image_max_subblock_len, image_headers_seen,
+              offset_out, threshold_out);
         }
         pos += table_size;
       }
 
       if (pos >= length) {
-        return false;
+        return gif_reassembly_finalize_phase_hint(
+            pos + 1U - length, image_max_subblock_len,
+            image_headers_seen, offset_out, threshold_out);
       }
       pos++;
       if (gif_reassembly_scan_subblocks_for_phase(
-              data, length, &pos, offset_out, threshold_out)) {
+              data, length, &pos, &image_max_subblock_len,
+              &image_headers_seen, offset_out, threshold_out)) {
         return true;
       }
       continue;
@@ -2912,6 +2974,11 @@ static inline bool gif_reassembly_block_matches_phase_hint(
     return false;
   }
 
+  if (gif_reassembly_block_matches_phase_transition(apparentblocknumber,
+                                                    offset)) {
+    return true;
+  }
+
   for (uint32_t hits = 0; hits < GIF_REASSEMBLY_PHASE_MIN_HEADERS; hits++) {
     unsigned char subblock_len = 0;
 
@@ -2929,6 +2996,73 @@ static inline bool gif_reassembly_block_matches_phase_hint(
   return true;
 }
 
+static inline bool gif_reassembly_block_matches_phase_transition(
+    int64_t apparentblocknumber, uint32_t offset) {
+  uint64_t pos = offset;
+
+  if (apparentblocknumber < 0
+      || scalpel_state.blocksize == 0
+      || offset >= scalpel_state.blocksize) {
+    return false;
+  }
+
+  for (uint32_t headers = 0;
+       headers < GIF_REASSEMBLY_PHASE_MIN_HEADERS; headers++) {
+    unsigned char subblock_len = 0;
+
+    if (pos >= scalpel_state.blocksize
+        || !get_apparent_block_bytes(scalpel_state.filemirror,
+                                     apparentblocknumber, pos, 1,
+                                     &subblock_len)) {
+      return false;
+    }
+
+    if (subblock_len == 0) {
+      unsigned char record[10] = {0};
+
+      pos++;
+      if (pos >= scalpel_state.blocksize
+          || !get_apparent_block_bytes(scalpel_state.filemirror,
+                                       apparentblocknumber, pos, 1,
+                                       record)) {
+        return false;
+      }
+
+      if (record[0] == 0x3B) {
+        return true;
+      }
+      if (record[0] == 0x21) {
+        if (pos + 2U > scalpel_state.blocksize
+            || !get_apparent_block_bytes(scalpel_state.filemirror,
+                                         apparentblocknumber, pos, 2,
+                                         record)) {
+          return false;
+        }
+        return record[1] == 0x01 || record[1] == 0xF9
+               || record[1] == 0xFE || record[1] == 0xFF;
+      }
+      if (record[0] == 0x2C) {
+        if (pos + sizeof(record) > scalpel_state.blocksize
+            || !get_apparent_block_bytes(scalpel_state.filemirror,
+                                         apparentblocknumber, pos,
+                                         sizeof(record), record)) {
+          return false;
+        }
+        return (record[5] != 0 || record[6] != 0)
+               && (record[7] != 0 || record[8] != 0);
+      }
+      return false;
+    }
+
+    if (pos > UINT64_MAX - 1U - (uint64_t)subblock_len) {
+      return false;
+    }
+    pos += 1U + (uint64_t)subblock_len;
+  }
+
+  return false;
+}
+
 static inline bool gif_reassembly_block_matches_phase_probe_hint(
     int64_t apparentblocknumber, uint32_t offset, uint8_t threshold) {
   uint64_t pos = offset;
@@ -2938,6 +3072,11 @@ static inline bool gif_reassembly_block_matches_phase_probe_hint(
       || scalpel_state.blocksize == 0
       || offset >= scalpel_state.blocksize) {
     return false;
+  }
+
+  if (gif_reassembly_block_matches_phase_transition(apparentblocknumber,
+                                                    offset)) {
+    return true;
   }
 
   for (uint32_t hits = 0; hits < GIF_REASSEMBLY_PHASE_PROBE_MIN_HEADERS;
@@ -3000,7 +3139,6 @@ static inline int64_t gif_reassembly_phase_choice(
     GIFCarveState *state, int64_t *resume_after_out) {
   int64_t apparent_blocks;
   int64_t toconsider;
-  int64_t original_scan_start;
   int64_t local_forward_cutoff = -1;
   uint32_t phase_offset = 0;
   uint8_t phase_threshold = 0;
@@ -3038,8 +3176,6 @@ static inline int64_t gif_reassembly_phase_choice(
   if (scan_start < 0) {
     scan_start += apparent_blocks;
   }
-  original_scan_start = scan_start;
-
   toconsider = scan_count > 0 ? scan_count : apparent_blocks;
   if (toconsider > apparent_blocks) {
     toconsider = apparent_blocks;
@@ -3081,7 +3217,7 @@ static inline int64_t gif_reassembly_phase_choice(
       }
 
       if (previous_apparentblocknumber >= 0
-          && apparentblocknumber >= original_scan_start
+          && apparentblocknumber > previous_apparentblocknumber
           && apparentblocknumber <= local_forward_cutoff) {
         continue;
       }
@@ -3272,33 +3408,6 @@ static inline void gif_reassembly_arm_actual_backscan(CarveInfo *candidate) {
   }
 }
 
-static inline bool gif_reassembly_score_advanced_enough(
-    const GIFReassemblyScore *current, const GIFReassemblyScore *saved) {
-  return current->completed_frames > saved->completed_frames;
-}
-
-static inline bool gif_reassembly_share_frontier_strong_enough(
-    const GIFReassemblyScore *current, uint64_t data_length) {
-  uint64_t slack = (uint64_t)scalpel_state.blocksize;
-  uint64_t covered;
-
-  if (data_length == 0) {
-    return false;
-  }
-
-  covered = current->checkpoint_curpos + 1;
-  if (covered < data_length && data_length - covered > slack) {
-    return false;
-  }
-
-  covered = current->last_normal_pos + 1;
-  if (covered < data_length && data_length - covered > slack) {
-    return false;
-  }
-
-  return true;
-}
-
 static inline uint64_t gif_reassembly_score_covered_length(
     const GIFReassemblyScore *score) {
   uint64_t covered = 0;
@@ -3361,139 +3470,6 @@ static inline void gif_reassembly_clamp_nonvalidated_summary(
   if (summary->validates_to + 1 > limit) {
     summary->validates_to = limit > 0 ? limit - 1 : 0;
   }
-}
-
-static inline bool gif_reassembly_should_share(CarveInfo *candidate,
-                                               uint64_t data_length) {
-  void *state = NULL;
-  GIFCarveState *gif_state = NULL;
-  GIFReassemblyScore current = {0};
-  GIFReassemblyScore saved = {0};
-  bool should_share = false;
-
-  if (! scalpel_state.share_reassembly
-      || candidate->clone
-      || candidate->cloned
-      || blockvector_get_num_blocks(candidate->b) < GIF_REASSEMBLY_SHARE_MIN_BLOCKS
-      || ! carve_hash_key_valid(candidate->carvehashkey)) {
-    return false;
-  }
-
-  gif_reassembly_capture_score(candidate, &current);
-  if (! gif_reassembly_share_frontier_strong_enough(&current, data_length)) {
-    return false;
-  }
-
-  state = carve_get_state(candidate->carvehashkey);
-  if (! state) {
-    return false;
-  }
-
-  gif_state = (GIFCarveState *)state;
-  if (! gif_state->valid) {
-    should_share = false;
-    goto done;
-  }
-
-  if (! gif_state->share_score_valid) {
-    // Initial sharing is only safe after the candidate has crossed a second
-    // completed-frame boundary. One-frame frontiers are still ambiguous on
-    // mixed GIF/ELF reproducers and can fork bad clones.
-    should_share = current.completed_frames > 1;
-    goto done;
-  }
-
-  saved.completed_frames = gif_state->share_completed_frames;
-  saved.checkpoint_curpos = gif_state->share_checkpoint_curpos;
-  saved.last_good_row_pos = gif_state->share_last_good_row_pos;
-  saved.last_normal_pos = gif_state->share_last_normal_pos;
-
-  // Re-share only after another completed frame has been proven. This keeps
-  // GIF work sharing from amplifying branches that only make weak intra-frame
-  // progress.
-  should_share =
-      gif_reassembly_score_advanced_enough(&current, &saved)
-      && data_length > gif_state->share_data_length
-      && data_length - gif_state->share_data_length
-             >= (uint64_t)scalpel_state.blocksize;
-
-done:
-  gif_free_carve_state(&state);
-  return should_share;
-}
-
-static inline bool gif_reassembly_share_disabled(CarveInfo *candidate) {
-  void *state = NULL;
-  GIFCarveState *gif_state = NULL;
-  bool disabled = false;
-
-  if (! carve_hash_key_valid(candidate->carvehashkey)) {
-    return false;
-  }
-
-  state = carve_get_state(candidate->carvehashkey);
-  if (! state) {
-    return false;
-  }
-
-  gif_state = (GIFCarveState *)state;
-  disabled = gif_state->share_disabled;
-  gif_free_carve_state(&state);
-  return disabled;
-}
-
-static inline void gif_reassembly_disable_share(CarveInfo *candidate) {
-  void *state = NULL;
-  GIFCarveState *gif_state = NULL;
-  GIFCarveState updated = {0};
-
-  if (! carve_hash_key_valid(candidate->carvehashkey)) {
-    return;
-  }
-
-  state = carve_get_state(candidate->carvehashkey);
-  if (! state) {
-    return;
-  }
-
-  gif_state = (GIFCarveState *)state;
-  if (gif_state->share_disabled) {
-    gif_free_carve_state(&state);
-    return;
-  }
-
-  updated = *gif_state;
-  updated.share_disabled = true;
-  carve_put_state(candidate->carvehashkey, &updated);
-  gif_free_carve_state(&state);
-}
-
-static inline void gif_reassembly_mark_shared(CarveInfo *candidate,
-                                              const GIFReassemblyScore *score,
-                                              uint64_t data_length) {
-  void *state = NULL;
-  GIFCarveState *gif_state = NULL;
-  GIFCarveState updated = {0};
-
-  if (! carve_hash_key_valid(candidate->carvehashkey)) {
-    return;
-  }
-
-  state = carve_get_state(candidate->carvehashkey);
-  if (! state) {
-    return;
-  }
-
-  gif_state = (GIFCarveState *)state;
-  updated = *gif_state;
-  updated.share_score_valid = true;
-  updated.share_completed_frames = score->completed_frames;
-  updated.share_checkpoint_curpos = score->checkpoint_curpos;
-  updated.share_last_good_row_pos = score->last_good_row_pos;
-  updated.share_last_normal_pos = score->last_normal_pos;
-  updated.share_data_length = data_length;
-  carve_put_state(candidate->carvehashkey, &updated);
-  gif_free_carve_state(&state);
 }
 
 static inline void gif_reassembly_probe_score(
@@ -3598,7 +3574,8 @@ static inline bool gif_reassembly_probe_nonlocal_return(
     int id, CarveInfo *candidate, uint64_t oldlength,
     const GIFCarveState *base_state, int64_t actualblocknumber,
     int64_t previous_apparentblocknumber,
-    GIFValidationSummary *summary_out) {
+    GIFValidationSummary *summary_out, uint32_t *chain_blocks_out,
+    uint32_t *return_blocks_out, int64_t *return_start_out) {
   uint64_t slot = blockvector_get_num_blocks(candidate->b) - 1;
   uint64_t old_blocks = blockvector_get_num_blocks(candidate->b);
   uint64_t apparent_blocks =
@@ -3614,11 +3591,21 @@ static inline bool gif_reassembly_probe_nonlocal_return(
   uint32_t chain_blocks = 1;
   GIFCarveState chain_state = {0};
   GIFCarveState trial_state = {0};
+  GIFValidationSummary chain_summary = {0};
   GIFValidationSummary best_summary = {0};
   GIFValidationSummary trial_summary = {0};
   bool ok = false;
 
   memset(summary_out, 0, sizeof(*summary_out));
+  if (chain_blocks_out) {
+    *chain_blocks_out = 0;
+  }
+  if (return_blocks_out) {
+    *return_blocks_out = 0;
+  }
+  if (return_start_out) {
+    *return_start_out = -1;
+  }
   (void)id;
 
   if (!candidate || previous_apparentblocknumber < 0
@@ -3662,6 +3649,8 @@ static inline bool gif_reassembly_probe_nonlocal_return(
     int64_t next_apparent = first_apparent + (int64_t)chain_blocks;
     int64_t next_actual;
     uint64_t chain_slot = old_blocks + (uint64_t)chain_blocks - 1;
+    uint64_t chain_oldlength;
+    GIFCarveState prior_chain_state = chain_state;
 
     if ((uint64_t)next_apparent >= apparent_blocks
         || apparent_block_in_blockvector(candidate->b, next_apparent)) {
@@ -3686,16 +3675,25 @@ static inline bool gif_reassembly_probe_nonlocal_return(
     resize_blockvector(candidate->b, chain_slot + 1);
     blockvector_set_apparent_blocknumber(candidate->b, chain_slot,
                                          next_apparent);
-    chain_oldlengths[chain_blocks - 1] =
+    chain_oldlength =
         inflate_blockvector_single_block(candidate->b, chain_slot);
     gif_reassembly_validate_local_probe(candidate, &chain_state,
                                         &trial_summary);
     if (gif_reassembly_compare_probe_summary(&trial_summary,
                                              &best_summary) > 0) {
       best_summary = trial_summary;
+      chain_oldlengths[chain_blocks - 1] = chain_oldlength;
+      chain_blocks++;
+      continue;
     }
-    chain_blocks++;
+
+    chain_state = prior_chain_state;
+    deflate_blockvector_single_block(candidate->b, chain_slot,
+                                     chain_oldlength);
+    resize_blockvector(candidate->b, chain_slot);
+    break;
   }
+  chain_summary = best_summary;
 
   for (int64_t j = 0;
        j < GIF_REASSEMBLY_RETURN_SCAN_WINDOW && (uint64_t)j < apparent_blocks;
@@ -3703,7 +3701,9 @@ static inline bool gif_reassembly_probe_nonlocal_return(
     int64_t return_apparent = (return_start + j) % (int64_t)apparent_blocks;
     int64_t return_actual;
     uint64_t return_slot = old_blocks + (uint64_t)chain_blocks - 1;
-    uint64_t return_oldlength;
+    uint64_t return_oldlengths[GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS] = {0};
+    uint32_t return_blocks = 0;
+    GIFValidationSummary return_summary = {0};
 
     if (apparent_block_in_blockvector(candidate->b, return_apparent)) {
       continue;
@@ -3728,18 +3728,103 @@ static inline bool gif_reassembly_probe_nonlocal_return(
     resize_blockvector(candidate->b, return_slot + 1);
     blockvector_set_apparent_blocknumber(candidate->b, return_slot,
                                          return_apparent);
-    return_oldlength = inflate_blockvector_single_block(candidate->b,
-                                                        return_slot);
+    return_oldlengths[0] = inflate_blockvector_single_block(candidate->b,
+                                                           return_slot);
     trial_state = chain_state;
     gif_reassembly_validate_local_probe(candidate, &trial_state,
                                         &trial_summary);
     if (gif_reassembly_compare_probe_summary(&trial_summary,
-                                             &best_summary) > 0) {
-      best_summary = trial_summary;
+                                             &chain_summary) > 0) {
+      return_summary = trial_summary;
+      return_blocks = 1;
+
+      while (return_blocks < GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS) {
+        int64_t next_return_apparent =
+            (return_apparent + (int64_t)return_blocks)
+            % (int64_t)apparent_blocks;
+        int64_t next_return_actual;
+        uint64_t next_return_slot = return_slot + return_blocks;
+
+        if (apparent_block_in_blockvector(candidate->b,
+                                          next_return_apparent)) {
+          break;
+        }
+
+        next_return_actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror, next_return_apparent);
+        if (next_return_actual < 0
+            || filemirror_get_blocktype(scalpel_state.filemirror,
+                                        next_return_actual,
+                                        candidate->needleidx)
+                   == BLOCK_CONFIDENCE_INVALID
+            || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                               next_return_actual)
+            || gif_reassembly_checkpoint_requested()) {
+          break;
+        }
+
+        resize_blockvector(candidate->b, next_return_slot + 1);
+        blockvector_set_apparent_blocknumber(candidate->b,
+                                             next_return_slot,
+                                             next_return_apparent);
+        return_oldlengths[return_blocks] =
+            inflate_blockvector_single_block(candidate->b,
+                                             next_return_slot);
+        gif_reassembly_validate_local_probe(candidate, &trial_state,
+                                            &trial_summary);
+        if (gif_reassembly_compare_probe_summary(&trial_summary,
+                                                 &return_summary) <= 0) {
+          deflate_blockvector_single_block(
+              candidate->b, next_return_slot,
+              return_oldlengths[return_blocks]);
+          resize_blockvector(candidate->b, next_return_slot);
+          break;
+        }
+
+        return_summary = trial_summary;
+        return_blocks++;
+      }
+
+      if ((!return_blocks_out
+           && gif_reassembly_compare_probe_summary(&return_summary,
+                                                    &best_summary) > 0)
+          || (return_blocks_out
+              && (return_blocks > *return_blocks_out
+                  || (return_blocks == *return_blocks_out
+                      && gif_reassembly_compare_probe_summary(
+                             &return_summary, &best_summary) > 0)))) {
+        best_summary = return_summary;
+        if (return_blocks_out) {
+          *return_blocks_out = return_blocks;
+        }
+        if (return_start_out) {
+          *return_start_out = return_apparent;
+        }
+      }
     }
-    deflate_blockvector_single_block(candidate->b, return_slot,
-                                     return_oldlength);
-    resize_blockvector(candidate->b, return_slot);
+    else {
+      deflate_blockvector_single_block(candidate->b, return_slot,
+                                       return_oldlengths[0]);
+      resize_blockvector(candidate->b, return_slot);
+      continue;
+    }
+
+    while (return_blocks > 0) {
+      uint64_t return_index = return_slot + return_blocks - 1;
+      deflate_blockvector_single_block(candidate->b, return_index,
+                                       return_oldlengths[return_blocks - 1]);
+      resize_blockvector(candidate->b, return_index);
+      return_blocks--;
+    }
+
+    if (return_blocks_out
+        && *return_blocks_out == GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS) {
+      break;
+    }
+  }
+
+  if (chain_blocks_out) {
+    *chain_blocks_out = chain_blocks;
   }
 
   while (chain_blocks > 1) {
@@ -3778,7 +3863,7 @@ static inline bool gif_reassembly_probe_nonlocal_potential(
   if (gif_reassembly_probe_nonlocal_return(id, candidate, oldlength,
                                            base_state, actualblocknumber,
                                            previous_apparentblocknumber,
-                                           &trial_summary)
+                                           &trial_summary, NULL, NULL, NULL)
       && (!ok
           || gif_reassembly_compare_probe_summary(&trial_summary,
                                                   &best_summary) > 0)) {
@@ -3798,14 +3883,22 @@ static inline int64_t gif_reassembly_phase_probe_choice(
     GIFCarveState *state, int64_t *resume_after_out) {
   int64_t apparent_blocks;
   int64_t toconsider;
-  int64_t original_scan_start;
   int64_t local_forward_cutoff = -1;
+  int64_t best_choice = -1;
+  int64_t best_reserved = INT64_MAX;
+  BlockValidationDecision best_confidence = BLOCK_CONFIDENCE_INVALID;
   uint32_t phase_offset = 0;
   uint8_t phase_threshold = 0;
   uint64_t oldlength;
   uint64_t required_validates_to;
   uint32_t probes = 0;
+  uint32_t probe_limit = GIF_REASSEMBLY_PHASE_PROBE_SCAN_LIMIT;
   bool wrap_prefix_first = false;
+  bool backfill_mode = false;
+  uint32_t best_chain_blocks = UINT32_MAX;
+  uint32_t best_return_blocks = 0;
+  int64_t best_return_start = -1;
+  GIFValidationSummary best_probe_summary = {0};
 
   if (resume_after_out) {
     *resume_after_out = -1;
@@ -3869,8 +3962,6 @@ static inline int64_t gif_reassembly_phase_probe_choice(
   if (scan_start < 0) {
     scan_start += apparent_blocks;
   }
-  original_scan_start = scan_start;
-
   toconsider = scan_count > 0 ? scan_count : apparent_blocks;
   if (toconsider > apparent_blocks) {
     toconsider = apparent_blocks;
@@ -3883,6 +3974,13 @@ static inline int64_t gif_reassembly_phase_probe_choice(
         local_forward_cutoff < apparent_blocks
         && scan_start > local_forward_cutoff;
   }
+
+phase_probe_restart:
+  probes = 0;
+  probe_limit = backfill_mode
+                    ? GIF_REASSEMBLY_PHASE_PROBE_SCAN_LIMIT
+                          * GIF_REASSEMBLY_PHASE_ANCHOR_BACKFILL
+                    : GIF_REASSEMBLY_PHASE_PROBE_SCAN_LIMIT;
 
   for (int pass = 0; pass < (wrap_prefix_first ? 2 : 1); pass++) {
     int64_t pass_start = scan_start;
@@ -3904,18 +4002,14 @@ static inline int64_t gif_reassembly_phase_probe_choice(
 
     for (int64_t j = 0; j < pass_count; j++) {
       int64_t apparentblocknumber = (pass_start + j) % apparent_blocks;
-      int64_t actualblocknumber;
-      GIFValidationSummary probe_summary = {0};
+      int64_t anchor_actualblocknumber;
 
       if (gif_reassembly_checkpoint_requested()) {
         gif_reassembly_store_state(candidate, state);
         return -1;
       }
 
-      if (probes >= GIF_REASSEMBLY_PHASE_PROBE_SCAN_LIMIT) {
-        state->reassembly_phase_scan_exhausted = true;
-        state->reassembly_phase_scan_exhausted_length = oldlength;
-        gif_reassembly_store_state(candidate, state);
+      if (probes >= probe_limit) {
         if (gif_reassembly_debug_candidate(candidate)) {
           fprintf(stderr,
                   "[gifdbg] phase-probe-limit start=%" PRId64
@@ -3927,11 +4021,11 @@ static inline int64_t gif_reassembly_phase_probe_choice(
                   apparentblocknumber, probes, phase_offset,
                   phase_threshold, oldlength);
         }
-        return -1;
+        goto phase_probe_complete;
       }
 
       if (previous_apparentblocknumber >= 0
-          && apparentblocknumber >= original_scan_start
+          && apparentblocknumber > previous_apparentblocknumber
           && apparentblocknumber <= local_forward_cutoff) {
         continue;
       }
@@ -3944,62 +4038,181 @@ static inline int64_t gif_reassembly_phase_probe_choice(
         continue;
       }
 
-      actualblocknumber =
+      anchor_actualblocknumber =
           filemirror_actual_blocknumber(scalpel_state.filemirror,
                                         apparentblocknumber);
       if (!gif_reassembly_actual_block_is_giflike(candidate,
-                                                  actualblocknumber)) {
+                                                  anchor_actualblocknumber)) {
         continue;
       }
 
-      probes++;
-      if (!gif_reassembly_probe_followon(
-              0, candidate, oldlength, state, actualblocknumber,
-              &probe_summary)) {
+      for (int backfill = backfill_mode ? 1 : 0;
+           backfill <= (backfill_mode
+                            ? GIF_REASSEMBLY_PHASE_ANCHOR_BACKFILL
+                            : 0);
+           backfill++) {
+        int64_t probe_actualblocknumber =
+            anchor_actualblocknumber - (int64_t)backfill;
+        int64_t probe_apparentblocknumber;
+        GIFValidationSummary probe_summary = {0};
+        GIFValidationSummary deep_summary = {0};
+        uint32_t probe_chain_blocks = 0;
+        uint32_t probe_return_blocks = 0;
+        int64_t probe_return_start = -1;
+
+        if (probe_actualblocknumber < 0) {
+          continue;
+        }
+
+        probe_apparentblocknumber = filemirror_apparent_blocknumber(
+            scalpel_state.filemirror, probe_actualblocknumber);
+        if (probe_apparentblocknumber < 0
+            || (previous_apparentblocknumber >= 0
+                && probe_apparentblocknumber > previous_apparentblocknumber
+                && probe_apparentblocknumber <= local_forward_cutoff)
+            || !gif_reassembly_slot_allows_choice(
+                   candidate, slot, probe_apparentblocknumber)
+            || apparent_block_in_blockvector(candidate->b,
+                                             probe_apparentblocknumber)
+            || !gif_reassembly_actual_block_is_giflike(
+                   candidate, probe_actualblocknumber)) {
+          continue;
+        }
+
+        if (gif_reassembly_checkpoint_requested()) {
+          gif_reassembly_store_state(candidate, state);
+          return -1;
+        }
+
+        if (probes >= probe_limit) {
+          goto phase_probe_complete;
+        }
+        probes++;
+
+        if (!gif_reassembly_probe_followon(
+                0, candidate, oldlength, state, probe_actualblocknumber,
+                &probe_summary)) {
+          if (gif_reassembly_debug_candidate(candidate)) {
+            fprintf(stderr,
+                    "[gifdbg] phase-probe-no-follow start=%" PRId64
+                    " prev=%" PRId64 " choice=%" PRId64
+                    " actual=%" PRId64 " backfill=%d probes=%u\n",
+                    blockvector_get_actual_blocknumber(candidate->b, 0),
+                    previous_apparentblocknumber, probe_apparentblocknumber,
+                    probe_actualblocknumber, backfill, probes);
+          }
+          continue;
+        }
+
         if (gif_reassembly_debug_candidate(candidate)) {
           fprintf(stderr,
-                  "[gifdbg] phase-probe-no-follow start=%" PRId64
+                  "[gifdbg] phase-probe-trial start=%" PRId64
                   " prev=%" PRId64 " choice=%" PRId64
-                  " actual=%" PRId64 " probes=%u\n",
+                  " actual=%" PRId64 " backfill=%d probe_vt=%" PRIu64
+                  " required=%" PRIu64 " probes=%u\n",
                   blockvector_get_actual_blocknumber(candidate->b, 0),
-                  previous_apparentblocknumber, apparentblocknumber,
-                  actualblocknumber, probes);
+                  previous_apparentblocknumber, probe_apparentblocknumber,
+                  probe_actualblocknumber, backfill,
+                  probe_summary.validates_to, required_validates_to, probes);
         }
-        continue;
-      }
 
-      if (gif_reassembly_debug_candidate(candidate)) {
-        fprintf(stderr,
-                "[gifdbg] phase-probe-trial start=%" PRId64
-                " prev=%" PRId64 " choice=%" PRId64
-                " actual=%" PRId64 " probe_vt=%" PRIu64
-                " required=%" PRIu64 " probes=%u\n",
-                blockvector_get_actual_blocknumber(candidate->b, 0),
-                previous_apparentblocknumber, apparentblocknumber,
-                actualblocknumber, probe_summary.validates_to,
-                required_validates_to, probes);
-      }
+        if (probe_summary.validates
+            || probe_summary.validates_to >= required_validates_to) {
+          BlockValidationDecision confidence =
+              filemirror_get_blocktype(scalpel_state.filemirror,
+                                       probe_actualblocknumber,
+                                       candidate->needleidx);
+          int64_t reserved = scalpel_state.reservations
+                                 ? filemirror_actual_block_reserved(
+                                       scalpel_state.filemirror,
+                                       probe_actualblocknumber)
+                                 : 0;
+          int cmp;
+          bool select_probe = false;
 
-      if (probe_summary.validates
-          || probe_summary.validates_to >= required_validates_to) {
-        if (resume_after_out) {
-          *resume_after_out = (apparentblocknumber + 1) % apparent_blocks;
+          if (gif_reassembly_probe_nonlocal_return(
+                  0, candidate, oldlength, state, probe_actualblocknumber,
+                  previous_apparentblocknumber, &deep_summary,
+                  &probe_chain_blocks, &probe_return_blocks,
+                  &probe_return_start)
+              && gif_reassembly_compare_probe_summary(&deep_summary,
+                                                      &probe_summary) > 0) {
+            probe_summary = deep_summary;
+          }
+
+          cmp = best_choice < 0
+                    ? 1
+                    : gif_reassembly_compare_probe_summary(
+                          &probe_summary, &best_probe_summary);
+          if (best_choice < 0) {
+            select_probe = true;
+          }
+          else if (probe_summary.validates != best_probe_summary.validates) {
+            select_probe = probe_summary.validates;
+          }
+          else if (probe_return_blocks != best_return_blocks) {
+            select_probe = probe_return_blocks > best_return_blocks;
+          }
+          else if (probe_return_blocks > 0
+                   && probe_chain_blocks != best_chain_blocks) {
+            select_probe = probe_chain_blocks < best_chain_blocks;
+          }
+          else if (confidence != best_confidence) {
+            select_probe = confidence > best_confidence;
+          }
+          else if (reserved != best_reserved) {
+            select_probe = reserved < best_reserved;
+          }
+          else {
+            select_probe = cmp > 0;
+          }
+
+          if (select_probe) {
+            best_choice = probe_apparentblocknumber;
+            best_reserved = reserved;
+            best_confidence = confidence;
+            best_chain_blocks = probe_chain_blocks;
+            best_return_blocks = probe_return_blocks;
+            best_return_start = probe_return_start;
+            best_probe_summary = probe_summary;
+          }
         }
-        if (gif_reassembly_debug_candidate(candidate)) {
-          fprintf(stderr,
-                  "[gifdbg] phase-probe-choice start=%" PRId64
-                  " prev=%" PRId64 " choice=%" PRId64
-                  " actual=%" PRId64 " offset=%u threshold=%u"
-                  " probe_vt=%" PRIu64 " oldlength=%" PRIu64
-                  " probes=%u\n",
-                  blockvector_get_actual_blocknumber(candidate->b, 0),
-                  previous_apparentblocknumber, apparentblocknumber,
-                  actualblocknumber, phase_offset, phase_threshold,
-                  probe_summary.validates_to, oldlength, probes);
-        }
-        return apparentblocknumber;
       }
     }
+  }
+
+phase_probe_complete:
+  if (best_choice >= 0) {
+    if (best_return_blocks > 0 && best_return_start >= 0) {
+      gif_reassembly_set_return_start(state, best_return_start, true);
+      gif_reassembly_store_state(candidate, state);
+    }
+    if (resume_after_out) {
+      *resume_after_out = (best_choice + 1) % apparent_blocks;
+    }
+    if (gif_reassembly_debug_candidate(candidate)) {
+      fprintf(stderr,
+              "[gifdbg] phase-probe-choice start=%" PRId64
+              " prev=%" PRId64 " choice=%" PRId64
+              " actual=%" PRId64 " offset=%u threshold=%u"
+              " probe_vt=%" PRIu64 " oldlength=%" PRIu64
+              " probes=%u chain_blocks=%u return_blocks=%u"
+              " return_start=%" PRId64 "\n",
+              blockvector_get_actual_blocknumber(candidate->b, 0),
+              previous_apparentblocknumber, best_choice,
+              filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                            best_choice),
+              phase_offset, phase_threshold,
+              best_probe_summary.validates_to, oldlength, probes,
+              (unsigned)best_chain_blocks, (unsigned)best_return_blocks,
+              best_return_start);
+    }
+    return best_choice;
+  }
+
+  if (!backfill_mode) {
+    backfill_mode = true;
+    goto phase_probe_restart;
   }
 
   state->reassembly_phase_scan_exhausted = true;
@@ -4023,7 +4236,6 @@ static inline int64_t gif_reassembly_completion_probe_choice(
     GIFCarveState *state, int64_t *resume_after_out) {
   int64_t apparent_blocks;
   int64_t toconsider;
-  int64_t original_scan_start;
   int64_t local_forward_cutoff = -1;
   uint64_t oldlength;
   uint32_t probes = 0;
@@ -4062,8 +4274,6 @@ static inline int64_t gif_reassembly_completion_probe_choice(
   if (scan_start < 0) {
     scan_start += apparent_blocks;
   }
-  original_scan_start = scan_start;
-
   toconsider = scan_count > 0 ? scan_count : apparent_blocks;
   if (toconsider > apparent_blocks) {
     toconsider = apparent_blocks;
@@ -4119,7 +4329,8 @@ static inline int64_t gif_reassembly_completion_probe_choice(
         return -1;
       }
 
-      if (apparentblocknumber >= original_scan_start
+      if (previous_apparentblocknumber >= 0
+          && apparentblocknumber > previous_apparentblocknumber
           && apparentblocknumber <= local_forward_cutoff) {
         continue;
       }
@@ -4420,8 +4631,7 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
     int64_t last_apparent =
         blockvector_get_apparent_blocknumber(
             candidate->b, blockvector_get_num_blocks(candidate->b) - 2);
-    int64_t next_apparent =
-        last_apparent + (candidate->block_choice_start == -2 ? 2 : 1);
+    int64_t next_apparent = last_apparent + 1;
     candidate->block_choice_start = -1;
 
     plateau_wrap_resume =
@@ -4470,16 +4680,6 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
         candidate->block_choice_start = wrapped_next;
       }
     }
-    else if (prestart_gap_start >= 0
-             && start_apparentblocknumber > prestart_gap_start
-             && blockvector_get_num_blocks(candidate->b) <= 3
-             && !apparent_block_in_blockvector(candidate->b,
-                                              prestart_gap_start)) {
-      /* When the candidate still contains only the header pair plus the
-         speculative slot, an OUTOFORDER 2-6 style layout must search the
-         bounded prestart window before jumping forward or whole-image. */
-      candidate->block_choice_start = prestart_gap_start;
-    }
     else {
       candidate->block_choice_start = next_apparent;
     }
@@ -4523,7 +4723,8 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
   }
 }
 
-static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
+static inline int64_t gif_reassembly_get_block_choice(
+    CarveInfo *candidate, GIFCarveState *runtime_state) {
   int64_t reserved;
   int64_t block_choice = -1;
   int64_t actualblocknumber;
@@ -4539,17 +4740,27 @@ static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
   int64_t local_forward_end = -1;
   int64_t anchor_resume_start = -1;
   int64_t prestart_end = -1;
+  int64_t scan_best_choice = -1;
+  int64_t scan_contiguous_choice = -1;
+  int64_t scan_best_reserved = INT64_MAX;
+  int64_t scan_contiguous_reserved = INT64_MAX;
+  uint64_t committed_blocks = 0;
   uint64_t slot = 0;
   uint64_t evaluated;
   uint64_t immediate_evaluated = 0;
   bool viable = false;
+  bool scan_consecutive = false;
   bool have_committed_local_gap = false;
   bool local_forward_phase = false;
+  bool local_gap_phase = false;
   bool prestart_phase = false;
   bool prestart_scan_active = false;
   bool return_window_phase = false;
   bool choice_removed = false;
   bool anchor_yield_tried = false;
+  BlockValidationDecision scan_blocktype = BLOCK_CONFIDENCE_INVALID;
+  BlockValidationDecision scan_best_confidence = BLOCK_CONFIDENCE_INVALID;
+  BlockValidationDecision scan_contiguous_confidence = BLOCK_CONFIDENCE_INVALID;
   GIFCarveState gif_state = {0};
 
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
@@ -4561,6 +4772,11 @@ static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
 #endif
 
   count = filemirror_apparent_blocks(scalpel_state.filemirror);
+  if (scalpel_state.blocksize > 0) {
+    committed_blocks =
+        CEILDIV(blockvector_get_data_length(candidate->b),
+                (uint64_t)scalpel_state.blocksize);
+  }
   local_gap_start = gif_reassembly_recent_forward_gap_start(candidate);
   prestart_gap_start = gif_reassembly_prestart_gap_start(candidate);
   start_apparentblocknumber = gif_reassembly_anchor_apparent_block(candidate);
@@ -4625,11 +4841,22 @@ static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
     immediate_next = start_apparentblocknumber + 1;
   }
 
+  if (gif_state.reassembly_return_pending
+      && gif_state.reassembly_return_deferred
+      && gif_state.reassembly_return_start >= 0
+      && immediate_next >= 0
+      && (immediate_next >= count
+          || apparent_block_in_blockvector(candidate->b, immediate_next))) {
+    gif_state.reassembly_return_deferred = false;
+    gif_reassembly_store_state(candidate, &gif_state);
+    candidate->block_choice_start = gif_state.reassembly_return_start;
+  }
+
   if (local_gap_start < 0
       && prestart_gap_start < 0
       && (!gif_state.reassembly_return_pending
           || gif_state.reassembly_return_deferred)
-      && blockvector_get_num_blocks(candidate->b) <= 2
+      && committed_blocks <= 2
       && immediate_next >= 0
       && immediate_next < count) {
     /* Early GIF candidates often consist of only the first header block, or
@@ -4639,7 +4866,7 @@ static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
   }
 
   if (immediate_next >= 0
-      && blockvector_get_num_blocks(candidate->b) == 1
+      && committed_blocks == 1
       && start_apparentblocknumber >= 0
       && count > 0) {
     int64_t scan_end = immediate_next + GIF_REASSEMBLY_GAP_SCAN_WINDOW;
@@ -4675,6 +4902,7 @@ static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
 
       candidate->block_choice_start =
           (block_choice + 1) % filemirror_apparent_blocks(scalpel_state.filemirror);
+      blockvector_remove_choice(candidate->b, slot, block_choice);
       return block_choice;
     }
   }
@@ -4892,24 +5120,49 @@ static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
     local_forward_phase = true;
   }
   else if (local_gap_start >= 0
-      && candidate->block_choice_start == local_gap_start
-      && count > GIF_REASSEMBLY_GAP_SCAN_WINDOW) {
-    count = GIF_REASSEMBLY_GAP_SCAN_WINDOW;
+      && gif_reassembly_apparent_in_forward_window(
+             local_gap_start, candidate->block_choice_start,
+             GIF_REASSEMBLY_GAP_SCAN_WINDOW)) {
+    int64_t offset = candidate->block_choice_start - local_gap_start;
+    if (offset < 0) {
+      offset += full_scan_count;
+    }
+    count = GIF_REASSEMBLY_GAP_SCAN_WINDOW - offset;
+    if (count > full_scan_count) {
+      count = full_scan_count;
+    }
+    local_gap_phase = true;
   }
   else if (prestart_gap_start >= 0
            && start_apparentblocknumber > prestart_gap_start
-           && candidate->block_choice_start == prestart_gap_start) {
+           && candidate->block_choice_start >= prestart_gap_start
+           && candidate->block_choice_start < start_apparentblocknumber) {
     prestart_end = start_apparentblocknumber;
-    if (prestart_end > prestart_gap_start) {
-      count = prestart_end - prestart_gap_start;
+    if (prestart_end > candidate->block_choice_start) {
+      count = prestart_end - candidate->block_choice_start;
       prestart_phase = true;
     }
   }
   else if (gif_state.reassembly_return_pending
            && gif_state.reassembly_return_start >= 0
-           && candidate->block_choice_start
-                  == gif_state.reassembly_return_start) {
-    count = GIF_REASSEMBLY_RETURN_SCAN_WINDOW;
+           && gif_reassembly_choice_in_return_window(
+                  &gif_state, candidate->block_choice_start)) {
+    int64_t offset;
+
+    if (gif_state.reassembly_return_actual_valid) {
+      int64_t current_actual = filemirror_actual_blocknumber(
+          scalpel_state.filemirror, candidate->block_choice_start);
+      offset = current_actual - gif_state.reassembly_return_actual;
+    }
+    else {
+      offset = candidate->block_choice_start
+               - gif_state.reassembly_return_start;
+      if (offset < 0) {
+        offset += full_scan_count;
+      }
+    }
+
+    count = GIF_REASSEMBLY_RETURN_SCAN_WINDOW - offset;
     if (count > full_scan_count) {
       count = full_scan_count;
     }
@@ -4941,6 +5194,13 @@ static inline int64_t gif_reassembly_get_block_choice(CarveInfo *candidate) {
   }
 
 restart_scan:
+  scan_best_choice = -1;
+  scan_contiguous_choice = -1;
+  scan_best_reserved = INT64_MAX;
+  scan_contiguous_reserved = INT64_MAX;
+  scan_best_confidence = BLOCK_CONFIDENCE_INVALID;
+  scan_contiguous_confidence = BLOCK_CONFIDENCE_INVALID;
+
   while (count > 0) {
     block_choice = blockvector_get_choice(
         candidate->b, blockvector_get_num_blocks(candidate->b) - 1,
@@ -4954,6 +5214,8 @@ restart_scan:
       break;
     }
 
+    scan_consecutive = immediate_next >= 0 && block_choice == immediate_next;
+
     candidate->block_choice_start =
         (block_choice + 1) % filemirror_apparent_blocks(scalpel_state.filemirror);
 
@@ -4961,9 +5223,12 @@ restart_scan:
     actualblocknumber =
         filemirror_actual_blocknumber(scalpel_state.filemirror, block_choice);
 
-    viable =
+    scan_blocktype =
         filemirror_get_blocktype(scalpel_state.filemirror, actualblocknumber,
-                                 candidate->needleidx) != BLOCK_CONFIDENCE_INVALID
+                                 candidate->needleidx);
+
+    viable =
+        scan_blocktype != BLOCK_CONFIDENCE_INVALID
         && ! apparent_block_in_blockvector(candidate->b, block_choice);
 
     reserved = scalpel_state.reservations
@@ -4977,15 +5242,42 @@ restart_scan:
         && block_choice <= previous_apparentblocknumber + 16) {
       fprintf(stderr,
               "[gifdbg] scan start=%" PRId64 " prev=%" PRId64
-              " choice=%" PRId64 " actual=%" PRId64 " viable=%d reserved=%" PRId64
-              " count_left=%" PRId64 "\n",
+              " choice=%" PRId64 " actual=%" PRId64 " viable=%d confidence=%u"
+              " reserved=%" PRId64 " count_left=%" PRId64 "\n",
               blockvector_get_actual_blocknumber(candidate->b, 0),
               previous_apparentblocknumber, block_choice, actualblocknumber,
-              viable ? 1 : 0, reserved, count);
+              viable ? 1 : 0, (unsigned)scan_blocktype, reserved, count);
     }
 
     if (viable) {
-      goto done;
+      // A bounded forward window represents a physical locality hypothesis.
+      // Test it in disk order; confidence ranks the wider fallback scan.
+      if (local_forward_phase || local_gap_phase || return_window_phase) {
+        goto done;
+      }
+
+      if (scan_consecutive
+          && scan_blocktype == BLOCK_CONFIDENCE_VALID
+          && reserved == 0) {
+        goto done;
+      }
+
+      if (scan_consecutive && scan_contiguous_choice == -1) {
+        scan_contiguous_choice = block_choice;
+        scan_contiguous_confidence = scan_blocktype;
+        scan_contiguous_reserved = reserved;
+      }
+
+      if (scan_best_choice == -1
+          || scan_blocktype > scan_best_confidence
+          || (scan_blocktype == scan_best_confidence
+              && reserved < scan_best_reserved)) {
+        scan_best_choice = block_choice;
+        scan_best_confidence = scan_blocktype;
+        scan_best_reserved = reserved;
+      }
+      block_choice = -1;
+      continue;
     }
 
     if (! viable) {
@@ -4994,6 +5286,30 @@ restart_scan:
                                 block_choice);
       block_choice = -1;
     }
+  }
+
+  if (scan_contiguous_choice != -1
+      && scan_best_choice != -1
+      && scan_best_choice != scan_contiguous_choice) {
+    int best_conf = (int)scan_best_confidence;
+    int contiguous_conf = (int)scan_contiguous_confidence;
+    if (best_conf < contiguous_conf + 20
+        && !(scan_best_confidence == BLOCK_CONFIDENCE_VALID
+             && scan_contiguous_confidence < 80)) {
+      scan_best_choice = scan_contiguous_choice;
+      scan_best_confidence = scan_contiguous_confidence;
+      scan_best_reserved = scan_contiguous_reserved;
+    }
+  }
+  else if (scan_contiguous_choice != -1 && scan_best_choice == -1) {
+    scan_best_choice = scan_contiguous_choice;
+    scan_best_confidence = scan_contiguous_confidence;
+    scan_best_reserved = scan_contiguous_reserved;
+  }
+
+  if (scan_best_choice != -1) {
+    block_choice = scan_best_choice;
+    goto done;
   }
 
   if (block_choice == -1
@@ -5135,6 +5451,9 @@ restart_scan:
   }
 
 done:
+  if (runtime_state) {
+    gif_reassembly_copy_runtime_fields(runtime_state, &gif_state);
+  }
   if (block_choice == -1 && gif_reassembly_debug_candidate(candidate)) {
     fprintf(stderr,
             "[gifdbg] no-choice start=%" PRId64
@@ -5156,7 +5475,7 @@ done:
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
   clock_gettime(CLOCK_MONOTONIC, &BLK_endtime);
   uint64_t BLK_elapsed =
-      (BLK_endtime.tv_sec - BLK_starttime.tv_sec) * 1000000000ULL
+      (BLK_endtime.tv_sec - BLK_starttime.tv_sec) * NANOSECONDS_PER_SECOND
       + (BLK_endtime.tv_nsec - BLK_starttime.tv_nsec);
 
   atomic_fetch_add_explicit(
@@ -5178,14 +5497,6 @@ done:
 
 static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
   GIFCarveState gif_state = {0};
-
-  /* A prior failed gallop can leave block_choice_start at -2, which means
-     "seed the next slot from tail+2". Once the current tail actually commits,
-     that stale skip hint must not survive into the next extension, or an
-     immediate local successor can be skipped outright (e.g. 53 -> 55). */
-  if (candidate->block_choice_start == -2) {
-    candidate->block_choice_start = 0;
-  }
 
   if (! candidate->fastpath) {
     blockvector_set_apparent_blocknumber(
@@ -5296,6 +5607,7 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
       }
     }
     else if (gif_state.reassembly_return_pending
+        && !gif_state.reassembly_return_deferred
         && current_apparent >= 0
         && gif_reassembly_choice_in_return_window(&gif_state,
                                                   current_apparent)) {
@@ -5319,7 +5631,8 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
         gif_reassembly_clear_return_start(&gif_state);
       }
     }
-    else if (current_apparent >= 0
+    else if (!gif_state.reassembly_return_pending
+        && current_apparent >= 0
         && previous_apparent >= 0
         && current_apparent < previous_apparent) {
       gif_reassembly_set_return_start_near_actual(
@@ -5473,7 +5786,7 @@ static inline void gif_reassembly_checkpoint_flush(CarveInfo *candidate) {
   gif_validate_core(blockvector_get_data_pointer(candidate->b), data_length,
                     &cold_validates, &cold_validates_to, &cold_promising,
                     candidate->needleidx, scalpel_state.blocksize, NULL,
-                    &cold_state, false);
+                    &cold_state);
   if (gif_reassembly_debug_candidate(candidate)) {
     fprintf(stderr,
             "[gifdbg] ckpt-cold start=%" PRId64
@@ -5512,7 +5825,7 @@ static inline void gif_reassembly_checkpoint_flush(CarveInfo *candidate) {
       gif_validate_core(blockvector_get_data_pointer(candidate->b), data_length,
                         &cold_validates, &cold_validates_to, &cold_promising,
                         candidate->needleidx, scalpel_state.blocksize, NULL,
-                        &cold_state, false);
+                        &cold_state);
       preserve_frontier = false;
       preserve_scan_slot = false;
       frontier_metadata_only = false;
@@ -5550,7 +5863,7 @@ static inline void gif_reassembly_checkpoint_flush(CarveInfo *candidate) {
                           blockvector_get_data_length(candidate->b),
                           &cold_validates, &cold_validates_to, &cold_promising,
                           candidate->needleidx, scalpel_state.blocksize, NULL,
-                          &cold_state, false);
+                          &cold_state);
         preserve_frontier = false;
         preserve_scan_slot = false;
       }
@@ -5695,6 +6008,7 @@ static inline void gif_reassembly_did_not_validate(
   bool current_is_local_forward = false;
   bool trial_preserves_length = false;
   uint64_t committed_prestart_tail_blocks = 0;
+  uint64_t committed_blocks = 0;
   uint64_t trusted_plateau_blocks = 0;
   uint64_t prestart_accept_allowance =
       (uint64_t)scalpel_state.blocksize + GIF_REASSEMBLY_VALIDATE_SLACK;
@@ -5710,6 +6024,8 @@ static inline void gif_reassembly_did_not_validate(
   local_gap_start = gif_reassembly_recent_forward_gap_start(candidate);
   prestart_gap_start = gif_reassembly_prestart_gap_start(candidate);
   if (scalpel_state.blocksize > 0) {
+    committed_blocks =
+        CEILDIV(oldlength, (uint64_t)scalpel_state.blocksize);
     start_apparentblocknumber =
         gif_reassembly_anchor_apparent_block(candidate);
     committed_prestart_tail_blocks =
@@ -5722,7 +6038,7 @@ static inline void gif_reassembly_did_not_validate(
     trusted_plateau_blocks = gif_state.reassembly_trusted_plateau_blocks;
   }
   current_is_seed_forward =
-      blockvector_get_num_blocks(candidate->b) == 1
+      committed_blocks == 1
       && gif_reassembly_local_seed_choice(start_apparentblocknumber,
                                           current_apparentblocknumber);
   current_is_local_gap =
@@ -5772,17 +6088,25 @@ static inline void gif_reassembly_did_not_validate(
     return;
   }
 
-  // OPUS47/G7: accept-shortcuts now require score_advanced (stricter than
-  // score_not_regressed) when the trial doesn't actually push validates_to
-  // past the old length. This prevents committing a trial that merely
-  // matches the prior committed length under a heuristic "close enough"
-  // rule.
+  // A trial must either extend byte validation or improve the structural
+  // score before it can be committed by a local shortcut.
   bool trial_advanced_bytes = trial_summary->validates_to >= oldlength;
   trial_preserves_length = trial_summary->validates_to + 1 >= oldlength;
   bool trial_supported_by_progress =
       !base_state
       || trial_advanced_bytes
       || gif_reassembly_score_advanced(&trial_summary->score, &base_score);
+
+  if (current_is_local_forward
+      && gif_state.reassembly_return_pending
+      && gif_state.reassembly_return_deferred
+      && gif_state.reassembly_return_start >= 0
+      && !trial_advanced_bytes) {
+    gif_state.reassembly_return_deferred = false;
+    gif_reassembly_store_state(candidate, &gif_state);
+    candidate->block_choice_start = gif_state.reassembly_return_start;
+    return;
+  }
   if (no_best_yet
       && current_is_seed_forward
       && trial_preserves_length
@@ -6017,30 +6341,6 @@ static inline void gif_reassembly_did_not_validate(
       && gif_reassembly_score_not_regressed(&trial_summary->score,
                                             &base_score)) {
     gif_reassembly_arm_actual_backscan(candidate);
-  }
-
-  if (no_best_yet
-      && previous_apparentblocknumber >= 0
-      && current_apparentblocknumber > previous_apparentblocknumber + 1
-      && current_apparentblocknumber
-             < previous_apparentblocknumber + 1
-                   + GIF_REASSEMBLY_GAP_SCAN_WINDOW
-      && (trial_summary->validates_to
-                 + (uint64_t)scalpel_state.blocksize
-                 + GIF_REASSEMBLY_VALIDATE_SLACK
-             < oldlength - 1
-          || (base_state
-              && !gif_reassembly_score_not_regressed(&trial_summary->score,
-                                                     &base_score)))) {
-    candidate->block_choice_start =
-        previous_apparentblocknumber + 1 + GIF_REASSEMBLY_GAP_SCAN_WINDOW;
-    return;
-  }
-
-  if (previous_apparentblocknumber >= 0
-      && current_apparentblocknumber > previous_apparentblocknumber + 1
-      && trial_summary->validates_to <= oldlength + GIF_REASSEMBLY_VALIDATE_SLACK) {
-    gif_reassembly_disable_share(candidate);
   }
 
   if (no_best_yet
@@ -6777,7 +7077,7 @@ static inline int64_t gif_reassembly_backtrack(
         && candidate->block_choice_start >= apparent_blocks) {
       candidate->block_choice_start = gif_state.reassembly_return_start;
     }
-    block_choice = gif_reassembly_get_block_choice(candidate);
+    block_choice = gif_reassembly_get_block_choice(candidate, &gif_state);
     if (plateau_wrap_backtrack
         && block_choice >= 0
         && block_choice < gif_state.reassembly_return_start) {
@@ -6892,7 +7192,8 @@ static inline void gif_reassembly_gallop(
   }
 
   if (! gallop_count) {
-    candidate->block_choice_start = -2;
+    candidate->block_choice_start =
+        pregallop_tail_apparent >= 0 ? pregallop_tail_apparent + 1 : 0;
   }
   else {
     if (gif_reassembly_checkpoint_requested()) {
@@ -6983,7 +7284,8 @@ static inline void gif_reassembly_gallop(
       candidate->newblock = pregallop_newblock;
       resize_blockvector(candidate->b, pregallop_num_blocks);
       candidate->fastpath = false;
-      candidate->block_choice_start = -2;
+      candidate->block_choice_start =
+          pregallop_tail_apparent >= 0 ? pregallop_tail_apparent + 1 : 0;
     }
   }
 
@@ -7064,8 +7366,9 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
     checkpoint_interrupted = false;
 
     while (! candidate->fastpath
-           && (block_choice = gif_reassembly_get_block_choice(candidate)) >= 0) {
-      if (reassembly_check_kill_queue(work->id, &candidate, uuidp, uuidc)) {
+           && (block_choice = gif_reassembly_get_block_choice(
+                   candidate, &base_state)) >= 0) {
+      if (reassembly_check_kill_queue(work, &candidate, uuidp, uuidc)) {
         goto done_do_not_write_candidate;
       }
 
@@ -7219,13 +7522,7 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
         goto done_write_candidate;
       }
       if (promoted_current) {
-        if (! stop_scanning) {
-          gif_reassembly_maybe_share(work->id, candidate);
-        }
         continue;
-      }
-      if (! stop_scanning) {
-        gif_reassembly_maybe_share(work->id, candidate);
       }
     }
     else {
@@ -7282,9 +7579,6 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
         goto done_write_candidate;
       }
       if (promoted_current) {
-        if (! stop_scanning) {
-          gif_reassembly_maybe_share(work->id, candidate);
-        }
         continue;
       }
 
@@ -7330,9 +7624,6 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
           }
           gif_reassembly_store_state(candidate, &committed_state);
           candidate->best_validates_to = committed_summary.validates_to;
-          if (! stop_scanning) {
-            gif_reassembly_maybe_share(work->id, candidate);
-          }
           if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                    memory_order_acquire)) {
             gif_reassembly_checkpoint_flush(candidate);
@@ -7379,7 +7670,6 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
             gif_reassembly_store_state(candidate, &backtrack_state);
           }
         }
-        gif_reassembly_maybe_share(work->id, candidate);
       }
       else {
         destroy_candidate(&candidate);
@@ -7428,9 +7718,11 @@ static inline int32_t gif_lzw_read_code(GIFLZWState *s,
       if (sb_len == 0) {
         return -1;  // block terminator
       }
+      s->sb_truncated = false;
       // Buffer the entire sub-block and advance curpos past it
       // (this is the bursty advance that matches libgif's pattern)
       if (mem->curpos + sb_len > length) {
+        s->sb_truncated = true;
         sb_len = (uint8_t)(length - mem->curpos);
       }
       memcpy(s->sb_buf, data + mem->curpos, sb_len);
@@ -7858,8 +8150,10 @@ static inline void gif_print_carve_state(const void *state) {
     fprintf(stdout, "NULL\n");
   }
   else {
-    fprintf(stdout, "valid=%d ckpt=%" PRIu64 " lgp=%" PRIu64 " frames=%u",
-            s->valid, s->checkpoint_curpos, s->last_good_row_pos, s->completed_frames);
+    fprintf(stdout, "valid=%d ckpt=%" PRIu64 " lgp=%" PRIu64 " frames=%u"
+            " snap=%d snap_pos=%" PRIu64 " snap_row=%u",
+            s->valid, s->checkpoint_curpos, s->last_good_row_pos, s->completed_frames,
+            s->snap_valid, s->snap_pos, s->snap_next_row);
   }
 }
 
@@ -7876,15 +8170,18 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
                                           uint32_t needleidx, uint32_t blocksize, void *blockhashkey) {
   bool header_anchor = false;
   bool all_zero = false;
+  BlockValidationDecision structural_decision = BLOCK_CONFIDENCE_VALID;
 
   (void)needleidx;
   (void)blocksize;
   (void)blockhashkey;
 
-  *decision = BLOCK_CONFIDENCE_VALID;
   *validates_to = length > 0 ? length - 1 : 0;
 
   if (scalpel_state.no_defrag) {
+    if (*decision == BLOCK_CONFIDENCE_INVALID) {
+      *decision = BLOCK_CONFIDENCE_VALID;
+    }
     return needleidx;
   }
 
@@ -7898,7 +8195,7 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
   // Zero-block check: reject truly all-zero blocks. Some valid interior GIF
   // blocks begin with long zero runs, so a leading 0x00 by itself is not a
   // reliable rejection signal.
-  if (! header_anchor && *decision == BLOCK_CONFIDENCE_VALID) {
+  if (! header_anchor && structural_decision == BLOCK_CONFIDENCE_VALID) {
     if (length >= 1024) {
       uint64_t zero_total = 0;
       uint64_t lane_zero[4] = {0, 0, 0, 0};
@@ -7935,10 +8232,10 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
       }
 
       if (all_zero) {
-        *decision = BLOCK_CONFIDENCE_INVALID;
+        structural_decision = BLOCK_CONFIDENCE_INVALID;
       }
 
-      if (*decision == BLOCK_CONFIDENCE_VALID) {
+      if (structural_decision == BLOCK_CONFIDENCE_VALID) {
         lane_len = length / 4;
         for (i = 0; i < 4; i++) {
           if (lane_zero[i] > max_lane_zero) {
@@ -7952,19 +8249,19 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
             && zero_total >= length / 8
             && max_lane_zero >= (lane_len * 19) / 20
             && max_lane_zero >= (zero_total * 19) / 20) {
-          *decision = BLOCK_CONFIDENCE_INVALID;
+          structural_decision = BLOCK_CONFIDENCE_INVALID;
         }
       }
 
-      if (*decision == BLOCK_CONFIDENCE_VALID
+      if (structural_decision == BLOCK_CONFIDENCE_VALID
           && printable >= (length * 7) / 8
           && hi_bytes <= length / 4096) {
         // Reject plain-text lookup/name tables. Compressed GIF image data
         // contains plenty of non-printable and high-value bytes.
-        *decision = BLOCK_CONFIDENCE_INVALID;
+        structural_decision = BLOCK_CONFIDENCE_INVALID;
       }
 
-      if (*decision == BLOCK_CONFIDENCE_VALID) {
+      if (structural_decision == BLOCK_CONFIDENCE_VALID) {
         for (i = 0; i < 8; i++) {
           uint64_t best_count = 0;
           uint32_t best_byte = 0;
@@ -7998,7 +8295,7 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
         if (printable >= (length * 3) / 5
             && top8_total >= (length * 3) / 20
             && lane_max >= lane_len / 20) {
-          *decision = BLOCK_CONFIDENCE_INVALID;
+          structural_decision = BLOCK_CONFIDENCE_INVALID;
         }
       }
     }
@@ -8011,7 +8308,7 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
         }
       }
       if (all_zero) {
-        *decision = BLOCK_CONFIDENCE_INVALID;
+        structural_decision = BLOCK_CONFIDENCE_INVALID;
       }
     }
   }
@@ -8024,7 +8321,7 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
   // This check is conservative: it only rejects blocks that clearly lack GIF sub-block structure.
   // It does not attempt to identify which GIF file a block belongs to (same-phase blocks from
   // different GIF files will both pass).
-  if (! header_anchor && *decision == BLOCK_CONFIDENCE_VALID && length >= 512) {
+  if (! header_anchor && structural_decision == BLOCK_CONFIDENCE_VALID && length >= 512) {
     // OPUS47/G3,G4: derive the "full sub-block" threshold from what the
     // encoder actually used, rather than hard-coding 250. The GIF spec
     // allows any 1..255 byte sub-blocks. Real files vary, and a 250 cutoff
@@ -8084,19 +8381,26 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
       }
       // If we had enough positions to check and most failed, reject
       if (checks >= 3 && bad >= 3) {
-        *decision = BLOCK_CONFIDENCE_LOW;
+        structural_decision = BLOCK_CONFIDENCE_LOW;
       }
     }
     else if (max_sb_len > 0 && max_sb_len < 64) {
       // Very small sub-blocks only — could be a very short/low-resolution
       // GIF frame or non-GIF data. Downgrade but don't reject.
-      *decision = BLOCK_CONFIDENCE_LOW;
+      structural_decision = BLOCK_CONFIDENCE_LOW;
     }
     else {
       // No parseable sub-block chain from offset 0. Downgrade (full
       // validator still gets a say).
-      *decision = BLOCK_CONFIDENCE_LOW;
+      structural_decision = BLOCK_CONFIDENCE_LOW;
     }
+  }
+
+  if (structural_decision == BLOCK_CONFIDENCE_INVALID) {
+    *decision = BLOCK_CONFIDENCE_INVALID;
+  }
+  else if (*decision == BLOCK_CONFIDENCE_INVALID) {
+    *decision = structural_decision;
   }
 
   if (scalpel_state.mode_verbose) {
@@ -8174,8 +8478,7 @@ static inline void gif_validate_core(char *data, uint64_t length,
                                      uint32_t needleidx,
                                      uint32_t blocksize,
                                      void *carvehashkey,
-                                     GIFCarveState *direct_state,
-                                     bool save_checkpoint_hash) {
+                                     GIFCarveState *direct_state) {
   GIFHeader gif_hdr;
   memset(&gif_hdr, 0, sizeof(gif_hdr));
   GIFColor *frame_lcmap = NULL;
@@ -8213,21 +8516,33 @@ static inline void gif_validate_core(char *data, uint64_t length,
   uint8_t *prev_scanline = NULL;
   size_t prev_scanline_capacity = 0;
   GIFLZWState *_frame_lzw = NULL;
+  // Ring of pending resume snapshots for this call. Allocation is lazy; a
+  // failed allocation leaves validation correct but disables snapshot reuse.
+  GIFSnapPending *snap_ring = NULL;
+  uint32_t snap_ring_head = 0;
+  uint64_t snap_ring_last_block = UINT64_MAX;
 
   // Checkpoint restore: check for saved state from a previous validation call on the same
   // candidate. If the prefix of data matches (verified by XXH3 hash), skip already-validated
   // frames and restore detection state, so only new data is fully processed.
   bool in_replay = false;
-  bool restored_from_checkpoint = false;
+  bool restored_from_frame_checkpoint = false;
   uint32_t frames_to_skip = 0;
   uint64_t replay_checkpoint_curpos = 0;
   GIFCarveState replay_state_storage = {0};
   GIFCarveState *replay_state = NULL;
+  bool resume_snap = false;
+  bool snap_src_set = false;
+  GIFCarveState snap_src;
 
   (void)needleidx;
   (void)blocksize;
 
   if (direct_state) {
+    if (direct_state->valid) {
+      snap_src = *direct_state;
+      snap_src_set = true;
+    }
     if (direct_state->valid && direct_state->checkpoint_curpos > 0
         && direct_state->checkpoint_curpos <= length) {
       uint64_t hash = XXH3_64bits(data, direct_state->checkpoint_curpos);
@@ -8243,6 +8558,10 @@ static inline void gif_validate_core(char *data, uint64_t length,
   }
   else if (carvehashkey) {
     GIFCarveState *saved = (GIFCarveState *)carve_get_state(carvehashkey);
+    if (saved && saved->valid) {
+      snap_src = *saved;
+      snap_src_set = true;
+    }
     if (saved && saved->valid && saved->checkpoint_curpos > 0
         && saved->checkpoint_curpos <= length) {
       uint64_t hash = XXH3_64bits(data, saved->checkpoint_curpos);
@@ -8256,6 +8575,23 @@ static inline void gif_validate_core(char *data, uint64_t length,
       }
     }
     gif_free_carve_state((void **)&saved);
+  }
+
+  // Qualify the intra-frame LZW resume snapshot on its own prefix hash,
+  // independently of the frame-skip gate above. Trials share the candidate's
+  // committed prefix and differ in the tail, so a snapshot below the changed
+  // bytes stays usable even when the frame-skip gate's longer hash fails.
+  if (snap_src_set && snap_src.snap_valid
+      && snap_src.snap_pos > 0 && snap_src.snap_pos <= length
+      && snap_src.snap_record_pos < snap_src.snap_pos
+      && !snap_src.snap_lzw.sb_truncated
+      && !(snap_src.snap_frame_index > 0 && snap_src.snap_next_row == 0)
+      && (! snap_src.snap_mad_active
+          || snap_src.snap_next_row == 0
+          || (snap_src.snap_prev_row_present
+              && snap_src.snap_prev_row_len <= GIF_SNAP_PREV_ROW_MAX))
+      && XXH3_64bits(data, snap_src.snap_pos) == snap_src.snap_prefix_hash) {
+    resume_snap = true;
   }
 
   *validates = false;
@@ -8551,10 +8887,28 @@ static inline void gif_validate_core(char *data, uint64_t length,
     mem.curpos = hdr_end;
   }
 
+  // Intra-frame resume takes priority over frame-skip replay. It jumps
+  // straight to the snapshot frame's image descriptor (skipping all earlier
+  // frames without touching them), and the descriptor branch below then
+  // restores the LZW decoder mid-frame. The frame-skip path remains the
+  // fallback when no snapshot qualifies.
+  if (resume_snap) {
+    mem.curpos = snap_src.snap_record_pos;
+    ImageNum = (int)snap_src.snap_frame_index;
+    frames_at_lgp_boundary = (uint32_t)ImageNum;
+    lgp_boundary_block = (bs > 0) ? snap_src.snap_record_pos / bs : 0;
+    reliable_pos = snap_src.snap_record_pos;
+    if (snap_src.snap_last_good_mad_pos > outer_last_good_mad_pos) {
+      outer_last_good_mad_pos = snap_src.snap_last_good_mad_pos;
+    }
+    first_frame_end = snap_src.first_frame_end;
+    in_replay = false;
+    frames_to_skip = 0;
+  }
   // Checkpoint frame-skip: if restoring from saved state, skip completed frames by walking
   // sub-blocks directly (no LZW decompression). This advances mem.curpos past all already-
   // validated frames.
-  if (in_replay && frames_to_skip > 0) {
+  else if (in_replay && frames_to_skip > 0) {
     uint64_t skip_pos = mem.curpos;
     uint32_t skipped = 0;
     while (skipped < frames_to_skip && skip_pos < length) {
@@ -8584,7 +8938,7 @@ static inline void gif_validate_core(char *data, uint64_t length,
       // Restore cross-frame detection state from checkpoint
       first_frame_end = replay_state->first_frame_end;
       // bad_mad_streak, running_mad_sum, mad_count, BPR are per-frame (not restored)
-      restored_from_checkpoint = true;
+      restored_from_frame_checkpoint = true;
     } else {
       in_replay = false;
       frames_to_skip = 0;
@@ -8729,6 +9083,11 @@ static inline void gif_validate_core(char *data, uint64_t length,
       uint64_t last_good_mad_pos = (outer_last_good_mad_pos > 0)
                                    ? outer_last_good_mad_pos : mem.curpos;
       bool mad_active = false;
+      // True once prev_scanline holds the row before the one about to be
+      // compared. Normally set at the end of every row; a snapshot resume
+      // without a stored previous row leaves it false for one row, skipping
+      // a MAD comparison over bytes the earlier call already validated.
+      bool mad_prev_seeded = false;
       // OPUS47/G1,G2: frame-scope flag set by the tail probe when it
       // confirms EOI termination. For no-MAD frames (interlaced, missing
       // palette, small) this is the only integrity signal available — we
@@ -8756,8 +9115,87 @@ static inline void gif_validate_core(char *data, uint64_t length,
         goto done;
       }
 
-      for (int row = 0; row < max_rows; row++) {
+      // Restore the LZW decoder mid-frame from the qualified snapshot.
+      // The descriptor, colormap, buffers, and alignment probe above were
+      // rebuilt by the normal parse; only the decode position, decoder state,
+      // and per-frame detector context come from the snapshot.
+      int resume_row_start = 0;
+      if (resume_snap && pre_record_pos == snap_src.snap_record_pos) {
+        *_frame_lzw = snap_src.snap_lzw;
+        mem.curpos = snap_src.snap_pos;
+        resume_row_start = (int)snap_src.snap_next_row;
+        if (resume_row_start > max_rows) {
+          resume_row_start = max_rows;
+        }
+        last_normal_pos = snap_src.snap_last_normal_pos;
+        last_good_mad_pos = snap_src.snap_last_good_mad_pos;
+        bad_mad_streak = (int)snap_src.snap_bad_mad_streak;
+        running_mad_sum = snap_src.snap_running_mad_sum;
+        mad_count = (int)snap_src.snap_mad_count;
+        running_bpr_sum = snap_src.snap_running_bpr_sum;
+        running_bpr_sq = snap_src.snap_running_bpr_sq;
+        bpr_count = snap_src.snap_bpr_count;
+        if (mad_active && snap_src.snap_prev_row_present
+            && snap_src.snap_prev_row_len == (uint32_t)img_width) {
+          memcpy(prev_scanline, snap_src.snap_prev_row, (size_t)img_width);
+          mad_prev_seeded = true;
+        }
+        if (scalpel_state.mode_verbose) {
+          lock_fprintf(stdout,
+              "GIF LZW resume: frame %u row %d pos %" PRIu64 " (seeded=%d)\n",
+              snap_src.snap_frame_index, resume_row_start,
+              snap_src.snap_pos, mad_prev_seeded ? 1 : 0);
+        }
+        resume_snap = false;
+      }
+
+      for (int row = resume_row_start; row < max_rows; row++) {
         uint64_t pos_before = mem.curpos;
+
+        // Capture a pending resume snapshot at the first row that starts
+        // in a new block. The decoder state is copied before the row decodes,
+        // so the entry is exactly resumable at this row. done: persists the
+        // newest entry whose position lies at or below the checkpoint.
+        if (bs > 0 && pos_before / bs != snap_ring_last_block
+            && !_frame_lzw->sb_truncated
+            && (ImageNum == 0 || row > 0)
+            && (! mad_active
+                || row == 0
+                || (mad_prev_seeded
+                    && img_width <= GIF_SNAP_PREV_ROW_MAX))) {
+          if (!snap_ring) {
+            snap_ring = (GIFSnapPending *)calloc(GIF_SNAP_RING,
+                                                 sizeof(GIFSnapPending));
+          }
+          if (snap_ring) {
+            GIFSnapPending *pend = &snap_ring[snap_ring_head];
+            pend->valid = true;
+            pend->mad_active = mad_active;
+            pend->next_row = (uint32_t)row;
+            pend->frame_index = (uint32_t)ImageNum;
+            pend->pos = pos_before;
+            pend->record_pos = pre_record_pos;
+            pend->last_good_mad_pos = last_good_mad_pos;
+            pend->last_normal_pos = last_normal_pos;
+            pend->running_mad_sum = running_mad_sum;
+            pend->mad_count = (uint32_t)mad_count;
+            pend->bad_mad_streak = (int32_t)bad_mad_streak;
+            pend->running_bpr_sum = running_bpr_sum;
+            pend->running_bpr_sq = running_bpr_sq;
+            pend->bpr_count = bpr_count;
+            pend->lzw = *_frame_lzw;
+            pend->prev_row_present = false;
+            pend->prev_row_len = 0;
+            if (mad_active && mad_prev_seeded
+                && img_width <= GIF_SNAP_PREV_ROW_MAX) {
+              memcpy(pend->prev_row, prev_scanline, (size_t)img_width);
+              pend->prev_row_len = (uint32_t)img_width;
+              pend->prev_row_present = true;
+            }
+            snap_ring_head = (snap_ring_head + 1) % GIF_SNAP_RING;
+            snap_ring_last_block = pos_before / bs;
+          }
+        }
 
         int64_t _lzw_rc = gif_lzw_decode_row(_frame_lzw, &mem,
             scanline, img_width);
@@ -8957,7 +9395,7 @@ static inline void gif_validate_core(char *data, uint64_t length,
         // DETECTION 5: RGB MAD gate. Compare decoded pixel RGB values between
         // consecutive rows. Wrong LZW data produces random palette indices that
         // map to random RGB values, creating very high inter-row MAD.
-        if (mad_active && row > 0) {
+        if (mad_active && row > 0 && mad_prev_seeded) {
           double mad_sum = 0.0;
           int samples = 0;
           for (int px = 0; px < img_width && samples < rgb_sample_count; px += 4) {
@@ -9024,6 +9462,7 @@ static inline void gif_validate_core(char *data, uint64_t length,
         // Save current scanline for next row's MAD comparison
         if (mad_active) {
           memcpy(prev_scanline, scanline, img_width * sizeof(uint8_t));
+          mad_prev_seeded = true;
         }
 
         // Accumulate bytes-per-row statistics for Layer B.
@@ -9168,6 +9607,7 @@ done:
   free(scanline);    scanline = NULL;
   free(prev_scanline); prev_scanline = NULL;
   free(_frame_lzw);  _frame_lzw = NULL;
+  // snap_ring is freed after the state save below consumes it
 
   bs = scalpel_state.blocksize;
 
@@ -9232,14 +9672,50 @@ done:
       if (ckpt_safe) {
         existing.valid = true;
         existing.checkpoint_curpos = ckpt_pos;
-        if (save_checkpoint_hash) {
-          existing.prefix_hash = XXH3_64bits(data, ckpt_pos);
-        }
+        // A valid replay state always carries the hash for its checkpoint
+        // position.
+        existing.prefix_hash = XXH3_64bits(data, ckpt_pos);
         existing.data_length = length;
         existing.completed_frames = frames_at_lgp_boundary;
         existing.first_frame_end = first_frame_end;
         existing.last_good_row_pos = outer_last_good_mad_pos;
         existing.last_normal_pos = reliable_pos;
+
+        // Persist the newest pending resume snapshot at or below the
+        // checkpoint position. When none qualifies, any stored
+        // snapshot is kept; its own prefix hash still guards it.
+        if (snap_ring) {
+          GIFSnapPending *best = NULL;
+          for (uint32_t si = 0; si < GIF_SNAP_RING; si++) {
+            GIFSnapPending *pend = &snap_ring[si];
+            if (pend->valid && pend->pos <= ckpt_pos
+                && (!best || pend->pos > best->pos)) {
+              best = pend;
+            }
+          }
+          if (best) {
+            existing.snap_valid = true;
+            existing.snap_mad_active = best->mad_active;
+            existing.snap_prev_row_present = best->prev_row_present;
+            existing.snap_next_row = best->next_row;
+            existing.snap_frame_index = best->frame_index;
+            existing.snap_pos = best->pos;
+            existing.snap_record_pos = best->record_pos;
+            existing.snap_prefix_hash = XXH3_64bits(data, best->pos);
+            existing.snap_last_good_mad_pos = best->last_good_mad_pos;
+            existing.snap_last_normal_pos = best->last_normal_pos;
+            existing.snap_running_mad_sum = best->running_mad_sum;
+            existing.snap_mad_count = best->mad_count;
+            existing.snap_bad_mad_streak = best->bad_mad_streak;
+            existing.snap_running_bpr_sum = best->running_bpr_sum;
+            existing.snap_running_bpr_sq = best->running_bpr_sq;
+            existing.snap_bpr_count = best->bpr_count;
+            existing.snap_prev_row_len = best->prev_row_len;
+            existing.snap_lzw = best->lzw;
+            memcpy(existing.snap_prev_row, best->prev_row,
+                   sizeof(existing.snap_prev_row));
+          }
+        }
       }
     }
 
@@ -9250,6 +9726,8 @@ done:
       carve_put_state(carvehashkey, &existing);
     }
   }
+  free(snap_ring);
+  snap_ring = NULL;
 
   if (*validates) {
     // File validated completely (found terminator) — curpos is trustworthy
@@ -9387,14 +9865,8 @@ done:
     }
   }
 
-  // Sub-block alignment cap using FIRST frame's alignment reference.
-  // Only check boundaries within the first frame's data range (where
-  // alignment is guaranteed correct). This catches wrong blocks within
-  // the first frame (OUTOFORDER, GAP) without false-positiving at
-  // Floor: never let validates_to drop below blocksize-1 for non-validated
-  // candidates.  Without this, validates_to can be 0 (from sub-block
-  // boundary caps at lines 1768/1778) and promising stays false, causing
-  // carve.c to destroy the candidate on !promising && !validates.
+  // Preserve the first filesystem block of an incomplete candidate so its
+  // header prefix remains available for fragmented reassembly.
   if (! *validates && bs > 0 && length >= (uint64_t)bs
       && *validates_to < (uint64_t)bs - 1) {
     *validates_to = (uint64_t)bs - 1;
@@ -9406,12 +9878,11 @@ done:
                  (int)*validates, *validates_to, (int)*promising);
   }
 
-  // A resumed candidate that cannot advance beyond the already-proven replay
-  // prefix is a dead branch. Keeping it promising causes large fragmented GIF
-  // runs to spawn huge numbers of clones that all stop at the same saved
-  // boundary. Only the branch that crosses replay_checkpoint_curpos should
-  // survive.
-  if (!*validates && *promising && restored_from_checkpoint
+  // A candidate restored through the committed frame checkpoint that cannot
+  // advance beyond the already-proven replay prefix is a dead branch. An
+  // intra-frame snapshot is only a decoder optimization and must not change
+  // whether the same bytes remain promising.
+  if (!*validates && *promising && restored_from_frame_checkpoint
       && replay_checkpoint_curpos > 0
       && *validates_to + 1 <= replay_checkpoint_curpos) {
     *promising = false;
@@ -9423,7 +9894,7 @@ done:
   // some valid fragmented branches need one extension to cross the replay
   // checkpoint and a later extension to accumulate proof in the next block.
   // But letting them trail by multiple blocks causes stale branches to clone.
-  if (!*validates && *promising && restored_from_checkpoint
+  if (!*validates && *promising && restored_from_frame_checkpoint
       && bs > 0 && length >= (uint64_t)bs * 2
       && *validates_to + 1 <= length - (uint64_t)bs * 2) {
     *promising = false;
@@ -9445,7 +9916,7 @@ static inline void gif_file_validate(char *data, uint64_t length,
                                      uint32_t blocksize,
                                      void *carvehashkey) {
   gif_validate_core(data, length, validates, validates_to, promising,
-                    needleidx, blocksize, carvehashkey, NULL, true);
+                    needleidx, blocksize, carvehashkey, NULL);
 }
 
 

@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the GNU General Public
 // License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
@@ -143,11 +143,12 @@ int main(int argc, char *argv[]) {
   FILE *blockmapfile = NULL;
   Blockmap *blockmap = NULL;
   char imgfn[PATH_MAX];
-  char blockmapfn[PATH_MAX * 2];
+  char blockmapfn[PATH_MAX];
   uint64_t deduped = 0;
   uint64_t zeroblocks = 0;
   uint64_t filesize;
   uint64_t numblocks;
+  off_t image_size;
   uint64_t start_block = 0, end_block = 0;
   bool start_block_set = false, end_block_set = false;
   int32_t arg;
@@ -200,8 +201,8 @@ int main(int argc, char *argv[]) {
     case 'q':
       errno = 0;
       temp = strtol(optarg, &endptr, 10);
-      if (errno != 0 || *endptr != '\0' || temp < 0 || temp % 512) {
-        fprintf(stderr, "\nERROR: blocksize for -q option must be >= 512 and a multiple of 512.  Aborting.\n");
+      if (errno != 0 || *endptr != '\0' || temp < 512 || temp > UINT32_MAX || temp % 512) {
+        fprintf(stderr, "\nERROR: blocksize for -q option must be between 512 and 4294967295 and a multiple of 512.  Aborting.\n");
         fprintf(stderr, "%s", BLACK);
         exit(-1);
       }
@@ -226,11 +227,23 @@ int main(int argc, char *argv[]) {
 
   fprintf(stdout, "%s", BLACK);
 
-  strncpy(imgfn, argv[optind], PATH_MAX / 2 - 1);
-  imgfn[PATH_MAX / 2 - 1] = 0;
+  if (! copy_string_complete(imgfn, sizeof(imgfn), argv[optind])) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr,
+            "\nERROR: Image pathname is too long (maximum %zu characters). Aborting.\n",
+            sizeof(imgfn) - 1);
+    fprintf(stderr, "%s", BLACK);
+    return -1;
+  }
   optind++;
-  strncpy(blockmapfn, argv[optind], PATH_MAX / 2 - 1);
-  blockmapfn[PATH_MAX / 2 - 1] = 0;
+  if (! copy_string_complete(blockmapfn, sizeof(blockmapfn), argv[optind])) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr,
+            "\nERROR: Blockmap pathname is too long (maximum %zu characters). Aborting.\n",
+            sizeof(blockmapfn) - 1);
+    fprintf(stderr, "%s", BLACK);
+    return -1;
+  }
 
   fprintf(stdout, "Image file:\t\t\t\t%s\"\n", imgfn);
   fprintf(stdout, "Blockmap file:\t\t\t\t\"%s\"\n", blockmapfn);
@@ -258,9 +271,34 @@ int main(int argc, char *argv[]) {
   }
 
   // get size of image file
-  fseek(imgfile, 0, SEEK_END);
-  filesize = ftello(imgfile);
-  fseek(imgfile, 0, SEEK_SET);
+  if (fseeko(imgfile, 0, SEEK_END) != 0) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "\nERROR: Couldn't seek image file \"%s\". Aborting.\n", imgfn);
+    fprintf(stderr, "%s", BLACK);
+    goto die;
+  }
+
+  image_size = ftello(imgfile);
+  if (image_size < 0) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "\nERROR: Couldn't determine size of image file \"%s\". Aborting.\n", imgfn);
+    fprintf(stderr, "%s", BLACK);
+    goto die;
+  }
+  if (image_size == 0) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "\nERROR: Image file \"%s\" is empty; a blockmap requires at least one block. Aborting.\n",
+            imgfn);
+    fprintf(stderr, "%s", BLACK);
+    goto die;
+  }
+  if (fseeko(imgfile, 0, SEEK_SET) != 0) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "\nERROR: Couldn't rewind image file \"%s\". Aborting.\n", imgfn);
+    fprintf(stderr, "%s", BLACK);
+    goto die;
+  }
+  filesize = (uint64_t)image_size;
 
   // establish number of blocks that blockmap must cover
   numblocks = CEILDIV(filesize, blocksize);

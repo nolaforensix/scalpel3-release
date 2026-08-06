@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -236,6 +236,7 @@ typedef struct PNGMarkerEntry {
 typedef struct PNGCrcHashTable {
   PNGCrcEntry *buckets[PNG_CRC_HASH_BUCKETS];
   int64_t total_entries;
+  uint32_t block_forward[32];
   uint32_t *actual_crc;
   unsigned char *actual_valid;
   int64_t actual_count;
@@ -245,6 +246,21 @@ typedef struct PNGCrcHashTable {
   PNGMarkerEntry *marker_pool;
   uint64_t marker_count;
 } PNGCrcHashTable;
+
+static inline bool png_crc_inverse_for_len(z_off_t len, uint32_t inv[32]);
+static inline void png_crc_forward_for_len(z_off_t len,
+                                            uint32_t forward[32]);
+static inline uint32_t png_crc_apply_forward(const uint32_t forward[32],
+                                              uint32_t value);
+static inline uint32_t png_crc_apply_inverse(const uint32_t inv[32],
+                                              uint32_t value);
+static inline int png_compare_int64(const void *left, const void *right);
+
+static inline int png_compare_int64(const void *left, const void *right) {
+  int64_t a = *(const int64_t *)left;
+  int64_t b = *(const int64_t *)right;
+  return (a > b) - (a < b);
+}
 
 static inline bool png_crc_actual_valid(PNGCrcHashTable *ht,
                                         int64_t actual) {
@@ -302,10 +318,8 @@ static inline bool png_crc_actual_pair_crc(PNGCrcHashTable *ht,
   if (ap0 < 0 || ap1 < 0 || ap0 == ap1) {
     return false;
   }
-  *out_crc = (uint32_t)crc32_combine(
-      (uLong)ht->actual_crc[actual_start],
-      (uLong)ht->actual_crc[actual_start + 1],
-      (z_off_t)scalpel_state.blocksize);
+  *out_crc = png_crc_apply_forward(ht->block_forward,
+      ht->actual_crc[actual_start]) ^ ht->actual_crc[actual_start + 1];
   *out_ap0 = ap0;
   *out_ap1 = ap1;
   return true;
@@ -520,12 +534,10 @@ static inline void png_crc_marker_index_build(PNGCrcHashTable *ht) {
 // we must try every stored-CRC candidate that could complete the chunk
 // before giving up.  Raised to 256 for the same reason.
 #define PNG_BBK_SUFFIX_TRY_LIMIT 256U
-/* The generic M=4 meet-in-the-middle path is quadratic in the current
- * uncovered-block universe.  On the large corpus N is ~645k, which turns
- * the tail into an effectively unbounded CPU burn after useful recovery
- * has stopped.  Keep the generic path for focused/small corpora only; large
- * corpora need format-specific fast patterns, not brute-force M=4. */
-#define PNG_M4_FEASIBLE_MAX_N 8192U
+// A complete M=4 meet-in-the-middle search stores every ordered left pair.
+// Bound per-worker storage rather than using an arbitrary candidate count;
+// larger searches continue to use the structured run and anchor solvers.
+#define PNG_M4_PAIR_MEMORY_LIMIT (32ULL * 1024ULL * 1024ULL)
 
 /* M=3 Phase C is also quadratic: it fixes one middle block, then scans a
  * second block and hash-solves the third.  Keep it for small residual
@@ -595,54 +607,6 @@ static inline bool png_bbk_append_suffix_trial(
   trial_fixed[*trial_count] = fixed_suffix;
   (*trial_count)++;
   return true;
-}
-
-static inline bool png_bbk_build_minv(uint32_t minv_out[32],
-                                       z_off_t trail_len) {
-  uint32_t aug[32];
-  for (int i = 0; i < 32; i++) {
-    aug[i] = (uint32_t)crc32_combine(
-        (uLong)(1U << i), 0UL, trail_len);
-    minv_out[i] = 1U << i;
-  }
-  for (int col = 0; col < 32; col++) {
-    int pivot = -1;
-    for (int row = col; row < 32; row++) {
-      if (aug[row] & (1U << col)) {
-        pivot = row;
-        break;
-      }
-    }
-    if (pivot < 0) {
-      return false;
-    }
-    if (pivot != col) {
-      uint32_t tmp = aug[col];
-      aug[col] = aug[pivot];
-      aug[pivot] = tmp;
-      tmp = minv_out[col];
-      minv_out[col] = minv_out[pivot];
-      minv_out[pivot] = tmp;
-    }
-    for (int row = 0; row < 32; row++) {
-      if (row != col && (aug[row] & (1U << col))) {
-        aug[row] ^= aug[col];
-        minv_out[row] ^= minv_out[col];
-      }
-    }
-  }
-  return true;
-}
-
-static inline uint32_t png_bbk_apply_minv(const uint32_t minv[32],
-                                           uint32_t value) {
-  uint32_t result = 0;
-  for (int bit = 0; bit < 32; bit++) {
-    if (value & (1U << bit)) {
-      result ^= minv[bit];
-    }
-  }
-  return result;
 }
 
 static inline bool png_bbk_entry_allowed_with_path(
@@ -867,11 +831,11 @@ static inline int png_bbk_contiguous_run_solve(CarveInfo *candidate,
   }
 
   uint32_t inv[32];
-  if (!png_bbk_build_minv(inv, finfo[n_fill - 1].trail)) {
+  if (!png_crc_inverse_for_len(finfo[n_fill - 1].trail, inv)) {
     return 0;
   }
 
-  uint32_t needed_run_crc = png_bbk_apply_minv(inv, unknown_target);
+  uint32_t needed_run_crc = png_crc_apply_inverse(inv, unknown_target);
   PNGGapWindowTable *runs = png_gap_window_table_get(ht, n_fill);
   if (!runs) {
     return 0;
@@ -928,8 +892,9 @@ static inline bool png_bbk_actual_run_contribution(PNGCrcHashTable *ht,
                                                     uint32_t n_fill,
                                                     uint64_t idat_end,
                                                     const BBKFillInfo *finfo,
+                                                    const uint32_t tail_forward[32],
                                                     uint32_t *out) {
-  if (!ht || !fill_pos || !finfo || !out || n_fill == 0) {
+  if (!ht || !fill_pos || !finfo || !tail_forward || !out || n_fill == 0) {
     return false;
   }
 
@@ -967,10 +932,7 @@ static inline bool png_bbk_actual_run_contribution(PNGCrcHashTable *ht,
   if (!have_bytes || last_ov_end > idat_end) {
     return false;
   }
-  *out = (last_ov_end < idat_end)
-      ? (uint32_t)crc32_combine((uLong)crc, 0UL,
-          (z_off_t)(idat_end - last_ov_end))
-      : crc;
+  *out = png_crc_apply_forward(tail_forward, crc);
   return true;
 }
 
@@ -1004,6 +966,19 @@ static inline int png_bbk_contiguous_run_scan_solve(CarveInfo *candidate,
     return 0;
   }
 
+  uint64_t last_overlap_end = 0;
+  for (uint32_t i = 0; i < n_fill; i++) {
+    if (finfo[i].ov_end > finfo[i].ov_start) {
+      last_overlap_end = finfo[i].ov_end;
+    }
+  }
+  if (last_overlap_end == 0 || last_overlap_end > idat_end) {
+    return 0;
+  }
+  uint32_t tail_forward[32];
+  png_crc_forward_for_len((z_off_t)(idat_end - last_overlap_end),
+                          tail_forward);
+
   uint64_t checked = 0;
   int64_t apparent[PNG_GAP_INDEX_MAX_M];
   for (uint32_t bucket = 0; bucket < PNG_GAP_WINDOW_BUCKETS; bucket++) {
@@ -1032,7 +1007,7 @@ static inline int png_bbk_contiguous_run_scan_solve(CarveInfo *candidate,
       uint32_t contrib = 0;
       if (!png_bbk_actual_run_contribution(ht, we->start_actual,
               suffix_start_nb, fill_pos, n_fill, idat_end,
-              finfo, &contrib)
+              finfo, tail_forward, &contrib)
           || contrib != unknown_target) {
         continue;
       }
@@ -1204,9 +1179,13 @@ static inline int png_bbk_exact_solve(CarveInfo *candidate,
   }
 
   uint32_t last_minv[32];
-  if (!png_bbk_build_minv(last_minv, finfo[n_fill - 1].trail)) {
+  if (!png_crc_inverse_for_len(finfo[n_fill - 1].trail, last_minv)) {
     png_bbk_resume_reset(local);
     return 0;
+  }
+  uint32_t trail_forward[PNG_BBK_EXACT_MAX_FILL][32];
+  for (uint32_t i = 0; i + 1 < n_fill; i++) {
+    png_crc_forward_for_len(finfo[i].trail, trail_forward[i]);
   }
 
   uint32_t flat_count = (uint32_t)ht->total_entries;
@@ -1379,11 +1358,9 @@ static inline int png_bbk_exact_solve(CarveInfo *candidate,
             png_bbk_resume_reset(local);
             return 0;
           }
-          shifted_xor ^= finfo[i].trail > 0
-              ? (uint32_t)crc32_combine((uLong)e->crc, 0UL, finfo[i].trail)
-              : e->crc;
+          shifted_xor ^= png_crc_apply_forward(trail_forward[i], e->crc);
         }
-        leaf_need_crc = png_bbk_apply_minv(
+        leaf_need_crc = png_crc_apply_inverse(
             last_minv, unknown_target ^ shifted_xor);
         leaf_last_actual = -1;
         at_leaf = true;
@@ -1568,10 +1545,10 @@ static inline int png_bbk_single_swap_solve(CarveInfo *candidate,
   // possible match iff shift(e->crc, tail_p) equals the target
   // contribution: shift(CRC(old), tail_p) XOR (current_crc XOR
   // bbk_stored_crc).  This replaces a physical inflate+crc verify with
-  // two crc32_combine calls per hash entry — roughly 100x faster on the
-  // retry-with-all-positions path, which is the path that large-corpus
-  // OUTOFORDER candidates land on when is_fill classifies nothing as
-  // fill (BBK blind spot for swapped/displaced blocks).
+  // an inverse shift and exact CRC-table lookup.  The retry path then
+  // physically verifies only exact CRC matches instead of scanning every
+  // table entry.  This is the path that large-corpus OUTOFORDER candidates
+  // reach when is_fill classifies nothing as fill.
   uint32_t current_crc = 0;
   bool have_cur_crc = false;
   {
@@ -1597,7 +1574,8 @@ static inline int png_bbk_single_swap_solve(CarveInfo *candidate,
     // physical verify for every candidate (e.g. boundary-overlap blocks
     // where linearity doesn't hold over just the block's CRC).
     bool pos_alg_ok = false;
-    uint32_t pos_target_contrib = 0;
+    uint32_t pos_current_crc = 0;
+    uint32_t pos_required_crc = 0;
     uint64_t pos_tail = 0;
     {
       uint64_t pbs = (suffix_start_nb + fpos) * bs_u;
@@ -1609,12 +1587,22 @@ static inline int png_bbk_single_swap_solve(CarveInfo *candidate,
         uint32_t cur_bcrc = png_get_block_crc(orig_ab,
             candidate->needleidx, &ok);
         if (ok) {
-          uint32_t cur_contrib = (pos_tail > 0)
-              ? (uint32_t)crc32_combine(
-                    (uLong)cur_bcrc, 0UL, (z_off_t)pos_tail)
-              : cur_bcrc;
-          pos_target_contrib = cur_contrib ^ needed_delta;
+          pos_current_crc = cur_bcrc;
           pos_alg_ok = true;
+        }
+      }
+    }
+
+    if (pos_alg_ok) {
+      if (pos_tail == 0) {
+        pos_required_crc = pos_current_crc ^ needed_delta;
+      } else {
+        uint32_t pos_inv[32];
+        if (png_crc_inverse_for_len((z_off_t)pos_tail, pos_inv)) {
+          pos_required_crc = pos_current_crc
+              ^ png_crc_apply_inverse(pos_inv, needed_delta);
+        } else {
+          pos_alg_ok = false;
         }
       }
     }
@@ -1624,50 +1612,60 @@ static inline int png_bbk_single_swap_solve(CarveInfo *candidate,
       continue;
     }
 
-    for (uint32_t bk = 0; bk < PNG_CRC_HASH_BUCKETS; bk++) {
-      if ((bk & 0xFFU) == 0U
+    uint32_t bk = 0;
+    uint64_t scan_count = 0;
+    PNGCrcEntry *scan_entry = NULL;
+    PNGCrcEntry *direct_entry = pos_alg_ok
+        ? png_crc_table_find(ht, pos_required_crc) : NULL;
+    while (true) {
+      PNGCrcEntry *e = NULL;
+      if (pos_alg_ok) {
+        if (!direct_entry) {
+          break;
+        }
+        e = direct_entry;
+        direct_entry = png_crc_table_next(direct_entry, pos_required_crc);
+      } else {
+        while (!scan_entry && bk < PNG_CRC_HASH_BUCKETS) {
+          if ((bk & 0xFFU) == 0U
+              && png_reassembly_yield_requested(candidate)) {
+            return -1;
+          }
+          scan_entry = ht->buckets[bk++];
+        }
+        if (!scan_entry) {
+          break;
+        }
+        e = scan_entry;
+        scan_entry = scan_entry->next;
+      }
+
+      if ((scan_count++ & 0xFFULL) == 0ULL
           && png_reassembly_yield_requested(candidate)) {
         return -1;
       }
-      for (PNGCrcEntry *e = ht->buckets[bk]; e; e = e->next) {
-        if (filemirror_actual_block_covered(
-                scalpel_state.filemirror, e->actual_block)) {
-          continue;
-        }
-        int64_t trial_ab = filemirror_apparent_blocknumber(
-            scalpel_state.filemirror, e->actual_block);
-        if (trial_ab < 0 || trial_ab == orig_ab) {
-          continue;
-        }
-
-        // Algebraic pre-filter (full-middle positions only).  If this
-        // rejects the candidate, no swap placing it at fpos can produce
-        // the target IDAT CRC.  This is exact in GF(2) — no false
-        // negatives.  If pos_alg_ok is false we fall through and do the
-        // full physical verify as before.
-        if (pos_alg_ok) {
-          uint32_t e_contrib = (pos_tail > 0)
-              ? (uint32_t)crc32_combine(
-                    (uLong)e->crc, 0UL, (z_off_t)pos_tail)
-              : e->crc;
-          if (e_contrib != pos_target_contrib) {
-            continue;
-          }
-        }
-
-        blockvector_set_apparent_blocknumber(candidate->b,
-            suffix_start_nb + fpos, trial_ab);
-        inflate_blockvector_single_block(candidate->b,
-            suffix_start_nb + fpos);
-        if (png_bbk_verify_crc(candidate, idat_start,
-                bbk_crc_len, bbk_stored_crc)) {
-          return 1;
-        }
-        blockvector_set_apparent_blocknumber(candidate->b,
-            suffix_start_nb + fpos, orig_ab);
-        inflate_blockvector_single_block(candidate->b,
-            suffix_start_nb + fpos);
+      if (filemirror_actual_block_covered(
+              scalpel_state.filemirror, e->actual_block)) {
+        continue;
       }
+      int64_t trial_ab = filemirror_apparent_blocknumber(
+          scalpel_state.filemirror, e->actual_block);
+      if (trial_ab < 0 || trial_ab == orig_ab) {
+        continue;
+      }
+
+      blockvector_set_apparent_blocknumber(candidate->b,
+          suffix_start_nb + fpos, trial_ab);
+      inflate_blockvector_single_block(candidate->b,
+          suffix_start_nb + fpos);
+      if (png_bbk_verify_crc(candidate, idat_start,
+              bbk_crc_len, bbk_stored_crc)) {
+        return 1;
+      }
+      blockvector_set_apparent_blocknumber(candidate->b,
+          suffix_start_nb + fpos, orig_ab);
+      inflate_blockvector_single_block(candidate->b,
+          suffix_start_nb + fpos);
     }
   }
   png_bbk_restore_fill_positions(candidate, suffix_start_nb, fill_pos,
@@ -1829,7 +1827,9 @@ static inline uint32_t png_block_validate(char *data,
 					  void *blockhashkey) {
   (void)blocksize;
 
-  *decision = BLOCK_CONFIDENCE_VALID;
+  if (*decision == BLOCK_CONFIDENCE_INVALID) {
+    *decision = BLOCK_CONFIDENCE_VALID;
+  }
   *validates_to = length > 0 ? length - 1 : 0;
 
   if (scalpel_state.no_defrag) {
@@ -1892,8 +1892,6 @@ static inline uint32_t png_block_validate(char *data,
 #define PNG_B8F_DEBUG 0       /* diagnostic output for B8f sub-block ratio check */
 #define PNG_B11_DEBUG 0       /* diagnostic output for B11 window-distance auto-correlation */
 #define PNG_B12_DEBUG 0       /* diagnostic output for B12 MAD spike detection */
-#define PNG_B13_DEBUG 0       /* diagnostic: B13 sliding-window MAD (observe only) */
-#define PNG_MAD_WINDOW 16     /* B13: sliding window size (rows) */
 
 typedef unsigned char  uch;
 typedef unsigned short ush;
@@ -2079,6 +2077,35 @@ typedef struct PNGCheckpointLocals {
     printbuf_state prbuf_state;
 } PNGCheckpointLocals;
 
+typedef struct PNGM2ResumeState {
+    bool active;
+    bool best_found;
+    bool best_validated;
+    uint8_t pad;
+    uint32_t fill_needed;
+    uint32_t bucket;
+    uint64_t suffix_nb;
+    uint64_t crc_pos;
+    int64_t suffix_actual;
+    int64_t next_actual;
+    uint64_t best_validates_to;
+    uint64_t best_advance_to;
+    uint32_t best_locality;
+    uint32_t best_pad;
+    int64_t best_left_actual;
+    int64_t best_right_actual;
+    int64_t best_suffix_actual;
+} PNGM2ResumeState;
+
+static inline void png_m2_resume_reset(PNGM2ResumeState *state) {
+    memset(state, 0, sizeof(*state));
+    state->suffix_actual = -1;
+    state->next_actual = -1;
+    state->best_left_actual = -1;
+    state->best_right_actual = -1;
+    state->best_suffix_actual = -1;
+}
+
 typedef struct PNGCarveState {
     bool valid;
     uint64_t prefix_hash;         /* XXH3 of data[0..checkpoint_curpos) */
@@ -2194,19 +2221,6 @@ typedef struct PNGCarveState {
     double   b12_spike_mad;
     double   b12_spike_ratio;
     uint64_t b12_rows_into_block;
-    /* B13: Sliding-window MAD gate */
-    double   b13_mad_window[PNG_MAD_WINDOW];
-    uint32_t b13_mad_window_idx;
-    uint32_t b13_mad_window_count;
-    double   b13_mad_window_sum;
-    /* B14: Sustained window-depression echo detector */
-    uint32_t b14_depressed_rows;
-    uint32_t b14_total_rows;
-    uint64_t b14_depression_start;
-    uint64_t b14_freeze_pos;
-    /* B15: Filter-type echo detector */
-    uint32_t b15_consec_non_paeth;
-    uint64_t b15_freeze_pos;
     /* Combined suspicion */
     double   b8_suspicion;
     double   b8_max_suspicion_since_crc;
@@ -2253,12 +2267,13 @@ typedef struct PNGCarveState {
     int64_t  solver_right_idx;      /* er1 flat index to resume at */
     int64_t  solver_right_idx2;     /* er2 flat index to resume at */
     uint64_t solver_suffix_nb;      /* suffix_start_nb these fields apply to */
-    uint8_t  solver_phase;          /* 0 none, 1 M3-B, 2 M3-C, 3 M4, 5 suffix-run */
-    uint8_t  solver_pair_idx;       /* M3-B pair index */
+    uint8_t  solver_phase;          /* 0 none, 1 M3-B, 2 M3-C, 3 M4,
+                                     * 4 M3 split-run, 5 suffix-run */
+    uint8_t  solver_pair_idx;       /* M3 split-run pair index */
     uint16_t solver_phase_pad;
-    uint32_t solver_chunk_i;        /* M4 chunk start index i */
-    uint32_t solver_chunk_j;        /* M4 chunk start index j */
+    uint64_t solver_m4_universe_hash;
     uint64_t solver_table_epoch;    /* apparent-block mapping epoch */
+    PNGM2ResumeState m2_resume;
 
     /* Heap-backed solver table cache.  It is cloned for in-process queue
      * handoff, but is intentionally dropped from disk checkpoints; scalar
@@ -2346,9 +2361,9 @@ typedef struct PNGReassemblyPrivateState {
   uint8_t  solver_phase;
   uint8_t  solver_pair_idx;
   uint16_t solver_phase_pad;
-  uint32_t solver_chunk_i;
-  uint32_t solver_chunk_j;
+  uint64_t solver_m4_universe_hash;
   uint64_t solver_table_epoch;
+  PNGM2ResumeState m2_resume;
   PNGSolverContext *solver_ctx;
   bool     gap_fast_resume_valid;
   bool     gap_fast_exhausted;
@@ -2400,8 +2415,8 @@ static inline void png_solver_resume_reset(PNGCarveState *local) {
   local->solver_phase = 0;
   local->solver_pair_idx = 0;
   local->solver_phase_pad = 0;
-  local->solver_chunk_i = 0;
-  local->solver_chunk_j = 0;
+  local->solver_m4_universe_hash = 0;
+  png_m2_resume_reset(&local->m2_resume);
 }
 
 static inline void png_bbk_resume_reset(PNGCarveState *local) {
@@ -2603,9 +2618,9 @@ static inline void png_reassembly_private_save(
   dst->solver_phase = src->solver_phase;
   dst->solver_pair_idx = src->solver_pair_idx;
   dst->solver_phase_pad = src->solver_phase_pad;
-  dst->solver_chunk_i = src->solver_chunk_i;
-  dst->solver_chunk_j = src->solver_chunk_j;
+  dst->solver_m4_universe_hash = src->solver_m4_universe_hash;
   dst->solver_table_epoch = src->solver_table_epoch;
+  dst->m2_resume = src->m2_resume;
   dst->solver_ctx = src->solver_ctx;
   dst->gap_fast_resume_valid = src->gap_fast_resume_valid;
   dst->gap_fast_exhausted = src->gap_fast_exhausted;
@@ -2666,9 +2681,9 @@ static inline void png_reassembly_private_restore(
   dst->solver_phase = src->solver_phase;
   dst->solver_pair_idx = src->solver_pair_idx;
   dst->solver_phase_pad = src->solver_phase_pad;
-  dst->solver_chunk_i = src->solver_chunk_i;
-  dst->solver_chunk_j = src->solver_chunk_j;
+  dst->solver_m4_universe_hash = src->solver_m4_universe_hash;
   dst->solver_table_epoch = src->solver_table_epoch;
+  dst->m2_resume = src->m2_resume;
   dst->solver_ctx = src->solver_ctx;
   dst->gap_fast_resume_valid = src->gap_fast_resume_valid;
   dst->gap_fast_exhausted = src->gap_fast_exhausted;
@@ -2920,58 +2935,13 @@ typedef struct PNGMemIO {
   double    b12_spike_ratio;      /* mad/avg ratio at the spike — keep highest */
   uint64_t  b12_rows_into_block;  /* rows decoded since last block boundary */
 
-  /* B13: Sliding-window MAD gate.
-   * Echo data produces per-row MAD at ~0.5× the running average —
-   * individual rows pass the [avg/3, 3×avg] bounds, but a WINDOW
-   * of 16 consecutive echo rows has a clearly depressed average.
-   * Track last PNG_MAD_WINDOW good-row MAD values in a circular
-   * buffer.  In the H6 gate, block last_good_filter_pos from
-   * advancing when the window average is below running_avg × 0.60
-   * AND we're past the last CRC boundary. */
-  double    b13_mad_window[PNG_MAD_WINDOW]; /* circular buffer of recent good-row MAD */
-  uint32_t  b13_mad_window_idx;   /* next write position in circular buffer */
-  uint32_t  b13_mad_window_count; /* entries filled (max PNG_MAD_WINDOW) */
-  double    b13_mad_window_sum;   /* running sum of buffer entries */
-
-  /* B14: Sustained window-depression echo detector.
-   *
-   * Echo data (dictionary laundering) produces per-row MAD at ~0.32-0.50×
-   * the running average.  Individual rows pass per-row bounds, but B13's
-   * sliding window catches the sustained depression.  B13 alone was too
-   * hair-trigger (single depressed window → block lgfp).
-   *
-   * B14 requires SUSTAINED depression: the B13 window average must stay
-   * below 0.55× of the running average for 48+ consecutive good rows
-   * after a CRC boundary.  When confirmed, freeze lgfp at the position
-   * where the depression started — the echo transition point.
-   *
-   * 0.55× is between observed echo (0.32-0.50×) and the lowest correct-
-   * data window ratio (0.56×).  Echo hovers near the boundary, so a
-   * strict consecutive-row requirement misses it (one row pops above
-   * and resets the count).  Instead, use a budget: track depressed and
-   * total rows since first depression.  If 40+ of the last 48 rows are
-   * depressed, confirm echo.  If >8 non-depressed rows accumulate,
-   * reset — the depression isn't sustained enough.  This tolerates
-   * occasional jitter while still requiring overwhelming evidence. */
-  uint32_t  b14_depressed_rows;     /* rows where window avg < 0.55× since start */
-  uint32_t  b14_total_rows;         /* total rows evaluated since first depression */
-  uint64_t  b14_depression_start;   /* input_pos where depression first detected */
-  uint64_t  b14_freeze_pos;         /* confirmed echo: freeze lgfp at this position */
-
-  /* B15: Filter-type echo detector.
-   *
-   * Echo data (dictionary laundering) produces decompressed bytes biased
-   * toward 0 because the LZ77 sliding window contains filter residuals
-   * near 0.  The first byte of each row (the filter type) ends up as 0
-   * (None) instead of 4 (Paeth).  Photographic PNGs use Paeth for 90-97%
-   * of rows.  16 consecutive non-Paeth rows in such an image is a 10^-16
-   * event in correct data but the norm in echo data.
-   *
-   * When running Paeth fraction > 0.70 and we see 16 consecutive non-Paeth
-   * rows, freeze lgfp.  This prevents the wrong block from advancing lgfp,
-   * opening a gap that the gap check (branch 51) can detect. */
-  uint32_t  b15_consec_non_paeth;   /* consecutive rows with filter type != 4 */
-  uint64_t  b15_freeze_pos;         /* confirmed echo: freeze lgfp here */
+  // Historical note: B13/B14/B15 were experimental echo detectors.
+  // B13 tracked a sliding MAD window; B14 tried to freeze progress after
+  // sustained MAD depression; B15 tried to freeze progress after a run of
+  // non-Paeth filters.  B14/B15 freeze positions were never consumed by
+  // scoring, so the hot-loop work did not affect recovery.  They are
+  // intentionally absent unless a future corpus shows a measured need for
+  // a new, wired-in ranking signal.
 
   /* Combined suspicion: latest normalized dev/thresh from each detector.
    * Updated at block boundary, EOF, and post-inflate check sites.
@@ -3242,21 +3212,6 @@ static inline void init_PNGMemIO(PNGMemIO *m, char *data, uint64_t length,
   m->b12_spike_mad = 0.0;
   m->b12_spike_ratio = 0.0;
   m->b12_rows_into_block = 0;
-  /* B13: Sliding-window MAD gate */
-  if (!complete_contiguous_probe) {
-    memset(m->b13_mad_window, 0, sizeof(m->b13_mad_window));
-  }
-  m->b13_mad_window_idx = 0;
-  m->b13_mad_window_count = 0;
-  m->b13_mad_window_sum = 0.0;
-  /* B14: Sustained window-depression echo detector */
-  m->b14_depressed_rows = 0;
-  m->b14_total_rows = 0;
-  m->b14_depression_start = 0;
-  m->b14_freeze_pos = 0;
-  /* B15: Filter-type echo detector */
-  m->b15_consec_non_paeth = 0;
-  m->b15_freeze_pos = 0;
   /* Combined suspicion */
   m->b8_suspicion = 0.0;
   m->b8_max_suspicion_since_crc = 0.0;
@@ -3761,7 +3716,7 @@ int pngcheck(PNGMemIO *mem) {
   ush delay_num = 0, delay_den = 0;
   uch dispose_op = 0, blend_op = 0;
   ulg zhead = 1;   /* 0x10000 indicates both zlib header bytes read */
-  ulg crc, filecrc;
+  ulg crc, filecrc = 0;
   long num_chunks = 0L;
   long w = 0L, h = 0L;
   int bitdepth = 0, sampledepth = 0, ityp = 1, lace = 0, nplte = 0;
@@ -3964,19 +3919,6 @@ int pngcheck(PNGMemIO *mem) {
         mem->b12_spike_mad = saved->b12_spike_mad;
         mem->b12_spike_ratio = saved->b12_spike_ratio;
         mem->b12_rows_into_block = saved->b12_rows_into_block;
-        /* B13: Sliding-window MAD gate */
-        memcpy(mem->b13_mad_window, saved->b13_mad_window, sizeof(mem->b13_mad_window));
-        mem->b13_mad_window_idx = saved->b13_mad_window_idx;
-        mem->b13_mad_window_count = saved->b13_mad_window_count;
-        mem->b13_mad_window_sum = saved->b13_mad_window_sum;
-        /* B14: Sustained window-depression echo detector */
-        mem->b14_depressed_rows = saved->b14_depressed_rows;
-        mem->b14_total_rows = saved->b14_total_rows;
-        mem->b14_depression_start = saved->b14_depression_start;
-        mem->b14_freeze_pos = saved->b14_freeze_pos;
-        /* B15: Filter-type echo detector */
-        mem->b15_consec_non_paeth = saved->b15_consec_non_paeth;
-        mem->b15_freeze_pos = saved->b15_freeze_pos;
         /* Combined suspicion */
         mem->b8_suspicion = saved->b8_suspicion;
         mem->b8_max_suspicion_since_crc = saved->b8_max_suspicion_since_crc;
@@ -4869,7 +4811,6 @@ int pngcheck(PNGMemIO *mem) {
                             mem->b12_spike_pos = mem->last_filter_blk_boundary;
                             mem->b12_spike_mad = mad;
                             mem->b12_spike_ratio = ratio;
-                            /* (B14 no longer armed here — uses B13 window instead) */
 #if PNG_B12_DEBUG
                             fprintf(stderr, "B12-SPIKE: mad=%.1f avg=%.1f ratio=%.1f"
                                     " blk_pos=%"PRIu64" ipos=%"PRIu64
@@ -4978,96 +4919,6 @@ int pngcheck(PNGMemIO *mem) {
                         mem->running_corr_sum += is_paeth;
                         mem->corr_count++;
                         mem->consecutive_good_rows++;
-                        /* B13: update sliding MAD window with this good row */
-                        {
-                          if (mem->b13_mad_window_count >= PNG_MAD_WINDOW) {
-                            mem->b13_mad_window_sum -= mem->b13_mad_window[mem->b13_mad_window_idx];
-                          } else {
-                            mem->b13_mad_window_count++;
-                          }
-                          mem->b13_mad_window[mem->b13_mad_window_idx] = mad;
-                          mem->b13_mad_window_sum += mad;
-                          mem->b13_mad_window_idx =
-                            (mem->b13_mad_window_idx + 1) % PNG_MAD_WINDOW;
-                        }
-                        /* B14: sustained window-depression echo detector.
-                         * Budget model: 40 depressed out of 48 total rows.
-                         * Tolerates occasional jitter above threshold. */
-                        if (mem->b14_freeze_pos == 0
-                            && mem->b13_mad_window_count >= PNG_MAD_WINDOW
-                            && mem->mad_count >= 32
-                            && mem->last_idat_crc_pos > 0) {
-                          uint64_t ipos_b14 = mem->curpos - zstrm.avail_in;
-                          if (ipos_b14 > mem->last_idat_crc_pos) {
-                            double wnd_avg = mem->b13_mad_window_sum / mem->b13_mad_window_count;
-                            double run_avg = mem->running_mad_sum / mem->mad_count;
-                            if (run_avg > 15.0) {
-                              int depressed = (wnd_avg < run_avg * 0.55);
-                              if (depressed) {
-                                if (mem->b14_total_rows == 0)
-                                  mem->b14_depression_start = ipos_b14;
-                                mem->b14_depressed_rows++;
-                              }
-                              if (mem->b14_total_rows > 0 || depressed) {
-                                /* Only start counting once first depressed row seen */
-                                mem->b14_total_rows++;
-                                uint32_t nondep = mem->b14_total_rows - mem->b14_depressed_rows;
-                                if (mem->b14_depressed_rows >= 40) {
-                                  /* 40+ depressed rows: confirmed echo */
-                                  mem->b14_freeze_pos = mem->b14_depression_start;
-#if PNG_B13_DEBUG
-                                  fprintf(stderr, "B14-FREEZE: dep=%u/%u wnd=%.1f "
-                                          "run=%.1f ratio=%.3f start=%"PRIu64
-                                          " ipos=%"PRIu64"\n",
-                                          mem->b14_depressed_rows, mem->b14_total_rows,
-                                          wnd_avg, run_avg,
-                                          wnd_avg / run_avg,
-                                          mem->b14_depression_start, ipos_b14);
-#endif
-                                } else if (nondep > 8) {
-                                  /* Too many non-depressed rows: not sustained echo */
-#if PNG_B13_DEBUG
-                                  if (mem->b14_depressed_rows > 4) {
-                                    fprintf(stderr, "B14-RESET: dep=%u/%u wnd=%.1f "
-                                            "run=%.1f ratio=%.3f ipos=%"PRIu64"\n",
-                                            mem->b14_depressed_rows, mem->b14_total_rows,
-                                            wnd_avg, run_avg,
-                                            run_avg > 0 ? wnd_avg / run_avg : 0.0,
-                                            ipos_b14);
-                                  }
-#endif
-                                  mem->b14_depressed_rows = 0;
-                                  mem->b14_total_rows = 0;
-                                  mem->b14_depression_start = 0;
-                                }
-                              }
-                            }
-                          }
-                        }
-                        /* B15: Filter-type echo detector.
-                         * 16 consecutive non-Paeth rows in a Paeth-dominant
-                         * image is an unmistakable echo signature. */
-                        if (mem->b15_freeze_pos == 0
-                            && mem->corr_count > 30) {
-                          double run_paeth = mem->running_corr_sum / mem->corr_count;
-                          if (run_paeth > 0.70) {
-                            if (filttype != 4) {
-                              mem->b15_consec_non_paeth++;
-                              if (mem->b15_consec_non_paeth >= 16) {
-                                uint64_t ipos_b15 = mem->curpos - zstrm.avail_in;
-                                mem->b15_freeze_pos = ipos_b15;
-#if PNG_B13_DEBUG
-                                fprintf(stderr, "B15-FREEZE: paeth=%.3f "
-                                        "consec_non=%u ipos=%"PRIu64"\n",
-                                        run_paeth,
-                                        mem->b15_consec_non_paeth, ipos_b15);
-#endif
-                              }
-                            } else {
-                              mem->b15_consec_non_paeth = 0;
-                            }
-                          }
-                        }
                       } else {
                         mem->consecutive_good_rows = 0;
                       }
@@ -5160,7 +5011,7 @@ int pngcheck(PNGMemIO *mem) {
                         mem->b10_block_mad_count++;
                         mem->h9_mad_count_since_d4++;  /* diagnostic */
 
-                        /* Track Paeth fraction for H8/H7 partial-row support */
+                        /* Track Paeth fraction for H7 partial-row support */
                         int is_paeth = (filttype == 4) ? 1 : 0;
                         mem->running_mad_sum += partial_mad;
                         mem->mad_count++;
@@ -5413,45 +5264,12 @@ int pngcheck(PNGMemIO *mem) {
                 }
 
                 /* H6 gate = 3. With MAD validation, correct data passes on
-                 * virtually every row, so gate=3 is easily reachable. The
-                 * sliding window echo from wrong data typically produces only
-                 * 2 consecutive good rows before MAD diverges.
-                 *
-                 * B13 addition: after the last CRC boundary, also check
-                 * whether the sliding MAD window average is anomalously
-                 * low vs the running average.  Echo data produces per-row
-                 * MAD at ~0.5× running avg — each row passes the per-row
-                 * [avg/3, 3×avg] bounds, but the WINDOW of 16 rows has a
-                 * clearly depressed average.  Block last_good_filter_pos
-                 * from advancing when this sustained drop is detected,
-                 * causing the gap check to fire sooner and cap VT before
-                 * echo blocks. */
+                 * virtually every row, so gate=3 is easily reachable. Wrong
+                 * data typically fails MAD quickly, preventing validated
+                 * progress from advancing through it. */
                 {
                   uint64_t input_pos_gate = mem->curpos - zstrm.avail_in;
                   uint32_t h6_gate = 3;
-                  /* B13: OBSERVE ONLY — do not block last_good_filter_pos.
-                   * 0.60× threshold was too aggressive: correct files with
-                   * smooth post-CRC regions trigger false positives.
-                   * Log the window ratio so we can find a safe threshold. */
-#if PNG_B13_DEBUG
-                  if (mem->last_idat_crc_pos > 0
-                      && input_pos_gate > mem->last_idat_crc_pos
-                      && mem->b13_mad_window_count >= PNG_MAD_WINDOW
-                      && mem->mad_count >= 32) {
-                    double wnd_avg = mem->b13_mad_window_sum / mem->b13_mad_window_count;
-                    double run_avg = mem->running_mad_sum / mem->mad_count;
-                    if (run_avg > 15.0 && wnd_avg < run_avg * 0.70) {
-                      static _Atomic uint64_t b13_dbg_ctr = 0;
-                      if ((b13_dbg_ctr++ & 0x3FFF) == 0)
-                        fprintf(stderr, "B13-OBSERVE: wnd=%.1f run=%.1f "
-                                "ratio=%.3f ipos=%"PRIu64" crc=%"PRIu64
-                                " cgr=%u\n",
-                                wnd_avg, run_avg, wnd_avg / run_avg,
-                                input_pos_gate, mem->last_idat_crc_pos,
-                                mem->consecutive_good_rows);
-                    }
-                  }
-#endif
                   if (mem->consecutive_good_rows >= h6_gate)
                     mem->last_good_filter_pos = input_pos_gate;
                 }
@@ -7342,19 +7160,6 @@ int pngcheck(PNGMemIO *mem) {
         ckpt.b12_spike_mad = mem->b12_spike_mad;
         ckpt.b12_spike_ratio = mem->b12_spike_ratio;
         ckpt.b12_rows_into_block = mem->b12_rows_into_block;
-        /* B13: Sliding-window MAD gate */
-        memcpy(ckpt.b13_mad_window, mem->b13_mad_window, sizeof(ckpt.b13_mad_window));
-        ckpt.b13_mad_window_idx = mem->b13_mad_window_idx;
-        ckpt.b13_mad_window_count = mem->b13_mad_window_count;
-        ckpt.b13_mad_window_sum = mem->b13_mad_window_sum;
-        /* B14: Sustained window-depression echo detector */
-        ckpt.b14_depressed_rows = mem->b14_depressed_rows;
-        ckpt.b14_total_rows = mem->b14_total_rows;
-        ckpt.b14_depression_start = mem->b14_depression_start;
-        ckpt.b14_freeze_pos = mem->b14_freeze_pos;
-        /* B15: Filter-type echo detector */
-        ckpt.b15_consec_non_paeth = mem->b15_consec_non_paeth;
-        ckpt.b15_freeze_pos = mem->b15_freeze_pos;
         /* Combined suspicion */
         ckpt.b8_suspicion = mem->b8_suspicion;
         ckpt.b8_max_suspicion_since_crc = mem->b8_max_suspicion_since_crc;
@@ -8129,106 +7934,7 @@ static inline void png_validate_core(char *data,
           vt_branch = 54;  /* H7 post-CRC Paeth fraction cap */
         }
       }
-    }
-
-    /* H8: Blind spot Paeth fraction tiebreaker.
-     *
-     * In the CRC blind spot, correct and echo blocks both achieve
-     * vt = len-1 (branch 5) because no CRC or localized error
-     * distinguishes them.  The engine picks whichever is tested first,
-     * leading to ~50% chance of selecting an echo block.
-     *
-     * Key insight: correct blocks have Paeth fraction matching the
-     * running average (~90-97% for photographic images), while echo
-     * blocks have much lower Paeth (~5-15%) because LZ77 back-
-     * references into the sliding window produce arbitrary byte
-     * values as the "filter type" byte at each row boundary.
-     *
-     * b9_block_filt[4] / b9_block_rows gives the Paeth fraction
-     * for JUST the candidate block (counters reset at each disk
-     * block boundary; candidate is the last block, never reset).
-     *
-     * When the candidate Paeth fraction is below 0.40, reduce VT
-     * by 1.  This tiny reduction is enough for the engine's strict >
-     * comparison to prefer candidates with normal Paeth fraction.
-     *
-     * ABSOLUTE threshold (0.40) is critical for safety:
-     *   - Correct blocks always have Paeth > 0.70 → NEVER reduced
-     *   - Echo blocks typically have Paeth 0.05-0.15 → ALWAYS reduced
-     *   - The 0.40 threshold gives 30pp margin on both sides
-     *   - A relative threshold (e.g., 0.80 × running) was DANGEROUS:
-     *     correct blocks with natural Paeth dips (e.g., 0.75 when
-     *     running is 0.95) got penalized while echo blocks with
-     *     lucky Paeth escaped, causing CAT 6 regression.
-     *
-     * Conditions:
-     *   - vt_branch == 5: full VT, no other check fired
-     *   - mid_idat, blocksize > 0: we're carving mid-IDAT
-     *   - b9_block_rows >= 4: enough rows for stable fraction.
-     *     With 1-3 rows, the fraction is too coarse — a single
-     *     non-Paeth row in correct data (5% per-row probability)
-     *     drops the fraction below 0.40, penalizing the correct
-     *     block and breaking the engine's fastpath (vt must ==
-     *     len-1 to activate fastpath; len-2 disables it,
-     *     changing the entire evaluation strategy).
-     *     With >= 4 rows, P(correct < 0.40) < 0.05%.
-     *   - corr_count > 10: enough running baseline
-     *   - running Paeth > 0.70: image uses mostly Paeth
-     *   - candidate Paeth < 0.40: clearly not photographic Paeth */
-    if (vt_branch == 5 && mem.mid_idat && mem.blocksize > 0
-        && mem.b9_block_rows >= 4
-        && mem.corr_count > 10
-        && mem.last_idat_crc_pos > 0) {
-      double running_paeth = mem.running_corr_sum / mem.corr_count;
-      double cand_paeth = (double)mem.b9_block_filt[4] / mem.b9_block_rows;
-      if (running_paeth > 0.70
-          && cand_paeth < 0.40) {
-        vt = (vt > 0) ? vt - 1 : 0;
-        vt_branch = 59;  /* H8 blind spot Paeth tiebreaker */
-      }
-    }
-
-    /* H9: Blind spot MAD tiebreaker for wide images.
-     *
-     * H8 uses per-block Paeth fraction but needs >= 4 rows per block to
-     * be statistically reliable.  Wide images have only 1 row per 16K
-     * block, making H8 useless.  H9 uses a different signal: per-block
-     * MAD suspicion from the B10 infrastructure.
-     *
-     * B10 computes per-block MAD average at disk block boundaries and
-     * stores normalized suspicion = |block_avg - run_avg| / threshold,
-     * where threshold = max(1.5 × run_avg, 3σ).  This is computed
-     * BEFORE the per-block counters are reset, so b10_suspicion at VT
-     * time reflects the last completed disk block (the candidate block).
-     *
-     * Echo blocks produce anomalously high pixel MAD from dictionary
-     * laundering (garbage pixels via wrong zlib sliding window):
-     *   - Correct data: suspicion typically 0.0-0.8
-     *   - Echo data: suspicion typically 1.5-3.0+
-     *
-     * Using suspicion > 1.5 as threshold: well above correct-block
-     * variance, safely catches echo blocks.
-     *
-     * Guards:
-     *   - vt_branch == 5: only in blind spot (no prior error/cap)
-     *   - b9_block_rows < 4: only when H8 can't fire (wide images)
-     *   - b10_block_count >= 4: stable running MAD baseline
-     *   - b10_suspicion > 1.5: anomalous MAD for this block */
-    if (vt_branch == 5 && mem.mid_idat && mem.blocksize > 0
-        && mem.b10_block_count >= 4
-        && mem.h9_cand_mad_count >= 3   // P4: 2 → 3 to match the demotion path
-        && mem.last_idat_crc_pos > 0) {
-      double run_avg = mem.b10_running_mad_avg / mem.b10_block_count;
-      double cand_avg = mem.h9_cand_mad_sum / mem.h9_cand_mad_count;
-      // P4: match the threshold tightening applied to the demotion path
-      // below so the blind-spot tiebreaker and the primary H9 path agree.
-      if (run_avg > 7.0
-          && cand_avg > run_avg * 4.0
-          && mem.b10_anomaly_pos > 0) {
-        vt = (vt > 0) ? vt - 1 : 0;
-        vt_branch = 60;  /* H9 blind spot MAD tiebreaker */
-      }
-    }
+	    }
 
     /* Ring buffer backstop: catch cases where 2+ self-consistent wrong
      * IDATs polluted both last_idat_crc_pos AND prev_idat_crc_pos,
@@ -8245,6 +7951,17 @@ static inline void png_validate_core(char *data,
      * already set VT <= prev_idat_crc_pos (using the clean prev).
      * VT > prev only happens when prev itself is polluted. */
     *validates_to = vt;
+
+    // Historical note: two non-kOK blind-spot tiebreakers were removed
+    // from this fallback path.  H8 was a candidate-block Paeth-fraction
+    // tiebreaker; H9 was a candidate-block MAD tiebreaker.  They were
+    // intended to reduce VT by one byte for echo-like candidate blocks
+    // when no deterministic CRC/error signal distinguished candidates.
+    // In the old code they were unreachable because they tested
+    // vt_branch == 5 before vt_branch was assigned 5 below.  Enabling
+    // them did not improve the measured GAP, OOO, or GAP+OOO PNG
+    // corpora, so they are intentionally not parked here as inactive
+    // code.  The live H9 block below is a different kOK demotion path.
     if (!vt_branch) vt_branch = 5;  /* plain fallback */
   }
 
@@ -8253,8 +7970,9 @@ static inline void png_validate_core(char *data,
    *
    * Blind-spot echo blocks validate fully (err == kOK) because the zlib
    * stream decompresses without error and no CRC boundary falls within
-   * the candidate block.  H6c/H7/H8 run only in the error path and
-   * never see these blocks.
+   * the candidate block.  H6c/H7 run only in the error path and never
+   * see these blocks.  The old H8 fallback tiebreaker was also an
+   * error-path idea and is intentionally not present.
    *
    * B10 suspicion IS available because the block boundary code computed
    * it before resetting per-block counters.  For echo blocks, the
@@ -8664,6 +8382,9 @@ static inline bool png_parse_first_idat(CarveInfo *candidate,
         | (uint32_t)data[pos + 3];
     if (data[pos + 4] == 'I' && data[pos + 5] == 'D'
         && data[pos + 6] == 'A' && data[pos + 7] == 'T') {
+      if (chunk_len > PNG_MAX_IDAT_BODY_LEN) {
+        return false;
+      }
       *idat_body_start = pos + 8;
       *idat_body_size = chunk_len;
       *idat_crc_pos = pos + 8 + chunk_len;
@@ -8978,11 +8699,30 @@ static inline bool png_chunk_type_is_ascii(const uint8_t *type) {
       && isASCIIalpha((int)type[3]);
 }
 
+static inline void png_crc_forward_for_len(z_off_t len,
+                                            uint32_t forward[32]) {
+  uLong op = crc32_combine_gen(len);
+  for (int i = 0; i < 32; i++) {
+    forward[i] = (uint32_t)crc32_combine_op(
+        (uLong)(1U << i), 0UL, op);
+  }
+}
+
+static inline uint32_t png_crc_apply_forward(const uint32_t forward[32],
+                                              uint32_t value) {
+  uint32_t out = 0;
+  for (int bit = 0; bit < 32; bit++) {
+    if (value & (1U << bit)) {
+      out ^= forward[bit];
+    }
+  }
+  return out;
+}
+
 static inline bool png_crc_inverse_for_len(z_off_t len, uint32_t inv[32]) {
   uint32_t aug[32];
+  png_crc_forward_for_len(len, aug);
   for (int i = 0; i < 32; i++) {
-    uint32_t e_val = 1U << i;
-    aug[i] = (uint32_t)crc32_combine((uLong)e_val, 0UL, len);
     inv[i] = 1U << i;
   }
 
@@ -9070,6 +8810,8 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
   }
 
   uint32_t bs = scalpel_state.blocksize;
+  uint32_t block_forward[32];
+  png_crc_forward_for_len((z_off_t)bs, block_forward);
   for (int64_t start = 0; start < max_windows64; start++) {
     bool ok_window = true;
     uint32_t run_crc = crc32(0, NULL, 0);
@@ -9079,8 +8821,8 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
         ok_window = false;
         break;
       }
-      run_crc = (uint32_t)crc32_combine((uLong)run_crc,
-          (uLong)ht->actual_crc[actual], (z_off_t)bs);
+      run_crc = png_crc_apply_forward(block_forward, run_crc)
+          ^ ht->actual_crc[actual];
     }
     if (!ok_window) {
       continue;
@@ -9109,6 +8851,8 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
 static inline PNGCrcHashTable *png_build_crc_table(uint32_t png_needleidx) {
   PNGCrcHashTable *ht = (PNGCrcHashTable *)calloc(1, sizeof(PNGCrcHashTable));
   if (!ht) return NULL;
+  png_crc_forward_for_len((z_off_t)scalpel_state.blocksize,
+                          ht->block_forward);
   int64_t total = (int64_t)CEILDIV(filemirror_filesize(
       scalpel_state.filemirror), (uint64_t)scalpel_state.blocksize);
   if (total > 0) {
@@ -9215,13 +8959,10 @@ typedef struct PNGSolverStateSnapshot {
   long     idat_data_sz;
   bool     valid;
   bool     have_iend;
-  /* Echo-fingerprint fields — we both need to restore them on reject
-   * AND read them post-validate to distinguish correct vs echo-spurious
-   * matches (which pass CRC but produce non-Paeth filter distributions). */
+  /* Echo-fingerprint fields are restored on reject so a failed trial does
+   * not poison the next solver placement attempt. */
   double   post_crc_corr_sum;
   uint32_t post_crc_corr_count;
-  uint64_t b15_freeze_pos;
-  uint32_t b15_consec_non_paeth;
   double   running_corr_sum;
   uint64_t corr_count;
   double   post_crc_mad_sum;
@@ -9242,9 +8983,9 @@ typedef struct PNGSolverStateSnapshot {
   uint8_t  solver_phase;
   uint8_t  solver_pair_idx;
   uint16_t solver_phase_pad;
-  uint32_t solver_chunk_i;
-  uint32_t solver_chunk_j;
+  uint64_t solver_m4_universe_hash;
   uint64_t solver_table_epoch;
+  PNGM2ResumeState m2_resume;
   bool     gap_fast_resume_valid;
   bool     gap_fast_exhausted;
   uint32_t gap_fast_M;
@@ -9275,8 +9016,6 @@ static inline void png_solver_snapshot(PNGSolverStateSnapshot *snap,
   snap->have_iend            = local->have_iend;
   snap->post_crc_corr_sum    = local->post_crc_corr_sum;
   snap->post_crc_corr_count  = local->post_crc_corr_count;
-  snap->b15_freeze_pos       = local->b15_freeze_pos;
-  snap->b15_consec_non_paeth = local->b15_consec_non_paeth;
   snap->running_corr_sum     = local->running_corr_sum;
   snap->corr_count           = local->corr_count;
   snap->post_crc_mad_sum     = local->post_crc_mad_sum;
@@ -9291,9 +9030,9 @@ static inline void png_solver_snapshot(PNGSolverStateSnapshot *snap,
   snap->solver_phase         = local->solver_phase;
   snap->solver_pair_idx      = local->solver_pair_idx;
   snap->solver_phase_pad     = local->solver_phase_pad;
-  snap->solver_chunk_i       = local->solver_chunk_i;
-  snap->solver_chunk_j       = local->solver_chunk_j;
+  snap->solver_m4_universe_hash = local->solver_m4_universe_hash;
   snap->solver_table_epoch   = local->solver_table_epoch;
+  snap->m2_resume            = local->m2_resume;
   snap->gap_fast_resume_valid = local->gap_fast_resume_valid;
   snap->gap_fast_exhausted   = local->gap_fast_exhausted;
   snap->gap_fast_M           = local->gap_fast_M;
@@ -9324,8 +9063,6 @@ static inline void png_solver_restore(PNGCarveState *local,
   local->have_iend            = snap->have_iend;
   local->post_crc_corr_sum    = snap->post_crc_corr_sum;
   local->post_crc_corr_count  = snap->post_crc_corr_count;
-  local->b15_freeze_pos       = snap->b15_freeze_pos;
-  local->b15_consec_non_paeth = snap->b15_consec_non_paeth;
   local->running_corr_sum     = snap->running_corr_sum;
   local->corr_count           = snap->corr_count;
   local->post_crc_mad_sum     = snap->post_crc_mad_sum;
@@ -9340,9 +9077,9 @@ static inline void png_solver_restore(PNGCarveState *local,
   local->solver_phase         = snap->solver_phase;
   local->solver_pair_idx      = snap->solver_pair_idx;
   local->solver_phase_pad     = snap->solver_phase_pad;
-  local->solver_chunk_i       = snap->solver_chunk_i;
-  local->solver_chunk_j       = snap->solver_chunk_j;
+  local->solver_m4_universe_hash = snap->solver_m4_universe_hash;
   local->solver_table_epoch   = snap->solver_table_epoch;
+  local->m2_resume            = snap->m2_resume;
   local->gap_fast_resume_valid = snap->gap_fast_resume_valid;
   local->gap_fast_exhausted   = snap->gap_fast_exhausted;
   local->gap_fast_M           = snap->gap_fast_M;
@@ -9412,15 +9149,6 @@ static inline bool png_solver_confirm_match(
     // Full validation rejected.  That's normal for multi-IDAT files where
     // later IDATs still have wrong blocks at this solve iteration.  Accept
     // only if the validator actually walked past the IDAT solved here.
-    //
-    // B15 is useful for ordinary trial validation, but it can false-positive
-    // after a CRC-proven solver placement.  Keep accepted CRC progress while
-    // discarding speculative B15 state so the next pass can judge later data
-    // independently.
-    if (local->b15_freeze_pos != 0 && snap.b15_freeze_pos == 0) {
-      local->b15_freeze_pos = snap.b15_freeze_pos;
-      local->b15_consec_non_paeth = snap.b15_consec_non_paeth;
-    }
     return true;
   }
 
@@ -9556,8 +9284,6 @@ static inline int png_crc_solve_idat(
     int64_t last_block, int64_t total_apparent,
     uint64_t crc_pos, long idat_sz,
     ThreadWork *work, uuid_string_t uuidp, uuid_string_t uuidc) {
-  (void)total_apparent;
-
   static int64_t png_trace_start_block = -2;
   if (png_trace_start_block == -2) {
     const char *trace_env = getenv("SCALPEL_PNG_TRACE_STARTBLOCK");
@@ -9581,6 +9307,11 @@ static inline int png_crc_solve_idat(
   }
   uint32_t bs = scalpel_state.blocksize;
   if (bs == 0) {
+    return 0;
+  }
+  if (total_apparent <= 0 || last_block < -1
+      || (uint64_t)fill_needed > (uint64_t)total_apparent
+      || last_block >= total_apparent - (int64_t)fill_needed) {
     return 0;
   }
 
@@ -9687,10 +9418,6 @@ static inline int png_crc_solve_idat(
   if (M < 1) {
     // No full middle blocks — can't use algebraic hash table approach.
     // Fall back to direct CRC search for small IDATs.
-    if (last_block + (int64_t)fill_needed >= (int64_t)(filemirror_filesize(
-            scalpel_state.filemirror) / (uint64_t)bs)) {
-      return 0;
-    }
     // Place contiguous fill and check CRC
     png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
     for (uint32_t f = 0; f < fill_needed; f++) {
@@ -9768,37 +9495,12 @@ static inline int png_crc_solve_idat(
         uint32_t _wr = crc32(0, NULL, 0);
         _wr = crc32(_wr, (const unsigned char *)(_d0 + _cs), (uInt)_cl);
 
-        // GF(2) inverse for after_len
-        uint32_t _Minv[32], _aug[32];
-        for (int i = 0; i < 32; i++) {
-          uint32_t e_val = 1U << i;
-          _aug[i] = (_al > 0) ? (uint32_t)crc32_combine((uLong)e_val, 0UL, (z_off_t)_al) : e_val;
-          _Minv[i] = 1U << i;
-        }
-        { bool _inv = true;
-          for (int col = 0; col < 32 && _inv; col++) {
-            int pv = -1;
-            for (int row = col; row < 32; row++) {
-              if (_aug[row] & (1U << col)) { pv = row; break; }
-            }
-            if (pv < 0) { _inv = false; break; }
-            if (pv != col) {
-              uint32_t t = _aug[col]; _aug[col] = _aug[pv]; _aug[pv] = t;
-              t = _Minv[col]; _Minv[col] = _Minv[pv]; _Minv[pv] = t;
-            }
-            for (int row = 0; row < 32; row++) {
-              if (row != col && (_aug[row] & (1U << col))) {
-                _aug[row] ^= _aug[col]; _Minv[row] ^= _Minv[col];
-              }
-            }
-          }
-          if (! _inv) { continue; }
+        uint32_t _Minv[32];
+        if (!png_crc_inverse_for_len((z_off_t)_al, _Minv)) {
+          continue;
         }
 
-        uint32_t _delta = 0;
-        for (int b2 = 0; b2 < 32; b2++) {
-          if (_diff & (1U << b2)) { _delta ^= _Minv[b2]; }
-        }
+        uint32_t _delta = png_crc_apply_inverse(_Minv, _diff);
         uint32_t _needed = _wr ^ _delta;
 
         int64_t _sab = blockvector_get_apparent_blocknumber(
@@ -9956,9 +9658,6 @@ static inline int png_crc_solve_idat(
   }
 
   // Step 2: Place contiguous blocks and inflate (need BV data for boundaries).
-  if (last_block + (int64_t)fill_needed >= (int64_t)(filemirror_filesize(scalpel_state.filemirror) / (uint64_t)scalpel_state.blocksize)) {
-    return 0;
-  }
   png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
   for (uint32_t f = 0; f < fill_needed; f++) {
     int64_t ab = last_block + 1 + (int64_t)f;
@@ -10168,7 +9867,7 @@ static inline int png_crc_solve_idat(
         int64_t best_suffix_ap = -1;
         uint64_t best_data_length = 0;
         uint64_t best_num_blocks = 0;
-        PNGSolverStateSnapshot best_snap;
+        PNGSolverStateSnapshot best_snap = {0};
 
         for (uint32_t delta = 0;
              delta <= PNG_M2_ANCHOR_SCAN_MAX && !solved; delta++) {
@@ -10339,14 +10038,26 @@ static inline int png_crc_solve_idat(
 
       if (quick_mid_ok) {
         z_off_t after[3];
+        uint32_t after_forward[3][32];
         uint32_t shifted_contig[3];
         for (int mi = 0; mi < 3; mi++) {
           uint64_t blk_end = (suffix_start_nb + first_full + (uint32_t)mi)
               * (uint64_t)bs + (uint64_t)bs;
           after[mi] = (z_off_t)(crc_region_end > blk_end
               ? crc_region_end - blk_end : 0);
-          shifted_contig[mi] = (uint32_t)crc32_combine(
-              (uLong)quick_mid_crc[mi], 0UL, after[mi]);
+          png_crc_forward_for_len(after[mi], after_forward[mi]);
+          shifted_contig[mi] = png_crc_apply_forward(
+              after_forward[mi], quick_mid_crc[mi]);
+        }
+
+        uint32_t block_forward[32];
+        uint32_t suffix_forward[32];
+        png_crc_forward_for_len((z_off_t)bs, block_forward);
+        png_crc_forward_for_len((z_off_t)suffix_partial_len, suffix_forward);
+        uint32_t quick_crc_up_to_suffix = crc_prefix;
+        for (int mi = 0; mi < 3; mi++) {
+          quick_crc_up_to_suffix = png_crc_apply_forward(block_forward,
+              quick_crc_up_to_suffix) ^ quick_mid_crc[mi];
         }
 
         int64_t prefix_last_actual = (suffix_start_nb > 0)
@@ -10375,8 +10086,8 @@ static inline int png_crc_solve_idat(
         }
 
         if (local_pair_ok) {
-          uint32_t shifted_local_pair = (uint32_t)crc32_combine(
-              (uLong)local_pair_crc, 0UL, after[1]);
+          uint32_t shifted_local_pair = png_crc_apply_forward(
+              after_forward[1], local_pair_crc);
 
           for (int64_t si = 0; si < suffix_cand_count && !solved; si++) {
             PNGSuffixCand *sc = &suffix_cands[si];
@@ -10406,15 +10117,8 @@ static inline int png_crc_solve_idat(
               continue;
             }
 
-            uint32_t crc_up_to_suffix = crc_prefix;
-            for (int mi = 0; mi < 3; mi++) {
-              crc_up_to_suffix = (uint32_t)crc32_combine(
-                  (uLong)crc_up_to_suffix, (uLong)quick_mid_crc[mi],
-                  (z_off_t)bs);
-            }
-            uint32_t crc_with_sc = (uint32_t)crc32_combine(
-                (uLong)crc_up_to_suffix, (uLong)sc->partial_crc,
-                (z_off_t)suffix_partial_len);
+            uint32_t crc_with_sc = png_crc_apply_forward(suffix_forward,
+                quick_crc_up_to_suffix) ^ sc->partial_crc;
             uint32_t diff = sc->stored_crc ^ crc_with_sc;
             if (diff == 0) {
               continue;
@@ -10422,8 +10126,8 @@ static inline int png_crc_solve_idat(
 
             uint32_t target_all = diff ^ shifted_contig[0]
                 ^ shifted_contig[1] ^ shifted_contig[2];
-            uint32_t shifted_tail = (uint32_t)crc32_combine(
-                (uLong)ht->actual_crc[tail_actual], 0UL, after[2]);
+            uint32_t shifted_tail = png_crc_apply_forward(after_forward[2],
+                ht->actual_crc[tail_actual]);
             if (trace_anchor_sc) {
               lock_fprintf(stdout,
                   "PNG_TRACE_M3_ANCHOR_CHECK si=%" PRId64
@@ -10500,8 +10204,8 @@ static inline int png_crc_solve_idat(
           int64_t local_head_ap = png_crc_actual_to_apparent(ht,
               local_head_actual);
           if (local_head_ap >= 0 && !_AB_IN_BV_PREFIX(local_head_ap)) {
-            uint32_t shifted_local_head = (uint32_t)crc32_combine(
-                (uLong)ht->actual_crc[local_head_actual], 0UL, after[0]);
+            uint32_t shifted_local_head = png_crc_apply_forward(
+                after_forward[0], ht->actual_crc[local_head_actual]);
 
             for (int64_t si = 0; si < suffix_cand_count && !solved; si++) {
               PNGSuffixCand *sc = &suffix_cands[si];
@@ -10529,15 +10233,8 @@ static inline int png_crc_solve_idat(
                 continue;
               }
 
-              uint32_t crc_up_to_suffix = crc_prefix;
-              for (int mi = 0; mi < 3; mi++) {
-                crc_up_to_suffix = (uint32_t)crc32_combine(
-                    (uLong)crc_up_to_suffix, (uLong)quick_mid_crc[mi],
-                    (z_off_t)bs);
-              }
-              uint32_t crc_with_sc = (uint32_t)crc32_combine(
-                  (uLong)crc_up_to_suffix, (uLong)sc->partial_crc,
-                  (z_off_t)suffix_partial_len);
+              uint32_t crc_with_sc = png_crc_apply_forward(suffix_forward,
+                  quick_crc_up_to_suffix) ^ sc->partial_crc;
               uint32_t diff = sc->stored_crc ^ crc_with_sc;
               if (diff == 0) {
                 continue;
@@ -10545,10 +10242,10 @@ static inline int png_crc_solve_idat(
 
               uint32_t target_all = diff ^ shifted_contig[0]
                   ^ shifted_contig[1] ^ shifted_contig[2];
-              uint32_t shifted_tail1 = (uint32_t)crc32_combine(
-                  (uLong)ht->actual_crc[tail1_actual], 0UL, after[1]);
-              uint32_t shifted_tail2 = (uint32_t)crc32_combine(
-                  (uLong)ht->actual_crc[tail2_actual], 0UL, after[2]);
+              uint32_t shifted_tail1 = png_crc_apply_forward(
+                  after_forward[1], ht->actual_crc[tail1_actual]);
+              uint32_t shifted_tail2 = png_crc_apply_forward(
+                  after_forward[2], ht->actual_crc[tail2_actual]);
               bool trace_anchor_sc = png_trace_this
                   && (png_trace_actual_block < 0
                       || sc->actual_block == png_trace_actual_block);
@@ -10678,7 +10375,7 @@ static inline int png_crc_solve_idat(
 	      int64_t best_suffix_ap = -1;
 	      uint64_t best_data_length = 0;
 	      uint64_t best_num_blocks = 0;
-	      PNGSolverStateSnapshot best_snap;
+	      PNGSolverStateSnapshot best_snap = {0};
 	      bool stop_gap_scan = false;
 
 	      for (int64_t si = resume_si;
@@ -10714,8 +10411,7 @@ static inline int png_crc_solve_idat(
           continue;
         }
 
-        uint32_t f_right = (uint32_t)crc32_combine(0UL,
-            (uLong)sc->partial_crc, (z_off_t)suffix_partial_len);
+        uint32_t f_right = sc->partial_crc;
         uint32_t req_left = png_crc_apply_inverse(gap_suffix_inv,
             sc->stored_crc ^ f_right);
         uint32_t req_run = req_left ^ shifted_prefix;
@@ -10809,7 +10505,7 @@ static inline int png_crc_solve_idat(
             best_data_length = blockvector_get_data_length(candidate->b);
             best_num_blocks = blockvector_get_num_blocks(candidate->b);
             png_solver_snapshot(&best_snap, local);
-            if (validated) {
+            if (validated || locality == M) {
               stop_gap_scan = true;
             }
           }
@@ -10940,6 +10636,11 @@ static inline int png_crc_solve_idat(
       bool gap_match_cap_reached = false;
       int64_t gap_cap_resume_si = 0;
       int64_t gap_cap_resume_start = 0;
+      uint32_t gap_block_forward[32];
+      uint32_t gap_suffix_forward[32];
+      png_crc_forward_for_len((z_off_t)bs, gap_block_forward);
+      png_crc_forward_for_len((z_off_t)suffix_partial_len,
+                              gap_suffix_forward);
 
       for (int64_t si = resume_si;
            si < suffix_cand_count
@@ -10981,15 +10682,14 @@ static inline int png_crc_solve_idat(
                         scalpel_state.filemirror, ab))) {
               window_ok = false; break;
             }
-            window_crc = (uint32_t)crc32_combine(
-                (uLong)window_crc, (uLong)ab_crc[ab], (z_off_t)bs);
+            window_crc = png_crc_apply_forward(gap_block_forward,
+                window_crc) ^ ab_crc[ab];
           }
           if (!window_ok) { continue; }
 
           // Combine with suffix partial and check against stored CRC.
-          uint32_t full_crc = (uint32_t)crc32_combine(
-              (uLong)window_crc, (uLong)sc->partial_crc,
-              (z_off_t)suffix_partial_len);
+          uint32_t full_crc = png_crc_apply_forward(gap_suffix_forward,
+              window_crc) ^ sc->partial_crc;
           if (full_crc != sc->stored_crc) { continue; }
 
           // CRC match — record it, keep scanning.
@@ -11039,7 +10739,7 @@ static inline int png_crc_solve_idat(
 	      int64_t best_sc_idx = -1;
 	      uint64_t best_data_length = 0;
 	      uint64_t best_num_blocks = 0;
-	      PNGSolverStateSnapshot best_snap;
+	      PNGSolverStateSnapshot best_snap = {0};
 	      for (uint32_t mi = 0; mi < gap_match_count && !solved; mi++) {
 	        int64_t m_start = gap_match_start[mi];
 	        int64_t m_si = gap_match_sc_idx[mi];
@@ -11098,7 +10798,7 @@ static inline int png_crc_solve_idat(
             best_num_blocks = blockvector_get_num_blocks(candidate->b);
             png_solver_snapshot(&best_snap, local);
           }
-          if (validated) {
+          if (validated || locality == M) {
             solved = true;
           }
         }
@@ -11217,14 +10917,26 @@ static inline int png_crc_solve_idat(
 
     if (mid_crc_ok) {
       z_off_t after[3];
+      uint32_t after_forward[3][32];
       uint32_t shifted_contig[3];
       for (int mi = 0; mi < 3; mi++) {
         uint64_t blk_end = (suffix_start_nb + first_full + (uint32_t)mi)
             * (uint64_t)bs + (uint64_t)bs;
         after[mi] = (z_off_t)(crc_region_end > blk_end
             ? crc_region_end - blk_end : 0);
-        shifted_contig[mi] = (uint32_t)crc32_combine(
-            (uLong)mid_crc[mi], 0UL, after[mi]);
+        png_crc_forward_for_len(after[mi], after_forward[mi]);
+        shifted_contig[mi] = png_crc_apply_forward(
+            after_forward[mi], mid_crc[mi]);
+      }
+
+      uint32_t block_forward[32];
+      uint32_t suffix_forward[32];
+      png_crc_forward_for_len((z_off_t)bs, block_forward);
+      png_crc_forward_for_len((z_off_t)suffix_partial_len, suffix_forward);
+      uint32_t mid_crc_up_to_suffix = crc_prefix;
+      for (int mi = 0; mi < 3; mi++) {
+        mid_crc_up_to_suffix = png_crc_apply_forward(block_forward,
+            mid_crc_up_to_suffix) ^ mid_crc[mi];
       }
 
       uint32_t inv_after0[32];
@@ -11247,7 +10959,7 @@ static inline int png_crc_solve_idat(
       #define PNG_M3_FAST_SHIFT_AP(_ap, _pos) \
         ({ uint32_t _ap_crc = 0; \
            (void)png_crc_apparent_crc(ht, (_ap), &_ap_crc, NULL); \
-           (uint32_t)crc32_combine((uLong)_ap_crc, 0UL, after[(_pos)]); })
+           png_crc_apply_forward(after_forward[(_pos)], _ap_crc); })
       #define PNG_M3_FAST_RESTORE_CONTIG() do { \
         for (uint32_t _rf = 0; _rf < fill_needed; _rf++) { \
           int64_t _orig = last_block + 1 + (int64_t)_rf; \
@@ -11351,15 +11063,8 @@ static inline int png_crc_solve_idat(
           continue;
         }
 
-        uint32_t crc_up_to_suffix = crc_prefix;
-        for (int mi = 0; mi < 3; mi++) {
-          crc_up_to_suffix = (uint32_t)crc32_combine(
-              (uLong)crc_up_to_suffix, (uLong)mid_crc[mi],
-              (z_off_t)bs);
-        }
-        uint32_t crc_with_sc = (uint32_t)crc32_combine(
-            (uLong)crc_up_to_suffix, (uLong)sc->partial_crc,
-            (z_off_t)suffix_partial_len);
+        uint32_t crc_with_sc = png_crc_apply_forward(suffix_forward,
+            mid_crc_up_to_suffix) ^ sc->partial_crc;
         uint32_t diff = sc->stored_crc ^ crc_with_sc;
         if (diff == 0) {
           continue;
@@ -11532,56 +11237,6 @@ static inline int png_crc_solve_idat(
     }
   }
 
-  // MitM split is computed below; GF(2) matrix needs right_total_len
-  // which depends on right_count.  Declare here, compute after split.
-  z_off_t right_total_len = 0;
-
-  // Build M[i] = crc32_combine(e_i, 0, right_total_len) for i=0..31
-  uint32_t Mmat[32];
-  for (int i = 0; i < 32; i++) {
-    uint32_t e_i = 1U << i;
-    Mmat[i] = (uint32_t)crc32_combine((uLong)e_i, 0UL, right_total_len);
-  }
-
-  // Gaussian elimination for M^{-1}
-  uint32_t Minv[32];
-  uint32_t aug[32];
-  for (int i = 0; i < 32; i++) {
-    aug[i] = Mmat[i];
-    Minv[i] = 1U << i;
-  }
-  bool invertible = true;
-  for (int col = 0; col < 32 && invertible; col++) {
-    int pivot = -1;
-    for (int row = col; row < 32; row++) {
-      if (aug[row] & (1U << col)) {
-        pivot = row;
-        break;
-      }
-    }
-    if (pivot < 0) {
-      invertible = false;
-      break;
-    }
-    if (pivot != col) {
-      uint32_t tmp;
-      tmp = aug[col]; aug[col] = aug[pivot]; aug[pivot] = tmp;
-      tmp = Minv[col]; Minv[col] = Minv[pivot]; Minv[pivot] = tmp;
-    }
-    for (int row = 0; row < 32; row++) {
-      if (row != col && (aug[row] & (1U << col))) {
-        aug[row] ^= aug[col];
-        Minv[row] ^= Minv[col];
-      }
-    }
-  }
-
-  if (!invertible) {
-    free(suffix_cands);
-    resize_blockvector(candidate->b, suffix_start_nb);
-    return 0;
-  }
-
   // MitM: split M middle blocks into left half and right half.
   // Split middle blocks: left gets more to keep right scan cheap.
   // Right scan includes the suffix block (iterated separately), so
@@ -11597,51 +11252,25 @@ static inline int png_crc_solve_idat(
   int64_t resume_er2 = 0;
   uint8_t resume_phase = 0;
   uint8_t resume_pair = 0;
-  uint32_t resume_chunk_i = 0;
-  uint32_t resume_chunk_j = 0;
 
-  // Now compute right_total_len and GF(2) matrix
-  right_total_len = (z_off_t)right_count * (z_off_t)bs + (z_off_t)suffix_partial_len;
+  z_off_t right_total_len = (z_off_t)right_count * (z_off_t)bs
+      + (z_off_t)suffix_partial_len;
 
-  // Recompute GF(2) matrix for the actual right_total_len
-  for (int i = 0; i < 32; i++) {
-    uint32_t e_i = 1U << i;
-    Mmat[i] = (uint32_t)crc32_combine((uLong)e_i, 0UL, right_total_len);
-  }
-  // Redo Gaussian elimination
-  for (int i = 0; i < 32; i++) {
-    aug[i] = Mmat[i];
-    Minv[i] = 1U << i;
-  }
-  invertible = true;
-  for (int col = 0; col < 32 && invertible; col++) {
-    int pivot = -1;
-    for (int row = col; row < 32; row++) {
-      if (aug[row] & (1U << col)) {
-        pivot = row;
-        break;
-      }
-    }
-    if (pivot < 0) {
-      invertible = false;
-      break;
-    }
-    if (pivot != col) {
-      uint32_t tmp;
-      tmp = aug[col]; aug[col] = aug[pivot]; aug[pivot] = tmp;
-      tmp = Minv[col]; Minv[col] = Minv[pivot]; Minv[pivot] = tmp;
-    }
-    for (int row = 0; row < 32; row++) {
-      if (row != col && (aug[row] & (1U << col))) {
-        aug[row] ^= aug[col];
-        Minv[row] ^= Minv[col];
-      }
-    }
-  }
-  if (!invertible) {
+  uint32_t Minv[32];
+  if (!png_crc_inverse_for_len(right_total_len, Minv)) {
     free(suffix_cands);
     resize_blockvector(candidate->b, suffix_start_nb);
     return 0;
+  }
+
+  // Resume from the saved frontier when the IDAT geometry still matches.
+  if (local->solver_suffix_nb == suffix_start_nb
+      && local->solver_phase != 0) {
+    resume_si = local->solver_suffix_idx;
+    resume_er1 = local->solver_right_idx;
+    resume_er2 = local->solver_right_idx2;
+    resume_phase = local->solver_phase;
+    resume_pair = local->solver_pair_idx;
   }
 
   // Build left table: all combinations of left_count middle blocks.
@@ -11745,237 +11374,359 @@ static inline int png_crc_solve_idat(
     PNGSuffixCand *sc_arr = sctx->suffix_cands;
     (void)left_pool; /* suppress unused warning — used via left_table chains */
 
-    // Resume from saved frontier if suffix_start_nb matches.
-    resume_si = 0;
-    resume_er1 = 0;
-    resume_er2 = 0;
-    resume_phase = 0;
-    resume_pair = 0;
-    resume_chunk_i = 0;
-    resume_chunk_j = 0;
-    if (local->solver_suffix_nb == suffix_start_nb
-        && local->solver_phase != 0) {
-      resume_si = local->solver_suffix_idx;
-      resume_er1 = local->solver_right_idx;
-      resume_er2 = local->solver_right_idx2;
-      resume_phase = local->solver_phase;
-      resume_pair = local->solver_pair_idx;
-      resume_chunk_i = local->solver_chunk_i;
-      resume_chunk_j = local->solver_chunk_j;
+    bool m2_best_found = false;
+    bool m2_best_validated = false;
+    uint64_t m2_best_validates_to = 0;
+    uint64_t m2_best_advance_to = 0;
+    uint32_t m2_best_locality = 0;
+    int64_t m2_best_left_actual = -1;
+    int64_t m2_best_right_actual = -1;
+    int64_t m2_best_suffix_actual = -1;
+    bool stop_m2_scan = false;
+    int64_t m2_start_si = 0;
+    uint64_t m2_poll_count = 0;
+
+    if (right_count == 1) {
+      bool resume_matches = local->m2_resume.active
+          && local->m2_resume.suffix_nb == suffix_start_nb
+          && local->m2_resume.crc_pos == crc_pos
+          && local->m2_resume.fill_needed == fill_needed;
+      if (!resume_matches) {
+        png_m2_resume_reset(&local->m2_resume);
+        local->m2_resume.active = true;
+        local->m2_resume.suffix_nb = suffix_start_nb;
+        local->m2_resume.crc_pos = crc_pos;
+        local->m2_resume.fill_needed = fill_needed;
+      } else {
+        m2_best_found = local->m2_resume.best_found;
+        m2_best_validated = local->m2_resume.best_validated;
+        m2_best_validates_to = local->m2_resume.best_validates_to;
+        m2_best_advance_to = local->m2_resume.best_advance_to;
+        m2_best_locality = local->m2_resume.best_locality;
+        m2_best_left_actual = local->m2_resume.best_left_actual;
+        m2_best_right_actual = local->m2_resume.best_right_actual;
+        m2_best_suffix_actual = local->m2_resume.best_suffix_actual;
+
+        if (m2_best_found) {
+          int64_t best_left = png_crc_actual_to_apparent(
+              ht, m2_best_left_actual);
+          int64_t best_right = png_crc_actual_to_apparent(
+              ht, m2_best_right_actual);
+          int64_t best_suffix = png_crc_actual_to_apparent(
+              ht, m2_best_suffix_actual);
+          if (best_left < 0 || best_right < 0 || best_suffix < 0
+              || best_left == best_right || best_left == best_suffix
+              || best_right == best_suffix
+              || _AB_IN_BV_PREFIX(best_left)
+              || _AB_IN_BV_PREFIX(best_right)
+              || _AB_IN_BV_PREFIX(best_suffix)) {
+            m2_best_found = false;
+            local->m2_resume.best_found = false;
+          }
+        }
+
+        if (local->m2_resume.suffix_actual >= 0) {
+          bool found_suffix = false;
+          for (int64_t si = 0; si < suffix_cand_count; si++) {
+            if (sc_arr[si].actual_block
+                == local->m2_resume.suffix_actual) {
+              m2_start_si = si;
+              found_suffix = true;
+              break;
+            }
+          }
+          if (!found_suffix) {
+            local->m2_resume.bucket = 0;
+            local->m2_resume.next_actual = -1;
+            local->m2_resume.suffix_actual = -1;
+          }
+        }
+      }
+    } else {
+      png_m2_resume_reset(&local->m2_resume);
     }
 
-	    bool m2_best_found = false;
-	    bool m2_best_validated = false;
-	    uint64_t m2_best_validates_to = 0;
-	    uint64_t m2_best_advance_to = 0;
-	    uint32_t m2_best_locality = 0;
-	    int64_t m2_best_left = -1;
-	    int64_t m2_best_right = -1;
-	    int64_t m2_best_suffix = -1;
-	    uint64_t m2_best_data_length = 0;
-	    uint64_t m2_best_num_blocks = 0;
-	    PNGSolverStateSnapshot m2_best_snap;
-	    bool stop_m2_scan = false;
+    uint32_t m2_suffix_forward[32];
+    if (right_count == 1) {
+      png_crc_forward_for_len((z_off_t)suffix_partial_len,
+                              m2_suffix_forward);
+    }
 
-	    // Suffix candidate loop — M=2 (right_count == 1) uses sc->stored_crc.
-	    for (int64_t si = resume_si;
-	         si < suffix_cand_count && !stop_m2_scan; si++) {
-	      PNGSuffixCand *sc = &sc_arr[si];
-	      if (!sc->valid) {
-	        continue;
-	      }
-	      if (right_count == 1) {
-	        // M=2: left=1, right=1. For each right middle block:
-	        for (uint32_t br = 0;
-	             br < PNG_CRC_HASH_BUCKETS && !stop_m2_scan; br++) {
-	          for (PNGCrcEntry *er = ht->buckets[br];
-	               er && !stop_m2_scan; er = er->next) {
-            /* Skip covered or unmapped right-candidates at loop time —
-             * they can't be placed, so the expensive algebra below is
-             * wasted on them.  Also skip blocks already in BV prefix. */
-            if (filemirror_actual_block_covered(
-                    scalpel_state.filemirror, er->actual_block)) {
+    // Suffix candidate loop — M=2 (right_count == 1) uses sc->stored_crc.
+    for (int64_t si = m2_start_si; si < suffix_cand_count && !stop_m2_scan;
+         si++) {
+      PNGSuffixCand *sc = &sc_arr[si];
+      if (!sc->valid || right_count != 1) {
+        continue;
+      }
+
+      uint32_t br_start = 0;
+      bool use_resume_cursor =
+          local->m2_resume.suffix_actual == sc->actual_block;
+      if (use_resume_cursor) {
+        br_start = local->m2_resume.bucket;
+        if (br_start >= PNG_CRC_HASH_BUCKETS) {
+          br_start = 0;
+          use_resume_cursor = false;
+        }
+      }
+
+      // M=2: left=1, right=1. For each right middle block:
+      for (uint32_t br = br_start; br < PNG_CRC_HASH_BUCKETS && !stop_m2_scan;
+           br++) {
+        PNGCrcEntry *er_start = ht->buckets[br];
+        if (use_resume_cursor && br == br_start &&
+            local->m2_resume.next_actual >= 0) {
+          PNGCrcEntry *saved = er_start;
+          while (saved && saved->actual_block != local->m2_resume.next_actual) {
+            saved = saved->next;
+          }
+          if (saved) {
+            er_start = saved;
+          }
+        }
+        use_resume_cursor = false;
+
+        for (PNGCrcEntry *er = er_start; er && !stop_m2_scan; er = er->next) {
+          if ((m2_poll_count++ & 0xFFULL) == 0ULL &&
+              png_reassembly_yield_requested(candidate)) {
+            local->m2_resume.active = true;
+            local->m2_resume.suffix_nb = suffix_start_nb;
+            local->m2_resume.crc_pos = crc_pos;
+            local->m2_resume.fill_needed = fill_needed;
+            local->m2_resume.suffix_actual = sc->actual_block;
+            local->m2_resume.bucket = br;
+            local->m2_resume.next_actual = er->actual_block;
+            resize_blockvector(candidate->b, suffix_start_nb);
+            return -1;
+          }
+          /* Skip covered or unmapped right-candidates at loop time —
+           * they can't be placed, so the expensive algebra below is
+           * wasted on them.  Also skip blocks already in BV prefix. */
+          if (filemirror_actual_block_covered(scalpel_state.filemirror,
+                                              er->actual_block)) {
+            continue;
+          }
+          int64_t _er_ap = filemirror_apparent_blocknumber(
+              scalpel_state.filemirror, er->actual_block);
+          if (_er_ap < 0) {
+            continue;
+          }
+          if (_AB_IN_BV_PREFIX(_er_ap)) {
+            continue;
+          }
+          // right_crc = combine(b_right, suffix_partial)
+          uint32_t rcrc = png_crc_apply_forward(m2_suffix_forward,
+              er->crc) ^ sc->partial_crc;
+          uint32_t f_right = rcrc;
+          uint32_t xored = sc->stored_crc ^ f_right;
+          uint32_t req_left = 0;
+          for (int bit = 0; bit < 32; bit++) {
+            if (xored & (1U << bit)) {
+              req_left ^= Minv[bit];
+            }
+          }
+          // Lookup in left table
+          uint32_t lidx = req_left % MITM_BUCKETS2;
+          for (MitmEntry2 *me = left_table[lidx]; me && !solved;
+               me = me->next) {
+            if (me->crc != req_left) {
               continue;
             }
-            int64_t _er_ap = filemirror_apparent_blocknumber(
+            // Match: me->actual = left middle, er->actual_block = right middle,
+            // sc = suffix
+            if (me->actual == er->actual_block ||
+                me->actual == sc->actual_block ||
+                er->actual_block == sc->actual_block) {
+              continue;
+            }
+            /* Skip if left is covered (right already filtered above). */
+            if (filemirror_actual_block_covered(scalpel_state.filemirror,
+                                                me->actual)) {
+              continue;
+            }
+            // Place all blocks and full verify
+            int64_t ab_l = filemirror_apparent_blocknumber(
+                scalpel_state.filemirror, me->actual);
+            int64_t ab_r = filemirror_apparent_blocknumber(
                 scalpel_state.filemirror, er->actual_block);
-            if (_er_ap < 0) { continue; }
-            if (_AB_IN_BV_PREFIX(_er_ap)) { continue; }
-            // right_crc = combine(b_right, suffix_partial)
-            uint32_t rcrc = (uint32_t)crc32_combine(
-                (uLong)er->crc, (uLong)sc->partial_crc, (z_off_t)suffix_partial_len);
-            // f(right) = crc32_combine(0, rcrc, right_total_len)
-            uint32_t f_right = (uint32_t)crc32_combine(0UL, (uLong)rcrc, right_total_len);
-            uint32_t xored = sc->stored_crc ^ f_right;
-            uint32_t req_left = 0;
-            for (int bit = 0; bit < 32; bit++) {
-              if (xored & (1U << bit)) {
-                req_left ^= Minv[bit];
+            if (ab_l < 0 || ab_r < 0) {
+              continue;
+            }
+            /* Skip if left would duplicate a block already in the
+             * BV prefix (right was filtered above, suffix_ab too).
+             * Suffix candidate's apparent block also not in prefix. */
+            if (_AB_IN_BV_PREFIX(ab_l)) {
+              continue;
+            }
+            if (_AB_IN_BV_PREFIX(sc->apparent_block)) {
+              continue;
+            }
+            blockvector_set_apparent_blocknumber(
+                candidate->b, suffix_start_nb + first_full, ab_l);
+            blockvector_set_apparent_blocknumber(
+                candidate->b, suffix_start_nb + first_full + 1, ab_r);
+            blockvector_set_apparent_blocknumber(
+                candidate->b, suffix_start_nb + suffix_fill_pos,
+                sc->apparent_block);
+            for (uint32_t f = 0; f < fill_needed; f++) {
+              inflate_blockvector_single_block(candidate->b,
+                                               suffix_start_nb + f);
+            }
+            const char *vd = blockvector_get_data_pointer(candidate->b);
+            uint64_t vdl = blockvector_get_data_length(candidate->b);
+            if (crc_field_pos + 4 <= vdl) {
+              uint32_t vcrc = crc32(0, NULL, 0);
+              vcrc = crc32(vcrc, (const unsigned char *)(vd + type_start),
+                           (uInt)crc_region_len);
+              // Compare against sc->stored_crc (from mmap), NOT BV data.
+              // BV-read stored CRC is tautological — placed blocks may be
+              // from a different IDAT with internally consistent CRC.
+              if (vcrc == sc->stored_crc) {
+                bool _sok = false;
+                uint64_t _nxt = crc_field_pos + 8;
+                if (_nxt + 4 <= vdl) {
+                  const unsigned char *_tp = (const unsigned char *)(vd + _nxt);
+                  const unsigned char *_lp =
+                      (const unsigned char *)(vd + crc_field_pos + 4);
+                  uint32_t _nl = ((uint32_t)_lp[0] << 24) |
+                                 ((uint32_t)_lp[1] << 16) |
+                                 ((uint32_t)_lp[2] << 8) | (uint32_t)_lp[3];
+                  if (_tp[0] == 'I' && _tp[1] == 'D' && _tp[2] == 'A' &&
+                      _tp[3] == 'T' && _nl <= PNG_MAX_IDAT_BODY_LEN) {
+                    _sok = true;
+                  } else if (_tp[0] == 'I' && _tp[1] == 'E' && _tp[2] == 'N' &&
+                             _tp[3] == 'D' && _nl == 0 && _nxt + 8 <= vdl) {
+                    const unsigned char *_ic =
+                        (const unsigned char *)(vd + _nxt + 4);
+                    uint32_t _icrc = ((uint32_t)_ic[0] << 24) |
+                                     ((uint32_t)_ic[1] << 16) |
+                                     ((uint32_t)_ic[2] << 8) | (uint32_t)_ic[3];
+                    if (_icrc == 0xAE426082U) {
+                      _sok = true;
+                    }
+                  }
+                }
+                if (_sok) {
+                  PNGSolverStateSnapshot _pre_snap;
+                  png_solver_snapshot(&_pre_snap, local);
+                  uint64_t _crc_pre = local->last_chunk_crc_pos;
+                  bool _sv2;
+                  uint64_t _svt2;
+                  _sv2 = png_direct_validate(work->id, candidate, &_svt2, local,
+                                             uuidp, uuidc);
+                  uint64_t _advance = local->last_chunk_crc_pos;
+                  bool _plausible = _sv2 || _advance > _crc_pre;
+                  int64_t _window_ap[PNG_GAP_INDEX_MAX_M];
+                  _window_ap[0] = ab_l;
+                  _window_ap[1] = ab_r;
+                  uint32_t _locality = png_gap_locality_score(
+                      candidate, suffix_start_nb, first_full, _window_ap, M);
+                  if (png_trace_this) {
+                    lock_fprintf(stdout,
+                                 "PNG_TRACE_M2_TRY si=%" PRId64 " left=%" PRId64
+                                 " right=%" PRId64 " suffix=%" PRId64
+                                 " suffix_actual=%" PRId64
+                                 " validated=%d vt=%" PRIu64 " advance=%" PRIu64
+                                 " pre=%" PRIu64 " locality=%u plausible=%d\n",
+                                 si, ab_l, ab_r, sc->apparent_block,
+                                 sc->actual_block, _sv2 ? 1 : 0, _svt2,
+                                 _advance, _crc_pre, _locality,
+                                 _plausible ? 1 : 0);
+                  }
+                  bool _new_best =
+                      _plausible &&
+                      png_gap_match_better(
+                          _sv2, _svt2, _advance, _locality, m2_best_found,
+                          m2_best_validated, m2_best_validates_to,
+                          m2_best_advance_to, m2_best_locality);
+                  if (_new_best) {
+                    m2_best_found = true;
+                    m2_best_validated = _sv2;
+                    m2_best_validates_to = _svt2;
+                    m2_best_advance_to = _advance;
+                    m2_best_locality = _locality;
+                    m2_best_left_actual = me->actual;
+                    m2_best_right_actual = er->actual_block;
+                    m2_best_suffix_actual = sc->actual_block;
+                    if (_sv2 || _locality == M) {
+                      stop_m2_scan = true;
+                    }
+                  }
+                  png_solver_restore(local, &_pre_snap);
+                  if (_new_best) {
+                    local->m2_resume.best_found = true;
+                    local->m2_resume.best_validated = m2_best_validated;
+                    local->m2_resume.best_validates_to = m2_best_validates_to;
+                    local->m2_resume.best_advance_to = m2_best_advance_to;
+                    local->m2_resume.best_locality = m2_best_locality;
+                    local->m2_resume.best_left_actual = m2_best_left_actual;
+                    local->m2_resume.best_right_actual = m2_best_right_actual;
+                    local->m2_resume.best_suffix_actual = m2_best_suffix_actual;
+                  }
+                }
               }
             }
-            // Lookup in left table
-            uint32_t lidx = req_left % MITM_BUCKETS2;
-            for (MitmEntry2 *me = left_table[lidx]; me && !solved; me = me->next) {
-              if (me->crc != req_left) {
-                continue;
-              }
-              // Match: me->actual = left middle, er->actual_block = right middle, sc = suffix
-              if (me->actual == er->actual_block || me->actual == sc->actual_block
-                  || er->actual_block == sc->actual_block) {
-                continue;
-              }
-              /* Skip if left is covered (right already filtered above). */
-              if (filemirror_actual_block_covered(
-                      scalpel_state.filemirror, me->actual)) {
-                continue;
-              }
-              // Place all blocks and full verify
-              int64_t ab_l = filemirror_apparent_blocknumber(scalpel_state.filemirror, me->actual);
-              int64_t ab_r = filemirror_apparent_blocknumber(scalpel_state.filemirror, er->actual_block);
-              if (ab_l < 0 || ab_r < 0) {
-                continue;
-              }
-              /* Skip if left would duplicate a block already in the
-               * BV prefix (right was filtered above, suffix_ab too).
-               * Suffix candidate's apparent block also not in prefix. */
-              if (_AB_IN_BV_PREFIX(ab_l)) { continue; }
-              if (_AB_IN_BV_PREFIX(sc->apparent_block)) { continue; }
+            // Undo — restore contiguous before trying the next match.
+            for (uint32_t f = 0; f < fill_needed; f++) {
+              int64_t orig = last_block + 1 + (int64_t)f;
               blockvector_set_apparent_blocknumber(candidate->b,
-                  suffix_start_nb + first_full, ab_l);
-              blockvector_set_apparent_blocknumber(candidate->b,
-                  suffix_start_nb + first_full + 1, ab_r);
-              blockvector_set_apparent_blocknumber(candidate->b,
-                  suffix_start_nb + suffix_fill_pos, sc->apparent_block);
-              for (uint32_t f = 0; f < fill_needed; f++) {
-                inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
-              }
-              const char *vd = blockvector_get_data_pointer(candidate->b);
-              uint64_t vdl = blockvector_get_data_length(candidate->b);
-              if (crc_field_pos + 4 <= vdl) {
-                uint32_t vcrc = crc32(0, NULL, 0);
-                vcrc = crc32(vcrc, (const unsigned char *)(vd + type_start),
-                             (uInt)crc_region_len);
-                // Compare against sc->stored_crc (from mmap), NOT BV data.
-                // BV-read stored CRC is tautological — placed blocks may be
-                // from a different IDAT with internally consistent CRC.
-                if (vcrc == sc->stored_crc) {
-                  bool _sok = false;
-                  uint64_t _nxt = crc_field_pos + 8;
-                  if (_nxt + 4 <= vdl) {
-                    const unsigned char *_tp =
-                        (const unsigned char *)(vd + _nxt);
-                    const unsigned char *_lp =
-                        (const unsigned char *)(vd + crc_field_pos + 4);
-                    uint32_t _nl = ((uint32_t)_lp[0] << 24)
-                        | ((uint32_t)_lp[1] << 16)
-                        | ((uint32_t)_lp[2] << 8) | (uint32_t)_lp[3];
-                    if (_tp[0]=='I' && _tp[1]=='D'
-                        && _tp[2]=='A' && _tp[3]=='T'
-                        && _nl <= PNG_MAX_IDAT_BODY_LEN) {
-                      _sok = true;
-                    } else if (_tp[0]=='I' && _tp[1]=='E'
-                               && _tp[2]=='N' && _tp[3]=='D'
-                               && _nl == 0 && _nxt + 8 <= vdl) {
-                      const unsigned char *_ic =
-                          (const unsigned char *)(vd + _nxt + 4);
-                      uint32_t _icrc = ((uint32_t)_ic[0] << 24)
-                          | ((uint32_t)_ic[1] << 16)
-                          | ((uint32_t)_ic[2] << 8) | (uint32_t)_ic[3];
-                      if (_icrc == 0xAE426082U) { _sok = true; }
-                    }
-	                  }
-	                  if (_sok) {
-	                    PNGSolverStateSnapshot _pre_snap;
-	                    png_solver_snapshot(&_pre_snap, local);
-	                    uint64_t _crc_pre = local->last_chunk_crc_pos;
-	                    bool _sv2; uint64_t _svt2;
-	                    _sv2 = png_direct_validate(work->id, candidate,
-	                        &_svt2, local, uuidp, uuidc);
-	                    uint64_t _advance = local->last_chunk_crc_pos;
-	                    bool _plausible = _sv2 || _advance > _crc_pre;
-	                    int64_t _window_ap[PNG_GAP_INDEX_MAX_M];
-	                    _window_ap[0] = ab_l;
-	                    _window_ap[1] = ab_r;
-	                    uint32_t _locality = png_gap_locality_score(candidate,
-	                        suffix_start_nb, first_full, _window_ap, M);
-	                    if (png_trace_this) {
-	                      lock_fprintf(stdout,
-	                          "PNG_TRACE_M2_TRY si=%" PRId64
-	                          " left=%" PRId64 " right=%" PRId64
-	                          " suffix=%" PRId64 " suffix_actual=%" PRId64
-	                          " validated=%d vt=%" PRIu64
-	                          " advance=%" PRIu64 " pre=%" PRIu64
-	                          " locality=%u plausible=%d\n",
-	                          si, ab_l, ab_r, sc->apparent_block,
-	                          sc->actual_block, _sv2 ? 1 : 0, _svt2,
-	                          _advance, _crc_pre, _locality,
-	                          _plausible ? 1 : 0);
-	                    }
-	                    if (_plausible && png_gap_match_better(_sv2, _svt2,
-	                        _advance, _locality, m2_best_found,
-	                        m2_best_validated, m2_best_validates_to,
-	                        m2_best_advance_to, m2_best_locality)) {
-	                      m2_best_found = true;
-	                      m2_best_validated = _sv2;
-	                      m2_best_validates_to = _svt2;
-	                      m2_best_advance_to = _advance;
-	                      m2_best_locality = _locality;
-	                      m2_best_left = ab_l;
-	                      m2_best_right = ab_r;
-	                      m2_best_suffix = sc->apparent_block;
-	                      m2_best_data_length =
-	                          blockvector_get_data_length(candidate->b);
-	                      m2_best_num_blocks =
-	                          blockvector_get_num_blocks(candidate->b);
-	                      png_solver_snapshot(&m2_best_snap, local);
-	                      if (_sv2 || _locality == M) {
-	                        stop_m2_scan = true;
-	                      }
-	                    }
-	                    png_solver_restore(local, &_pre_snap);
-	                  }
-	                }
-	              }
-	              // Undo — restore contiguous before trying the next match.
-	              for (uint32_t f = 0; f < fill_needed; f++) {
-	                int64_t orig = last_block + 1 + (int64_t)f;
-	                blockvector_set_apparent_blocknumber(candidate->b,
-	                    suffix_start_nb + f, orig);
-	                inflate_blockvector_single_block(candidate->b,
-	                    suffix_start_nb + f);
-	              }
-	            }
-	          }
-	        }
-	      }
-	    } // end suffix candidate loop (M=2)
+                                                   suffix_start_nb + f, orig);
+              inflate_blockvector_single_block(candidate->b,
+                                               suffix_start_nb + f);
+            }
+          }
+        }
+      }
+    } // end suffix candidate loop (M=2)
 
-	    if (m2_best_found) {
-	      png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
-	      blockvector_set_apparent_blocknumber(candidate->b,
-	          suffix_start_nb + first_full, m2_best_left);
-	      blockvector_set_apparent_blocknumber(candidate->b,
-	          suffix_start_nb + first_full + 1, m2_best_right);
-	      blockvector_set_apparent_blocknumber(candidate->b,
-	          suffix_start_nb + suffix_fill_pos, m2_best_suffix);
-	      for (uint32_t f = 0; f < fill_needed; f++) {
-	        inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
-	      }
-	      if (m2_best_data_length > 0) {
-	        blockvector_set_data_length(candidate->b, m2_best_data_length);
-	      }
-	      if (m2_best_num_blocks > 0) {
-	        resize_blockvector(candidate->b, m2_best_num_blocks);
-	      }
-	      png_solver_restore(local, &m2_best_snap);
-	      if (scalpel_state.mode_verbose) {
-	        lock_fprintf(stdout,
-	            "%sPNG CRC SOLVER: M=2 selected blocks [%" PRId64
-	            ",%" PRId64 "] suffix %" PRId64 "%s\n",
-	            GREEN, m2_best_left, m2_best_right, m2_best_suffix, BLACK);
-	      }
-	      solved = true;
-	    }
+    png_m2_resume_reset(&local->m2_resume);
+    if (m2_best_found) {
+      int64_t m2_best_left =
+          png_crc_actual_to_apparent(ht, m2_best_left_actual);
+      int64_t m2_best_right =
+          png_crc_actual_to_apparent(ht, m2_best_right_actual);
+      int64_t m2_best_suffix =
+          png_crc_actual_to_apparent(ht, m2_best_suffix_actual);
+      bool best_placeable =
+          m2_best_left >= 0 && m2_best_right >= 0 && m2_best_suffix >= 0 &&
+          m2_best_left != m2_best_right && m2_best_left != m2_best_suffix &&
+          m2_best_right != m2_best_suffix && !_AB_IN_BV_PREFIX(m2_best_left) &&
+          !_AB_IN_BV_PREFIX(m2_best_right) && !_AB_IN_BV_PREFIX(m2_best_suffix);
+      if (best_placeable) {
+        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+        blockvector_set_apparent_blocknumber(
+            candidate->b, suffix_start_nb + first_full, m2_best_left);
+        blockvector_set_apparent_blocknumber(
+            candidate->b, suffix_start_nb + first_full + 1, m2_best_right);
+        blockvector_set_apparent_blocknumber(
+            candidate->b, suffix_start_nb + suffix_fill_pos, m2_best_suffix);
+        for (uint32_t f = 0; f < fill_needed; f++) {
+          inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
+        }
+
+        PNGSolverStateSnapshot final_pre_snap;
+        png_solver_snapshot(&final_pre_snap, local);
+        uint64_t final_crc_pre = local->last_chunk_crc_pos;
+        uint64_t final_vt = 0;
+        bool final_validated = png_direct_validate(
+            work->id, candidate, &final_vt, local, uuidp, uuidc);
+        bool final_plausible =
+            final_validated || local->last_chunk_crc_pos > final_crc_pre;
+        if (final_plausible) {
+          if (scalpel_state.mode_verbose) {
+            lock_fprintf(stdout,
+                         "%sPNG CRC SOLVER: M=2 selected blocks [%" PRId64
+                         ",%" PRId64 "] suffix %" PRId64 "%s\n",
+                         GREEN, m2_best_left, m2_best_right, m2_best_suffix,
+                         BLACK);
+          }
+          solved = true;
+        } else {
+          png_solver_restore(local, &final_pre_snap);
+        }
+      }
+    }
 
     // ================================================================
     // M=3 algebraic solver: O(S × N) where S ~ 1-5 suffix candidates.
@@ -12007,18 +11758,30 @@ static inline int png_crc_solve_idat(
       if (mid_crc_ok) {
         // Compute bytes_after for each of the 3 middle positions.
         z_off_t after[3];
+        uint32_t after_forward[3][32];
         for (int mi = 0; mi < 3; mi++) {
           uint64_t blk_end = (suffix_start_nb + first_full + mi)
               * (uint64_t)bs + bs;
           after[mi] = (z_off_t)(crc_region_end > blk_end
               ? crc_region_end - blk_end : 0);
+          png_crc_forward_for_len(after[mi], after_forward[mi]);
         }
 
         // Shifted contiguous CRCs (constant per position).
         uint32_t shifted_contig[3];
         for (int mi = 0; mi < 3; mi++) {
-          shifted_contig[mi] = (uint32_t)crc32_combine(
-              (uLong)mid_crc[mi], 0UL, after[mi]);
+          shifted_contig[mi] = png_crc_apply_forward(
+              after_forward[mi], mid_crc[mi]);
+        }
+
+        uint32_t block_forward[32];
+        uint32_t suffix_forward[32];
+        png_crc_forward_for_len((z_off_t)bs, block_forward);
+        png_crc_forward_for_len((z_off_t)suffix_partial_len, suffix_forward);
+        uint32_t mid_crc_up_to_suffix = crc_prefix;
+        for (int mi = 0; mi < 3; mi++) {
+          mid_crc_up_to_suffix = png_crc_apply_forward(block_forward,
+              mid_crc_up_to_suffix) ^ mid_crc[mi];
         }
 
         // Build shifted-CRC lookup tables ONCE (geometry-only, O(N)).
@@ -12064,8 +11827,8 @@ static inline int png_crc_solve_idat(
                         scalpel_state.filemirror, e->actual_block) < 0) {
                   continue;
                 }
-                uint32_t sc2 = (uint32_t)crc32_combine(
-                    (uLong)e->crc, 0UL, after[mi]);
+                uint32_t sc2 = png_crc_apply_forward(
+                    after_forward[mi], e->crc);
                 Er2Entry *ent = &sctx->m3_pool[mi][cnt++];
                 ent->shifted_crc = sc2;
                 ent->actual_block = e->actual_block;
@@ -12115,14 +11878,8 @@ static inline int png_crc_solve_idat(
 
           // Compute diff using THIS suffix candidate's stored CRC.
           // CRC of prefix + 3 contiguous middle blocks + suffix partial:
-          uint32_t crc_up_to_suffix = crc_prefix;
-          for (int mi = 0; mi < 3; mi++) {
-            crc_up_to_suffix = (uint32_t)crc32_combine(
-                (uLong)crc_up_to_suffix, (uLong)mid_crc[mi], (z_off_t)bs);
-          }
-          uint32_t crc_with_sc = (uint32_t)crc32_combine(
-              (uLong)crc_up_to_suffix, (uLong)sc->partial_crc,
-              (z_off_t)suffix_partial_len);
+          uint32_t crc_with_sc = png_crc_apply_forward(suffix_forward,
+              mid_crc_up_to_suffix) ^ sc->partial_crc;
           uint32_t diff = sc->stored_crc ^ crc_with_sc;
           if (diff == 0) { continue; }  // contiguous already matches this suffix
 
@@ -12150,8 +11907,8 @@ static inline int png_crc_solve_idat(
             #define PNG_M3_AP_FROM_ACT(_act) \
               png_crc_actual_to_apparent(ht, (_act))
             #define PNG_M3_SHIFT_AP(_ap, _pos) \
-              ((uint32_t)crc32_combine((uLong)m3_ab_crc[(_ap)], 0UL, \
-                                       after[(_pos)]))
+              png_crc_apply_forward(after_forward[(_pos)], \
+                                    m3_ab_crc[(_ap)])
             #define PNG_M3_RESTORE_CONTIG() do { \
               for (uint32_t _rf = 0; _rf < fill_needed; _rf++) { \
                 int64_t _orig = last_block + 1 + (int64_t)_rf; \
@@ -12458,11 +12215,10 @@ static inline int png_crc_solve_idat(
                   continue;
                 }
 
-                uint32_t pair_shift =
-                    (uint32_t)crc32_combine((uLong)m3_ab_crc[start],
-                                            0UL, after[pa])
-                    ^ (uint32_t)crc32_combine(
-                        (uLong)m3_ab_crc[start + 1], 0UL, after[pb]);
+                uint32_t pair_shift = png_crc_apply_forward(
+                    after_forward[pa], m3_ab_crc[start])
+                    ^ png_crc_apply_forward(
+                        after_forward[pb], m3_ab_crc[start + 1]);
                 uint32_t needed_single = target_all ^ pair_shift;
                 uint32_t bidx = needed_single % PNG_M3_BUCKETS;
                 for (Er2Entry *me = m3_htab[ti_s][bidx];
@@ -12683,6 +12439,8 @@ static inline int png_crc_solve_idat(
                   local->solver_suffix_nb = suffix_start_nb;
                   // BV has contiguous fill — trim to clean state.
                   resize_blockvector(candidate->b, suffix_start_nb);
+                  free(m3_ab_crc);
+                  free(m3_ab_valid);
                   return -1;
                 }
                 Er2Entry *cea = &sctx->m3_pool[ti_a][ei];
@@ -12801,6 +12559,8 @@ static inline int png_crc_solve_idat(
                 local->solver_suffix_nb = suffix_start_nb;
                 // Tables persist in sctx — do NOT free.
                 resize_blockvector(candidate->b, suffix_start_nb);
+                free(m3_ab_crc);
+                free(m3_ab_valid);
                 return -1;
               }
             }
@@ -12848,6 +12608,8 @@ static inline int png_crc_solve_idat(
                 local->solver_right_idx2 = 0;
                 local->solver_suffix_nb = suffix_start_nb;
                 resize_blockvector(candidate->b, suffix_start_nb);
+                free(m3_ab_crc);
+                free(m3_ab_valid);
                 return -1;
               }
 
@@ -12884,6 +12646,8 @@ static inline int png_crc_solve_idat(
                   local->solver_right_idx2 = e1;
                   local->solver_suffix_nb = suffix_start_nb;
                   resize_blockvector(candidate->b, suffix_start_nb);
+                  free(m3_ab_crc);
+                  free(m3_ab_valid);
                   return -1;
                 }
                 Er2Entry *c1 = &sctx->m3_pool[ti_1][e1];
@@ -13013,238 +12777,369 @@ static inline int png_crc_solve_idat(
   } // end left_count == 1
   /* OLD M=3 O(N²) code removed — replaced with O(N) decomposition above. */
   else if (left_count == 2) {
-    // M=4: O(N^2) meet-in-the-middle with chunked pair generation.
-    // Build left pair table in C×C chunks to bound memory, scan right
-    // pairs against each chunk.  CRC-verify after placing blocks.
-    uint32_t N = (uint32_t)ht->total_entries;
-    if (N > PNG_M4_FEASIBLE_MAX_N) {
-      if (scalpel_state.mode_verbose) {
-        lock_fprintf(stdout,
-            "PNG SOLVER: M=%u skipped generic M4 search (N=%u > %u)\n",
-            M, N, PNG_M4_FEASIBLE_MAX_N);
-      }
-      png_solver_resume_reset(local);
-      resize_blockvector(candidate->b, suffix_start_nb);
-      free(suffix_cands);
-      return 0;
-    }
-    if (scalpel_state.mode_verbose && N > 20000) {
-      lock_fprintf(stdout,
-          "PNG SOLVER: M=%u running large-N chunked search (N=%u)\n",
-          M, N);
-    }
-    {
-      uint32_t dbl_shifted = (uint32_t)crc32_combine(
-          (uLong)crc_prefix, 0UL, (z_off_t)bs * 2);
-      bool m4_yielded = false;
+    // M=4: complete 2+2 meet-in-the-middle search.  Earlier structured
+    // solvers handle large candidate universes; this exact fallback runs
+    // only when every ordered left pair fits inside the per-worker budget.
+    typedef struct PNGM4PairEntry {
+      uint32_t crc;
+      uint32_t first;
+      uint32_t second;
+      uint32_t next;
+    } PNGM4PairEntry;
 
-      PNGCrcEntry **flat = (PNGCrcEntry **)malloc(N * sizeof(PNGCrcEntry *));
-      uint32_t *shifted = (uint32_t *)malloc(N * sizeof(uint32_t));
-      if (flat && shifted) {
-        uint32_t fi = 0;
-        for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
-          for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
-            if (fi < N) {
-              flat[fi] = e;
-              shifted[fi] = (uint32_t)crc32_combine(
-                  (uLong)e->crc, 0UL, (z_off_t)bs);
-              fi++;
-            }
-          }
+    PNGCrcEntry **flat = NULL;
+    uint32_t *shifted = NULL;
+    PNGM4PairEntry *pair_pool = NULL;
+    uint32_t *pair_buckets = NULL;
+    uint32_t fi = 0;
+    uint32_t pair_bucket_count = 0;
+    uint64_t pair_count = 0;
+    bool m4_yielded = false;
+
+    uint64_t viable_count = 0;
+    for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
+      for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
+        if (filemirror_actual_block_covered(scalpel_state.filemirror,
+                                            e->actual_block)) {
+          continue;
         }
+        int64_t apparent = filemirror_apparent_blocknumber(
+            scalpel_state.filemirror, e->actual_block);
+        if (apparent < 0 || _AB_IN_BV_PREFIX(apparent)) {
+          continue;
+        }
+        viable_count++;
+      }
+    }
 
-        #define M4_CHUNK 1000
-        #define M4_BUCKETS 131072
-        typedef struct M4Entry {
-          uint32_t crc; int64_t a0, a1; struct M4Entry *next;
-        } M4Entry;
+    if (viable_count < 4 || viable_count > UINT32_MAX) {
+      goto m4_done;
+    }
+    pair_count = viable_count * (viable_count - 1);
+    if (pair_count > PNG_M4_PAIR_MEMORY_LIMIT / sizeof(PNGM4PairEntry)) {
+      if (scalpel_state.mode_verbose || png_trace_this) {
+        lock_fprintf(stdout,
+            "PNG SOLVER: M=4 exact search skipped: %" PRIu64
+            " viable blocks require %" PRIu64
+            " pair bytes (budget=%" PRIu64 ")\n",
+            viable_count,
+            pair_count * (uint64_t)sizeof(PNGM4PairEntry),
+            (uint64_t)PNG_M4_PAIR_MEMORY_LIMIT);
+      }
+      goto m4_done;
+    }
 
-        uint32_t ci_start = (resume_phase == 3) ? resume_chunk_i : 0;
-        for (uint32_t ci = ci_start; ci < fi && !solved; ci += M4_CHUNK) {
-          uint32_t ci_end = ci + M4_CHUNK;
-          if (ci_end > fi) ci_end = fi;
+    flat = (PNGCrcEntry **)malloc(
+        (size_t)viable_count * sizeof(PNGCrcEntry *));
+    if (!flat) {
+      goto m4_done;
+    }
+    for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
+      for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
+        if (filemirror_actual_block_covered(scalpel_state.filemirror,
+                                            e->actual_block)) {
+          continue;
+        }
+        int64_t apparent = filemirror_apparent_blocknumber(
+            scalpel_state.filemirror, e->actual_block);
+        if (apparent < 0 || _AB_IN_BV_PREFIX(apparent)) {
+          continue;
+        }
+        if (fi < viable_count) {
+          flat[fi++] = e;
+        }
+      }
+    }
+    if (fi < 4) {
+      goto m4_done;
+    }
 
-          uint32_t cj_start = (resume_phase == 3 && ci == resume_chunk_i)
-              ? resume_chunk_j : 0;
-          for (uint32_t cj = cj_start; cj < fi && !solved; cj += M4_CHUNK) {
-            uint32_t cj_end = cj + M4_CHUNK;
-            if (cj_end > fi) cj_end = fi;
+    // Resume indices are meaningful only while the ordered viable-block and
+    // suffix-candidate universes are unchanged.  Coverage can change across a
+    // progress checkpoint, so fingerprint both lists and the IDAT geometry.
+    XXH3_state_t m4_hash_state;
+    if (XXH3_64bits_reset(&m4_hash_state) != XXH_OK
+        || XXH3_64bits_update(&m4_hash_state, &suffix_start_nb,
+                              sizeof(suffix_start_nb)) != XXH_OK
+        || XXH3_64bits_update(&m4_hash_state, &crc_pos,
+                              sizeof(crc_pos)) != XXH_OK
+        || XXH3_64bits_update(&m4_hash_state, &idat_sz,
+                              sizeof(idat_sz)) != XXH_OK
+        || XXH3_64bits_update(&m4_hash_state, &fill_needed,
+                              sizeof(fill_needed)) != XXH_OK
+        || XXH3_64bits_update(&m4_hash_state, &first_full,
+                              sizeof(first_full)) != XXH_OK
+        || XXH3_64bits_update(&m4_hash_state, &suffix_fill_pos,
+                              sizeof(suffix_fill_pos)) != XXH_OK
+        || XXH3_64bits_update(&m4_hash_state, &fi, sizeof(fi)) != XXH_OK) {
+      goto m4_done;
+    }
+    for (uint32_t i = 0; i < fi; i++) {
+      int64_t actual = flat[i]->actual_block;
+      if (XXH3_64bits_update(&m4_hash_state, &actual, sizeof(actual))
+          != XXH_OK) {
+        goto m4_done;
+      }
+    }
+    if (XXH3_64bits_update(&m4_hash_state, &suffix_cand_count,
+                           sizeof(suffix_cand_count)) != XXH_OK) {
+      goto m4_done;
+    }
+    for (int64_t i = 0; i < suffix_cand_count; i++) {
+      int64_t actual = suffix_cands[i].actual_block;
+      if (XXH3_64bits_update(&m4_hash_state, &actual, sizeof(actual))
+          != XXH_OK) {
+        goto m4_done;
+      }
+    }
+    uint64_t m4_universe_hash = XXH3_64bits_digest(&m4_hash_state);
+    if (m4_universe_hash == 0) {
+      m4_universe_hash = UINT64_MAX;
+    }
+    if (resume_phase == 3
+        && local->solver_m4_universe_hash != m4_universe_hash) {
+      if (scalpel_state.mode_verbose || png_trace_this) {
+        lock_fprintf(stdout,
+            "PNG SOLVER: M=4 viable universe changed; restarting scan\n");
+      }
+      resume_si = 0;
+      resume_er1 = 0;
+      resume_er2 = 0;
+      resume_phase = 0;
+      local->solver_suffix_idx = 0;
+      local->solver_right_idx = 0;
+      local->solver_right_idx2 = 0;
+      local->solver_phase = 0;
+      local->solver_m4_universe_hash = 0;
+    }
 
-            // Yield check between chunks.
-            if (png_reassembly_yield_requested(candidate)) {
-              local->solver_phase = 3;
-              local->solver_pair_idx = 0;
-              local->solver_chunk_i = ci;
-              local->solver_chunk_j = cj;
-              local->solver_suffix_idx = 0;
-              local->solver_right_idx = 0;
-              local->solver_right_idx2 = 0;
-              local->solver_suffix_nb = suffix_start_nb;
-              m4_yielded = true;
-              goto m4_done;
-            }
+    pair_count = (uint64_t)fi * (uint64_t)(fi - 1);
+    pair_bucket_count = 1024;
+    while ((uint64_t)pair_bucket_count < (pair_count + 1) / 2) {
+      pair_bucket_count <<= 1;
+    }
+    uint64_t m4_bytes = pair_count * sizeof(PNGM4PairEntry)
+        + (uint64_t)pair_bucket_count * sizeof(uint32_t)
+        + (uint64_t)fi * (sizeof(PNGCrcEntry *) + sizeof(uint32_t));
+    if (m4_bytes > PNG_M4_PAIR_MEMORY_LIMIT) {
+      if (scalpel_state.mode_verbose || png_trace_this) {
+        lock_fprintf(stdout,
+            "PNG SOLVER: M=4 exact search skipped: %u viable blocks"
+            " require %" PRIu64 " bytes (budget=%" PRIu64 ")\n",
+            fi, m4_bytes, (uint64_t)PNG_M4_PAIR_MEMORY_LIMIT);
+      }
+      goto m4_done;
+    }
 
-            uint64_t chunk_pairs = (uint64_t)(ci_end - ci) * (cj_end - cj);
-            M4Entry **m4tab = (M4Entry **)calloc(M4_BUCKETS,
-                sizeof(M4Entry *));
-            M4Entry *m4pool = (M4Entry *)malloc(
-                (size_t)chunk_pairs * sizeof(M4Entry));
-            if (!m4tab || !m4pool) {
-              free(m4tab); free(m4pool);
-              goto m4_done;
-            }
+    shifted = (uint32_t *)malloc((size_t)fi * sizeof(uint32_t));
+    pair_pool = (PNGM4PairEntry *)malloc(
+        (size_t)pair_count * sizeof(PNGM4PairEntry));
+    pair_buckets = (uint32_t *)malloc(
+        (size_t)pair_bucket_count * sizeof(uint32_t));
+    if (!shifted || !pair_pool || !pair_buckets) {
+      goto m4_done;
+    }
+    memset(pair_buckets, 0xff,
+           (size_t)pair_bucket_count * sizeof(uint32_t));
 
-            uint64_t pidx = 0;
-            for (uint32_t i = ci; i < ci_end; i++) {
-              for (uint32_t j = cj; j < cj_end; j++) {
-                if (i == j) continue;
-                if (flat[i]->actual_block == flat[j]->actual_block) continue;
-                uint32_t lcrc = dbl_shifted ^ shifted[i] ^ flat[j]->crc;
-                M4Entry *me = &m4pool[pidx++];
-                me->crc = lcrc;
-                me->a0 = flat[i]->actual_block;
-                me->a1 = flat[j]->actual_block;
-                me->next = m4tab[lcrc % M4_BUCKETS];
-                m4tab[lcrc % M4_BUCKETS] = me;
-              }
-            }
+    uint32_t block_forward[32];
+    uint32_t prefix_forward[32];
+    uint32_t suffix_forward[32];
+    png_crc_forward_for_len((z_off_t)bs, block_forward);
+    png_crc_forward_for_len((z_off_t)bs * 2, prefix_forward);
+    png_crc_forward_for_len((z_off_t)suffix_partial_len,
+                            suffix_forward);
+    uint32_t shifted_prefix = png_crc_apply_forward(prefix_forward,
+                                                     crc_prefix);
+    for (uint32_t i = 0; i < fi; i++) {
+      shifted[i] = png_crc_apply_forward(block_forward, flat[i]->crc);
+    }
 
-            // Right scan against this chunk's left pairs.
-            bool yield_this_chunk = false;
-            int64_t si_start = (resume_phase == 3
-                && ci == resume_chunk_i
-                && cj == resume_chunk_j)
-                ? resume_si : 0;
-            for (int64_t si = si_start;
-                 si < suffix_cand_count && !solved && !yield_this_chunk;
-                 si++) {
-              PNGSuffixCand *sc = &suffix_cands[si];
-              uint32_t er_start = (resume_phase == 3
-                  && ci == resume_chunk_i
-                  && cj == resume_chunk_j
-                  && si == si_start
-                  && resume_er1 > 0)
-                  ? (uint32_t)resume_er1 : 0;
-              for (uint32_t er = er_start; er < fi && !solved; er++) {
-                if ((er & 0xFF) == 0
-                    && png_reassembly_yield_requested(candidate)) {
-                  local->solver_phase = 3;
-                  local->solver_pair_idx = 0;
-                  local->solver_chunk_i = ci;
-                  local->solver_chunk_j = cj;
-                  local->solver_suffix_idx = si;
-                  local->solver_right_idx = er;
-                  local->solver_right_idx2 = 0;
-                  local->solver_suffix_nb = suffix_start_nb;
-                  m4_yielded = true;
-                  yield_this_chunk = true;
-                  break;
-                }
-                uint32_t rcrc = (uint32_t)crc32_combine(
-                    (uLong)flat[er]->crc, (uLong)sc->partial_crc,
-                    (z_off_t)suffix_partial_len);
-                uint32_t f_right = (uint32_t)crc32_combine(
-                    0UL, (uLong)rcrc, right_total_len);
-                uint32_t xored = sc->stored_crc ^ f_right;
-                uint32_t target = 0;
-                for (int bit = 0; bit < 32; bit++) {
-                  if (xored & (1U << bit)) { target ^= Minv[bit]; }
-                }
-                M4Entry *me = m4tab[target % M4_BUCKETS];
-                while (me) {
-                  if (me->crc == target
-                      && me->a0 != flat[er]->actual_block
-                      && me->a1 != flat[er]->actual_block
-                      && me->a0 != sc->actual_block
-                      && me->a1 != sc->actual_block
-                      && flat[er]->actual_block != sc->actual_block) {
-                    int64_t ab0 = filemirror_apparent_blocknumber(
-                        scalpel_state.filemirror, me->a0);
-                    int64_t ab1 = filemirror_apparent_blocknumber(
-                        scalpel_state.filemirror, me->a1);
-                    int64_t ab2 = filemirror_apparent_blocknumber(
-                        scalpel_state.filemirror, flat[er]->actual_block);
-                    int64_t ab3 = filemirror_apparent_blocknumber(
-                        scalpel_state.filemirror, sc->actual_block);
-                    if (ab0 >= 0 && ab1 >= 0 && ab2 >= 0 && ab3 >= 0) {
-                      blockvector_set_apparent_blocknumber(candidate->b,
-                          suffix_start_nb + first_full, ab0);
-                      blockvector_set_apparent_blocknumber(candidate->b,
-                          suffix_start_nb + first_full + 1, ab1);
-                      blockvector_set_apparent_blocknumber(candidate->b,
-                          suffix_start_nb + first_full + 2, ab2);
-                      blockvector_set_apparent_blocknumber(candidate->b,
-                          suffix_start_nb + fill_needed - 1, ab3);
-                      for (uint32_t inf = 0; inf < fill_needed; inf++) {
-                        inflate_blockvector_single_block(candidate->b,
-                            suffix_start_nb + inf);
-                      }
-                      // CRC verification — confirm actual data matches.
-                      const char *vd4 =
-                          blockvector_get_data_pointer(candidate->b);
-                      uint64_t vdl4 =
-                          blockvector_get_data_length(candidate->b);
-                      if (vd4 && type_start + crc_region_len <= vdl4) {
-                        uint32_t vc4 = crc32(0, NULL, 0);
-                        vc4 = crc32(vc4,
-                            (const unsigned char *)(vd4 + type_start),
-                            (uInt)crc_region_len);
-                        if (vc4 == sc->stored_crc) {
-                          // CRC match — validate before committing to
-                          // guard against spurious GF(2) collisions.
-                          if (png_solver_confirm_match(candidate, local,
-                                  work, uuidp, uuidc, crc_pos, idat_sz)) {
-                            solved = true;
-                            if (scalpel_state.mode_verbose) {
-                              lock_fprintf(stdout,
-                                  "PNG SOLVER M=%u: SOLVED+VERIFIED "
-                                  "%" PRId64 " %" PRId64 " %" PRId64
-                                  " %" PRId64 "\n", M, me->a0, me->a1,
-                                  flat[er]->actual_block,
-                                  sc->actual_block);
-                            }
-                          } else if (scalpel_state.mode_verbose) {
-                            lock_fprintf(stdout,
-                                "PNG SOLVER M=%u: REJECTED (spurious) "
-                                "%" PRId64 " %" PRId64 " %" PRId64
-                                " %" PRId64 "\n", M, me->a0, me->a1,
-                                flat[er]->actual_block,
-                                sc->actual_block);
-                          }
-                        }
-                      }
+    uint64_t pidx = 0;
+    for (uint32_t i = 0; i < fi && !m4_yielded; i++) {
+      for (uint32_t j = 0; j < fi; j++) {
+        if (i == j) {
+          continue;
+        }
+        if ((pidx & 0xFFFFULL) == 0ULL
+            && png_reassembly_yield_requested(candidate)) {
+          local->solver_phase = 3;
+          local->solver_suffix_idx = 0;
+          local->solver_right_idx = 0;
+          local->solver_right_idx2 = 0;
+          local->solver_suffix_nb = suffix_start_nb;
+          local->solver_m4_universe_hash = m4_universe_hash;
+          m4_yielded = true;
+          break;
+        }
+        uint32_t left_crc = shifted_prefix ^ shifted[i] ^ flat[j]->crc;
+        uint32_t bucket = left_crc & (pair_bucket_count - 1);
+        PNGM4PairEntry *entry = &pair_pool[pidx];
+        entry->crc = left_crc;
+        entry->first = i;
+        entry->second = j;
+        entry->next = pair_buckets[bucket];
+        pair_buckets[bucket] = (uint32_t)pidx;
+        pidx++;
+      }
+    }
+    if (m4_yielded) {
+      goto m4_done;
+    }
+
+    int64_t si_start = resume_phase == 3 ? resume_si : 0;
+    uint64_t m4_poll_count = 0;
+    for (int64_t si = si_start; si < suffix_cand_count && !solved; si++) {
+      PNGSuffixCand *sc = &suffix_cands[si];
+      if (!sc->valid || sc->apparent_block < 0
+          || _AB_IN_BV_PREFIX(sc->apparent_block)
+          || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                             sc->actual_block)) {
+        continue;
+      }
+
+      uint32_t r0_start = (resume_phase == 3 && si == si_start
+                           && resume_er1 >= 0)
+          ? (uint32_t)resume_er1 : 0;
+      for (uint32_t r0 = r0_start; r0 < fi && !solved; r0++) {
+        uint32_t r1_start = (resume_phase == 3 && si == si_start
+                             && r0 == r0_start && resume_er2 >= 0)
+            ? (uint32_t)resume_er2 : 0;
+        for (uint32_t r1 = r1_start; r1 < fi && !solved; r1++) {
+          if (r0 == r1
+              || flat[r0]->actual_block == sc->actual_block
+              || flat[r1]->actual_block == sc->actual_block) {
+            continue;
+          }
+          if ((m4_poll_count++ & 0xFFULL) == 0ULL
+              && png_reassembly_yield_requested(candidate)) {
+            local->solver_phase = 3;
+            local->solver_suffix_idx = si;
+            local->solver_right_idx = r0;
+            local->solver_right_idx2 = r1;
+            local->solver_suffix_nb = suffix_start_nb;
+            local->solver_m4_universe_hash = m4_universe_hash;
+            m4_yielded = true;
+            break;
+          }
+
+          uint32_t right_pair_crc = shifted[r0] ^ flat[r1]->crc;
+          uint32_t right_crc = png_crc_apply_forward(suffix_forward,
+              right_pair_crc) ^ sc->partial_crc;
+          uint32_t required_left = png_crc_apply_inverse(Minv,
+              sc->stored_crc ^ right_crc);
+          uint32_t entry_index = pair_buckets[
+              required_left & (pair_bucket_count - 1)];
+
+          while (entry_index != UINT32_MAX && !solved) {
+            PNGM4PairEntry *entry = &pair_pool[entry_index];
+            if (entry->crc == required_left) {
+              PNGCrcEntry *left0 = flat[entry->first];
+              PNGCrcEntry *left1 = flat[entry->second];
+              if (left0->actual_block != flat[r0]->actual_block
+                  && left0->actual_block != flat[r1]->actual_block
+                  && left1->actual_block != flat[r0]->actual_block
+                  && left1->actual_block != flat[r1]->actual_block
+                  && left0->actual_block != sc->actual_block
+                  && left1->actual_block != sc->actual_block) {
+                int64_t ab0 = filemirror_apparent_blocknumber(
+                    scalpel_state.filemirror, left0->actual_block);
+                int64_t ab1 = filemirror_apparent_blocknumber(
+                    scalpel_state.filemirror, left1->actual_block);
+                int64_t ab2 = filemirror_apparent_blocknumber(
+                    scalpel_state.filemirror, flat[r0]->actual_block);
+                int64_t ab3 = filemirror_apparent_blocknumber(
+                    scalpel_state.filemirror, flat[r1]->actual_block);
+                if (ab0 >= 0 && ab1 >= 0 && ab2 >= 0 && ab3 >= 0) {
+                  PNGSolverStateSnapshot pre_snap;
+                  png_solver_snapshot(&pre_snap, local);
+                  png_solver_resize_trial(candidate,
+                                          suffix_start_nb + fill_needed);
+                  blockvector_set_apparent_blocknumber(candidate->b,
+                      suffix_start_nb + first_full, ab0);
+                  blockvector_set_apparent_blocknumber(candidate->b,
+                      suffix_start_nb + first_full + 1, ab1);
+                  blockvector_set_apparent_blocknumber(candidate->b,
+                      suffix_start_nb + first_full + 2, ab2);
+                  blockvector_set_apparent_blocknumber(candidate->b,
+                      suffix_start_nb + first_full + 3, ab3);
+                  blockvector_set_apparent_blocknumber(candidate->b,
+                      suffix_start_nb + suffix_fill_pos,
+                      sc->apparent_block);
+                  for (uint32_t f = 0; f < fill_needed; f++) {
+                    inflate_blockvector_single_block(candidate->b,
+                                                     suffix_start_nb + f);
+                  }
+
+                  const char *trial_data =
+                      blockvector_get_data_pointer(candidate->b);
+                  uint64_t trial_length =
+                      blockvector_get_data_length(candidate->b);
+                  bool crc_matches = false;
+                  if (trial_data && type_start + crc_region_len
+                      <= trial_length) {
+                    uint32_t trial_crc = crc32(0, NULL, 0);
+                    trial_crc = crc32(trial_crc,
+                        (const unsigned char *)(trial_data + type_start),
+                        (uInt)crc_region_len);
+                    crc_matches = trial_crc == sc->stored_crc;
+                  }
+                  if (crc_matches
+                      && png_solver_crc_marker_matches(candidate,
+                          type_start, crc_region_len, crc_field_pos,
+                          sc->stored_crc)
+                      && png_solver_confirm_match(candidate, local, work,
+                          uuidp, uuidc, crc_pos, idat_sz)) {
+                    solved = true;
+                    if (scalpel_state.mode_verbose || png_trace_this) {
+                      lock_fprintf(stdout,
+                          "PNG CRC SOLVER: M=4 selected blocks ["
+                          "%" PRId64 ",%" PRId64 ",%" PRId64
+                          ",%" PRId64 "] suffix %" PRId64 "\n",
+                          ab0, ab1, ab2, ab3, sc->apparent_block);
                     }
                   }
-                  me = me->next;
+                  if (!solved) {
+                    png_solver_restore(local, &pre_snap);
+                    for (uint32_t f = 0; f < fill_needed; f++) {
+                      int64_t original = last_block + 1 + (int64_t)f;
+                      blockvector_set_apparent_blocknumber(candidate->b,
+                          suffix_start_nb + f, original);
+                      inflate_blockvector_single_block(candidate->b,
+                                                       suffix_start_nb + f);
+                    }
+                  }
                 }
               }
             }
-            free(m4tab);
-            free(m4pool);
-            if (yield_this_chunk) {
-              goto m4_done;
-            }
+            entry_index = entry->next;
           }
         }
-m4_done: ;
+        if (m4_yielded) {
+          break;
+        }
       }
-      free(flat);
-      free(shifted);
-      if (m4_yielded) {
-        resize_blockvector(candidate->b, suffix_start_nb);
-        return -1;
-      }
+      resume_phase = 0;
+    }
+
+m4_done:
+    free(pair_buckets);
+    free(pair_pool);
+    free(shifted);
+    free(flat);
+    if (m4_yielded) {
+      resize_blockvector(candidate->b, suffix_start_nb);
+      return -1;
     }
 
     png_solver_resume_reset(local);
-
     if (!solved) {
-      // Restore contiguous blocks
       for (uint32_t f = 0; f < fill_needed; f++) {
-        int64_t orig = last_block + 1 + (int64_t)f;
+        int64_t original = last_block + 1 + (int64_t)f;
         blockvector_set_apparent_blocknumber(candidate->b,
-            suffix_start_nb + f, orig);
-        inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
+            suffix_start_nb + f, original);
+        inflate_blockvector_single_block(candidate->b,
+                                         suffix_start_nb + f);
       }
     }
   }
@@ -13410,6 +13305,11 @@ static inline void png_reassembly_init_candidate(CarveInfo *candidate,
             | ((uint32_t)data[pos + 1] << 16)
             | ((uint32_t)data[pos + 2] << 8)
             | (uint32_t)data[pos + 3];
+        const uint8_t *type = data + pos + 4;
+        if (!png_chunk_type_is_ascii(type)
+            || chunk_len > PNG_MAX_IDAT_BODY_LEN) {
+          break;
+        }
         uint64_t crc_at = pos + 8 + (uint64_t)chunk_len;
         if (crc_at + 4 > dl) {
           // Chunk extends past BV data.  Temporarily extend
@@ -13546,7 +13446,7 @@ static inline bool png_direct_validate(int id, CarveInfo *candidate,
 
 #if VALIDATOR_PERFORMANCE_STATS > 0
   clock_gettime(CLOCK_MONOTONIC, &FV_endtime);
-  uint64_t FV_elapsed = (FV_endtime.tv_sec - FV_starttime.tv_sec) * (uint64_t)1000000000
+  uint64_t FV_elapsed = (FV_endtime.tv_sec - FV_starttime.tv_sec) * NANOSECONDS_PER_SECOND
                        + (FV_endtime.tv_nsec - FV_starttime.tv_nsec);
   atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].FV_calls,
                             1, memory_order_acq_rel);
@@ -13719,7 +13619,8 @@ static inline bool png_trim_output_blind_idat_tail(
         | ((uint32_t)data[pos + 2] << 8)
         | (uint32_t)data[pos + 3];
     const uint8_t *type = data + pos + 4;
-    if (!png_chunk_type_is_ascii(type) || chunk_len > 100000000U) {
+    if (!png_chunk_type_is_ascii(type)
+        || chunk_len > PNG_MAX_IDAT_BODY_LEN) {
       break;
     }
 
@@ -13803,6 +13704,11 @@ static inline void png_trim_checkpoint_candidate(
       && local->solver_suffix_nb > 0
       && local->solver_suffix_nb < keep_blocks) {
     keep_blocks = local->solver_suffix_nb;
+  }
+  if (local->m2_resume.active
+      && local->m2_resume.suffix_nb > 0
+      && local->m2_resume.suffix_nb < keep_blocks) {
+    keep_blocks = local->m2_resume.suffix_nb;
   }
   if (local->bbk_resume_active
       && local->bbk_resume_suffix_nb > 0
@@ -13959,7 +13865,7 @@ png_reassembly_restart:
       }
       state_published = false;
     }
-    if (reassembly_check_kill_queue(work->id, &candidate, uuidp, uuidc)) {
+    if (reassembly_check_kill_queue(work, &candidate, uuidp, uuidc)) {
       goto done_do_not_write_candidate;
     }
     if (reassembly_check_max_size(work->id, candidate, uuidp, uuidc)) {
@@ -14029,7 +13935,7 @@ png_reassembly_restart:
                 | ((uint32_t)bvd[p + 1] << 16)
                 | ((uint32_t)bvd[p + 2] << 8)
                 | (uint32_t)bvd[p + 3];
-            if (cl > 100000000U) { break; }
+            if (cl > PNG_MAX_IDAT_BODY_LEN) { break; }
             uint64_t nxt = p + 12 + (uint64_t)cl;
             if (nxt > walk_limit) { break; }
             if (nxt > crc_pos
@@ -14050,7 +13956,8 @@ png_reassembly_restart:
                                 | ((uint32_t)bvd[crc_pos + 1] << 16)
                                 | ((uint32_t)bvd[crc_pos + 2] << 8)
                                 | (uint32_t)bvd[crc_pos + 3]);
-          if (actual_sz > 0 && (uint64_t)actual_sz < 100000000ULL) {
+          if (actual_sz > 0
+              && (uint64_t)actual_sz <= PNG_MAX_IDAT_BODY_LEN) {
             idat_sz = actual_sz;
           }
         }
@@ -14213,6 +14120,8 @@ png_reassembly_restart:
                      crc_pos, idat_sz, fill_needed,
                      accept_on_validates_to);
       }
+      int64_t total_apparent = (int64_t)filemirror_apparent_blocks(
+          scalpel_state.filemirror);
       int64_t last_block = blockvector_get_apparent_blocknumber(candidate->b,
           suffix_start_nb - 1);
       // OOO fixup: if the solver placed a far-away OOO block at the last
@@ -14225,9 +14134,108 @@ png_reassembly_restart:
         int64_t gap = last_block - expected;
         if (gap < 0) { gap = -gap; }
         if (gap > (int64_t)fill_needed + 4 && expected >= 0
-            && expected < (int64_t)filemirror_apparent_blocks(
-                scalpel_state.filemirror)) {
+            && expected < total_apparent) {
           last_block = expected;
+        }
+      }
+
+      bool baseline_available = total_apparent > 0 && last_block >= -1
+          && (uint64_t)fill_needed <= (uint64_t)total_apparent
+          && last_block < total_apparent - (int64_t)fill_needed;
+
+      // A header or repaired fragment can lie near the end of apparent
+      // address space.  The contiguous trial is only a baseline for the CRC
+      // solver, so select another unused window rather than indexing past the
+      // blockmap.
+      if (!baseline_available) {
+        int64_t trial_start = -1;
+        bool first_window_available = fill_needed <= total_apparent;
+        for (uint32_t f = 0; first_window_available && f < fill_needed; f++) {
+          int64_t actual = filemirror_actual_blocknumber(
+              scalpel_state.filemirror, (int64_t)f);
+          if (actual < 0
+              || filemirror_actual_block_covered(
+                  scalpel_state.filemirror, actual)
+              || apparent_block_in_blockvector(candidate->b, (int64_t)f)) {
+            first_window_available = false;
+          }
+        }
+        if (first_window_available) {
+          trial_start = 0;
+        }
+        else {
+          uint64_t used_count = blockvector_get_num_blocks(candidate->b);
+          int64_t *used = NULL;
+          if (used_count <= SIZE_MAX / sizeof(int64_t)) {
+            used = (int64_t *)malloc((size_t)used_count * sizeof(int64_t));
+          }
+          if (used) {
+            for (uint64_t i = 0; i < used_count; i++) {
+              used[i] = blockvector_get_apparent_blocknumber(candidate->b, i);
+            }
+            qsort(used, (size_t)used_count, sizeof(int64_t),
+                  png_compare_int64);
+
+            uint64_t used_index = 0;
+            uint32_t available_run = 0;
+            for (int64_t apparent = 0;
+                 apparent < total_apparent && trial_start < 0;
+                 apparent++) {
+              while (used_index < used_count
+                     && used[used_index] < apparent) {
+                used_index++;
+              }
+              bool in_candidate = used_index < used_count
+                  && used[used_index] == apparent;
+              if (in_candidate) {
+                while (used_index < used_count
+                       && used[used_index] == apparent) {
+                  used_index++;
+                }
+              }
+              int64_t actual = filemirror_actual_blocknumber(
+                  scalpel_state.filemirror, apparent);
+              if (in_candidate || actual < 0
+                  || filemirror_actual_block_covered(
+                      scalpel_state.filemirror, actual)) {
+                available_run = 0;
+              }
+              else if (++available_run == fill_needed) {
+                trial_start = apparent + 1 - (int64_t)fill_needed;
+              }
+            }
+            free(used);
+          }
+          else {
+            // Preserve recovery under allocation pressure using the original
+            // bounded-memory scan.
+            for (int64_t start = 0;
+                 start + (int64_t)fill_needed <= total_apparent;
+                 start++) {
+              bool available = true;
+              for (uint32_t f = 0; f < fill_needed; f++) {
+                int64_t apparent = start + (int64_t)f;
+                int64_t actual = filemirror_actual_blocknumber(
+                    scalpel_state.filemirror, apparent);
+                if (actual < 0
+                    || filemirror_actual_block_covered(
+                        scalpel_state.filemirror, actual)
+                    || apparent_block_in_blockvector(candidate->b,
+                                                     apparent)) {
+                  available = false;
+                  break;
+                }
+              }
+              if (available) {
+                trial_start = start;
+                break;
+              }
+            }
+          }
+        }
+        if (trial_start >= 0) {
+          last_block = trial_start - 1;
+          baseline_available = true;
         }
       }
 
@@ -14236,9 +14244,6 @@ png_reassembly_restart:
       // when the CRC trim at line 9807 actually fires (meaning the solver's
       // blocks were superseded).  Resetting here caused the CRC trim to
       // erase solver progress on the very next iteration.
-      int64_t total_apparent = (int64_t)filemirror_apparent_blocks(
-          scalpel_state.filemirror);
-
       // IDAT marker filter: precompute which trial block must have an
       // IDAT marker and at what offset.  Used by ALL search tiers to
       // skip blocks that can't possibly contain the CRC boundary.
@@ -14415,7 +14420,8 @@ png_reassembly_restart:
 	          }
 	        }
 
-        if (!suffix_found && local && local->gap_fast_exhausted
+        if (!suffix_found && baseline_available
+            && local && local->gap_fast_exhausted
             && fill_needed >= PNG_GAP_INDEX_MAX_M
             && crc_pos > 0 && idat_sz > 0) {
           PNGCrcHashTable *pre_bbk_ht =
@@ -14524,7 +14530,8 @@ png_reassembly_restart:
         // the actual displaced count (typically 1-3 even when fill_needed=12).
         if (!suffix_found && crc_pos > 0 && idat_sz > 0) {
           PNGCrcHashTable *bbk_ht = png_ensure_crc_table(candidate->needleidx);
-          if (bbk_ht && bbk_ht->total_entries > 0) {
+          if (bbk_ht && bbk_ht->total_entries > 0
+              && baseline_available) {
             // Place contiguous fill first (baseline).
             png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
             for (uint32_t f = 0; f < fill_needed; f++) {
@@ -14988,7 +14995,7 @@ png_reassembly_restart:
         // pngcheck validator catches bad blocks (wrong filter bytes,
         // inflate errors, chunk boundary violations).  Accept on
         // CRC advance or validates_to progress.
-        if (last_block + (int64_t)fill_needed < (int64_t)(filemirror_filesize(scalpel_state.filemirror) / (uint64_t)scalpel_state.blocksize)) {
+        if (baseline_available) {
           png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
           for (uint32_t f = 0; f < fill_needed; f++) {
             int64_t ab = last_block + 1 + (int64_t)f;
@@ -15295,6 +15302,7 @@ png_reassembly_restart:
   }
 
 done_write_candidate:
+  ;
   bool wrote_crc_frontier = false;
   if (candidate->flavor != VALIDATED && local) {
     wrote_crc_frontier = png_preserve_crc_frontier_in_candidate(

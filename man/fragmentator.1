@@ -27,6 +27,9 @@ configfile
 \fBfragmentator\fR generates synthetic disk images for testing data carving tools based on instructions provided in a configuration file (usually ending in .frg). It produces an output image file and a corresponding \fI.key\fR file describing the layout.  Full documentation for \fBfragmentator\fR can be found in template.frg, included in the scalpel3 source distribution.
 .PP
 Global options specified in the \fIconfigfile\fR can be overridden via command-line flags. Care must be taken to ensure consistency (e.g., \fIRANDOMPADBLOCKS\fR and \fIZEROPADBLOCKS\fR are mutually exclusive).
+.PP
+Numeric command-line arguments must contain unsigned base-10 digits only.
+Except for \fBBLOCKSIZE\fR, they may range from 0 through 9223372036854775807.
 
 .SH OPTIONS
 .PP
@@ -64,7 +67,8 @@ Override \fBOUTPUTFILE\fR path. The filename must not end in ".frg".
 
 .TP
 .BI -q " blocksize"
-Override \fBBLOCKSIZE\fR. Must be a positive integer divisible by 512.
+Override \fBBLOCKSIZE\fR. Must be from 512 through 1073741824, inclusive,
+and divisible by 512.
 
 .TP
 .BI -r " randompadblocks"
@@ -92,7 +96,11 @@ Override \fBZEROPADBLOCKS\fR (integer >= 0). Mutually exclusive with \fB-r\fR.
 Override \fBZEROBLOCKS\fR (integer >= 0).
 
 .SH CONFIGURATION FILE
-See \fItemplate.frg\fR provided with the source distribution for details on the configuration file syntax.
+The \(oq#\(cq character begins a comment except when it appears inside a
+double-quoted argument. Pathnames containing \(oq#\(cq should therefore be
+double quoted.
+See \fItemplate.frg\fR provided with the source distribution for complete
+configuration-file syntax.
 
 .SH SEE ALSO
 .BR scalpel3 (1),

@@ -26,6 +26,12 @@ Behavior
     * Ground truth:  SHA256 over the full on-disk file size.
 - Error if blockvector Length != ground-truth file size.
 - Reports GT files not recovered (no blockvector mapped).
+- With --fail-on-invalid-validated, exits nonzero if a file in VALIDATED does
+  not match any ground-truth SHA256.
+- With --require-all-exact, exits nonzero unless every ground-truth file has a
+  byte-exact recovered snapshot, including snapshots retained in PROMISING.
+- With --require-exact-at-least N, exits nonzero unless at least N distinct
+  ground-truth files have a byte-exact recovered snapshot.
 
 Ground truth resolution
 -----------------------
@@ -139,7 +145,7 @@ def load_frg_list(path: Path) -> Tuple[Optional[int], Optional[str], List[str], 
     comment = 0
     
     for raw in text.splitlines():
-        line = raw.strip()
+        line = raw.split('#', 1)[0].strip()
         if line.startswith('/*'):
             comment += 1
             continue
@@ -717,7 +723,26 @@ def main() -> None:
     ap.add_argument("--frg", type=Path, default=None, help="Optional .frg file")
     ap.add_argument("--blockmap", required=True, type=Path, help="Blockmap file for dedup-aware comparison")
     ap.add_argument("--verbose", action="store_true", help="Verbose output")
+    ap.add_argument(
+        "--fail-on-invalid-validated",
+        action="store_true",
+        help="Exit nonzero if VALIDATED contains a file absent from ground truth",
+    )
+    ap.add_argument(
+        "--require-all-exact",
+        action="store_true",
+        help="Exit nonzero unless every ground-truth file has an exact recovery",
+    )
+    ap.add_argument(
+        "--require-exact-at-least",
+        type=int,
+        metavar="N",
+        help="Exit nonzero unless at least N ground-truth files have an exact recovery",
+    )
     args = ap.parse_args()
+
+    if args.require_exact_at_least is not None and args.require_exact_at_least < 0:
+        ap.error("--require-exact-at-least must be nonnegative")
     
     # Load key file
     print(f"[info] Loading key file: {args.key}")
@@ -769,6 +794,8 @@ def main() -> None:
     cat4_correct: List[Tuple[str, int, Path, int, int]] = []  # (gt, block, path, correct, expected)
     cat5_incorrect: List[Tuple[str, int, Path, int, int, int, int]] = []  # (gt, block, path, first_wrong, correct, expected, carved_count)
     tracked_pairs: Set[Tuple[str, int]] = set()
+    validated_pairs: Set[Tuple[str, int]] = set()
+    exact_recovery_files: Set[str] = set()
     
     # Find all directories recursively
     warned_missing_b = False
@@ -825,6 +852,7 @@ def main() -> None:
         
         pair_key = (gt_file, start_block)
         tracked_pairs.add(pair_key)
+        validated_pairs.add(pair_key)
         
         # Get GT file size
         gt_path, msg = resolve_gt_path(gt_file, key_dir)
@@ -877,6 +905,7 @@ def main() -> None:
                 if ok_gt and ok_img and gt_sha == img_sha:
                     # Category 1: Perfect
                     cat1_perfect.add(pair_key)
+                    exact_recovery_files.add(gt_file)
                 else:
                     # SHA256 mismatch - Category 5
                     cat5_incorrect.append((gt_file, start_block, bv_path, -1, blocks_correct, blocks_expected, len(actual_blocks)))
@@ -919,8 +948,11 @@ def main() -> None:
     if not warned_missing_b and warn_missing_blockvector_txt("INPROGRESS", len(inprogress_files), inprogress_non_txt):
         warned_missing_b = True
     
-    # Build recovery pool
-    recovery_pool: Dict[Tuple[str, int], Tuple[Path, int, List[int]]] = {}
+    # build recovery pool. a UUID can have several promising snapshots, and a
+    # longer speculative path is not necessarily more accurate than an earlier
+    # verified prefix, so retain every snapshot until after classification.
+    recovery_pool: List[Tuple[Tuple[str, int], Path, int, List[int]]] = []
+    recovery_pairs: Set[Tuple[str, int]] = set()
     
     for bv_path in promising_files + inprogress_files:
         bv_length, actual_blocks = parse_blockvector(bv_path)
@@ -946,18 +978,17 @@ def main() -> None:
         
         pair_key = (gt_file, start_block)
         
-        # Skip if already in cat1 or cat2
-        if pair_key in cat1_perfect or any(p[0:2] == pair_key for p in cat2_length):
+        if pair_key in validated_pairs:
             continue
         
-        # Keep longest
-        if pair_key not in recovery_pool or len(actual_blocks) > len(recovery_pool[pair_key][2]):
-            recovery_pool[pair_key] = (bv_path, bv_length, actual_blocks)
-    
-    print(f"[info] Recovery pool: {len(recovery_pool)} unique pairs")
-    
+        recovery_pool.append((pair_key, bv_path, bv_length, actual_blocks))
+        recovery_pairs.add(pair_key)
+
+    print(f"[info] Recovery pool: {len(recovery_pairs)} unique pairs, "
+          f"{len(recovery_pool)} snapshots")
+
     # Process recovery pool
-    for pair_key, (bv_path, bv_length, actual_blocks) in recovery_pool.items():
+    for pair_key, bv_path, bv_length, actual_blocks in recovery_pool:
         gt_file, start_block = pair_key
         tracked_pairs.add(pair_key)
         
@@ -994,6 +1025,22 @@ def main() -> None:
         if has_missing:
             first_missing_idx = min(missing_blocks_map[gt_file])
             blocks_expected = sum(1 for idx, phys in seq_pairs if idx < first_missing_idx)
+
+        # track byte-exact PROMISING snapshots independently so focused regression
+        # tests can require exact recovery without weakening VALIDATED semantics.
+        gt_path, _ = resolve_gt_path(gt_file, key_dir)
+        if gt_path and len(actual_blocks) == len(seq_pairs):
+            try:
+                gt_size = os.stat(gt_path).st_size
+            except OSError:
+                gt_size = -1
+            if bv_length == gt_size:
+                ok_gt, gt_sha = sha256_of_file(gt_path)
+                ok_img, img_sha = sha256_from_image_blocks(
+                    image_path, actual_blocks, block_size, bv_length
+                )
+                if ok_gt and ok_img and gt_sha == img_sha:
+                    exact_recovery_files.add(gt_file)
         
         # Categorize
         # For Category 4: terminal block can be wrong ONLY if it's actually the last block
@@ -1015,32 +1062,34 @@ def main() -> None:
     # DEDUPLICATION: Keep only BEST recovery per GT file
     # ========================================================================
     # Build mapping: gt_file -> (category, entry_data)
-    file_to_best: Dict[str, Tuple[int, tuple]] = {}
+    file_to_best: Dict[str, Tuple[int, tuple, tuple]] = {}
+
+    def keep_best(gt: str, category: int, entry: tuple, quality: tuple) -> None:
+        current = file_to_best.get(gt)
+        if (current is None or category < current[0]
+                or (category == current[0] and quality > current[2])):
+            file_to_best[gt] = (category, entry, quality)
     
     # Process all entries, keeping best category per file
     for gt, blk in cat1_perfect:
-        if gt not in file_to_best or file_to_best[gt][0] > 1:
-            file_to_best[gt] = (1, (gt, blk))
-    
+        keep_best(gt, 1, (gt, blk), (1,))
+
     for entry in cat2_length:
         gt = entry[0]
-        if gt not in file_to_best or file_to_best[gt][0] > 2:
-            file_to_best[gt] = (2, entry)
-    
+        keep_best(gt, 2, entry, (-abs(entry[3] - entry[4]),))
+
     for entry in cat3_missing:
         gt = entry[0]
-        if gt not in file_to_best or file_to_best[gt][0] > 3:
-            file_to_best[gt] = (3, entry)
-    
+        keep_best(gt, 3, entry, (entry[3] / max(entry[4], 1), entry[3]))
+
     for entry in cat4_correct:
         gt = entry[0]
-        if gt not in file_to_best or file_to_best[gt][0] > 4:
-            file_to_best[gt] = (4, entry)
-    
+        keep_best(gt, 4, entry, (entry[3] / max(entry[4], 1), entry[3]))
+
     for entry in cat5_incorrect:
         gt = entry[0]
-        if gt not in file_to_best or file_to_best[gt][0] > 5:
-            file_to_best[gt] = (5, entry)
+        keep_best(gt, 5, entry,
+                  (entry[4] / max(entry[5], 1), entry[4], -entry[6]))
     
     # Rebuild category lists with only best entries
     cat1_perfect_dedup = set()
@@ -1049,7 +1098,7 @@ def main() -> None:
     cat4_correct_dedup = []
     cat5_incorrect_dedup = []
     
-    for gt, (category, entry) in file_to_best.items():
+    for gt, (category, entry, _quality) in file_to_best.items():
         if category == 1:
             cat1_perfect_dedup.add(entry)
         elif category == 2:
@@ -1343,6 +1392,51 @@ def main() -> None:
     
     # Print overall summary
     print_summary(None)
+
+    failed = False
+    if args.fail_on_invalid_validated and invalid_in_validated:
+        print(
+            f"[fatal] {len(invalid_in_validated)} invalid file(s) were written "
+            "to VALIDATED.",
+            file=sys.stderr,
+        )
+        failed = True
+
+    if args.require_all_exact:
+        missing_exact = universe_files - exact_recovery_files
+        if missing_exact:
+            print(
+                f"[fatal] {len(missing_exact)} of {len(universe_files)} "
+                "ground-truth file(s) lack a byte-exact recovery:",
+                file=sys.stderr,
+            )
+            for gt_file in sorted(missing_exact):
+                print(f"  {gt_file}", file=sys.stderr)
+            failed = True
+        else:
+            print(
+                f"[OK] All {len(universe_files)} ground-truth file(s) have "
+                "a byte-exact recovery."
+            )
+
+    if args.require_exact_at_least is not None:
+        exact_count = len(universe_files & exact_recovery_files)
+        if exact_count < args.require_exact_at_least:
+            print(
+                f"[fatal] {exact_count} of {len(universe_files)} ground-truth "
+                f"file(s) have a byte-exact recovery; "
+                f"{args.require_exact_at_least} required.",
+                file=sys.stderr,
+            )
+            failed = True
+        else:
+            print(
+                f"[OK] {exact_count} ground-truth file(s) have a byte-exact "
+                f"recovery ({args.require_exact_at_least} required)."
+            )
+
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

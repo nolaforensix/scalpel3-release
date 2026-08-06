@@ -1,7 +1,12 @@
-# Template for fragmentator configuration. All blank lines and lines
-# beginning with '#' are ignored.  Multiline comments are supported:
+# Template for fragmentator configuration. Blank lines are ignored.
+# A '#' outside a double-quoted argument begins an inline comment, so
+# quote pathnames containing '#'. Multiline comments are supported:
 # use /* and */ to bracket lines and place the /* and */ strings on
 # lines by themselves. All options are case insensitive.
+
+# Numeric arguments must contain unsigned base-10 digits only. Except
+# for BLOCKSIZE and file block-number sets/ranges, they may range from
+# 0 through 9223372036854775807.
 
 # OUTPUTFILE (REQUIRED): Pathname for generated image file. It's
 # recommended that this match the name of the template file with the
@@ -17,7 +22,8 @@ OUTPUTFILE: something.img
 
 SEED: 1
 
-# BLOCKSIZE (REQUIRED): Block size for generated image file.
+# BLOCKSIZE (REQUIRED): Block size for generated image file. This must
+# be from 512 through 1073741824, inclusive, and divisible by 512.
 
 BLOCKSIZE: 8192
 
@@ -133,6 +139,9 @@ FILLHOLESSECONDARY: ZERO
 
 # There are rules regarding the compatibility of the various file
 # options:
+
+# o Block numbers and range endpoints must contain digits only and
+# must identify blocks that exist in the current FILE.
 
 # o OUTOFORDER AND FRAGMENTED: TRUE are mutually exclusive options--the
 # file may either contain specified out of order blocks or be

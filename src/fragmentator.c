@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -51,16 +51,17 @@
 //
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #define SCALPEL3_EXTERNAL
 #include "colors.h"
@@ -70,6 +71,7 @@
 
 // static configuration
 #define MAX_LINE_LENGTH 2048
+#define MAX_FRAGMENTATOR_BLOCK_SIZE INT64_C(1073741824)
 
 #define FRAGMENTATOR_BANNER_STRING                                                                                                 \
   "fragmentator v%s -- "                                                                                                           \
@@ -110,6 +112,7 @@ typedef struct Cluster {
   ClusterBlock *blocks;   // array of blocks that makes up cluster
   int64_t numblocks;      // total number of blocks, including fill blocks
   bool needs_fill;        // true if the cluster contains any CLUSTER_BLOCK_NEEDSFILL blocks
+  int64_t seq;            // creation-order sequence; stable tie-break for sorting
 } Cluster;
 
 // defines one FILE: in configuration file
@@ -223,14 +226,16 @@ bool no_frag = false;     // if true, strip all fragmentation directives and gen
                           // disk image
 
 // function prototypes
-static bool is_integer(char *str);
+static bool parse_bounded_int64(const char *value, int64_t minimum,
+                                int64_t maximum, int64_t *parsed);
 static bool is_boolean(char *str, bool *val);
 static char *trim_whitespace(char *str);
+static void strip_line_comment(char *input);
 static int compare_clusters(const void *a, const void *b);
 static bool parse_argument(char *arg_start, char *argument);
 static void parse_line(char *input, ParsedLine *result);
 static void parse_input(char *pathname);
-static LongsSet *process_int_or_intset_or_range(char *args);
+static LongsSet *process_int_or_intset_or_range(char *args, int64_t maximum);
 static void check_File_definition(File f);
 static void init_new_cluster(ClusterBlock *blocks, int64_t numblocks, bool needs_fill);
 static bool read_file_block(char *fn, int64_t block, char *data);
@@ -254,7 +259,8 @@ static void usage(void) {
                   "can be corrected by specifying values for both RANDOMPAD (=0) and ZEROPAD (>0) on the command line, to fully\n"
                   " override these values in the config file.  In general, use of the command line overrides is most appropriate for\n"
                   "scripting and testing purposes--it's generally easier and less error prone to simply generate appropriate\n"
-                  "stand-alone config files for fragmentator.\n\n"
+                  "stand-alone config files for fragmentator.\n"
+                  "Numeric arguments must contain unsigned base-10 digits only.\n\n"
 
                   "Usage: fragmentator [-a initialrandomblocks] [-b initialzeroblocks] [-f ZERO | RANDOM | FILE]\n"
                   "                    [-F ZERO | RANDOM] [-h]  [-H headerblocks] [-o outputfile] [-q blocksize]\n"
@@ -309,6 +315,7 @@ static void print_config_summary(FILE *fp) {
 static void process_command_line_args(int argc, char *argv[]) {
 
   int i;
+  int64_t parsed;
   bool match;
 
   fprintf(stderr, "%s", RED);
@@ -317,24 +324,24 @@ static void process_command_line_args(int argc, char *argv[]) {
 
     case 'a':
       // random blocks override
-      cmd_INITIALRANDOMBLOCKS = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_INITIALRANDOMBLOCKS < 0) {
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
         fprintf(stderr, "Fatal error for -a option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_INITIALRANDOMBLOCKS = parsed;
       break;
 
     case 'b':
       // random blocks override
-      cmd_INITIALZEROBLOCKS = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_INITIALZEROBLOCKS < 0) {
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
         fprintf(stderr, "Fatal error for -b option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_INITIALZEROBLOCKS = parsed;
       break;
 
      case 'c':
@@ -385,13 +392,13 @@ static void process_command_line_args(int argc, char *argv[]) {
 
     case 'H':
       // header blocks override
-      cmd_HEADERBLOCKS = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_HEADERBLOCKS < 1) {
-        fprintf(stderr, "Fatal error for -H option: Argument must be an integer >= 1.\n");
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
+        fprintf(stderr, "Fatal error for -H option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_HEADERBLOCKS = parsed;
       break;
 
     case 'o':
@@ -407,46 +414,49 @@ static void process_command_line_args(int argc, char *argv[]) {
 
     case 'q':
       // blocksize override
-      cmd_BLOCKSIZE = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_BLOCKSIZE < 512 || cmd_BLOCKSIZE % 512) {
-        fprintf(stderr, "Fatal error for -q option: argument must be a positive integer visible by 512.\n");
+      if (! parse_bounded_int64(optarg, 512, MAX_FRAGMENTATOR_BLOCK_SIZE, &parsed) || parsed % 512) {
+        fprintf(stderr,
+                "Fatal error for -q option: Argument must be an integer from 512 through %" PRId64
+                " and divisible by 512.\n",
+                MAX_FRAGMENTATOR_BLOCK_SIZE);
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_BLOCKSIZE = (int32_t)parsed;
       break;
 
     case 'r':
       // random pad blocks override
-      cmd_RANDOMPADBLOCKS = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_RANDOMPADBLOCKS < 0) {
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
         fprintf(stderr, "Fatal error for -r option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_RANDOMPADBLOCKS = parsed;
       break;
 
     case 'R':
       // random blocks override
-      cmd_RANDOMBLOCKS = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_RANDOMBLOCKS < 0) {
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
         fprintf(stderr, "Fatal error for -R option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_RANDOMBLOCKS = parsed;
       break;
 
     case 's':
       // random seed override
-      cmd_SEED = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_SEED < 0) {
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
         fprintf(stderr, "Fatal error for -s option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_SEED = parsed;
       break;
 
     case 'v':
@@ -455,24 +465,24 @@ static void process_command_line_args(int argc, char *argv[]) {
 
     case 'z':
       // zero pad blocks override
-      cmd_ZEROPADBLOCKS = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_ZEROPADBLOCKS < 0) {
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
         fprintf(stderr, "Fatal error for -z option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_ZEROPADBLOCKS = parsed;
       break;
 
     case 'Z':
       // zero blocks override
-      cmd_ZEROBLOCKS = strtol(optarg, NULL, 10);
-      if (! is_integer(optarg) || cmd_ZEROBLOCKS < 0) {
+      if (! parse_bounded_int64(optarg, 0, INT64_MAX, &parsed)) {
         fprintf(stderr, "Fatal error for -Z option: Argument must be an integer >= 0.\n");
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+      cmd_ZEROBLOCKS = parsed;
       break;
 
     default:
@@ -527,22 +537,41 @@ static void fragmentator_logo(void) {
 }
 
 
-// Cluster comparison function for qsort()
+// Cluster comparison function for qsort(). Total order: primary key is numblocks
+// (ascending), secondary key is the creation-order seq. The seq tie-break makes
+// equal-size clusters sort identically regardless of the libc qsort implementation,
+// so the same recipe and seed produce a byte-identical image on any platform.
+//
 static int compare_clusters(const void *a, const void *b) {
-  int64_t x = ((const Cluster *)a)->numblocks;
-  int64_t y = ((const Cluster *)b)->numblocks;
-  return (x > y) - (x < y);
+  const Cluster *ca = (const Cluster *)a;
+  const Cluster *cb = (const Cluster *)b;
+
+  if (ca->numblocks != cb->numblocks) {
+    return (ca->numblocks > cb->numblocks) - (ca->numblocks < cb->numblocks);
+  }
+  return (ca->seq > cb->seq) - (ca->seq < cb->seq);
 }
 
-// check if a string contains only an integer value
-static bool is_integer(char *str) {
+// parse a digits-only integer and require it to fit within the supplied bounds
+static bool parse_bounded_int64(const char *value, int64_t minimum,
+                                int64_t maximum, int64_t *parsed) {
 
-  for (size_t i = 0; i < strlen(str); i++) {
-    if (! isdigit(str[i])) {
-      return false;
-    }
+  char *end = NULL;
+  unsigned long long converted;
+
+  if (! value || ! parsed || minimum < 0 || maximum < minimum
+      || value[0] < '0' || value[0] > '9') {
+    return false;
   }
 
+  errno = 0;
+  converted = strtoull(value, &end, 10);
+  if (errno == ERANGE || ! end || *end != '\0'
+      || converted < (uint64_t)minimum || converted > (uint64_t)maximum) {
+    return false;
+  }
+
+  *parsed = (int64_t)converted;
   return true;
 }
 
@@ -552,11 +581,11 @@ static bool is_boolean(char *str, bool *val) {
 
   *val = false;
 
-  if (! strcasecmp(str, "true") || *str == '1') {
+  if (! strcasecmp(str, "true") || ! strcmp(str, "1")) {
     *val = true;
     return true;
   }
-  else if (! strcasecmp(str, "false") || *str == '0') {
+  else if (! strcasecmp(str, "false") || ! strcmp(str, "0")) {
     return true;
   }
   else {
@@ -590,9 +619,27 @@ static char *trim_whitespace(char *str) {
 }
 
 
+// strip an inline comment while preserving hash characters inside quoted arguments
+static void strip_line_comment(char *input) {
+
+  bool in_quotes = false;
+
+  while (*input) {
+    if (*input == '"') {
+      in_quotes = ! in_quotes;
+    }
+    else if (*input == '#' && ! in_quotes) {
+      *input = 0;
+      return;
+    }
+    input++;
+  }
+}
+
+
 // parse argument for keywords that allow integers or integer ranges as arguments. A set of longs is
 // returned that contains all ranges expanded. Duplicates are *not* removed by this function.
-static LongsSet *process_int_or_intset_or_range(char *args) {
+static LongsSet *process_int_or_intset_or_range(char *args, int64_t maximum) {
 
   char *token = strtok(args, ", ");
   LongsSet *set;
@@ -601,53 +648,42 @@ static LongsSet *process_int_or_intset_or_range(char *args) {
 
   while (token) {
     token = trim_whitespace(token);
-    if (strchr(token, '-')) {
-      int64_t start, end;
+    char *dash = strchr(token, '-');
+    if (dash) {
+      int64_t start = 0;
+      int64_t end = 0;
 
-      if (sscanf(token, "%" PRId64 "-%" PRId64 "", &start, &end) == 2) {
-        if (start <= end && start >= 0 && end < LLONG_MAX) {
-          add_to_LongsSet(set, start, end);
-        }
-        else {
-          fprintf(stderr, "%s", RED);
-          fprintf(stderr, "Fatal error: Invalid range \'%s\'. Start and end must be >= 0\n", token);
-          fprintf(stderr, "and < %" PRId64 " on line %" PRId64 ".\n", (int64_t)LLONG_MAX, LINENUMBER);
-          fprintf(stderr, "%s", BLACK);
-          // fatal
-          exit(-1);
-        }
-      }
-      else {
+      *dash = '\0';
+      bool valid = ! strchr(dash + 1, '-')
+                   && parse_bounded_int64(token, 0, maximum, &start)
+                   && parse_bounded_int64(dash + 1, 0, maximum, &end)
+                   && start <= end;
+      *dash = '-';
+
+      if (! valid) {
         fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Fatal error: Invalid argument format \'%s\' on line %" PRId64 ".\n", token, LINENUMBER);
+        fprintf(stderr, "Fatal error: Invalid range '%s'. Start and end must be fully numeric and\n", token);
+        fprintf(stderr, "between 0 and %" PRId64 " on line %" PRId64 ".\n", maximum, LINENUMBER);
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+
+      add_to_LongsSet(set, start, end);
     }
     else {
       int64_t value;
 
-      if (sscanf(token, "%" PRId64 "", &value) == 1) {
-        if (value >= 0 && value < LLONG_MAX) {
-          add_to_LongsSet(set, value, value);
-        }
-        else {
-          fprintf(stderr, "%s", RED);
-          fprintf(stderr, "Fatal error: Invalid number \'%" PRId64 "\'. Must be >= 0\n", value);
-          fprintf(stderr, "and < %" PRId64 " on line %" PRId64 ".\n", (int64_t)LLONG_MAX, LINENUMBER);
-          fprintf(stderr, "%s", BLACK);
-          // fatal
-          exit(-1);
-        }
-      }
-      else {
+      if (! parse_bounded_int64(token, 0, maximum, &value)) {
         fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Fatal error: Invalid number format: %s on line %" PRId64 ".\n", token, LINENUMBER);
+        fprintf(stderr, "Fatal error: Invalid number '%s'. It must be fully numeric and between\n", token);
+        fprintf(stderr, "0 and %" PRId64 " on line %" PRId64 ".\n", maximum, LINENUMBER);
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
+
+      add_to_LongsSet(set, value, value);
     }
     token = strtok(NULL, ", ");
   }
@@ -691,6 +727,7 @@ static bool parse_argument(char *arg_start, char *argument) {
 static void parse_line(char *input, ParsedLine *result) {
 
   result->type = KEYWORD_UNKNOWN;
+  result->argument[0] = 0;
   input = trim_whitespace(input);
   for (int32_t i = 0; i < KEYWORD_COUNT; i++) {
     const char *key = keywords[i];
@@ -839,12 +876,12 @@ static void parse_input(char *pathname) {
   ParsedLine parsed;
   char input_line[MAX_LINE_LENGTH + 1];
   char *input;
-  char *comment_start;
   FILE *fp;
   bool file_seen = false;
   int multiline_comment = 0;
   LongsSet *setarg;
   int i;
+  int64_t parsed_number;
   bool stop = false;
   off_t len;
   int perc1, perc2;
@@ -889,10 +926,7 @@ static void parse_input(char *pathname) {
 
     // strip leading and trailing whitespace and comments
     input = trim_whitespace(input_line);
-    comment_start = strchr(input, '#');
-    if (comment_start) {
-      *comment_start = 0;
-    }
+    strip_line_comment(input);
 
     if (! input[0]) {
       // comment line, just skip
@@ -916,7 +950,8 @@ static void parse_input(char *pathname) {
       }
     }
 
-    if (! strncasecmp(input, "whoathere", strlen("whoathere")) || ! strncasecmp(input, "whoathere", strlen("whoanelly"))
+    if (! strncasecmp(input, "whoathere", strlen("whoathere"))
+        || ! strncasecmp(input, "whoanelly", strlen("whoanelly"))
         || ! strncasecmp(input, "stop", strlen("stop"))) {
       // simulated end of input
       stop = true;
@@ -924,15 +959,7 @@ static void parse_input(char *pathname) {
     }
 
     parse_line(input_line, &parsed);  // doesn't return if there's an error
-
-    // for these options, argument is a set of integers and/or integer ranges
-    if (parsed.type == KEYWORD_MISSING || parsed.type == KEYWORD_OUTOFORDER || parsed.type == KEYWORD_GAP
-        || parsed.type == KEYWORD_DUPLICATE) {
-      setarg = process_int_or_intset_or_range(parsed.argument);
-    }
-    else {
-      setarg = NULL;
-    }
+    setarg = NULL;
 
     // certain configuration options are valid only until the first FILE: is processed
     switch (parsed.type) {
@@ -977,6 +1004,12 @@ static void parse_input(char *pathname) {
     default:;
     }
 
+    // expand file block sets only after checking their bounds against the current file
+    if (parsed.type == KEYWORD_MISSING || parsed.type == KEYWORD_OUTOFORDER || parsed.type == KEYWORD_GAP
+        || parsed.type == KEYWORD_DUPLICATE) {
+      setarg = process_int_or_intset_or_range(parsed.argument, FILES[FILENUM].numblocks - 1);
+    }
+
     // option is valid, so evaluate arguments
     switch (parsed.type) {
     case KEYWORD_OUTPUTFILE:  // string argument
@@ -1006,7 +1039,7 @@ static void parse_input(char *pathname) {
       break;
 
     case KEYWORD_SEED:  // numeric argument
-      if (SEED > 0) {
+      if (SEED >= 0) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Option on line %" PRId64 " should appear only once in the configuration file.\n",
                 LINENUMBER);
@@ -1014,7 +1047,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (SEED = atoi(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &SEED)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1033,16 +1066,19 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || atoi(parsed.argument) < 512 || (atoi(parsed.argument) % 512)) {
+      else if (! parse_bounded_int64(parsed.argument, 512, MAX_FRAGMENTATOR_BLOCK_SIZE, &parsed_number)
+               || parsed_number % 512) {
         fprintf(stderr, "%s", RED);
-        fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be a positive integer visible by 512\n",
-                parsed.argument, LINENUMBER);
+        fprintf(stderr,
+                "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer from 512 through %" PRId64
+                " and divisible by 512.\n",
+                parsed.argument, LINENUMBER, MAX_FRAGMENTATOR_BLOCK_SIZE);
         fprintf(stderr, "%s", BLACK);
         // fatal
         exit(-1);
       }
 
-      BLOCKSIZE = atoi(parsed.argument);
+      BLOCKSIZE = (int32_t)parsed_number;
       break;
 
     case KEYWORD_HEADERBLOCKS:  // numeric argument
@@ -1054,7 +1090,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (HEADERBLOCKS = atoll(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &HEADERBLOCKS)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1073,7 +1109,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (ZEROPADBLOCKS = atoll(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &ZEROPADBLOCKS)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1092,7 +1128,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (RANDOMPADBLOCKS = atoll(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &RANDOMPADBLOCKS)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1111,7 +1147,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (RANDOMBLOCKS = atoll(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &RANDOMBLOCKS)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1130,7 +1166,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (ZEROBLOCKS = atoll(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &ZEROBLOCKS)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1149,7 +1185,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (INITIALRANDOMBLOCKS = atoll(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &INITIALRANDOMBLOCKS)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1168,7 +1204,7 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else if (! is_integer(parsed.argument) || (INITIALZEROBLOCKS = atoll(parsed.argument)) < 0) {
+      else if (! parse_bounded_int64(parsed.argument, 0, INT64_MAX, &INITIALZEROBLOCKS)) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: Argument \"%s\" on line %" PRId64 " must be an integer >= 0.\n", parsed.argument,
                 LINENUMBER);
@@ -1246,7 +1282,7 @@ static void parse_input(char *pathname) {
 	  strcpy(OUTPUTFILE, cmd_OUTPUTFILE);
 	}
 
-	if (cmd_SEED > 0) {
+	if (cmd_SEED >= 0) {
 	  SEED = cmd_SEED;
 	}
 
@@ -1254,7 +1290,7 @@ static void parse_input(char *pathname) {
 	  BLOCKSIZE = cmd_BLOCKSIZE;
 	}
 
-	if (cmd_HEADERBLOCKS > 0) {
+	if (cmd_HEADERBLOCKS >= 0) {
 	  HEADERBLOCKS = cmd_HEADERBLOCKS;
 	}
 
@@ -1299,7 +1335,7 @@ static void parse_input(char *pathname) {
       }
 
       // make sure file exists and get length
-      FILE *f = fopen(parsed.argument, "r");
+      FILE *f = fopen(parsed.argument, "rb");
       if (! f) {
         fprintf(stderr, "%s", RED);
         fprintf(stderr, "\nFatal error: File \"%s\" on line %" PRId64 " not found.\n", parsed.argument, LINENUMBER);
@@ -1307,13 +1343,39 @@ static void parse_input(char *pathname) {
         // fatal
         exit(-1);
       }
-      else {
-        fseek(f, 0, SEEK_END);
-        FILES[FILENUM].length = ftello(f);
-        FILES[FILENUM].numblocks = CEILDIV(FILES[FILENUM].length, BLOCKSIZE);
+
+      struct stat source_stat;
+      if (fstat(fileno(f), &source_stat) != 0) {
+        int saved_errno = errno;
         fclose(f);
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr,
+                "\nFatal error: Can't inspect file \"%s\" on line %" PRId64 ": %s.\n",
+                parsed.argument, LINENUMBER, strerror(saved_errno));
+        fprintf(stderr, "%s", BLACK);
+        exit(-1);
+      }
+      if (! S_ISREG(source_stat.st_mode)) {
+        fclose(f);
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr,
+                "\nFatal error: File \"%s\" on line %" PRId64 " is not a regular file.\n",
+                parsed.argument, LINENUMBER);
+        fprintf(stderr, "%s", BLACK);
+        exit(-1);
+      }
+      if (fclose(f) != 0) {
+        int saved_errno = errno;
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr,
+                "\nFatal error: Can't close file \"%s\" on line %" PRId64 ": %s.\n",
+                parsed.argument, LINENUMBER, strerror(saved_errno));
+        fprintf(stderr, "%s", BLACK);
+        exit(-1);
       }
 
+      FILES[FILENUM].length = source_stat.st_size;
+      FILES[FILENUM].numblocks = CEILDIV(FILES[FILENUM].length, BLOCKSIZE);
       FILES[FILENUM].fn = malloc(strlen(parsed.argument) + 1);
       strcpy(FILES[FILENUM].fn, parsed.argument);
       FILES[FILENUM].missing = NULL;
@@ -1512,6 +1574,7 @@ static void init_new_cluster(ClusterBlock *blocks, int64_t numblocks, bool needs
   CLUSTERS[CLUSTERNUM].blocks = blocks;
   CLUSTERS[CLUSTERNUM].numblocks = numblocks;
   CLUSTERS[CLUSTERNUM].needs_fill = needs_fill;
+  CLUSTERS[CLUSTERNUM].seq = CLUSTERNUM;
   TOTALBLOCKS += CLUSTERS[CLUSTERNUM].numblocks;
 }
 
@@ -1520,32 +1583,69 @@ static void init_new_cluster(ClusterBlock *blocks, int64_t numblocks, bool needs
 // 'fn'
 bool read_file_block(char *fn, int64_t block, char *data) {
 
-  FILE *fp = fopen(fn, "r");
+  FILE *fp;
+  off_t offset;
   size_t ret;
+  int saved_errno;
+  int at_eof;
+  int read_error;
 
-  if (! fp) {
+  if (BLOCKSIZE <= 0 || block < 0 || block > INT64_MAX / BLOCKSIZE) {
     fprintf(stderr, "%s", RED);
-    fprintf(stderr, "Fatal error: Can't open input \"%s\".\n", fn);
+    fprintf(stderr, "Fatal error: Invalid block number %" PRId64 " for input file \"%s\".\n", block, fn);
     fprintf(stderr, "%s", BLACK);
-    // fatal
     return false;
   }
 
-  fseek(fp, block * BLOCKSIZE, SEEK_SET);
+  fp = fopen(fn, "rb");
+  if (! fp) {
+    saved_errno = errno;
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Fatal error: Can't open input \"%s\": %s.\n", fn, strerror(saved_errno));
+    fprintf(stderr, "%s", BLACK);
+    return false;
+  }
+
+  offset = (off_t)(block * (int64_t)BLOCKSIZE);
+  if (fseeko(fp, offset, SEEK_SET) != 0) {
+    saved_errno = errno;
+    fclose(fp);
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr,
+            "Fatal error: Can't seek to block %" PRId64 " in input file \"%s\": %s.\n",
+            block, fn, strerror(saved_errno));
+    fprintf(stderr, "%s", BLACK);
+    return false;
+  }
 
   bzero(data, BLOCKSIZE);
 
-  if (! (ret = fread(data, 1, BLOCKSIZE, fp))) {
+  errno = 0;
+  ret = fread(data, 1, BLOCKSIZE, fp);
+  saved_errno = errno;
+  at_eof = feof(fp);
+  read_error = ferror(fp);
+  if (! ret || read_error) {
+    fclose(fp);
     fprintf(stderr, "%s", RED);
-    fprintf(stderr, "Fatal error: Can't read block %" PRId64 " from input file \"%s\", return code = %ld.\n", block, fn, ret);
-    fprintf(stderr, "feof(): %d, ferror(): %d.\n ", feof(fp), ferror(fp));
+    fprintf(stderr,
+            "Fatal error: Can't read block %" PRId64 " from input file \"%s\": "
+            "%zu bytes read, feof() = %d, ferror() = %d%s%s.\n",
+            block, fn, ret, at_eof, read_error,
+            read_error ? ", error = " : "",
+            read_error ? strerror(saved_errno ? saved_errno : EIO) : "");
     fprintf(stderr, "%s", BLACK);
-
-    // fatal
     return false;
   }
 
-  fclose(fp);
+  if (fclose(fp) != 0) {
+    saved_errno = errno;
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "Fatal error: Can't close input file \"%s\": %s.\n", fn, strerror(saved_errno));
+    fprintf(stderr, "%s", BLACK);
+    return false;
+  }
+
   return true;
 }
 
@@ -1676,7 +1776,7 @@ static void create_clusters(void) {
   perc2 = 0;
 
   for (i = 0; i <= FILENUM; i++) {
-    perc2 = (int)((double)i / (double)FILENUM * (double)100);
+    perc2 = FILENUM > 0 ? (int)((double)i / (double)FILENUM * (double)100) : 100;
     if (perc1 != perc2 && isatty(1)) {
       perc1 = perc2;
       fprintf(stdout, "\b\b\b\b%3d%%", perc1);
@@ -1872,7 +1972,7 @@ static void create_clusters(void) {
   perc2 = 0;
 
   while (i <= CLUSTERNUM) {
-    perc2 = (int)((double)i / (double)(CLUSTERNUM) * (double)100);
+    perc2 = CLUSTERNUM > 0 ? (int)((double)i / (double)CLUSTERNUM * (double)100) : 100;
     if (perc1 != perc2 && isatty(1)) {
       perc1 = perc2;
       fprintf(stdout, "\b\b\b\b%3d%%", perc1);
@@ -1905,9 +2005,13 @@ static void create_clusters(void) {
       if (fillpref == FILLHOLES_FILE) {
         // try to find smaller clusters of file data that will fit into this hole
         k = i - 1;
-        while (k >= 0 && start_idx <= end_idx && CLUSTERS[k].numblocks <= end_idx - start_idx + 1) {
+        while (k >= 0 && start_idx <= end_idx) {
           if (CLUSTERS[k].coalesced) {
             // this cluster was already merged with another
+            k--;
+            continue;
+          }
+          else if (CLUSTERS[k].numblocks == 0 || CLUSTERS[k].numblocks > end_idx - start_idx + 1) {
             k--;
             continue;
           }
@@ -1965,13 +2069,12 @@ static void create_clusters(void) {
   fprintf(stdout, "Phase 2.3/3: Cleaning up...    ");
   fflush(stdout);
 
-  // now remove clusters marked as coalesced
-  i = 0;
+  // remove coalesced clusters in one pass while preserving survivor order
   perc1 = 0;
   perc2 = 0;
 
-  while (i <= CLUSTERNUM) {
-    perc2 = (int)((double)i / (double)CLUSTERNUM * (double)100);
+  for (i = 0, j = 0; i <= CLUSTERNUM; i++) {
+    perc2 = CLUSTERNUM > 0 ? (int)((double)i / (double)CLUSTERNUM * (double)100) : 100;
     if (perc1 != perc2 && isatty(1)) {
       perc1 = perc2;
       fprintf(stdout, "\b\b\b\b%3d%%", perc1);
@@ -1979,14 +2082,17 @@ static void create_clusters(void) {
     }
 
     if (CLUSTERS[i].coalesced) {
-      // bye bye
-      memmove(&CLUSTERS[i], &CLUSTERS[i + 1], sizeof(Cluster) * (CLUSTERNUM - i));
-      CLUSTERNUM--;
+      TOTALBLOCKS -= CLUSTERS[i].numblocks;
+      free(CLUSTERS[i].blocks);
+      continue;
     }
-    else {
-      i++;
+
+    if (i != j) {
+      CLUSTERS[j] = CLUSTERS[i];
     }
+    j++;
   }
+  CLUSTERNUM = j - 1;
 
   if (isatty(1)) {
     fprintf(stdout, "\b\b\b\b%3d%%\n", 100);
@@ -2386,7 +2492,7 @@ int main(int argc, char *argv[]) {
   }
 
   // seed random number generator
-  portable_srandom((unsigned)SEED);
+  portable_srandom((uint64_t)SEED);
 
   // open image file
   out = fopen(OUTPUTFILE, "wb");

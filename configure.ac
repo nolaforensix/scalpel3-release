@@ -21,6 +21,10 @@ AC_SYS_LARGEFILE
 # Checks for programs.
 AC_PROG_CC
 AC_PROG_CXX
+
+# scalpel3 and the ONNX Runtime C++ API require C++17.
+CXXFLAGS="$CXXFLAGS -std=c++17"
+
 AC_CHECK_PROG([gettext],[gettext],[yes],[no])
 AM_CONDITIONAL([FOUND_GETTEXT], [test "x$gettext" = xyes])
 AM_COND_IF([FOUND_GETTEXT],,[AC_MSG_ERROR([scalpel3 requires 'gettext'.])])
@@ -39,41 +43,13 @@ AM_COND_IF([FOUND_PKGCONFIG],,[AC_MSG_ERROR([scalpel3 requires 'pkg-config'.])])
 # ---- FUSE (blockmapfs)
 PKG_PROG_PKG_CONFIG
 
-PKG_CHECK_MODULES([FUSE], [fuse3], [], [
-  PKG_CHECK_MODULES([FUSE], [fuse], [], [
-    AC_MSG_ERROR([FUSE not found (tried fuse3, fuse).])
-  ])
+PKG_CHECK_MODULES([FUSE], [fuse3 >= 3.0], [], [
+  AC_MSG_ERROR([FUSE 3 development files are required for blockmapfs.])
 ])
 
 AC_SUBST([FUSE_CFLAGS])
 AC_SUBST([FUSE_LIBS])
 
-# MPI compiler (required for hpcscalpel3)
-# AC_ARG_VAR allows MPICC to be set via environment
-AC_ARG_VAR([MPICC], [MPI C compiler (defaults to mpicc if not set)])
-# Only search PATH if MPICC wasn't already provided
-if test -z "$MPICC"; then
-  AC_CHECK_PROG([MPICC], [mpicc], [mpicc], [])
-fi
-AS_IF([test -n "$MPICC"], [have_mpi=yes], [have_mpi=no])
-AM_CONDITIONAL([HAVE_MPI], [test "x$have_mpi" = "xyes"])
-AC_SUBST([MPICC])
-
-# Extract MPI compile flags so gcc can find MPI headers for hpcscalpel3;
-# linking uses @MPICC@ directly via hpcscalpel3_LINK in Makefile.am.
-MPI_CFLAGS=""
-if test "x$have_mpi" = "xyes"; then
-    # OpenMPI
-    MPI_CFLAGS=`$MPICC --showme:compile 2>/dev/null`
-    # MPICH (newer)
-    test -z "$MPI_CFLAGS" && \
-        MPI_CFLAGS=`$MPICC -compile-info 2>/dev/null | sed 's/^[[^ ]]* //'`
-    # MPICH (older) / Intel MPI
-    test -z "$MPI_CFLAGS" && \
-        MPI_CFLAGS=`$MPICC -compile_info 2>/dev/null | sed 's/^[[^ ]]* //'`
-    AC_MSG_NOTICE([MPI compile flags: $MPI_CFLAGS])
-fi
-AC_SUBST([MPI_CFLAGS])
 
 # SDL2 (required for diskviz)
 PKG_CHECK_MODULES([SDL2], [sdl2], [], [AC_MSG_ERROR([diskviz requires SDL2. Install libsdl2-dev.])])

@@ -260,7 +260,8 @@ bool serialize_queue_h(Queue *q,
 
 // read a queue from a file handle 'fp'.  Requires specification of a function
 // that can read a single element from disk--this function should return true if
-// the function successfully reads the element, otherwise false.
+// the function successfully reads the element, otherwise false. Each serialized
+// element must consume at least one byte.
 // 'deserialize_queue' returns true if all elements are successfully read,
 // otherwise false.  The deserialize_element() function will be passed a mode of
 // DESERIALIZE.  init_queue() *must* have been called on the queue before

@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -58,27 +58,22 @@ static void usage(void) {
   fprintf(stderr, "%s", BLUE);
   fprintf(stderr, "scalpel3-ctl interacts with a running scalpel3 instance on the local\n"
                   "machine and provides a \"human in the loop\" interface that supports\n"
-                  "initiating 'checkpoint and exit' operations, periodic checkpoints, various\n"
+                  "initiating checkpointed stop operations, periodic checkpoints, various\n"
                   "status reports, and termination of specific carving jobs, using their\n"
                   "unique IDs.\n\n"
 
-                  "Usage:  scalpel3-ctl [-b] [-bv UUID1 UUID2] [-c] [-h] [-k UUID] [-kq]\n"
+                  "Usage:  scalpel3-ctl [-b] [-c] [-h] [-k UUID] [-kq]\n"
                   "                     [-o scalpel_output_dir] [-p] [-s] [-x]\n\n"
 
                   "Options:\n\n"
 
                   "-b   Retrieve and display a copy of the current primary blockmap.\n\n"
 
-                  "-bv  Retrieve and display contents of blockvector associated with job\n"
-                  "     identified by primary UUID1 and clone UUID2.  Both UUIDs must be specified.\n\n"
-
-		  "IMPORTANT:  The -bv option is not currently implemented in the backend and will return\n"
-		  "            an error.  Stay tuned for full support.\n\n"
-
                   "-c   Request that scalpel3 create a progress checkpoint, which updates\n"
-		  "     the INPROGRESS directories, where UUIDs of files associated with reassembly jobs\n"
-                  "     can be scrutinized.  These UUIDs can be used to interact directly with specific\n"
-                  "     carving operations, using other options such as -k.\n\n"
+                  "     the INPROGRESS directories.  UUIDs of reassembly jobs can then be\n"
+                  "     scrutinized and used with commands such as -k.  This command is\n"
+                  "     available only during fragmented recovery; requests during other\n"
+                  "     phases are rejected.\n\n"
 
                   "-o   Specify output directory of targeted scalpel3 instance.  This is used\n"
                   "     to discriminate between multiple scalpel3 instances, as the IPC endpoint\n"
@@ -99,7 +94,9 @@ static void usage(void) {
 
                   "-s   Display current carving statistics.\n\n"
 
-                  "-x   Request that scalpel3 checkpoint and then exit as soon as possible.\n");
+                  "-x   Request that scalpel3 stop as soon as possible.  If restartable\n"
+                  "     checkpoint state exists, scalpel3 writes a checkpoint before exiting;\n"
+                  "     otherwise, it exits cleanly without writing checkpoint state.\n");
   fprintf(stderr, "%s", BLACK);
 }
 
@@ -107,11 +104,14 @@ static void usage(void) {
 int main(int argc, char *argv[]) {
 
   int sock = -1;
+  int exit_status = EXIT_FAILURE;
   struct sockaddr_un server;
   char uuid[PATH_MAX + 1];
   char buf;
+  ssize_t read_result;
   int n = 1;
   int numcmds = 0;
+  bool response_complete = false;
   bool kill = false;
   bool killq = false;
   bool checkpointexit = false;
@@ -120,7 +120,6 @@ int main(int argc, char *argv[]) {
   bool status = false;
   bool hello = false;
   bool blockmap = false;
-  bool blockvector = false;
   Queue candidates_queue;
   Queue killque;
   EssentialCarveInfo e;
@@ -137,29 +136,7 @@ int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
 
   while (n < argc && numcmds <= 1) {
-    if (! strcmp(argv[n], "-bv")) {
-      n++;
-      if (n <= argc - 1) {
-        if (strlen(argv[n]) != 36) {
-          fprintf(stderr, "%s", RED);
-          fprintf(stderr, "UUID for -bv option is in the incorrect format.\n");
-          fprintf(stderr, "%s", BLACK);
-          goto done;
-        }
-        strncpy(uuid, argv[n], 36);
-        uuid[36] = 0;
-      }
-      else {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "Missing UUID for -bv option.\n");
-        fprintf(stderr, "%s", BLACK);
-        goto done;
-      }
-      blockvector = true;
-      numcmds++;
-      n++;
-    }
-    else if (! strcmp(argv[n], "-b")) {
+    if (! strcmp(argv[n], "-b")) {
       blockmap = true;
       numcmds++;
       n++;
@@ -185,6 +162,12 @@ int main(int argc, char *argv[]) {
         }
         strncpy(uuid, argv[n], 36);
         uuid[36] = 0;
+        if (uuid_parse(uuid, binuuid) < 0 || uuid_is_null(binuuid)) {
+          fprintf(stderr, "%s", RED);
+          fprintf(stderr, "UUID for -k option is invalid.\n");
+          fprintf(stderr, "%s", BLACK);
+          goto done;
+        }
       }
       else {
         fprintf(stderr, "%s", RED);
@@ -241,7 +224,7 @@ int main(int argc, char *argv[]) {
   if (numcmds != 1) {
     usage();
     fprintf(stderr, "%s", RED);
-    fprintf(stderr, "\nSpecify exactly one of -b -bv -c -h, -k, -kq, -p, -s, or -x in a single invocation.\n");
+    fprintf(stderr, "\nSpecify exactly one of -b, -c, -h, -k, -kq, -p, -s, or -x in a single invocation.\n");
     fprintf(stderr, "%s", BLACK);
     goto done;
   }
@@ -370,6 +353,7 @@ int main(int argc, char *argv[]) {
       }
       destroy_queue(&candidates_queue);
     }
+    exit_status = EXIT_SUCCESS;
     goto done;
   }
   else if (killq) {
@@ -404,6 +388,7 @@ int main(int argc, char *argv[]) {
         fprintf(stdout, "%s\n", textuuid);
       }
     }
+    exit_status = EXIT_SUCCESS;
     goto done;
   }
   else if (hello) {
@@ -434,25 +419,42 @@ int main(int argc, char *argv[]) {
 
     display_blockmap(b);
     free_blockmap(&b);
+    exit_status = EXIT_SUCCESS;
     goto done;
   }
-  else if (blockvector) {
+  // get the complete NUL-terminated response from scalpel3 for textual commands
+  while (! response_complete) {
+    read_result = read(sock, &buf, 1);
+    if (read_result > 0) {
+      if (! buf) {
+        response_complete = true;
+      }
+      else {
+        putchar(buf);
+      }
+    }
+    else if (read_result < 0 && errno == EINTR) {
+      continue;
+    }
+    else {
+      break;
+    }
+  }
+
+  if (! response_complete) {
     fprintf(stderr, "%s", RED);
-    fprintf(stderr, "** -bv is not yet implemented **.\n");
+    fprintf(stderr, "The scalpel3 instance closed the IPC connection before completing the request.\n");
     fprintf(stderr, "%s", BLACK);
     goto done;
   }
 
-  // get textual response form scalpel3 for some commands
-  while (read(sock, &buf, 1) > 0 && buf) {
-    putchar(buf);
-  }
   putchar('\n');
+  exit_status = EXIT_SUCCESS;
 
 done:
-  if (sock > 0) {
+  if (sock >= 0) {
     close(sock);
   }
-  return 0;
+  return exit_status;
 }
 

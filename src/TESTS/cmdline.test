@@ -22,6 +22,9 @@ FRAGMENTATOR_ARGS=()
 HAS_Z_FILTER=0
 FRAGMENTATOR_MODE=0
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 # Parse the arguments.
 while [[ $# -gt 0 ]]; do
     if [[ "$FRAGMENTATOR_MODE" -eq 1 ]]; then
@@ -54,6 +57,8 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+cd "$SRC_DIR" || exit 1
 
 Q_ARG="-q $Q_VAL"
 
@@ -94,6 +99,7 @@ if [[ "$HAS_Z_FILTER" -eq 1 ]]; then
 else
     ./scalpel3 "${SCALPEL_ARGS[@]}" "${SCALPEL_NOFRAG_ARG[@]}" $Q_ARG -b -U csv -o scalpel-output TESTS/test.img TESTS/test.img.blockmap
 fi &&\
+test -s scalpel-output/blockclassification.dat &&\
 ./validate_blockvectors_fast.py --verbose --key TESTS/test.img.key --scalpel-dir scalpel-output --frg TESTS/test.frg --blockmap TESTS/test.img.blockmap
 rc=$?
 set +x

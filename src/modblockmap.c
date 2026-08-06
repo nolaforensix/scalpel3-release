@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the GNU General Public
 // License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
@@ -97,10 +97,21 @@
 
 #define MAX_STRING_LENGTH (4096 + 1)
 
+typedef enum ToolResult {
+  TOOL_RESULT_ERROR = -1,
+  TOOL_RESULT_NO_CHANGES = 0,
+  TOOL_RESULT_CHANGED = 1
+} ToolResult;
+
 typedef struct Tool {
   char toolname[PATH_MAX];
-  bool (*tool)(Blockmap *blockmap, char *logfile);
+  ToolResult (*tool)(Blockmap *blockmap, char *logfile);
 } Tool;
+
+typedef struct PhotorecRange {
+  int64_t first;
+  int64_t last;
+} PhotorecRange;
 
 
 // function prototypes for local functions
@@ -111,7 +122,10 @@ static void usage(void);
 
 
 // function prototypes for external tool handling functions
-static bool handle_photorec(Blockmap *blockmap, char *logfile);
+static bool extract_photorec_target(char *line, char target[PATH_MAX]);
+static ToolResult handle_photorec(Blockmap *blockmap, char *logfile);
+static bool parse_photorec_range(const char *text, int64_t *first, int64_t *last);
+static bool photorec_path_matches_target(const char *path, const char *target);
 
 //////////////////////////////////////////////////////////
 // DEFINITIONS FOR EXTERNAL TOOL HANDLING FUNCTIONS //
@@ -121,148 +135,249 @@ static bool handle_photorec(Blockmap *blockmap, char *logfile);
 // PHOTOREC //
 //////////////
 
-// process a photorec log file and cover blocks associated with recovered files. Returns true if any updates to blockmap
-// are made, otherwise false.
-static bool handle_photorec(Blockmap *blockmap, char *logfile) {
+// extract the whitespace-delimited /d argument from a photorec command line.
+static bool extract_photorec_target(char *line, char target[PATH_MAX]) {
 
-  char buf[PATH_MAX];
-  char target[PATH_MAX];
-  FILE *fp;
-  char *p1 = NULL;
-  char *p2 = NULL;
-  char *dash;
-  int64_t j;
-  int64_t block1, block2;
-  bool ret = false;
+  char *saveptr = NULL;
+  char *token;
+  size_t length;
 
-  // Strategy: photorec log file contains a line that starts with this:
-  //
-  // Command line: PhotoRec /log /logname photorec.log /d ./photorec_recovered
-  //
-  // ...and then later, lines associated with each recovered file that look like this:
-  //
-  // ./photorec_recovered.1/f0000420.txt 420-420
-  //
-  // ./photorec_recovered.1/f0055764.png 55764-56530
-  //
-  // ./photorec_recovered.1/f0058973.png 58973-60188
-  //
-  // ./photorec_recovered.1/f0065704.png 65704-66193
-  //
-  // By storing the string discovered on the "Command line" line that follows "/d" (e.g., "photorec_recovered", referred
-  // to below as the "target") and then matching this string at the beginning of lines of the log file and skipping
-  // whitespace on that line until a number is encountered, all the block ranges can be extracted and processed.
-  //
+  token = strtok_r(line, " \t\r\n", &saveptr);
+  while (token) {
+    if (! strcmp(token, "/d")) {
+      token = strtok_r(NULL, " \t\r\n", &saveptr);
+      if (! token || ! copy_string_complete(target, PATH_MAX, token)) {
+        return false;
+      }
+
+      // normalize trailing separators so both target/ and target.1 records match.
+      length = strlen(target);
+      while (length > 1 && target[length - 1] == '/') {
+        target[--length] = 0;
+      }
+      return true;
+    }
+    token = strtok_r(NULL, " \t\r\n", &saveptr);
+  }
+
+  return false;
+}
+
+
+// return true only when path names the configured photorec output or one of its numbered directories.
+static bool photorec_path_matches_target(const char *path, const char *target) {
+
+  size_t target_length = strlen(target);
+
+  return ! strncmp(path, target, target_length) &&
+         (path[target_length] == 0 || path[target_length] == '/' || path[target_length] == '.');
+}
+
+
+// parse a complete nonnegative m-n range without accepting signs, overflow, or trailing data.
+static bool parse_photorec_range(const char *text, int64_t *first, int64_t *last) {
+
+  char *endptr;
+  intmax_t value;
+
+  if (! text || ! isdigit((unsigned char)text[0])) {
+    return false;
+  }
+
+  errno = 0;
+  value = strtoimax(text, &endptr, 10);
+  if (errno == ERANGE || value < 0 || *endptr != '-') {
+    return false;
+  }
+  *first = (int64_t)value;
+
+  text = endptr + 1;
+  if (! isdigit((unsigned char)text[0])) {
+    return false;
+  }
+
+  errno = 0;
+  value = strtoimax(text, &endptr, 10);
+  if (errno == ERANGE || value < 0 || *endptr != 0) {
+    return false;
+  }
+  *last = (int64_t)value;
+
+  return *first <= *last;
+}
+
+
+// process a complete photorec log transactionally, then cover blocks associated with recovered files.
+static ToolResult handle_photorec(Blockmap *blockmap, char *logfile) {
+
+  char target[PATH_MAX] = "";
+  char *line = NULL;
+  char *command;
+  char *path;
+  char *range_text;
+  char *saveptr;
+  FILE *fp = NULL;
+  PhotorecRange *ranges = NULL;
+  PhotorecRange *grown;
+  size_t line_capacity = 0;
+  size_t line_number = 0;
+  size_t range_capacity = 0;
+  size_t range_count = 0;
+  size_t new_capacity;
+  int64_t first;
+  int64_t last;
+  int64_t block;
+  bool target_found = false;
+  ToolResult result = TOOL_RESULT_ERROR;
 
   if (! (fp = fopen(logfile, "r"))) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to open photorec log file \"%s\". No updates performed. Aborting.\n", logfile);
     fprintf(stderr, "%s", BLACK);
-    return false;
+    goto done;
   }
 
-  // no target found yet
-  target[0] = 0;
-  p1 = NULL;
-  p2 = NULL;
-  while (! p2 && ! feof(fp)) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-    fgets(buf, PATH_MAX, fp);
-#pragma GCC diagnostic pop
-    p1 = strstr(buf, "Command line:");
-    if (p1) {
-      p2 = strstr(buf, "/d");
+  while (getline(&line, &line_capacity, fp) >= 0) {
+    line_number++;
+
+    if (! target_found && (command = strstr(line, "Command line:"))) {
+      if (! extract_photorec_target(command, target)) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr,
+                "Failed to get /d argument from photorec log file \"%s\" at line %zu. "
+                "No updates performed. Aborting.\n",
+                logfile, line_number);
+        fprintf(stderr, "%s", BLACK);
+        goto done;
+      }
+      target_found = true;
+      continue;
     }
-  }
 
-  if (p2) {
-    // found "Command line:" and "/d" on current line, get argument for "/d"
-    p1 = strtok(p2, " \t");
-    p1 = strtok(NULL, " \t");
+    if (! target_found) {
+      continue;
+    }
 
-    if (! p1) {
+    saveptr = NULL;
+    path = strtok_r(line, " \t\r\n", &saveptr);
+    if (! path || ! photorec_path_matches_target(path, target)) {
+      continue;
+    }
+
+    range_text = strtok_r(NULL, " \t\r\n", &saveptr);
+    if (! parse_photorec_range(range_text, &first, &last)) {
       fprintf(stderr, "%s", RED);
-      fprintf(stderr, "Failed to get /d argument from photorec log file \"%s\". No updates performed. Aborting.\n",
-              logfile);
+      fprintf(stderr,
+              "ERROR: Bad range format in photorec log file \"%s\" at line %zu. "
+              "No updates performed. Aborting.\n",
+              logfile, line_number);
       fprintf(stderr, "%s", BLACK);
-      return false;
+      goto done;
     }
-    else {
-      strcpy(target, p1);
+
+    if ((uint64_t)first >= blockmap->numblocks || (uint64_t)last >= blockmap->numblocks) {
+      fprintf(stderr, "%s", RED);
+      fprintf(stderr,
+              "ERROR: Bad block range %" PRId64 "-%" PRId64
+              " in photorec log file \"%s\" at line %zu. No updates performed. Aborting.\n",
+              first, last, logfile, line_number);
+      fprintf(stderr, "%s", BLACK);
+      goto done;
     }
+
+    if (range_count == range_capacity) {
+      if (range_capacity > SIZE_MAX / 2) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr,
+                "ERROR: Too many ranges in photorec log file \"%s\". No updates performed. Aborting.\n",
+                logfile);
+        fprintf(stderr, "%s", BLACK);
+        goto done;
+      }
+
+      new_capacity = range_capacity ? range_capacity * 2 : 64;
+      if (new_capacity > SIZE_MAX / sizeof(*ranges)) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr,
+                "ERROR: Too many ranges in photorec log file \"%s\". No updates performed. Aborting.\n",
+                logfile);
+        fprintf(stderr, "%s", BLACK);
+        goto done;
+      }
+
+      grown = realloc(ranges, new_capacity * sizeof(*ranges));
+      check_memory_allocation(grown, __LINE__, __FILE__, "photorec block ranges");
+      ranges = grown;
+      range_capacity = new_capacity;
+    }
+
+    ranges[range_count++] = (PhotorecRange){.first = first, .last = last};
   }
 
-  if (! target[0]) {
+  if (ferror(fp)) {
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "ERROR: Failed to read photorec log file \"%s\". No updates performed. Aborting.\n", logfile);
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
+
+  if (! target_found) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "Failed to get /d argument from photorec log file \"%s\". No updates performed. Aborting.\n",
             logfile);
     fprintf(stderr, "%s", BLACK);
-    return false;
+    goto done;
   }
 
-  // now find target and process files and mark blocks covered
-  while (! feof(fp)) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-    fgets(buf, PATH_MAX, fp);
-#pragma GCC diagnostic pop
-    p1 = strstr(buf, target);
-    if (p1) {
-      p2 = strtok(p1, " \t");
-      p2 = strtok(NULL, " \t");
+  if (fclose(fp)) {
+    fp = NULL;
+    fprintf(stderr, "%s", RED);
+    fprintf(stderr, "ERROR: Failed to close photorec log file \"%s\". No updates performed. Aborting.\n", logfile);
+    fprintf(stderr, "%s", BLACK);
+    goto done;
+  }
+  fp = NULL;
 
-      // p2 now contains block range in the format mmm-nnn
+  for (size_t i = 0; i < range_count; i++) {
+    first = ranges[i].first;
+    last = ranges[i].last;
 
-      if (! (dash = (strchr(p2, '-')))) {
-        // something is very wrong--no dash discovered in range
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "\nERROR: Bad range format in photorec log file. No updates performed. Aborting.\n");
-        fprintf(stderr, "%s", BLACK);
-        return ret;
-      }
+    if ((uint64_t)first < blockmap->start_block || (uint64_t)first > blockmap->end_block) {
+      fprintf(stderr, "%s", BLUE);
+      fprintf(stderr,
+              "\nWARNING: Start of range block %" PRId64
+              " in photorec log is outside the active carve window %" PRIu64 " - %" PRIu64 ".\n\n",
+              first, blockmap->start_block, blockmap->end_block);
+      fprintf(stderr, "%s", BLACK);
+    }
 
-      *dash = 0;
-      block1 = atoll(p2);
-      *dash = ' ';
-      block2 = atoll(dash);
+    if ((uint64_t)last < blockmap->start_block || (uint64_t)last > blockmap->end_block) {
+      fprintf(stderr, "%s", BLUE);
+      fprintf(stderr,
+              "\nWARNING: End of range block %" PRId64
+              " in photorec log is outside the active carve window %" PRIu64 " - %" PRIu64 ".\n\n",
+              last, blockmap->start_block, blockmap->end_block);
+      fprintf(stderr, "%s", BLACK);
+    }
 
-      if (block1 < 0 || block1 > (int64_t)blockmap->numblocks - 1 || block2 < 0 ||
-          block2 > (int64_t)blockmap->numblocks - 1 || block1 > block2) {
-        fprintf(stderr, "%s", RED);
-        fprintf(stderr, "\nERROR: Bad block range in photorec log file.  No updates performed. Aborting.\n");
-        fprintf(stderr, "%s", BLACK);
-        return ret;
-      }
-
-      if (block1 < (int64_t)blockmap->start_block || block1 > (int64_t)blockmap->end_block) {
-        fprintf(stderr, "%s", BLUE);
-        fprintf(stderr,
-                "\nWARNING: Start of range block %" PRIu64
-                " in photorec log is outside the active carve window %" PRId64 " - %" PRId64 ".\n\n",
-                block1, blockmap->start_block, blockmap->end_block);
-        fprintf(stderr, "%s", BLACK);
-      }
-
-      if (block2 < (int64_t)blockmap->start_block || block2 > (int64_t)blockmap->end_block) {
-        fprintf(stderr, "%s", BLUE);
-        fprintf(stderr,
-                "\nWARNING: End of of range block %" PRIu64
-                " in photorec log is outside the active carve window %" PRId64 " - %" PRId64 ".\n\n",
-                block2, blockmap->start_block, blockmap->end_block);
-        fprintf(stderr, "%s", BLACK);
-      }
-
-      fprintf(stdout, "Covering blocks in the range %" PRIu64 "-%" PRIu64 ".\n", block1, block2);
-
-      for (j = block1; j <= block2; j++) {
-        cover_block(blockmap, j);
-        ret = true;
+    fprintf(stdout, "Covering blocks in the range %" PRId64 "-%" PRId64 ".\n", first, last);
+    for (block = first;; block++) {
+      cover_block(blockmap, block);
+      if (block == last) {
+        break;
       }
     }
   }
 
-  return ret;
+  result = range_count ? TOOL_RESULT_CHANGED : TOOL_RESULT_NO_CHANGES;
+
+done:
+  if (fp) {
+    fclose(fp);
+  }
+  free(line);
+  free(ranges);
+  return result;
 }
 
 //////////////////////////////////////////////////////////
@@ -398,6 +513,7 @@ int main(int argc, char *argv[]) {
   long long temp;
   Blockmap *blockmap;
   bool changes = false;
+  ToolResult tool_result;
 
 #if DISABLE_COLOR > 0
   DISABLE_ALL_COLOR;
@@ -455,8 +571,14 @@ int main(int argc, char *argv[]) {
 
   if (optind < argc && argv[optind]) {
     // image filename
-    strncpy(imagefn, argv[optind], PATH_MAX / 2 - 1);
-    imagefn[PATH_MAX / 2 - 1] = 0;
+    if (! copy_string_complete(imagefn, sizeof(imagefn), argv[optind])) {
+      fprintf(stderr, "%s", RED);
+      fprintf(stderr,
+              "\nERROR: Image pathname is too long (maximum %zu characters). Aborting.\n",
+              sizeof(imagefn) - 1);
+      fprintf(stderr, "%s", BLACK);
+      return -1;
+    }
   }
   else {
     fprintf(stderr, "%s", RED);
@@ -468,8 +590,14 @@ int main(int argc, char *argv[]) {
   optind++;
 
   if (optind < argc && argv[optind]) {
-    strncpy(blockmapfn, argv[optind], PATH_MAX / 2 - 1);
-    blockmapfn[PATH_MAX / 2 - 1] = 0;
+    if (! copy_string_complete(blockmapfn, sizeof(blockmapfn), argv[optind])) {
+      fprintf(stderr, "%s", RED);
+      fprintf(stderr,
+              "\nERROR: Blockmap pathname is too long (maximum %zu characters). Aborting.\n",
+              sizeof(blockmapfn) - 1);
+      fprintf(stderr, "%s", BLACK);
+      return -1;
+    }
   }
   else {
     fprintf(stderr, "%s", RED);
@@ -488,7 +616,7 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  if (! read_blockmap(&blockmap, f, true)) {
+  if (! read_blockmap(&blockmap, f)) {
     fprintf(stderr, "%s", RED);
     fprintf(stderr, "\nERROR: Couldn't read blockmap from file \"%s\". Aborting.\n", blockmapfn);
     fprintf(stderr, "%s", BLACK);
@@ -581,13 +709,16 @@ int main(int argc, char *argv[]) {
 
   i = optind;
   while (i < argc) {
-    strcpy(buf, argv[i]);
+    if (! copy_string_complete(buf, sizeof(buf), argv[i])) {
+      fprintf(stderr, "%s", RED);
+      fprintf(stderr,
+              "\nERROR: Blockmap update request is too long (maximum %zu characters). Aborting.\n",
+              sizeof(buf) - 1);
+      fprintf(stderr, "%s", BLACK);
+      return -1;
+    }
 
     if ((toolidx = detect_tool(buf)) >= 0) {
-      //
-      // GGRIII: this needs to be rewritten to handle tools besides photorec
-      //
-
       // get logfile
       i++;
       if (i >= argc) {
@@ -596,7 +727,14 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "%s", BLACK);
         return -1;
       }
-      changes = handle_photorec(blockmap, argv[i]) || changes;
+
+      tool_result = tools[toolidx].tool(blockmap, argv[i]);
+      if (tool_result == TOOL_RESULT_ERROR) {
+        return -1;
+      }
+      if (tool_result == TOOL_RESULT_CHANGED) {
+        changes = true;
+      }
     }
     else if (isalpha(buf[0])) {
       fprintf(stderr, "%s", RED);

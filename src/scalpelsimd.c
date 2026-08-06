@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the GNU General Public
 // License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
@@ -136,7 +136,17 @@ char *s3_exact_simd_or_scalar(char *needle, size_t m, char *hay, size_t n, size_
     return NULL;
   }
 
+  // clamp so the last-byte scan never starts before the earliest position where an m-byte
+  // match can end (offset m - 1). A smaller start_pos would let start_idx = (q - H) + 1 - m
+  // underflow (size_t) and slip past the start_idx + m <= n guard into an out-of-bounds read.
+  // Mirrors the identical clamp in the bitap sibling (util.c find_binary_string u64 path).
+  if (start_pos < m - 1) {
+    start_pos = m - 1;
+  }
+
+  const unsigned char first = (unsigned char)needle[0];
   const unsigned char last = (unsigned char)needle[m - 1];
+  const size_t first_distance = m - 1;
   const unsigned char *H = (const unsigned char *)hay;
   const unsigned char *end = H + n;
   const unsigned char *p = H + start_pos;
@@ -144,11 +154,18 @@ char *s3_exact_simd_or_scalar(char *needle, size_t m, char *hay, size_t n, size_
 #if SCALPEL3_USE_SIMD > 0
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
+  simde__m512i vfirst = simde_mm512_set1_epi8((char)first);
   simde__m512i vlast = simde_mm512_set1_epi8((char)last);
 
   while (p + 64 <= end) {
     simde__m512i v = simde_mm512_loadu_si512((const simde__m512i *)p);
     simde__mmask64 mask = simde_mm512_cmpeq_epi8_mask(v, vlast);
+
+    if (first_distance > 0) {
+      simde__m512i vstarts =
+          simde_mm512_loadu_si512((const simde__m512i *)(p - first_distance));
+      mask &= simde_mm512_cmpeq_epi8_mask(vstarts, vfirst);
+    }
 
     while (mask) {
       unsigned bit = __builtin_ctzll(mask);
@@ -178,11 +195,20 @@ char *s3_exact_simd_or_scalar(char *needle, size_t m, char *hay, size_t n, size_
   }
 
 #elif defined(__AVX2__)
+  simde__m256i vfirst = simde_mm256_set1_epi8((char)first);
   simde__m256i vlast = simde_mm256_set1_epi8((char)last);
 
   while (p + 32 <= end) {
     simde__m256i v = simde_mm256_loadu_si256((const simde__m256i *)p);
     simde__m256i cmp = simde_mm256_cmpeq_epi8(v, vlast);
+
+    if (first_distance > 0) {
+      simde__m256i vstarts =
+          simde_mm256_loadu_si256((const simde__m256i *)(p - first_distance));
+      cmp = simde_mm256_and_si256(
+          cmp, simde_mm256_cmpeq_epi8(vstarts, vfirst));
+    }
+
     int mask = simde_mm256_movemask_epi8(cmp);
 
     while (mask) {
@@ -222,11 +248,18 @@ char *s3_exact_simd_or_scalar(char *needle, size_t m, char *hay, size_t n, size_
   }
 
 #elif defined(__ARM_NEON) || defined(__aarch64__)
+  uint8x16_t vfirst = vdupq_n_u8(first);
   uint8x16_t vlast = vdupq_n_u8(last);
 
   while (p + 16 <= end) {
     uint8x16_t v = vld1q_u8(p);
     uint8x16_t cmp = vceqq_u8(v, vlast);
+
+    if (first_distance > 0) {
+      uint8x16_t vstarts = vld1q_u8(p - first_distance);
+      cmp = vandq_u8(cmp, vceqq_u8(vstarts, vfirst));
+    }
+
     uint64_t mask_low = vgetq_lane_u64(vreinterpretq_u64_u8(cmp), 0);
     uint64_t mask_high = vgetq_lane_u64(vreinterpretq_u64_u8(cmp), 1);
     for (int i = 0; i < 8 && mask_low; i++) {

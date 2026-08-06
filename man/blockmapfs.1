@@ -1,4 +1,4 @@
-.TH blockmapfs "1" "" "The scalpel3 Blockmap Filesystem" "The scalpel3 Blockmap Filesystem"
+.TH BLOCKMAPFS 1 "July 24, 2026" "Scalpel3 3.53.0" "Scalpel3 Manual"
 
 .SH NAME
 blockmapfs \- Read-only FUSE filesystem for blockmap-aware file access
@@ -8,22 +8,33 @@ blockmapfs \- Read-only FUSE filesystem for blockmap-aware file access
 mnt root
 
 .SH DESCRIPTION
+\fBblockmapfs\fR is a read-only, multithreaded FUSE filesystem. It presents a
+blockmap-compacted view of files below \fIroot\fR at \fImnt\fR.
 .PP
-\fBblockmapfs\fR is a read-only FUSE (Filesystem in Userspace) filesystem. It presents a view of files located in \fIroot\fR mounted at \fImnt\fR.
+Each exposed regular file has an adjacent regular blockmap named
+\fIfilename.blockmap\fR. When the source is read through the mount point,
+\fBblockmapfs\fR removes covered blocks from the visible byte stream. Reads
+across a covered region continue at the next uncovered block.
 .PP
-For every file accessed in the \fIroot\fR, \fBblockmapfs\fR expects a corresponding valid blockmap file named \fIfilename.blockmap\fR. When a file is read through the mount point, \fBblockmapfs\fR consults the blockmap to determine which blocks are "covered" (already carved or irrelevant). Covered blocks are hidden from the file view, effectively presenting the file as if those blocks were removed/skipped.
+Blockmap files, regular files without a blockmap, and symbolic links are hidden
+from directory listings and pathname access. Directories remain visible so
+mapped files in nested directories can be reached.
+.PP
+The effective coverage and a compact offset index are cached when a mapped file
+is first accessed. Each open file has an independent backing descriptor, and
+concurrent reads use positional I/O.
 
 .SH REQUIREMENTS
-.PP
 .IP \(bu 2
-FUSE (Linux) or macFUSE (macOS) must be installed.
+FUSE 3 (Linux) or a macFUSE release with FUSE 3 support (macOS) must be
+installed.
 .IP \(bu 2
-Each file in \fIroot\fR must have an associated blockmap in the same directory.
+\fImnt\fR and \fIroot\fR must be existing, non-overlapping directories.
 .IP \(bu 2
-Files in \fIroot\fR (source files and blockmaps) \fBMUST NOT\fR be modified while the filesystem is mounted, as blockmap data is cached.
+Source files and blockmaps \fBMUST NOT\fR be modified, replaced, or removed
+while the filesystem is mounted. Unmount before changing them, then remount.
 
 .SH OPTIONS
-.PP
 \fBblockmapfs\fR takes exactly two arguments:
 
 .TP
@@ -32,10 +43,18 @@ The directory where the filesystem will be mounted.
 
 .TP
 .I root
-The source directory containing the raw files and their associated \fI.blockmap\fR files.
+The source directory containing the raw files and their associated
+\fI.blockmap\fR files.
+
+.SH ERRORS
+An invalid blockmap causes access to its source file to fail. If a cached source
+or blockmap is replaced during a mount, subsequent opens fail with
+\fBESTALE\fR. The filesystem never falls back to exposing unfiltered source
+bytes.
 
 .SH EXIT STATUS
-Returns 0 on success, or -1 if arguments are missing or paths are invalid.
+Returns zero after a successful mount session and clean unmount. Returns
+nonzero if validation, mounting, or filesystem operation setup fails.
 
 .SH SEE ALSO
 .BR scalpel3 (1),

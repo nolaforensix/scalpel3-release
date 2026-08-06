@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -52,7 +52,9 @@ typedef struct VectorWriteThreadWork {
   pthread_cond_t check_work_available;  // allocation
   BlockVector *b;                       // blockvector to write
   char pathname[PATH_MAX];              // pathname for blockvector data
+  char staging_pathname[PATH_MAX];      // hidden pathname used until data publication
   char blockvector_pathname[PATH_MAX];  // pathname for blockvector metadata
+  CarveInfoFlavor flavor;               // selects write-once or replacement publication
   bool update_blockmap;                 // update shadow blockmap using b?
 } VectorWriteThreadWork;
 
@@ -157,6 +159,30 @@ static uint64_t blockvector_actual_block_length(BlockVector *b, uint64_t index);
 static void mem_pretouch_read(void *p, size_t n);
 static void mem_pretouch_write(void *p, size_t n);
 static bool all_consecutive_actual_blocknumbers(BlockVector *b);
+static uint64_t calculate_apparent_filesize(FileMirror *state, uint64_t num_covered);
+
+
+// calculate the byte length of the image after covered blocks are omitted. A covered partial final
+// block contributes only its actual bytes, while every other covered block contributes blocksize.
+static uint64_t calculate_apparent_filesize(FileMirror *state, uint64_t num_covered) {
+
+  uint64_t covered_bytes;
+  uint64_t final_block_length;
+
+  if (! num_covered) {
+    return state->filesize;
+  }
+
+  covered_bytes = num_covered * state->blocksize;
+  final_block_length = state->filesize % state->blocksize;
+
+  if (final_block_length
+      && is_block_covered(state->blockmap, state->blockmap->numblocks - 1)) {
+    covered_bytes -= state->blocksize - final_block_length;
+  }
+
+  return state->filesize - covered_bytes;
+}
 
 
 // GLOBALS
@@ -473,8 +499,8 @@ void init_essential_blockvector(BlockVector *b, EssentialBlockVector **e) {
 
   if (! *e) {
     (*e) = malloc(sizeof(EssentialBlockVector));
-    memset(*e, 0, sizeof(EssentialBlockVector));
     check_memory_allocation(*e, __LINE__, __FILE__, "e");
+    memset(*e, 0, sizeof(EssentialBlockVector));
   }
 
   if (scalpel_state.mode_verbose) {
@@ -504,8 +530,8 @@ void init_empty_essential_blockvector(EssentialBlockVector **e, uint64_t num_blo
 
   if (! *e) {
     (*e) = malloc(sizeof(EssentialBlockVector));
-    memset(*e, 0, sizeof(EssentialBlockVector));
     check_memory_allocation(*e, __LINE__, __FILE__, "e");
+    memset(*e, 0, sizeof(EssentialBlockVector));
   }
 
   if (scalpel_state.mode_verbose) {
@@ -929,7 +955,6 @@ static void inflate_blockvector_no_IO(BlockVector *b) {
     b->seqdata = NULL;
     b->data = realloc(b->data, b->malloc_length * b->filemirror->blocksize);
     check_memory_allocation(b->data, __LINE__, __FILE__, "b->data");
-    mem_pretouch_write(b->data, b->malloc_length * b->filemirror->blocksize);
 
     // Entering slow mode with a fresh buffer means existing valid[] bits
     // are no longer trustworthy for b->data contents. If they remain set,
@@ -1373,18 +1398,134 @@ bool apparent_block_in_blockvector(BlockVector *b, int64_t apparentblocknumber) 
 }
 
 
+static bool filemirror_staging_path(const char *pathname,
+                                    char staging_pathname[PATH_MAX]) {
+
+  static const char hex[] = "0123456789abcdef";
+  unsigned char hash[SHA256_DIGEST_LENGTH];
+  char hashhex[SHA256_DIGEST_LENGTH * 2 + 1];
+  const char *slash;
+  size_t directory_length;
+  int written;
+
+  if (! pathname || ! pathname[0] || ! staging_pathname) {
+    errno = EINVAL;
+    return false;
+  }
+
+  SHA256((const unsigned char *)pathname, strlen(pathname), hash);
+  for (size_t i = 0; i < sizeof(hash); i++) {
+    hashhex[i * 2] = hex[hash[i] >> 4];
+    hashhex[i * 2 + 1] = hex[hash[i] & 0x0f];
+  }
+  hashhex[sizeof(hash) * 2] = 0;
+
+  slash = strrchr(pathname, '/');
+  if (! slash) {
+    written = snprintf(staging_pathname, PATH_MAX,
+                       ".scalpel3-part-%s", hashhex);
+  }
+  else {
+    directory_length = (size_t)(slash - pathname);
+    written = snprintf(staging_pathname, PATH_MAX,
+                       "%.*s/.scalpel3-part-%s",
+                       (int)directory_length, pathname, hashhex);
+  }
+
+  if (written < 0 || written >= PATH_MAX) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+
+  return true;
+}
+
+
+// reserve the hidden staging pathname for an asynchronous output operation. For output in VALIDATED
+// and PROMISING, publication is write-once: a committed final pathname or an existing staging
+// reservation suppresses a duplicate. Output in INPROGRESS replaces a prior snapshot, so callers
+// wait for any earlier write to the same fixed pathname before reserving the next one.
+FilePublicationReservation filemirror_reserve_output(const char *pathname,
+                                                      CarveInfoFlavor flavor,
+                                                      char staging_pathname[PATH_MAX]) {
+
+  struct stat statbuf;
+  int fd;
+  int saved_errno;
+
+  if (! pathname || ! staging_pathname
+      || (flavor != VALIDATED && flavor != PROMISING
+          && flavor != INPROGRESS)) {
+    errno = EINVAL;
+    return FILE_PUBLICATION_ERROR;
+  }
+  if (! filemirror_staging_path(pathname, staging_pathname)) {
+    return FILE_PUBLICATION_ERROR;
+  }
+
+  if (flavor != INPROGRESS) {
+    if (lstat(pathname, &statbuf) == 0) {
+      return FILE_PUBLICATION_COMMITTED;
+    }
+    if (errno != ENOENT) {
+      return FILE_PUBLICATION_ERROR;
+    }
+  }
+
+  for (;;) {
+    fd = open(staging_pathname, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd >= 0) {
+      break;
+    }
+    if (errno != EEXIST) {
+      return FILE_PUBLICATION_ERROR;
+    }
+    if (flavor != INPROGRESS) {
+      return FILE_PUBLICATION_IN_PROGRESS;
+    }
+    sched_yield();
+  }
+
+  if (close(fd) != 0) {
+    saved_errno = errno;
+    unlink(staging_pathname);
+    errno = saved_errno;
+    return FILE_PUBLICATION_ERROR;
+  }
+
+  // close the race where an earlier writer moved the staging pathname to the final pathname
+  // between our initial final-path check and reservation attempt.
+  if (flavor != INPROGRESS && lstat(pathname, &statbuf) == 0) {
+    if (unlink(staging_pathname) != 0) {
+      return FILE_PUBLICATION_ERROR;
+    }
+    return FILE_PUBLICATION_COMMITTED;
+  }
+  if (flavor != INPROGRESS && errno != ENOENT) {
+    saved_errno = errno;
+    unlink(staging_pathname);
+    errno = saved_errno;
+    return FILE_PUBLICATION_ERROR;
+  }
+
+  return FILE_PUBLICATION_RESERVED;
+}
+
+
 // write data associated with blockvector 'b'. If 'pathname' is non-NULL, blockvector data is
-// written to the file 'pathname'. If 'blockvector_pathname' is non-NULL, blockvector metadata is
-// written to the file 'blockvector_pathname'. If 'update_blockmap' is true, then the shadow
-// blockmap is updated. This function handles assignment of blockvector write operations to vector
-// write threads so writes occur asynchronously.
+// written to 'staging_pathname' and then published as 'pathname'. If 'blockvector_pathname' is
+// non-NULL, blockvector metadata is staged and published with the data. If 'update_blockmap' is
+// true, then the shadow blockmap is updated only after data publication. This function handles
+// assignment of blockvector write operations to vector write threads so writes occur asynchronously.
 //
 // IMPORTANT: The blockvector is assumed to be inflated and normalized.n All resources associated
 // with the blockvetor are freed by by this function.
 //
 // DO NOT ACCESS THE BLOCKVECTOR AFTER CALLING THIS FUNCTION.
 //
-void write_blockvector(BlockVector *b, char *pathname, char *blockvector_pathname, bool update_blockmap) {
+void write_blockvector(BlockVector *b, char *pathname, char *staging_pathname,
+                       char *blockvector_pathname, CarveInfoFlavor flavor,
+                       bool update_blockmap) {
 
   int free_vector_thread = -1;
   uint32_t i;
@@ -1392,6 +1533,9 @@ void write_blockvector(BlockVector *b, char *pathname, char *blockvector_pathnam
   if (! b) {
     // fatal
     handle_error(SCALPEL_ERROR_UNINITIALIZED_BLOCKVECTOR, "write_blockvector()", __LINE__, __FILE__);
+  }
+  if (pathname && (! staging_pathname || ! staging_pathname[0])) {
+    handle_error(SCALPEL_ERROR_FILE_WRITE, pathname, __LINE__, __FILE__);
   }
 
   // one more vector operation pending
@@ -1442,6 +1586,15 @@ void write_blockvector(BlockVector *b, char *pathname, char *blockvector_pathnam
     (b->filemirror->vector_write_thread_work[free_vector_thread].pathname)[0] = 0;
   }
 
+  if (staging_pathname) {
+    strncpy(b->filemirror->vector_write_thread_work[free_vector_thread].staging_pathname,
+            staging_pathname, PATH_MAX - 1);
+    b->filemirror->vector_write_thread_work[free_vector_thread].staging_pathname[PATH_MAX - 1] = '\0';
+  }
+  else {
+    (b->filemirror->vector_write_thread_work[free_vector_thread].staging_pathname)[0] = 0;
+  }
+
   if (blockvector_pathname) {
     strncpy(b->filemirror->vector_write_thread_work[free_vector_thread].blockvector_pathname, blockvector_pathname, PATH_MAX - 1);
     b->filemirror->vector_write_thread_work[free_vector_thread].blockvector_pathname[PATH_MAX - 1] = '\0';
@@ -1451,6 +1604,7 @@ void write_blockvector(BlockVector *b, char *pathname, char *blockvector_pathnam
   }
 
   b->filemirror->vector_write_thread_work[free_vector_thread].update_blockmap = update_blockmap;
+  b->filemirror->vector_write_thread_work[free_vector_thread].flavor = flavor;
 
   // signal thread to proceed
   pthread_cond_signal(&b->filemirror->vector_write_thread_work[free_vector_thread].check_work_available);
@@ -1472,6 +1626,101 @@ void write_blockvector(BlockVector *b, char *pathname, char *blockvector_pathnam
 // Configuration for write optimizations
 #define WRITE_BUFFER_SIZE (4 * 1024 * 1024)  // 4MB buffer
 
+typedef enum FilePublicationResult {
+  FILE_PUBLISHED = 0,
+  FILE_ALREADY_PUBLISHED = 1,
+  FILE_PUBLICATION_FAILED = 2,
+} FilePublicationResult;
+
+
+static const char *file_publication_flavor_name(CarveInfoFlavor flavor) {
+
+  switch (flavor) {
+  case VALIDATED:
+    return "validated";
+  case PROMISING:
+    return "promising";
+  case INPROGRESS:
+    return "inprogress";
+  default:
+    return "unknown";
+  }
+}
+
+
+static void file_publication_test_crash_after(CarveInfoFlavor flavor,
+                                              const char *stage) {
+
+  const char *requested_stage = getenv("SCALPEL3_TEST_OUTPUT_CRASH_AFTER");
+  const char *requested_flavor = getenv("SCALPEL3_TEST_OUTPUT_FLAVOR");
+
+  if (requested_stage && ! strcmp(requested_stage, stage)
+      && (! requested_flavor
+          || ! strcmp(requested_flavor,
+                      file_publication_flavor_name(flavor)))) {
+    _exit(87);
+  }
+}
+
+
+// atomically publish a staged data file. A hard link supplies portable create-if-absent semantics
+// for VALIDATED and PROMISING output on the supported macOS/Linux filesystems. If a filesystem does
+// not support hard links, the staging reservation still prevents races between Scalpel writers, so
+// rename() is a safe fallback. INPROGRESS snapshots deliberately replace the prior pathname.
+static FilePublicationResult filemirror_publish_staged_file(
+    const char *staging_pathname, const char *pathname,
+    CarveInfoFlavor flavor) {
+
+  struct stat statbuf;
+  int saved_errno;
+  bool link_unsupported;
+
+  if (flavor == INPROGRESS) {
+    return rename(staging_pathname, pathname) == 0
+               ? FILE_PUBLISHED
+               : FILE_PUBLICATION_FAILED;
+  }
+
+  if (link(staging_pathname, pathname) == 0) {
+    if (unlink(staging_pathname) != 0) {
+      return FILE_PUBLICATION_FAILED;
+    }
+    return FILE_PUBLISHED;
+  }
+
+  saved_errno = errno;
+  if (saved_errno == EEXIST) {
+    if (unlink(staging_pathname) != 0) {
+      return FILE_PUBLICATION_FAILED;
+    }
+    return FILE_ALREADY_PUBLISHED;
+  }
+
+  link_unsupported = saved_errno == EPERM || saved_errno == EOPNOTSUPP
+                     || saved_errno == EMLINK;
+#if defined(ENOTSUP) && ENOTSUP != EOPNOTSUPP
+  link_unsupported = link_unsupported || saved_errno == ENOTSUP;
+#endif
+  if (! link_unsupported) {
+    errno = saved_errno;
+    return FILE_PUBLICATION_FAILED;
+  }
+
+  if (lstat(pathname, &statbuf) == 0) {
+    if (unlink(staging_pathname) != 0) {
+      return FILE_PUBLICATION_FAILED;
+    }
+    return FILE_ALREADY_PUBLISHED;
+  }
+  if (errno != ENOENT) {
+    return FILE_PUBLICATION_FAILED;
+  }
+
+  return rename(staging_pathname, pathname) == 0
+             ? FILE_PUBLISHED
+             : FILE_PUBLICATION_FAILED;
+}
+
 // optimized synchronous write that works on Linux and Mac
 static int write_file_optimized(const char *pathname, void *data, size_t length) {
 
@@ -1489,7 +1738,7 @@ static int write_file_optimized(const char *pathname, void *data, size_t length)
   }
 
   // Open with optimal flags for bulk writes
-  int flags = O_WRONLY | O_CREAT | O_TRUNC;
+  int flags = O_WRONLY | O_TRUNC;
 
 #ifdef __linux__
   // Linux-specific optimizations
@@ -1545,7 +1794,9 @@ static int write_file_optimized(const char *pathname, void *data, size_t length)
     }
   }
 
-  fclose(fp);
+  if (fclose(fp) != 0) {
+    ret = -1;
+  }
 
   return ret;
 }
@@ -1557,6 +1808,8 @@ static void *vector_write_thread(void *arg) {
   VectorWriteThreadWork *work = (VectorWriteThreadWork *)(arg);
   BlockVector *b;
   FILE *fp;
+  char blockvector_staging_pathname[PATH_MAX];
+  FilePublicationResult publication_result;
   struct timespec start, end;
 
   atomic_store_explicit(&work->vector_thread_running, true, memory_order_release);
@@ -1584,124 +1837,174 @@ static void *vector_write_thread(void *arg) {
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    // potentially write blockvector
-    if (work->blockvector_pathname[0]) {
-      fp = fopen(work->blockvector_pathname, "w");
-      if (fp) {
-        fprintf(fp, "Capacity:     %8" PRIu64 " blocks\n", work->b->numblocks);
-        fprintf(fp, "Length:       %8" PRIu64 " bytes\n", work->b->length);
-        fprintf(fp, "Index\t\tActual\t\tApparent\n");
-        for (uint64_t i = 0; i < work->b->numblocks; i++) {
-          if (work->b->valid[i]) {
-            fprintf(fp, "%8" PRId64 "\t%8" PRId64 "\t%8" PRId64 "\n", i, work->b->actual_blocknumber[i],
-                    work->b->apparent_blocknumber[i]);
-          }
-        }
-        fclose(fp);
-      }
-    }
-
-    // write data for blockvector
+    // stage blockvector data. The public pathname is untouched until every byte has been written
+    // and fclose() has confirmed that stdio did not encounter a delayed write error.
     if (work->pathname[0]) {
-      if (work->b->length == 0) {
-        lock_fprintf(stderr,
-                     "\nScalpel not writing zero length file \"%s\".\n"
-                     "The associated validator is probably misbehaving and should be checked.\n\n",
-                     work->pathname);
+      char *data = blockvector_get_data_pointer(work->b);
+
+      file_publication_test_crash_after(work->flavor, "data-write-started");
+
+      if (work->b->seqdata) {
+        // fast path: all blocks consecutive and valid via mmap.
+        if (write_file_optimized(work->staging_pathname, data,
+                                 work->b->length) < 0) {
+          handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname, __LINE__, __FILE__);
+        }
       }
       else {
-        char *data = blockvector_get_data_pointer(work->b);
-
-        if (work->b->seqdata) {
-          // fast path: all blocks consecutive and valid via mmap.
-          if (write_file_optimized(work->pathname, data, work->b->length) < 0) {
-            handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname, __LINE__, __FILE__);
-          }
+        // slow path: write coalesced runs of valid blocks, zeroes for invalid blocks.
+        // invalid blocks (valid[i] == false) may contain stale data from deflate/resize
+        // cycles--write zeroes instead.
+        int flags = O_WRONLY | O_TRUNC;
+#ifdef __linux__
+        flags |= O_NOATIME;
+#endif
+        int fd = open(work->staging_pathname, flags, 0644);
+        if (fd < 0) {
+          handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname, __LINE__, __FILE__);
         }
         else {
-          // slow path: write coalesced runs of valid blocks, zeroes for invalid blocks.
-          // Invalid blocks (valid[i] == false) may contain stale data from deflate/resize
-          // cycles--write zeroes instead.
-          int flags = O_WRONLY | O_CREAT | O_TRUNC;
-#ifdef __linux__
-          flags |= O_NOATIME;
-#endif
-          int fd = open(work->pathname, flags, 0644);
-          if (fd < 0) {
+          FILE *fp = fdopen(fd, "wb");
+          if (! fp) {
+            close(fd);
             handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname, __LINE__, __FILE__);
           }
           else {
-            FILE *fp = fdopen(fd, "wb");
-            if (! fp) {
-              close(fd);
-              handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname, __LINE__, __FILE__);
-            }
-            else {
-              uint64_t blocksize = work->b->filemirror->blocksize;
-              uint64_t remaining = work->b->length;
-              uint64_t i = 0;
-              bool write_error = false;
+            uint64_t blocksize = work->b->filemirror->blocksize;
+            uint64_t remaining = work->b->length;
+            uint64_t i = 0;
+            bool write_error = false;
 
-              while (i < work->b->numblocks && remaining > 0 && ! write_error) {
-                if (work->b->valid[i] && data) {
-                  // coalesce consecutive valid blocks into one write
-                  uint64_t run_start = i;
-                  uint64_t run_bytes = 0;
-                  while (i < work->b->numblocks && remaining > 0
-                         && work->b->valid[i]) {
-                    uint64_t chunk = (remaining < blocksize) ? remaining : blocksize;
-                    run_bytes += chunk;
-                    remaining -= chunk;
-                    i++;
-                  }
-                  if (fwrite(data + run_start * blocksize, 1, run_bytes, fp) != run_bytes) {
+            while (i < work->b->numblocks && remaining > 0 && ! write_error) {
+              if (work->b->valid[i] && data) {
+                // coalesce consecutive valid blocks into one write
+                uint64_t run_start = i;
+                uint64_t run_bytes = 0;
+                while (i < work->b->numblocks && remaining > 0
+                       && work->b->valid[i]) {
+                  uint64_t chunk = (remaining < blocksize) ? remaining : blocksize;
+                  run_bytes += chunk;
+                  remaining -= chunk;
+                  i++;
+                }
+                if (fwrite(data + run_start * blocksize, 1, run_bytes, fp) != run_bytes) {
+                  write_error = true;
+                }
+              }
+              else {
+                // coalesce consecutive invalid blocks into one zero write
+                uint64_t zero_bytes = 0;
+                while (i < work->b->numblocks && remaining > 0
+                       && ! work->b->valid[i]) {
+                  uint64_t chunk = (remaining < blocksize) ? remaining : blocksize;
+                  zero_bytes += chunk;
+                  remaining -= chunk;
+                  i++;
+                }
+                // write zeroes in blocksize-aligned chunks
+                static __thread char *zero_buf = NULL;
+                if (! zero_buf) {
+                  zero_buf = calloc(1, blocksize);
+                  check_memory_allocation(zero_buf, __LINE__, __FILE__, "zero_buf");
+                }
+                uint64_t zr = zero_bytes;
+                while (zr > 0 && ! write_error) {
+                  uint64_t zchunk = (zr < blocksize) ? zr : blocksize;
+                  if (fwrite(zero_buf, 1, zchunk, fp) != zchunk) {
                     write_error = true;
                   }
-                }
-                else {
-                  // coalesce consecutive invalid blocks into one zero write
-                  uint64_t zero_bytes = 0;
-                  while (i < work->b->numblocks && remaining > 0
-                         && ! work->b->valid[i]) {
-                    uint64_t chunk = (remaining < blocksize) ? remaining : blocksize;
-                    zero_bytes += chunk;
-                    remaining -= chunk;
-                    i++;
-                  }
-                  // write zeroes in blocksize-aligned chunks
-                  static __thread char *zero_buf = NULL;
-                  if (! zero_buf) {
-                    zero_buf = calloc(1, blocksize);
-                    check_memory_allocation(zero_buf, __LINE__, __FILE__, "zero_buf");
-                  }
-                  uint64_t zr = zero_bytes;
-                  while (zr > 0 && ! write_error) {
-                    uint64_t zchunk = (zr < blocksize) ? zr : blocksize;
-                    if (fwrite(zero_buf, 1, zchunk, fp) != zchunk) {
-                      write_error = true;
-                    }
-                    zr -= zchunk;
-                  }
+                  zr -= zchunk;
                 }
               }
-              fclose(fp);
+            }
+            bool close_error = fclose(fp) != 0;
+            if (remaining > 0 || close_error) {
+              write_error = true;
+            }
 
-              if (write_error) {
-                handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname, __LINE__, __FILE__);
-              }
+            if (write_error) {
+              handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname, __LINE__, __FILE__);
             }
           }
         }
       }
+
+      file_publication_test_crash_after(work->flavor, "data-staged");
     }
 
-    // Update the shadow blockmap if needed
+    // stage and publish optional metadata before the recovered-data pathname. The latter is the
+    // commit point, so a crash can leave an ignorable metadata sidecar but never a partial recovered
+    // file bearing its final name.
+    if (work->blockvector_pathname[0]) {
+      bool write_error = false;
+
+      if (! filemirror_staging_path(work->blockvector_pathname,
+                                    blockvector_staging_pathname)) {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, work->blockvector_pathname,
+                     __LINE__, __FILE__);
+      }
+
+      fp = fopen(blockvector_staging_pathname, "w");
+      if (! fp
+          || fprintf(fp, "Capacity:     %8" PRIu64 " blocks\n",
+                     work->b->numblocks) < 0
+          || fprintf(fp, "Length:       %8" PRIu64 " bytes\n",
+                     work->b->length) < 0
+          || fprintf(fp, "Index\t\tActual\t\tApparent\n") < 0) {
+        write_error = true;
+      }
+
+      if (fp && ! write_error) {
+        for (uint64_t i = 0; i < work->b->numblocks; i++) {
+          if (work->b->valid[i]
+              && fprintf(fp,
+                         "%8" PRId64 "\t%8" PRId64 "\t%8" PRId64 "\n",
+                         i, work->b->actual_blocknumber[i],
+                         work->b->apparent_blocknumber[i]) < 0) {
+            write_error = true;
+            break;
+          }
+        }
+      }
+
+      if (fp && fclose(fp) != 0) {
+        write_error = true;
+      }
+      if (write_error) {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, work->blockvector_pathname,
+                     __LINE__, __FILE__);
+      }
+
+      file_publication_test_crash_after(work->flavor, "blockvector-staged");
+      if (rename(blockvector_staging_pathname,
+                 work->blockvector_pathname) != 0) {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, work->blockvector_pathname,
+                     __LINE__, __FILE__);
+      }
+      file_publication_test_crash_after(work->flavor,
+                                        "blockvector-published");
+    }
+
+    if (work->pathname[0]) {
+      publication_result = filemirror_publish_staged_file(
+          work->staging_pathname, work->pathname, work->flavor);
+      if (publication_result == FILE_PUBLICATION_FAILED) {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, work->pathname,
+                     __LINE__, __FILE__);
+      }
+      file_publication_test_crash_after(work->flavor, "data-published");
+    }
+
+    // cover blocks only after the recovered file has reached its final pathname.
     if (work->update_blockmap) {
       filemirror_update_blockmap(work->state, work->b);
+      file_publication_test_crash_after(work->flavor, "blockmap-updated");
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
-    atomic_fetch_add_explicit(&random_write_wait, (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec),
+    atomic_fetch_add_explicit(&random_write_wait,
+                              (end.tv_sec - start.tv_sec) * NANOSECONDS_PER_SECOND
+                                + (end.tv_nsec - start.tv_nsec),
                               memory_order_acq_rel);
 
     // mark thread as ready again
@@ -1710,8 +2013,6 @@ static void *vector_write_thread(void *arg) {
     atomic_store_explicit(&work->b->filemirror->vector_write_thread_work[work->id].vector_thread_ready, true, memory_order_release);
 
     atomic_fetch_add_explicit(&work->b->filemirror->num_idle_vector_write_threads, 1, memory_order_acq_rel);
-
-    atomic_fetch_sub_explicit(&work->b->filemirror->vector_operations_pending, 1, memory_order_acq_rel);
 
     if (scalpel_state.mode_verbose) {
       lock_fprintf(stdout, "Write thread # %1d completed work on %p, sleeping.\n", work->id, work->b);
@@ -1723,8 +2024,14 @@ static void *vector_write_thread(void *arg) {
 
     MUTEX_ERROR_CHECK(pthread_mutex_unlock(&work->b->filemirror->choose_vector_write_thread), __LINE__, __FILE__);
 
-    // free blockvector resources
+    // free blockvector resources -- free_blockvector() releases this vector's block reservations
+    // (blockvector_unreserve_blocks), so the write operation is not truly complete until it
+    // returns. Decrement vector_operations_pending AFTER that, so the quiescence gate before a
+    // blockmap swap (~3049) or checkpoint cannot observe pending==0 while this worker is still
+    // mutating the blockmap. Capture the filemirror first, since free_blockvector() nulls b.
+    FileMirror *fm = b->filemirror;
     free_blockvector(&b);
+    atomic_fetch_sub_explicit(&fm->vector_operations_pending, 1, memory_order_acq_rel);
   }
 
   if (scalpel_state.mode_verbose) {
@@ -2134,8 +2441,16 @@ FileMirror *filemirror_start(char *image_pathname, char *blockmap_pathname, uint
   state->blocksize = blocksize;
   state->readahead_bytes = readahead_bytes;
   state->num_readahead_bufs = num_readahead_bufs;
-  strcpy(state->image_pathname, image_pathname);
-  strcpy(state->blockmap_pathname, blockmap_pathname);
+  if (! copy_string_complete(state->image_pathname,
+                             sizeof(state->image_pathname), image_pathname)) {
+    handle_error(SCALPEL_ERROR_FILE_OPEN, image_pathname, __LINE__, __FILE__);
+  }
+  // reserve one byte for the temporary suffix used during atomic blockmap publication
+  if (! copy_string_complete(state->blockmap_pathname,
+                             sizeof(state->blockmap_pathname) - 1,
+                             blockmap_pathname)) {
+    handle_error(SCALPEL_ERROR_FILE_WRITE, blockmap_pathname, __LINE__, __FILE__);
+  }
   state->num_threads = num_threads;
   state->peekahead_bytes = peekahead_bytes;
 
@@ -2186,7 +2501,7 @@ FileMirror *filemirror_start(char *image_pathname, char *blockmap_pathname, uint
     handle_error(SCALPEL_ERROR_NO_BLOCKMAP, NULL, __LINE__, __FILE__);
   }
 
-  if (! read_blockmap(&state->blockmap, blockmapfile, true)) {
+  if (! read_blockmap(&state->blockmap, blockmapfile)) {
     // fatal
     handle_error(SCALPEL_ERROR_BLOCKMAP_FORMAT, NULL, __LINE__, __FILE__);
   }
@@ -2275,37 +2590,29 @@ FileMirror *filemirror_start(char *image_pathname, char *blockmap_pathname, uint
     }
   }
 
-  if (num_covered) {
-    // now reduce apparent file size of the file being mirrored by # of blocks that are covered in
-    // the coverage blockmap.
-    if (state->filesize % state->blocksize != 0) {
-      state->apparent_filesize -= state->blocksize * (num_covered - 1);
-      state->apparent_filesize -= state->filesize % state->blocksize;
-    }
-    else {
-      state->apparent_filesize -= state->blocksize * num_covered;
-    }
-  }
+  state->apparent_filesize = calculate_apparent_filesize(state, num_covered);
 
   state->apparent_blocks = CEILDIV(state->apparent_filesize, state->blocksize);
 
-  // allocate blocktype structure
-  state->blocktype = (unsigned char **)malloc(state->blockmap->numblocks * sizeof(unsigned char *));
+  // allocate blocktype structure. It is stored COLUMN-MAJOR: blocktype[filetype] is a
+  // numblocks-byte column, so blocktype[filetype][block]. This lets add_blocktype_slot() add a
+  // subtype with a single column allocation instead of reallocating every block's row, keeps
+  // existing columns at stable addresses, and lets the checkpoint stream whole columns.
+  state->blocktype = (unsigned char **)malloc(scalpel_state.num_specs * sizeof(unsigned char *));
   check_memory_allocation(state->blocktype, __LINE__, __FILE__, "state->blocktype");
-  for (i = 0; i < state->blockmap->numblocks; i++) {
-    state->blocktype[i] = (unsigned char *)malloc(scalpel_state.num_specs * sizeof(unsigned char));
-    check_memory_allocation(state->blocktype, __LINE__, __FILE__, "state->blocktype");
-    for (j = 0; j < scalpel_state.num_specs; j++) {
-      state->blocktype[i][j] = BLOCK_CONFIDENCE_INVALID;
-    }
+  for (j = 0; j < scalpel_state.num_specs; j++) {
+    state->blocktype[j] = (unsigned char *)malloc(state->blockmap->numblocks * sizeof(unsigned char));
+    check_memory_allocation(state->blocktype[j], __LINE__, __FILE__, "state->blocktype");
+    memset(state->blocktype[j], BLOCK_CONFIDENCE_INVALID, state->blockmap->numblocks);
   }
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
-  // if restoring from checkpoint, read blocktype data
+  // if restoring from checkpoint, read the canonical block-classification database
   if (restoring_from_checkpoint) {
-    snprintf(fn, PATH_MAX, "%s/blocktypes.chk", scalpel_state.base_output_directory);
-    if (! filemirror_serialize_blocktype_data(state, DESERIALIZE, fn)) {
+    snprintf(fn, PATH_MAX, "%s/%s", scalpel_state.base_output_directory,
+             BLOCKCLASSIFICATION_FILENAME);
+    if (! filemirror_serialize_blockclassification_data(state, DESERIALIZE, fn)) {
       // fatal
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
@@ -2422,8 +2729,6 @@ void filemirror_stop(FileMirror *state) {
   BlockVector *b;
   uint32_t i;
   uint32_t pending;
-  char fn[PATH_MAX];
-  char newfn[PATH_MAX];
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Stopping file mirror.\n");
@@ -2433,8 +2738,7 @@ void filemirror_stop(FileMirror *state) {
     lock_fprintf(stdout, "filemirror_stop(): waiting for %1d vector operations to complete...\n", pending);
   }
 
-  while ((pending = atomic_load_explicit(&state->vector_operations_pending, memory_order_acquire)))
-    ;
+  filemirror_wait_for_vector_operations(state);
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "filemirror_stop(): all pending vector operations have completed.\n");
@@ -2497,12 +2801,7 @@ void filemirror_stop(FileMirror *state) {
   munmap(state->mmap, state->filesize);
   close(state->mmap_fd);
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-
   // write the most up-to-date blockmap
-  snprintf(fn, PATH_MAX, "%s_", state->blockmap_pathname);
-
   if (state->shadow_blockmap) {
     if (! clone_blockmap(state->shadow_blockmap, &state->blockmap)) {
       handle_error(SCALPEL_ERROR_BLOCKMAP_FORMAT, "clone_blockmap() for blockmap swap", __LINE__, __FILE__);
@@ -2510,29 +2809,10 @@ void filemirror_stop(FileMirror *state) {
     free_blockmap(&state->shadow_blockmap);
   }
 
-  filemirror_write_blockmap(state, fn);
+  filemirror_publish_blockmap(state);
 
-  // write blocktype data
-  snprintf(fn, PATH_MAX, "%s/blocktypes.chk_", scalpel_state.base_output_directory);
-  if (! filemirror_serialize_blocktype_data(state, SERIALIZE, fn)) {
-    // fatal
-    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
-  }
-
-  // finalize filenames for blockmap and blocktypes
-  snprintf(fn, PATH_MAX, "%s_", state->blockmap_pathname);
-  unlink(state->blockmap_pathname);
-  rename(fn, state->blockmap_pathname);
-
-  snprintf(fn, PATH_MAX, "%s/blocktypes.chk_", scalpel_state.base_output_directory);
-  snprintf(newfn, PATH_MAX, "%s/blocktypes.chk", scalpel_state.base_output_directory);
-  unlink(newfn);
-  rename(fn, newfn);
-
-#pragma GCC diagnostic pop
-
-  // free memory associated with mirror
-  for (i = 0; i < state->blockmap->numblocks; i++) {
+  // free memory associated with mirror. The blocktype table is column-major: one column per file type.
+  for (i = 0; i < scalpel_state.num_specs; i++) {
     free(state->blocktype[i]);
   }
 
@@ -2571,8 +2851,7 @@ void filemirror_rewind(FileMirror *state) {
     }
   }
 
-  while ((pending = atomic_load_explicit(&state->vector_operations_pending, memory_order_acquire)))
-    ;
+  filemirror_wait_for_vector_operations(state);
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Rewind: all pending vector operations have completed.\n");
@@ -2712,26 +2991,15 @@ static void read_vector(BlockVector *b) {
       length = b->filemirror->filesize - start;
     }
 
-    // warm up
-
-#if ! defined(__APPLE__)
-    madvise(b->filemirror->mmap + start, length, MADV_POPULATE_READ);
-#else
-    struct radvisory ra;
-
-    ra.ra_offset = start;
-    ra.ra_count = length;
-    fcntl(b->filemirror->mmap_fd, F_RDADVISE, &ra);
-    mem_pretouch_read(b->filemirror->mmap + start, length);
-#endif
-
     memcpy(b->data + startindex * b->filemirror->blocksize, b->filemirror->mmap + start, length);
     b->length += length;
   }
   b->non_peekahead_length = b->length;
 
   clock_gettime(CLOCK_MONOTONIC, &endtime);
-  atomic_fetch_add_explicit(&random_read_wait, (endtime.tv_sec - begintime.tv_sec) * 1e9 + (endtime.tv_nsec - begintime.tv_nsec),
+  atomic_fetch_add_explicit(&random_read_wait,
+                            (endtime.tv_sec - begintime.tv_sec) * NANOSECONDS_PER_SECOND
+                              + (endtime.tv_nsec - begintime.tv_nsec),
                             memory_order_acq_rel);
 
   // one less vector operation pending
@@ -2822,7 +3090,8 @@ BlockVector *filemirror_read(FileMirror *state) {
   }
 
   clock_gettime(CLOCK_MONOTONIC, &end);
-  seq_io_wait += (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec + 1);
+  seq_io_wait += (end.tv_sec - start.tv_sec) * NANOSECONDS_PER_SECOND
+                 + (end.tv_nsec - start.tv_nsec + 1);
 
   return b;
 }
@@ -2880,13 +3149,26 @@ bool filemirror_actual_location_covered(FileMirror *state, uint64_t location) {
 }
 
 
-// determines if an actual block in the image file is covered by a validated file. true is returned
-// if the block is covered, otherwise false is returned.
+// determines if an actual block in the image file is covered and therefore must not be
+// selected. Returns true if the block is committed to a validated file (primary blockmap),
+// or, when shadow peeking is enabled, if it has been claimed this epoch and is pending
+// commit at the next swap (shadow blockmap). Returns false otherwise.
 //
-// THIS FUNCTION IS THREAD-SAFE.
+// THIS FUNCTION IS THREAD-SAFE. The shadow blockmap is read without a lock, matching the
+// shadow peek in blockvector_get_choice(); the shadow pointer is allocated and freed only at
+// the quiescent blockmap swap, so it is stable while reader threads are active.
 bool filemirror_actual_block_covered(FileMirror *state, int64_t actualblocknumber) {
 
-  return state->blockmap_reverse_mapping[actualblocknumber] < 0;
+  if (state->blockmap_reverse_mapping[actualblocknumber] < 0) {
+    return true;
+  }
+  // also treat blocks claimed this epoch (shadow-covered, pending commit) as covered, so no
+  // candidate selects a block already spoken for. The shadow blockmap is allocated lazily,
+  // so it may be NULL before the first coverage this epoch.
+  if (! scalpel_state.disable_shadow_peeking && state->shadow_blockmap) {
+    return is_block_covered(state->shadow_blockmap, actualblocknumber);
+  }
+  return false;
 }
 
 
@@ -2941,13 +3223,14 @@ int64_t filemirror_actual_block_reserved(FileMirror *state, int64_t actualblockn
 }
 
 
-// write the primary blockmap back to disk. This is done by writing the new blockmap to a temporary
-// file and then renaming that file, to minimize the possibility of corrupting the blockmap.
+// write the primary blockmap to 'filename' and durably close it before returning
 //
 // THIS FUNCTION IS NOT THREAD-SAFE. CALLING CODE *MUST* ENFORCE MUTUAL EXCLUSION.
 void filemirror_write_blockmap(FileMirror *state, char *filename) {
 
   FILE *blockmapfile;
+  bool write_ok;
+  int saved_errno = 0;
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Writing blockmap.\n");
@@ -2959,15 +3242,86 @@ void filemirror_write_blockmap(FileMirror *state, char *filename) {
     handle_error(SCALPEL_ERROR_FILE_WRITE, filename, __LINE__, __FILE__);
   }
 
-  if (! write_blockmap(state->blockmap, blockmapfile)) {
-    // fatal
+  write_ok = write_blockmap(state->blockmap, blockmapfile);
+  if (! write_ok) {
+    saved_errno = errno ? errno : EIO;
+  }
+
+  if (! checkpoint_durable_close(blockmapfile) && saved_errno == 0) {
+    saved_errno = errno ? errno : EIO;
+  }
+
+  if (! write_ok || saved_errno != 0) {
+    unlink(filename);
+    errno = saved_errno;
+    perror("writing blockmap");
     handle_error(SCALPEL_ERROR_FILE_WRITE, filename, __LINE__, __FILE__);
   }
 
-  fclose(blockmapfile);
-
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Blockmap write complete.\n");
+  }
+}
+
+
+static bool filemirror_blockmap_parent_directory(const char *pathname,
+                                                 char directory[PATH_MAX]) {
+
+  const char *separator;
+  size_t length;
+
+  if (! pathname || ! pathname[0]) {
+    errno = EINVAL;
+    return false;
+  }
+
+  separator = strrchr(pathname, '/');
+  if (! separator) {
+    memcpy(directory, ".", 2);
+    return true;
+  }
+
+  length = separator == pathname ? 1U : (size_t)(separator - pathname);
+  if (length >= PATH_MAX) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+
+  memcpy(directory, pathname, length);
+  directory[length] = 0;
+  return true;
+}
+
+
+// publish the current blockmap only after its temporary file is durably stored
+void filemirror_publish_blockmap(FileMirror *state) {
+
+  char temporary_path[PATH_MAX];
+  char directory[PATH_MAX];
+  int saved_errno;
+  int written;
+
+  written = snprintf(temporary_path, sizeof(temporary_path), "%s_",
+                     state->blockmap_pathname);
+  if (written < 0 || (size_t)written >= sizeof(temporary_path)
+      || ! filemirror_blockmap_parent_directory(state->blockmap_pathname,
+                                                directory)) {
+    handle_error(SCALPEL_ERROR_FILE_WRITE, state->blockmap_pathname,
+                 __LINE__, __FILE__);
+  }
+
+  filemirror_write_blockmap(state, temporary_path);
+
+  // rename without unlinking first so every observer sees either the old complete map or the new
+  // complete map. Synchronizing the directory makes the replacement durable before success.
+  if (! checkpoint_atomic_replace(temporary_path, state->blockmap_pathname,
+                                  directory)) {
+    saved_errno = errno ? errno : EIO;
+    unlink(temporary_path);
+    errno = saved_errno;
+    perror("publishing blockmap");
+    handle_error(SCALPEL_ERROR_FILE_WRITE, state->blockmap_pathname,
+                 __LINE__, __FILE__);
   }
 }
 
@@ -3032,8 +3386,7 @@ void filemirror_swap_blockmaps(FileMirror *state) {
     }
 
     // vector operations have to complete before the blockmaps can be swapped
-    while ((pending = atomic_load_explicit(&state->vector_operations_pending, memory_order_acquire)))
-      ;
+    filemirror_wait_for_vector_operations(state);
 
     if (scalpel_state.mode_verbose) {
       lock_fprintf(stdout, "Blockmap swap: all pending vector operations have completed.\n");
@@ -3080,22 +3433,14 @@ void filemirror_swap_blockmaps(FileMirror *state) {
       }
     }
 
-    if (num_covered) {
-      // now reduce apparent file size of the file being mirrored by # of blocks that are covered in
-      // the coverage blockmap.
-      if (state->filesize % state->blocksize != 0) {
-        state->apparent_filesize -= state->blocksize * (num_covered - 1);
-        state->apparent_filesize -= state->filesize % state->blocksize;
-      }
-      else {
-        state->apparent_filesize -= state->blocksize * num_covered;
-      }
-    }
+    state->apparent_filesize = calculate_apparent_filesize(state, num_covered);
 
     state->apparent_blocks = CEILDIV(state->apparent_filesize, state->blocksize);
 
     if (scalpel_state.mode_verbose) {
-      lock_fprintf(stdout, "Swap of shadow and primary blockmaps complete.\n");
+      lock_fprintf(stdout,
+                   "Swap of shadow and primary blockmaps complete; apparent image file size = %" PRIu64 ".\n",
+                   state->apparent_filesize);
     }
   }
 }
@@ -3113,6 +3458,16 @@ uint32_t filemirror_load(FileMirror *state) {
 }
 
 
+// wait until all asynchronous vector writes and their blockmap updates have completed.
+void filemirror_wait_for_vector_operations(FileMirror *state) {
+
+  while (atomic_load_explicit(&state->vector_operations_pending,
+                              memory_order_acquire) > 0) {
+    sched_yield();
+  }
+}
+
+
 // retrieves a confidence level measuring the likelihood that 'actualblocknumber' could be a
 // component of a file of type 'filetype'. For non-exemplar blocks, the value associated with the
 // block's exemplar is returned.
@@ -3127,7 +3482,7 @@ BlockValidationDecision filemirror_get_blocktype(FileMirror *state, int64_t actu
     locked = true;
   }
 
-  BlockValidationDecision ret = state->blocktype[filemirror_get_exemplar(state, actualblocknumber)][filetype];
+  BlockValidationDecision ret = state->blocktype[filetype][filemirror_get_exemplar(state, actualblocknumber)];
 
   // need unlock?
   if (locked) {
@@ -3149,9 +3504,70 @@ void filemirror_set_blocktype(FileMirror *state, int64_t actualblocknumber, uint
   // need a lock to touch state->blocktype because of the realloc in filemirror_add_blocktype_slot()
   MUTEX_ERROR_CHECK(pthread_mutex_lock(&state->blocktype_lock), __LINE__, __FILE__);
 
-  state->blocktype[filemirror_get_exemplar(state, actualblocknumber)][filetype] = blocktype;
+  state->blocktype[filetype][filemirror_get_exemplar(state, actualblocknumber)] = blocktype;
 
   MUTEX_ERROR_CHECK(pthread_mutex_unlock(&state->blocktype_lock), __LINE__, __FILE__);
+}
+
+
+// records several file types' decisions for one block under a single lock acquisition and a single
+// exemplar lookup, instead of one lock round-trip per (block, file type). The exemplar is resolved
+// once, outside the lock: get_exemplar() reads only stable blockmap structures and is already called
+// lock-free elsewhere; only the state->blocktype directory access needs the lock, because of the
+// realloc in filemirror_add_blocktype_slot().
+//
+// THIS FUNCTION MUST NOT BE CALLED AFTER scalpel_state->block_validation_complete BECOMES true!
+void filemirror_set_blocktype_batch(FileMirror *state, int64_t actualblocknumber,
+                                    const BlocktypeAssignment *assignments, uint32_t count) {
+  if (count == 0) {
+    return;
+  }
+
+  int64_t exemplar = filemirror_get_exemplar(state, actualblocknumber);
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&state->blocktype_lock), __LINE__, __FILE__);
+  for (uint32_t i = 0; i < count; i++) {
+    state->blocktype[assignments[i].filetype][exemplar] = assignments[i].blocktype;
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&state->blocktype_lock), __LINE__, __FILE__);
+}
+
+
+// assign a default confidence to every unclassified exemplar in the active carve window for the
+// specified file types. This runs before block validators start, so the blocktype directory is
+// stable and one lock covers the complete operation. Existing classifier decisions are preserved.
+uint64_t filemirror_default_unclassified_blocktypes(
+    FileMirror *state,
+    const uint32_t *filetypes,
+    uint32_t count,
+    BlockValidationDecision default_blocktype) {
+
+  uint64_t updated = 0;
+
+  if (! state || ! filetypes || count == 0
+      || default_blocktype == BLOCK_CONFIDENCE_INVALID) {
+    return 0;
+  }
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&state->blocktype_lock), __LINE__, __FILE__);
+  for (uint64_t apparent = 0; apparent < state->apparent_blocks; apparent++) {
+    int64_t actual = state->blockmap_mapping[apparent];
+
+    if (get_exemplar(state->blockmap, actual) != actual) {
+      continue;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+      unsigned char *column = state->blocktype[filetypes[i]];
+
+      if (column[actual] == BLOCK_CONFIDENCE_INVALID) {
+        column[actual] = (unsigned char)default_blocktype;
+        updated++;
+      }
+    }
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&state->blocktype_lock), __LINE__, __FILE__);
+
+  return updated;
 }
 
 
@@ -3164,17 +3580,18 @@ void filemirror_set_blocktype(FileMirror *state, int64_t actualblocknumber, uint
 // filemirror_get_blocktype().
 void filemirror_add_blocktype_slot(FileMirror *state) {
 
-  uint64_t i;
-
   // need a lock to touch state->blocktype because of the realloc in this function
   MUTEX_ERROR_CHECK(pthread_mutex_lock(&state->blocktype_lock), __LINE__, __FILE__);
 
-  for (i = 0; i < state->blockmap->numblocks; i++) {
-    state->blocktype[i] = (unsigned char *)realloc(state->blocktype[i], scalpel_state.num_specs * sizeof(unsigned char));
-    check_memory_allocation(state->blocktype[i], __LINE__, __FILE__, "state->blocktype");
-
-    state->blocktype[i][scalpel_state.num_specs - 1] = BLOCK_CONFIDENCE_INVALID;
-  }
+  // grow the (small) column directory by one pointer and allocate a single new numblocks-byte
+  // column for the new file type. Existing columns are untouched, so their addresses stay stable.
+  // This replaces the previous per-block realloc loop (numblocks realloc calls per subtype).
+  state->blocktype = (unsigned char **)realloc(state->blocktype, scalpel_state.num_specs * sizeof(unsigned char *));
+  check_memory_allocation(state->blocktype, __LINE__, __FILE__, "state->blocktype");
+  state->blocktype[scalpel_state.num_specs - 1] =
+      (unsigned char *)malloc(state->blockmap->numblocks * sizeof(unsigned char));
+  check_memory_allocation(state->blocktype[scalpel_state.num_specs - 1], __LINE__, __FILE__, "state->blocktype");
+  memset(state->blocktype[scalpel_state.num_specs - 1], BLOCK_CONFIDENCE_INVALID, state->blockmap->numblocks);
 
   // release lock
   MUTEX_ERROR_CHECK(pthread_mutex_unlock(&state->blocktype_lock), __LINE__, __FILE__);
@@ -3188,20 +3605,23 @@ int64_t filemirror_get_exemplar(FileMirror *state, int64_t actualblocknumber) {
 }
 
 
-// read/write blocktypes data as part of checkpoint creation or restore. Returns true if the
-// blocktype data is processed successfully or false on failure. Only blocktype data for exemplar
-// blocks is stored.
+// Read or write the persistent block-classification database. The payload is column-major: one
+// byte per actual block for each file type. Only exemplar slots contain independent decisions;
+// consumers use the associated blockmap to resolve duplicate blocks. The header makes column
+// dimensions and the final post-validation subtype mapping explicit.
 //
 // THIS FUNCTION IS NOT THREAD-SAFE. CALLING CODE *MUST* ENFORCE MUTUAL EXCLUSION.
-bool filemirror_serialize_blocktype_data(FileMirror *state, StateSerialization mode, char *filename) {
+bool filemirror_serialize_blockclassification_data(FileMirror *state,
+                                                   StateSerialization mode,
+                                                   char *filename) {
 
-  FILE *fp;
-  uint64_t i;
-  uint32_t j;
-
-  size_t (*fb)(void *ptr, size_t size, size_t nitems,
-               FILE *stream) = mode == SERIALIZE ? (size_t (*)(void *ptr, size_t size, size_t nitems, FILE *stream))fwrite
-                                                 : (size_t (*)(void *ptr, size_t size, size_t nitems, FILE *stream))fread;
+  FILE *fp = NULL;
+  char magic[BLOCKCLASSIFICATION_MAGIC_SIZE];
+  uint32_t version = BLOCKCLASSIFICATION_VERSION;
+  uint32_t num_specs = scalpel_state.num_specs;
+  uint64_t blocksize = state->blocksize;
+  uint64_t numblocks = state->blockmap->numblocks;
+  bool ok = false;
 
   if (mode == SERIALIZE) {
     unlink(filename);
@@ -3209,22 +3629,84 @@ bool filemirror_serialize_blocktype_data(FileMirror *state, StateSerialization m
 
   fp = fopen(filename, mode == SERIALIZE ? "wb" : "rb");
   if (! fp) {
-    // fatal
-    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    return false;
   }
 
-  for (i = 0; i < state->blockmap->numblocks; i++) {
-    for (j = 0; j < scalpel_state.num_specs; j++) {
-      if (fb(&state->blocktype[i][j], sizeof(unsigned char), 1, fp) != 1) {
-        // something went wrong
-        return false;
+  if (mode == SERIALIZE) {
+    if (fwrite(BLOCKCLASSIFICATION_MAGIC, 1,
+               BLOCKCLASSIFICATION_MAGIC_SIZE, fp)
+            != BLOCKCLASSIFICATION_MAGIC_SIZE
+        || fwrite(&version, sizeof(version), 1, fp) != 1
+        || fwrite(&blocksize, sizeof(blocksize), 1, fp) != 1
+        || fwrite(&numblocks, sizeof(numblocks), 1, fp) != 1
+        || fwrite(&num_specs, sizeof(num_specs), 1, fp) != 1) {
+      goto done;
+    }
+
+    for (uint32_t j = 0; j < num_specs; j++) {
+      uint32_t filetype_len = (uint32_t)strlen(
+          scalpel_state.search_specs[j].FILETYPE);
+
+      if (filetype_len == 0 || filetype_len >= MAX_STRING_LENGTH
+          || fwrite(&filetype_len, sizeof(filetype_len), 1, fp) != 1
+          || fwrite(scalpel_state.search_specs[j].FILETYPE, 1,
+                    filetype_len, fp) != filetype_len) {
+        goto done;
+      }
+    }
+  }
+  else {
+    uint32_t stored_version;
+    uint32_t stored_num_specs;
+    uint64_t stored_blocksize;
+    uint64_t stored_numblocks;
+
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic)
+        || memcmp(magic, BLOCKCLASSIFICATION_MAGIC, sizeof(magic)) != 0
+        || fread(&stored_version, sizeof(stored_version), 1, fp) != 1
+        || stored_version != BLOCKCLASSIFICATION_VERSION
+        || fread(&stored_blocksize, sizeof(stored_blocksize), 1, fp) != 1
+        || stored_blocksize != blocksize
+        || fread(&stored_numblocks, sizeof(stored_numblocks), 1, fp) != 1
+        || stored_numblocks != numblocks
+        || fread(&stored_num_specs, sizeof(stored_num_specs), 1, fp) != 1
+        || stored_num_specs != num_specs) {
+      goto done;
+    }
+
+    for (uint32_t j = 0; j < num_specs; j++) {
+      char filetype[MAX_STRING_LENGTH];
+      uint32_t filetype_len;
+
+      if (fread(&filetype_len, sizeof(filetype_len), 1, fp) != 1
+          || filetype_len == 0 || filetype_len >= sizeof(filetype)
+          || fread(filetype, 1, filetype_len, fp) != filetype_len) {
+        goto done;
+      }
+      filetype[filetype_len] = '\0';
+      if (strcmp(filetype, scalpel_state.search_specs[j].FILETYPE) != 0) {
+        goto done;
       }
     }
   }
 
-  fclose(fp);
+  for (uint32_t j = 0; j < num_specs; j++) {
+    size_t processed = mode == SERIALIZE
+                           ? fwrite(state->blocktype[j], 1, numblocks, fp)
+                           : fread(state->blocktype[j], 1, numblocks, fp);
+    if (processed != numblocks) {
+      goto done;
+    }
+  }
 
-  return true;
+  ok = true;
+
+ done:
+  if ((mode == SERIALIZE && ! checkpoint_durable_close(fp))
+      || (mode == DESERIALIZE && fclose(fp) != 0)) {
+    ok = false;
+  }
+  return ok;
 }
 
 
@@ -3505,13 +3987,25 @@ bool get_apparent_block_bytes(FileMirror *state, int64_t apparentblocknumber,
 unsigned char *get_apparent_block_data(FileMirror *state, int64_t apparentblocknumber) {
 
   unsigned char *block_copy = calloc(state->blockmap->blocksize, 1);
-  int64_t actualblocknumber = state->blockmap_mapping[apparentblocknumber];
-  uint64_t length = ((uint64_t)actualblocknumber + 1) * state->blockmap->blocksize > state->filesize ?
-		   state->filesize % state->blockmap->blocksize : state->blockmap->blocksize;
-
   check_memory_allocation(block_copy, __LINE__, __FILE__, "block_copy");
-  memcpy(block_copy,
-	 state->mmap + state->blockmap_mapping[apparentblocknumber] * state->blockmap->blocksize,
-	 length);
+
+  // an out-of-range apparent block number is an internal inconsistency;
+  // filemirror_actual_blocknumber() raises a fatal
+  // SCALPEL_ERROR_BAD_BLOCKMAP_BLOCK_NUMBER. By construction an in-range
+  // apparent block always maps to a valid actual block, so no actual < 0
+  // check is needed, matching filemirror_actual_blocknumber().
+  int64_t actualblocknumber = filemirror_actual_blocknumber(state, apparentblocknumber);
+
+  uint64_t byte_start = (uint64_t)actualblocknumber * state->blockmap->blocksize;
+  if (byte_start >= state->filesize) {
+    // a mapped block starting past end-of-image means a corrupt mapping;
+    // fatal, as in filemirror_actual_location().
+    handle_error(SCALPEL_ERROR_BAD_BLOCKMAP_BLOCK_NUMBER, "get_apparent_block_data()", __LINE__, __FILE__);
+  }
+
+  uint64_t length = byte_start + state->blockmap->blocksize > state->filesize
+                    ? state->filesize - byte_start
+                    : state->blockmap->blocksize;
+  memcpy(block_copy, state->mmap + byte_start, length);
   return block_copy;
 }

@@ -108,3 +108,9 @@ src/zlib-ng
 
 # RAR development
 RARTEST/
+
+#lsp config file
+.clangd
+
+# 7Z development
+src/7zTest

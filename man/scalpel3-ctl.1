@@ -6,7 +6,6 @@ scalpel3-ctl \- Control and monitor a running scalpel3 instance
 .SH SYNOPSIS
 .B scalpel3-ctl
 [\fB-b\fR]
-[\fB-bv\fR \fIUUID1\fR \fIUUID2\fR]
 [\fB-c\fR]
 [\fB-h\fR]
 [\fB-k\fR \fIUUID\fR]
@@ -18,7 +17,7 @@ scalpel3-ctl \- Control and monitor a running scalpel3 instance
 
 .SH DESCRIPTION
 .PP
-\fBscalpel3-ctl\fR interacts with a running \fBscalpel3\fR instance on the local machine via Unix domain sockets. It provides a "human in the loop" interface that supports initiating checkpoints, getting progress reports, terminating specific carving jobs, and graceful shutdowns.
+\fBscalpel3-ctl\fR interacts with a running \fBscalpel3\fR instance on the local machine via Unix domain sockets. It provides a "human in the loop" interface that supports initiating checkpoints, getting progress reports, terminating specific carving jobs, and controlled shutdowns.
 .PP
 Exactly one command option (excluding \fB-o\fR) must be specified per invocation.
 
@@ -31,17 +30,13 @@ The following options are available:
 Retrieve and display a copy of the current primary blockmap.
 
 .TP
-.BI -bv " UUID1 UUID2"
-Retrieve and display contents of the blockvector associated with the job identified by primary \fIUUID1\fR and clone \fIUUID2\fR. Both UUIDs must be specified.
-.br
-
-\fBNote:\fR This option is currently not implemented in the backend and will return an error.
-
-.TP
 .B -c
-Request that scalpel3 create a progress checkpoint, which updates the INPROGRESS directories, where
-UUIDs of files associated with reassembly jobs can be scrutinized.  These UUIDs can be used to
-interact directly with specific carving operations, using other options such as \fB-k\fR.
+Request that scalpel3 create a progress checkpoint, which updates the
+INPROGRESS directories. UUIDs of files associated with reassembly jobs can
+then be scrutinized and used with other options such as \fB-k\fR.
+This command is available only during fragmented recovery; requests during
+other phases are rejected immediately. A successful response is sent only
+after the INPROGRESS update is complete.
 
 
 .TP
@@ -70,7 +65,13 @@ Display current carving statistics.
 
 .TP
 .B -x
-Request that scalpel3 checkpoint and then exit as soon as possible.
+Request that scalpel3 stop as soon as possible. If restartable checkpoint state exists, scalpel3 writes a checkpoint before exiting. If no restartable checkpoint state exists, scalpel3 exits cleanly without writing checkpoint state.
+
+.SH EXIT STATUS
+\fBscalpel3-ctl\fR exits with status 0 only after the requested operation
+receives a complete response. It exits with a nonzero status for invalid
+arguments, connection or transmission failures, malformed responses, or when
+the scalpel3 instance closes the IPC connection before completing the response.
 
 .SH SEE ALSO
 .BR scalpel3 (1)

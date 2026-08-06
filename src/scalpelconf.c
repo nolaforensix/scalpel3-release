@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -54,6 +54,14 @@
 // extension for carving operations (e.g., jpg) and the name for subdirectories containing recovered
 // files.
 //
+// o If MoDiCo support is desired for this file type, FILETYPE must either match a class name in
+// exe_vision/unix/class_names.json or be explicitly mapped to one in modico_classmap.c. The class
+// names file is model metadata; it is not the list of Scalpel file types. Do NOT add names to
+// class_names.json unless the MoDiCo model has been retrained/exported with the same class order.
+// For alternate Scalpel names that share an existing byte-level class (e.g., fzip uses zip), add an
+// alias in modico_classmap.c instead. If no mapping exists, Scalpel still works normally, but MoDiCo
+// will not populate block confidence values for that file type.
+//
 // o A boolean MASTER tag which must be set to true or false. Master file types are templates that
 // support dynamic creation of new file subtypes during runtime (in the block verification phase).
 //
@@ -90,9 +98,43 @@
 // determination about whether the block of data might potentially be a component of an instance of
 // the associated file type. See scalpel.h for a function prototype for BLOCKVALIDATOR and then look
 // at one of the established file types (e.g., "abc.h") for an example. NULL is permissible for
-// BLOCKVALIDATOR--this marks every block as a potential candidate for inclusion in a file of this
+// BLOCKVALIDATOR; this marks every block as a potential candidate for inclusion in a file of this
 // type. NULL is better than a block validator that simply validates every block without
 // scrutinizing the associated data.
+//
+// The value RETURNED by a block validator is the needleidx under which the block's decision is
+// recorded. (The confidence value itself is carried in and out via the 'decision' argument: on
+// entry it holds the confidence currently stored for the block, which may be a prior set by an
+// earlier classifier such as MoDiCo, and on return it holds the confidence the validator wants
+// stored.) A validator normally returns the same needleidx it was passed. However, if it recognizes
+// the block as a more specific SUBTYPE of its file type, it returns that subtype's needleidx and the
+// framework records the decision against the subtype rather than the base file type. For example,
+// csv_master_block_validate() creates a "csv-<N>col" subtype via add_file_subtype() and returns the
+// new subtype's needleidx.
+//
+// o BATCHEDBLOCKVALIDATOR is an alternative to BLOCKVALIDATOR and is MUTUALLY EXCLUSIVE with it (a
+// file type may define one or the other, never both; scalpel3 aborts at startup if both are set).
+// Whereas a BLOCKVALIDATOR is handed one block at a time by the validation threads, a
+// BATCHEDBLOCKVALIDATOR is invoked once and iterates the apparent blocks itself, deciding each
+// block's type and recording the decision directly via the block state API. It runs on the main
+// thread, in parallel with the validation threads that service the single-block validators. Like a
+// single-block validator, it may create subtypes with add_file_subtype(). Because it records its
+// own decisions, it returns nothing. See modico_populate_blocktypes() for the model it follows.
+//
+// IMPORTANT: validation backed by an ONNX model (or any GPU resource) must use a
+// BATCHEDBLOCKVALIDATOR, never a BLOCKVALIDATOR. Because the batched form owns its iteration, it
+// can initialize its model once at the top of its body (reading the run-wide execution provider
+// and GPU device list through the read-only onnx_providers.h accessors), batch its inference, and
+// tear everything down at the bottom of its body. Nothing outside the validator's own .h file is
+// involved: no scalpel.c changes, no additional hooks here. See elf.h's batched validator for a
+// complete example.
+//
+// o BLOCKVALIDATIONSCOPE declares when BLOCKVALIDATOR or BATCHEDBLOCKVALIDATOR runs.
+// BLOCK_VALIDATION_ALWAYS is the default and runs in all recovery modes.
+// BLOCK_VALIDATION_REASSEMBLY_ONLY is skipped under -c, and BLOCK_VALIDATION_DISABLED never runs.
+// When a validator is skipped, previously unclassified blocks are marked valid for that file type;
+// confidence values already supplied by MoDiCo are preserved. The -D option can override this
+// disposition for a run.
 //
 // o FILEVALIDATOR defines the corresponding file validation function. This function must be
 // thread-safe. It must also be stateless, aside from the use of the scalpel API for associating
@@ -321,7 +363,7 @@
 #include "abc.h"
 #include "csv.h"
 #include "elf.h"
-#include "fzip.h"
+// #include "fzip.h"
 #include "mp3.h"
 #include "zip.h"
 // #include "rar.h"
@@ -383,6 +425,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .DONTCARVE = png_no_carve,
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
       .BLOCKVALIDATOR = png_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
       .FILEVALIDATOR = png_file_validate,
       .SERIALIZEBLOCKSTATEFUNC = png_serialize_block_state,
       .CLONEBLOCKSTATEFUNC = png_clone_block_state,
@@ -411,6 +454,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .FOOTER = "/\\x{00}\x3b/",
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
       .BLOCKVALIDATOR = gif_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
       .FILEVALIDATOR = gif_file_validate,
       .PRIORITY = PRIORITY_PI,
       .SERIALIZEBLOCKSTATEFUNC = NULL,
@@ -473,8 +517,10 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .FOOTER = {0},
       .FOOTERFUNC = NULL,
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
-      .BLOCKVALIDATOR = elf_block_validate,
+      .BATCHEDBLOCKVALIDATOR = elf_batched_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
       .FILEVALIDATOR = elf_file_validate,
+      .CANDIDATEVALIDATOR = elf_candidate_validate_layout,
       .PRIORITY = PRIORITY_HIGHEST,
       .SERIALIZEBLOCKSTATEFUNC = elf_serialize_block_state,
       .CLONEBLOCKSTATEFUNC = elf_clone_block_state,
@@ -502,25 +548,26 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .FOOTERFUNC = NULL,
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
       .BLOCKVALIDATOR = zip_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
       .FILEVALIDATOR = zip_file_validate,
       .PRIORITY = PRIORITY_SIGMA,
       .NO_DEFRAG = true},
 
     // Fragmented ZIP files
     //
-    {
-      .FILETYPE = "fzip",
-      .MASTER = false,
-      .MINIMUMSIZE = 1024,
-      .MAXIMUMSIZE = 1000000000,
-      .HEADER = {0},
-      .FOOTER = "|somethingsomethingsomething|",
-      .FOOTERFUNC = NULL,
-      .BLOCKVALIDATOR = fzip_block_validate,
-      .SEARCHTYPE = SEARCHTYPE_BACKWARD,
-      .REASSEMBLYFUNC = fzip_reassembly,
-      .PRIORITY = PRIORITY_SIGMA,
-    },
+    // {
+    //   .FILETYPE = "fzip",
+    //   .MASTER = false,
+    //   .MINIMUMSIZE = 1024,
+    //   .MAXIMUMSIZE = 1000000000,
+    //   .HEADER = {0},
+    //   .FOOTER = "|somethingsomethingsomething|",
+    //   .FOOTERFUNC = NULL,
+    //   .BLOCKVALIDATOR = fzip_block_validate,
+    //   .SEARCHTYPE = SEARCHTYPE_BACKWARD,
+    //   .REASSEMBLYFUNC = fzip_reassembly,
+    //   .PRIORITY = PRIORITY_SIGMA,
+    // },
 
   //   {
   //     .FILETYPE = "rar",
@@ -623,7 +670,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .PRINTCARVESTATEFUNC       = pdf_print_carve_state,
       .REASSEMBLYFUNC            = pdf_reassembly,
       .PRIORITY = PRIORITY_SIGMA,
-      .NO_DEFRAG = true
+      .NO_DEFRAG = false
     },
 
     /////////////////////////////////////////////////////////////////

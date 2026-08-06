@@ -50,8 +50,10 @@ scalpel3.
 
 # Compilation Instructions
 
-On Linux and macOS, the configuration script should install needed dependencies. On macOS, this
-requires that either macports or homebrew be installed first.
+On Linux and macOS, the configuration script installs needed dependencies, including FUSE 3 for
+blockmapfs. On macOS, this requires that either MacPorts or Homebrew be installed first. The first
+macFUSE installation or upgrade may require approval in System Settings under Privacy & Security
+and a restart; rerun the configuration script after restarting.
 
 To build scalpel3, issue the following command:
 
@@ -71,7 +73,48 @@ create a synthetic disk image, creating a blockmap, and then running scalpel3.  
 the scalpel-output directory.  This very simple test should take no more than a minute or two on a
 fast machine.
 
+To generate and display the small disk visualization example, run `TESTS/cmdline.diskviz` from the
+`src` directory.
+
+Blockmapfs exposes directories and regular files that have an adjacent regular `.blockmap` file.
+It hides blockmap files, unmapped regular files, and symbolic links. The source and mount
+directories must not overlap. Source files and blockmaps are immutable for the lifetime of a
+mount; unmount and remount after changing either one.
+
+Only one active scalpel3 process may use a given base output directory.  Scalpel3 enforces this with
+a persistent `.scalpel3.lock` file whose operating-system lock is held for the process lifetime.  The
+file may remain after scalpel3 exits; its presence alone does not indicate that a process is active.
+Newly created scalpel3 output directories and files are owner-only (`0700` and `0600`,
+respectively); permissions can be changed externally when output must be shared.
+
 Some file type validators are experimental--see the scalpelconf.c comments for details.
+
+# Phase Databases and Early Exit
+
+After block validation completes, scalpel3 writes a persistent, versioned
+`blockclassification.dat` in the output directory.  It contains the final file-type and subtype
+mapping and the block confidence table produced by MoDiCo and the regular block validators.  The
+file is written even when checkpointing is disabled.  Restartable checkpoints depend on this file,
+so it must be retained with the checkpoint files for a later restore.
+
+Restartable state is kept in two alternating checkpoint slots.  Scalpel3 writes and verifies the
+inactive slot completely before atomically publishing it, and retains the previously published slot
+as a fallback.  If a save is interrupted or the published slot is damaged, restore selects the
+newest valid slot.  The image blockmap is deliberately outside this transaction: users and external
+tools may cover or uncover blocks between runs, and restored candidates are reconciled with the
+blockmap that is supplied to the resumed run.
+
+The `-H` option requires the phase after which scalpel3 should stop:
+
+```text
+-H block-validation
+-H header-footer
+```
+
+The first form writes `blockclassification.dat` and exits before header/footer searching.  The
+second continues through header/footer searching, writes `headersfooters.dat`, and then exits, so
+both databases are available.  A run without `-H` continues into carving normally.  The existing
+`-c` option remains the way to disable fragmented recovery and cannot be combined with `-H`.
 
 # Contributing
 

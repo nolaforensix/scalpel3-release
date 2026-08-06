@@ -1,5 +1,5 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G.Richard III and contributors.
+// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
 //
 // This program is free software : you can redistribute it and / or modify it under the terms of the
 // GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -45,6 +45,8 @@
 #define _LARGEFILE64_SOURCE 1
 #define _FILE_OFFSET_BITS 64
 
+#define FILEMIRROR_STAGING_PATTERN "*.scalpel3-part-*"
+
 #include "prioque.h"
 #include "roaring.h"            // GGRIII:  Address pre-std23 atomic vs. stdatomic incompat
 #include "scalpel.h"
@@ -68,6 +70,13 @@
 #include <sys/timeb.h>
 #include <time.h>
 #include <unistd.h>
+
+typedef enum FilePublicationReservation {
+  FILE_PUBLICATION_RESERVED = 0,
+  FILE_PUBLICATION_COMMITTED = 1,
+  FILE_PUBLICATION_IN_PROGRESS = 2,
+  FILE_PUBLICATION_ERROR = 3,
+} FilePublicationReservation;
 
 // main filemirror type
 typedef struct FileMirror FileMirror;
@@ -128,10 +137,16 @@ void deflate_blockvector_single_block(BlockVector *b,
                                       uint64_t apparentindex, uint64_t oldlength);
 void deflate_blockvector(BlockVector *b);
 void clone_blockvector(BlockVector *s, BlockVector **d, bool clone_choices);
+FilePublicationReservation filemirror_reserve_output(const char *pathname,
+                                                      CarveInfoFlavor flavor,
+                                                      char staging_pathname[PATH_MAX]);
 void write_blockvector(BlockVector *b,
                        char *pathname,
+                       char *staging_pathname,
                        char *blockvector_pathname,
+                       CarveInfoFlavor flavor,
                        bool update_blockmap);
+void filemirror_wait_for_vector_operations(FileMirror *state);
 void resize_blockvector(BlockVector *b, uint64_t num_blocks);
 void display_blockvector(BlockVector *b, char *msg);
 void validate_blockvector(BlockVector *b, bool truncate);
@@ -193,6 +208,7 @@ int64_t filemirror_apparent_blocknumber(FileMirror *state,
                                         int64_t actualblocknumber);
 void filemirror_update_blockmap(FileMirror *state, BlockVector *b);
 void filemirror_write_blockmap(FileMirror *state, char *filename);
+void filemirror_publish_blockmap(FileMirror *state);
 bool filemirror_write_blockmap_h(FileMirror *state, int handle);
 void filemirror_swap_blockmaps(FileMirror *state);
 uint32_t filemirror_load(FileMirror *state);
@@ -204,9 +220,26 @@ void filemirror_set_blocktype(FileMirror *state,
                               int64_t actualblocknumber,
                               uint32_t filetype,
                               BlockValidationDecision blocktype);
+// records several file types' decisions for one block under a single lock acquisition and a single
+// exemplar lookup, instead of one lock round-trip per (block, file type). Equivalent in effect to
+// calling filemirror_set_blocktype() once per assignment. Intended for callers that grade many file
+// types per block, such as MoDiCo. Same locking rationale and block_validation_complete restriction
+// as filemirror_set_blocktype(). BlocktypeAssignment is defined in scalpel.h, which is where the
+// complete BlockValidationDecision enum lives (it is not yet visible this early in the header chain).
+struct BlocktypeAssignment;
+void filemirror_set_blocktype_batch(FileMirror *state,
+                                    int64_t actualblocknumber,
+                                    const struct BlocktypeAssignment *assignments,
+                                    uint32_t count);
+uint64_t filemirror_default_unclassified_blocktypes(
+    FileMirror *state,
+    const uint32_t *filetypes,
+    uint32_t count,
+    BlockValidationDecision default_blocktype);
 void filemirror_add_blocktype_slot(FileMirror *state);
-bool filemirror_serialize_blocktype_data(FileMirror *state, StateSerialization mode,
-                                         char *filename);
+bool filemirror_serialize_blockclassification_data(FileMirror *state,
+                                                   StateSerialization mode,
+                                                   char *filename);
 unsigned char *get_apparent_block_data(FileMirror *state, int64_t apparentblocknumber);
 bool get_apparent_block_bytes(FileMirror *state, int64_t apparentblocknumber,
                               uint64_t offset, uint32_t count, unsigned char *out);
