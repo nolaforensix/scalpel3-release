@@ -1,32 +1,32 @@
-Scalpel3 License
-================
-Copyright (C) 2021-2026  Golden G. Richard III and contributors
+# Scalpel3 License
 
-Scalpel3 is free software: you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your
-option) any later version.
+Copyright (C) 2021-2026 Golden G. Richard III and contributors
 
-Scalpel3 is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-General Public License for more details.
+Scalpel3 is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, version 3 only.
 
-You should have received a copy of the GNU General Public License
-along with Scalpel3.  If not, see <https://www.gnu.org/licenses/>.
+Scalpel3 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
 
-----------------------------
-Additional Integration Terms
-----------------------------
+You should have received a copy of the GNU General Public License along with Scalpel3.
+If not, see <https://www.gnu.org/licenses/>.
 
-Linking or embedding Scalpel3 (statically or dynamically) into another
-program—such that the resulting executable or library forms a single
-combined work constitutes creation of a derivative work under the GPL.
-Any party distributing such a combined work must make the entire source
-code available under the terms of the GPL as well.
+The complete license text is provided in `COPYING`.
 
-Commercial entities wishing to use Scalpel3 in a closed-source or proprietary
-product or requiring support must obtain a separate commercial license.
+This license applies to the Scalpel3 backend, toolchain, and all file validators.
 
-For commercial licensing or questions about integration, contact:
-Golden G. Richard III (golden@cct.lsu.edu).
+## GPL Integration Notice
+
+The Scalpel3 copyright holders consider linking or embedding Scalpel3, statically or
+dynamically, into another program to create a single combined work governed by GPL v3. Anyone
+distributing such a combined work must comply with GPL v3, including providing the complete
+corresponding source for the combined work.
+
+For proprietary or commercial use cases that require integration or support, contact Golden G.
+Richard III (golden@cct.lsu.edu) to discuss commercial licensing.
+
+## Third-Party Components
+
+Third-party components remain subject to their respective licenses. See `THIRD_PARTY_NOTICES` for
+details.

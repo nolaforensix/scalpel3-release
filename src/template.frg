@@ -4,6 +4,14 @@
 # use /* and */ to bracket lines and place the /* and */ strings on
 # lines by themselves. All options are case insensitive.
 
+# Option values may contain environment variables using ${NAME}.
+# For example, first set the variable in your shell:
+#   export SCALPEL3_DATA="$HOME/SCALPEL3_DATA"
+# Then use it in a FILE entry:
+#   FILE: "${SCALPEL3_DATA}/jpg/example.jpg"
+#
+# Variable names are case sensitive.
+
 # Numeric arguments must contain unsigned base-10 digits only. Except
 # for BLOCKSIZE and file block-number sets/ranges, they may range from
 # 0 through 9223372036854775807.

@@ -1,35 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//------------------------------
-// Additional Integration Terms
-// -----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // FileMirror design and implementation Copyright (c) 2021-2026 by Golden G. Richard III. The
 // filemirror handles most high-performance sequential and vector-based I/O as well as blockmap
 // operations for scalpel3.
@@ -122,22 +116,23 @@ typedef struct FileMirror {
 // Data associated with blockvectors is synchronized only by inflate_blockvector() or
 // inflate_blockvector_single_block(). Changing apparent or actual block numbers does not update
 // data/seqdata. Until one of the inflate functions is called, data/seqdata may still represent the
-// byte view from the previous inflation.
+// byte view from the previous inflation. Inflation and deflation affect byte residency but do not
+// change the logical byte extent.
 
 typedef struct BlockVector {
   char *data;                     // data corresponding to valid apparent
                                   // block numbers when actual blocks are not adjacent
   char *seqdata;                  // data corresponding to valid apparent
                                   // block numbers when actual blocks are adjacent
-  uint64_t numblocks;             // # of blocks in block vector
+  uint64_t numblocks;             // number of logical block slots currently represented
   int64_t *apparent_blocknumber;  // vector of block numbers adjusted
                                   // to ignore covered blocks
   bool *valid;                    // true if data in corresponding
                                   // block is valid
   int64_t *actual_blocknumber;    // vector of actual block numbers in
                                   // file being mirrored
-  uint64_t length;                // length of 'data' in blockvector
-  uint64_t non_peekahead_length;  // length excluding sequential read peekahead bytes
+  uint64_t length;                // logical byte extent represented by the blockvector
+  uint64_t non_peekahead_length;  // logical extent excluding sequential read peekahead bytes
   roaring64_bitmap_t **choices;   // array of bitmaps representing
                                   // possible suitable block numbers for each block
   FileMirror *filemirror;         // associated file mirror
@@ -153,9 +148,9 @@ static void read_vector(BlockVector *b);
 static void inflate_blockvector_no_IO(BlockVector *b);
 static void blockvector_reserve_blocks(BlockVector *b, uint64_t start, uint64_t stop);
 static void blockvector_unreserve_blocks(BlockVector *b, uint64_t start, uint64_t stop);
-static void blockvector_init_choices(BlockVector *b, uint64_t index, roaring64_bitmap_t *s);
+static void blockvector_init_choices(BlockVector *b, uint64_t index,
+                                     const roaring64_bitmap_t *s);
 static void blockvector_set_actual_blocknumber(BlockVector *b, uint64_t index, int64_t blocknumber);
-static uint64_t blockvector_actual_block_length(BlockVector *b, uint64_t index);
 static void mem_pretouch_read(void *p, size_t n);
 static void mem_pretouch_write(void *p, size_t n);
 static bool all_consecutive_actual_blocknumbers(BlockVector *b);
@@ -210,7 +205,7 @@ atomic_ullong random_write_wait;
 // * SHOULD BE MANIPULATED BY A SINGLE THREAD AT A TIME.                        *
 // ******************************************************************************
 
-// set apparent length of data associated with blockvector
+// set the logical byte extent represented by a blockvector
 void blockvector_set_data_length(BlockVector *b, uint64_t length) {
 
   b->length = length <= b->numblocks * b->filemirror->blocksize ? length : b->numblocks * b->filemirror->blocksize;
@@ -218,7 +213,39 @@ void blockvector_set_data_length(BlockVector *b, uint64_t length) {
 }
 
 
-// get apparent length of data associated with blockvector
+// Use the complete extent of the current logical slots as the data length. A
+// short final evidence block contributes only the bytes present in the image
+// when it occupies the final slot.
+void blockvector_set_data_length_to_mapped_extent(BlockVector *b) {
+
+  uint64_t length;
+
+  if (! b) {
+    handle_error(SCALPEL_ERROR_UNINITIALIZED_BLOCKVECTOR,
+                 "blockvector_set_data_length_to_mapped_extent()",
+                 __LINE__, __FILE__);
+  }
+
+  length = b->numblocks * b->filemirror->blocksize;
+  if (b->numblocks > 0 && b->filemirror->filesize % b->filemirror->blocksize) {
+    const uint64_t last_index = b->numblocks - 1;
+    const int64_t apparent = b->apparent_blocknumber[last_index];
+    int64_t actual = b->actual_blocknumber[last_index];
+
+    if (apparent >= 0 && (uint64_t)apparent < b->filemirror->apparent_blocks) {
+      actual = b->filemirror->blockmap_mapping[apparent];
+    }
+    if (actual == (int64_t)b->filemirror->blockmap->numblocks - 1) {
+      length -= b->filemirror->blocksize
+                - b->filemirror->filesize % b->filemirror->blocksize;
+    }
+  }
+
+  blockvector_set_data_length(b, length);
+}
+
+
+// get the logical byte extent represented by a blockvector
 uint64_t blockvector_get_data_length(BlockVector *b) {
   return b->length;
 }
@@ -240,36 +267,22 @@ uint64_t blockvector_data_pointer_offset_to_actual_location(BlockVector *b, uint
 }
 
 
-static uint64_t blockvector_actual_block_length(BlockVector *b, uint64_t index) {
-
-  uint64_t block_start;
-  uint64_t blocksize = b->filemirror->blocksize;
-
-  if (b->actual_blocknumber[index] < 0) {
-    return 0;
-  }
-
-  block_start = (uint64_t)b->actual_blocknumber[index] * blocksize;
-  if (block_start >= b->filemirror->filesize) {
-    return 0;
-  }
-
-  return block_start + blocksize > b->filemirror->filesize
-             ? b->filemirror->filesize - block_start
-             : blocksize;
-}
-
-
 // return number of blocks currently in blockvector
 uint64_t blockvector_get_num_blocks(BlockVector *b) {
   return b->numblocks;
 }
 
 
-// set apparent blocknumber at specified index
+// Set the apparent block number at the specified index. An explicit negative
+// assignment makes the slot unmapped; clear its actual mapping as well so the
+// next inflation zero-fills the slot instead of reusing stale data.
 void blockvector_set_apparent_blocknumber(BlockVector *b, uint64_t index, int64_t blocknumber) {
 
   b->apparent_blocknumber[index] = blocknumber;
+  if (blocknumber < 0) {
+    b->valid[index] = false;
+    blockvector_set_actual_blocknumber(b, index, -1);
+  }
 }
 
 
@@ -303,18 +316,36 @@ int64_t blockvector_get_actual_blocknumber(BlockVector *b, uint64_t index) {
 // it does not generally synchronize block number changes with byte storage. If both the mmap
 // fast-path (seqdata) and the allocated buffer (data) are NULL, re-inflate the blockvector to
 // populate the data. This can happen when deflate_blockvector_single_block() clears seqdata but data
-// was never allocated (blocks were always read via the mmap fast path). The validated data length is
-// preserved across the re-inflate.
+// was never allocated (blocks were always read via the mmap fast path).
 char *blockvector_get_data_pointer(BlockVector *b) {
 
   if (b->seqdata) {
-    return b->seqdata;
+    const uint64_t blocksize = b->filemirror->blocksize;
+    const int64_t first_actual = b->actual_blocknumber[0];
+    const uint64_t capacity = b->numblocks * blocksize;
+    const uint64_t start = (uint64_t)first_actual * blocksize;
+    uint64_t available = b->filemirror->filesize - start;
+
+    if (available > capacity) {
+      available = capacity;
+    }
+    if (b->length <= available) {
+      return b->seqdata;
+    }
+
+    // A caller may extend the logical length through the short final image
+    // block. Materialize that view so the requested zero padding is backed by
+    // accessible memory rather than bytes beyond the mmap.
+    b->data = realloc(b->data, b->malloc_length * blocksize);
+    check_memory_allocation(b->data, __LINE__, __FILE__, "b->data");
+    memcpy(b->data, b->seqdata, available);
+    memset(b->data + available, 0, capacity - available);
+    b->seqdata = NULL;
+    return b->data;
   }
 
   if (!b->data && b->numblocks > 0) {
-    uint64_t saved_length = b->length;
     inflate_blockvector(b);
-    b->length = saved_length;
     if (b->seqdata) {
       return b->seqdata;
     }
@@ -379,8 +410,6 @@ void normalize_blockvector(BlockVector *b) {
     }
   }
 
-  b->non_peekahead_length = b->length;
-
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Normalization of blockvector %p complete.\n", b);
   }
@@ -393,9 +422,6 @@ void normalize_blockvector(BlockVector *b) {
 void clone_blockvector(BlockVector *s, BlockVector **d, bool clone_choices) {
 
   uint64_t i;
-  uint64_t saved_length;
-  uint64_t saved_non_peekahead_length;
-
   if (! s) {
     // fatal
     handle_error(SCALPEL_ERROR_UNINITIALIZED_BLOCKVECTOR, "clone_blockvector()", __LINE__, __FILE__);
@@ -405,11 +431,7 @@ void clone_blockvector(BlockVector *s, BlockVector **d, bool clone_choices) {
     lock_fprintf(stdout, "Cloning blockvector %p to %p.\n", s, *d);
   }
 
-  saved_length = s->length;
-  saved_non_peekahead_length = s->non_peekahead_length;
   inflate_blockvector(s);
-  s->length = saved_length;
-  s->non_peekahead_length = saved_non_peekahead_length;
 
   init_blockvector(s->filemirror, d, s->numblocks, false);
 
@@ -715,8 +737,9 @@ void validate_blockvector(BlockVector *b, bool truncate) {
 
 
 // resize the storage allocated to a blockvector to correspond to new 'num_blocks' value without
-// destroying existing data. The blockvector must have been previously initialized. A design goal is
-// to minimize the number of calls to realloc().
+// destroying existing data. Shrinking clamps the logical byte extent to the new capacity; growing
+// preserves it until the caller explicitly extends it. The blockvector must have been previously
+// initialized. A design goal is to minimize the number of calls to realloc().
 void resize_blockvector(BlockVector *b, uint64_t num_blocks) {
 
   uint64_t i;
@@ -819,7 +842,8 @@ resize_complete:
 
 
 // initialize a blockvector using *apparent* positions 'start' and 'stop' in the image file. All
-// block numbers are inserted and blocks are marked invalid. No I/O is performed.
+// block numbers are inserted, the logical length covers the mapped slots, and blocks are marked
+// invalid. No I/O is performed.
 void init_contiguous_blockvector(FileMirror *state, BlockVector **b, int64_t start, int64_t stop, bool disable_reservations) {
 
   uint64_t i;
@@ -832,7 +856,8 @@ void init_contiguous_blockvector(FileMirror *state, BlockVector **b, int64_t sta
   }
 
   (*b)->filemirror = state;
-  (*b)->numblocks = CEILDIV((stop - start + 1), state->blocksize);
+  (*b)->numblocks = (uint64_t)stop / state->blocksize
+                    - (uint64_t)start / state->blocksize + 1;
   (*b)->ignore_reservations = ! scalpel_state.reservations || disable_reservations;
   (*b)->malloc_length = (*b)->numblocks + MALLOC_SLACK;
   (*b)->actual_blocknumber = malloc(sizeof(int64_t) * (*b)->malloc_length);
@@ -854,6 +879,7 @@ void init_contiguous_blockvector(FileMirror *state, BlockVector **b, int64_t sta
   (*b)->data = NULL;
   (*b)->seqdata = NULL;
   (*b)->choices = NULL;
+  blockvector_set_data_length_to_mapped_extent(*b);
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Initialization of contiguous blockvector %p complete.\n", *b);
@@ -911,7 +937,7 @@ void free_blockvector(BlockVector **b) {
 
 
 // used internally to allocate memory and determine whether fast mode reads are possible. The
-// blockvector should already be normalized.
+// blockvector should already be normalized. This function does not change logical length.
 static void inflate_blockvector_no_IO(BlockVector *b) {
 
   uint64_t i;
@@ -934,15 +960,6 @@ static void inflate_blockvector_no_IO(BlockVector *b) {
 
     // set seqdata to allow fast reads against mmap()-ed image file
     b->seqdata = b->filemirror->mmap + b->actual_blocknumber[0] * b->filemirror->blocksize;
-    b->length = b->numblocks * b->filemirror->blocksize;
-
-    // cap length to file size
-    if (b->actual_blocknumber[b->numblocks - 1] == (int64_t)b->filemirror->blockmap->numblocks - 1
-        && b->filemirror->filesize % b->filemirror->blocksize) {
-      b->length -= b->filemirror->blocksize - b->filemirror->filesize % b->filemirror->blocksize;
-    }
-    b->non_peekahead_length = b->length;
-
     // make all blocks valid
     for (i = 0; i < b->numblocks; i++) {
       b->valid[i] = true;
@@ -975,7 +992,7 @@ static void inflate_blockvector_no_IO(BlockVector *b) {
 
 // allocate storage for blocks for a previously initialized blockvector, if that allocation was not
 // already performed. The blockvector is also normalized and vector I/O performed to populate the
-// blockvector.
+// blockvector. Logical length is unchanged.
 void inflate_blockvector(BlockVector *b) {
 
   if (scalpel_state.mode_verbose) {
@@ -1096,8 +1113,7 @@ uint64_t inflate_blockvector_single_block(BlockVector *b, uint64_t apparentindex
         b->valid[i] = false;
       }
 
-      // read_vector reads all blocks (including the new one) and sets b->length to the new correct
-      // total.
+      // read_vector reads all blocks, including the new one.
       read_vector(b);
     }
   }
@@ -1129,7 +1145,7 @@ void deflate_blockvector_single_block(BlockVector *b, uint64_t apparentindex, ui
 }
 
 
-// deallocate data storage for blocks for a previously initialized block vector.
+// deallocate resident data storage without changing the logical blockvector extent.
 void deflate_blockvector(BlockVector *b) {
 
   if (! b) {
@@ -1149,8 +1165,6 @@ void deflate_blockvector(BlockVector *b) {
 
   b->data = NULL;
   b->seqdata = NULL;
-  b->length = 0;
-  b->non_peekahead_length = 0;
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout, "Deflation of blockvector %p complete.\n", b);
@@ -1228,7 +1242,8 @@ static void blockvector_unreserve_blocks(BlockVector *b, uint64_t start, uint64_
 //
 // The exclusion set for a particular block index contains *actual* block numbers that have
 // been eliminated as choices. Membership in the set means excluded.
-void blockvector_init_choices(BlockVector *b, uint64_t index, roaring64_bitmap_t *s) {
+void blockvector_init_choices(BlockVector *b, uint64_t index,
+                              const roaring64_bitmap_t *s) {
 
   if (! b->choices) {
     // first use of choices (ever or since last free)
@@ -1310,6 +1325,67 @@ int64_t blockvector_get_choice(BlockVector *b, uint64_t index, int64_t apparentb
   }
 
   return blocknumber;
+}
+
+
+// determine whether an actual block has been explicitly excluded from the choices for one block
+// vector index. This does not apply blockmap selectability rules, so callers can distinguish a
+// rejected physical duplicate from one omitted by exemplar-only enumeration.
+bool blockvector_choice_is_excluded(BlockVector *b,
+                                    uint64_t index,
+                                    int64_t apparentblocknumber) {
+
+  int64_t actualblocknumber;
+
+  if (! b || index >= b->numblocks || apparentblocknumber < 0 ||
+      apparentblocknumber >= (int64_t)b->filemirror->apparent_blocks) {
+    return true;
+  }
+
+  actualblocknumber = b->filemirror->blockmap_mapping[apparentblocknumber];
+
+  if (actualblocknumber < 0) {
+    return true;
+  }
+
+  return b->choices && b->choices[index] &&
+    roaring64_bitmap_contains(b->choices[index], actualblocknumber);
+}
+
+
+// Return an owned copy of the actual-block exclusion set for one slot. NULL
+// means that no exclusions have been recorded.
+roaring64_bitmap_t *blockvector_clone_choice_exclusions(BlockVector *b,
+                                                        uint64_t index) {
+
+  if (! b || index >= b->numblocks || ! b->choices || ! b->choices[index]) {
+    return NULL;
+  }
+
+  roaring64_bitmap_t *copy = roaring64_bitmap_copy(b->choices[index]);
+  check_memory_allocation(copy, __LINE__, __FILE__,
+                          "blockvector choice exclusions");
+  return copy;
+}
+
+
+// Restore an actual-block exclusion set into one slot. Actual block numbers
+// remain stable when a checkpoint activates a newly merged blockmap.
+void blockvector_restore_choice_exclusions(
+    BlockVector *b,
+    uint64_t index,
+    const roaring64_bitmap_t *excluded_actual_blocks) {
+
+  if (! b || index >= b->numblocks) {
+    handle_error(SCALPEL_ERROR_BAD_BLOCKMAP_BLOCK_NUMBER,
+                 "blockvector_restore_choice_exclusions()", __LINE__,
+                 __FILE__);
+  }
+
+  blockvector_free_choices(b, index);
+  if (excluded_actual_blocks) {
+    blockvector_init_choices(b, index, excluded_actual_blocks);
+  }
 }
 
 
@@ -2547,6 +2623,11 @@ FileMirror *filemirror_start(char *image_pathname, char *blockmap_pathname, uint
     lock_fprintf(stdout, "Current carve window matches blockmap, no action is necessary.\n");
   }
 
+  // Reservations belong to live vectors, not the previous process.
+  for (i = 0; i < state->blockmap->numblocks; i++) {
+    atomic_store_explicit(&state->blockmap->reservations[i], 0, memory_order_relaxed);
+  }
+
   fseek(state->imagefile, 0, SEEK_SET);  // rewind image file
 
   state->blockmap_mapping = (int64_t *)malloc((state->blockmap->numblocks) * sizeof(int64_t));
@@ -2916,6 +2997,7 @@ static void read_vector(BlockVector *b) {
   uint64_t startindex;
   uint64_t start;
   uint64_t length;
+  uint64_t run_capacity;
   struct timespec begintime, endtime;
 
   if (! b) {
@@ -2936,25 +3018,16 @@ static void read_vector(BlockVector *b) {
   clock_gettime(CLOCK_MONOTONIC, &begintime);
 
   i = 0;
-  b->length = 0;
 
   while (i < b->numblocks) {
     // skip blocks marked valid
     while (i < b->numblocks && b->valid[i]) {
-      b->length += blockvector_actual_block_length(b, i);
       i++;
     }
 
     // zero and skip blocks with invalid actual block numbers
     while (i < b->numblocks && b->actual_blocknumber[i] < 0) {
-      uint64_t zlen = b->filemirror->blocksize;
-      // Cap to file boundary, same as valid blocks below.
-      if (b->length + zlen > b->filemirror->filesize) {
-        zlen = (b->length < b->filemirror->filesize)
-            ? b->filemirror->filesize - b->length : 0;
-      }
       memset(b->data + i * b->filemirror->blocksize, 0, b->filemirror->blocksize);
-      b->length += zlen;
       i++;
     }
 
@@ -2985,6 +3058,7 @@ static void read_vector(BlockVector *b) {
       b->valid[i] = true;
       i++;
     }
+    run_capacity = (i - startindex) * b->filemirror->blocksize;
 
     // constrain to actual image file size
     if (start + length > b->filemirror->filesize) {
@@ -2992,9 +3066,11 @@ static void read_vector(BlockVector *b) {
     }
 
     memcpy(b->data + startindex * b->filemirror->blocksize, b->filemirror->mmap + start, length);
-    b->length += length;
+    if (length < run_capacity) {
+      memset(b->data + startindex * b->filemirror->blocksize + length,
+             0, run_capacity - length);
+    }
   }
-  b->non_peekahead_length = b->length;
 
   clock_gettime(CLOCK_MONOTONIC, &endtime);
   atomic_fetch_add_explicit(&random_read_wait,
@@ -3220,6 +3296,15 @@ char *filemirror_actual_block_data_pointer(FileMirror *state,
 int64_t filemirror_actual_block_reserved(FileMirror *state, int64_t actualblocknumber) {
 
   return is_block_reserved(state->blockmap, actualblocknumber);
+}
+
+
+// return the number of uncovered physical copies represented by an actual block's exemplar
+//
+// THIS FUNCTION IS THREAD-SAFE.
+uint64_t filemirror_actual_block_reference_count(FileMirror *state, int64_t actualblocknumber) {
+
+  return get_reference_count(state->blockmap, actualblocknumber);
 }
 
 
@@ -3533,6 +3618,44 @@ void filemirror_set_blocktype_batch(FileMirror *state, int64_t actualblocknumber
 }
 
 
+// copy one complete file type confidence column.  This is intended for bulk persistence operations
+// that run before block validation completes; ordinary block selection should continue to use
+// filemirror_get_blocktype() so duplicate blocks resolve through their exemplars.
+bool filemirror_copy_blocktype_column(FileMirror *state, uint32_t filetype,
+                                      unsigned char *column, uint64_t count) {
+
+  if (! state || ! column || filetype >= scalpel_state.num_specs
+      || count != state->blockmap->numblocks || count > SIZE_MAX) {
+    return false;
+  }
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&state->blocktype_lock), __LINE__, __FILE__);
+  memcpy(column, state->blocktype[filetype], (size_t)count);
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&state->blocktype_lock), __LINE__, __FILE__);
+
+  return true;
+}
+
+
+// replace one complete file type confidence column.  The caller must invoke this before block
+// validation completes, while the block type directory can still be modified.
+bool filemirror_replace_blocktype_column(FileMirror *state, uint32_t filetype,
+                                         const unsigned char *column, uint64_t count) {
+
+  if (! state || ! column || scalpel_state.block_validation_complete
+      || filetype >= scalpel_state.num_specs
+      || count != state->blockmap->numblocks || count > SIZE_MAX) {
+    return false;
+  }
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&state->blocktype_lock), __LINE__, __FILE__);
+  memcpy(state->blocktype[filetype], column, (size_t)count);
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&state->blocktype_lock), __LINE__, __FILE__);
+
+  return true;
+}
+
+
 // assign a default confidence to every unclassified exemplar in the active carve window for the
 // specified file types. This runs before block validators start, so the blocktype directory is
 // stable and one lock covers the complete operation. Existing classifier decisions are preserved.
@@ -3723,13 +3846,14 @@ void seq_read_blockvector(FileMirror *state, BlockVector **b, FILE *fp) {
   uint64_t num_blocks = 0;
   char *serialized_bitmap;
   size_t serialized_length;
+  bool ignore_reservations;
 
   if (fread(&num_blocks, sizeof(num_blocks), 1, fp) != 1) {
     // fatal
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
-  init_blockvector(state, b, num_blocks, false);
+  init_blockvector(state, b, num_blocks, true);
 
   for (i = 0; i < num_blocks; i++) {
     if (fread(&((*b)->apparent_blocknumber[i]), sizeof((*b)->apparent_blocknumber[i]), 1, fp) != 1) {
@@ -3743,9 +3867,6 @@ void seq_read_blockvector(FileMirror *state, BlockVector **b, FILE *fp) {
       perror("actual blocknumber");
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
-
-    // must issue a reservation manually, since blockvector_set_actual_blocknumber() was bypassed
-    blockvector_reserve_blocks(*b, i, i);
   }
 
   if (fread(&((*b)->length), sizeof((*b)->length), 1, fp) != 1) {
@@ -3811,10 +3932,16 @@ void seq_read_blockvector(FileMirror *state, BlockVector **b, FILE *fp) {
   }
 
   // read ignore_reservations flag
-  if (fread(&(*b)->ignore_reservations, sizeof((*b)->ignore_reservations), 1, fp) != 1) {
+  if (fread(&ignore_reservations, sizeof(ignore_reservations), 1, fp) != 1) {
     perror("ignore_reservations");
     // fatal
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+
+  (*b)->ignore_reservations = ignore_reservations || ! scalpel_state.reservations;
+  // Acquire ownership only after the saved reservation policy is known.
+  if ((*b)->numblocks > 0) {
+    blockvector_reserve_blocks(*b, 0, (*b)->numblocks - 1);
   }
 }
 

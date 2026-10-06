@@ -1,34 +1,27 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-// ----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
-//
-// Please see LICENSE.md and README.md for further information.
-//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
 /**
@@ -111,10 +104,11 @@
  *      (contiguous runs of FULL/PARTIAL/UNKNOWN blocks in actual-block space)
  *      and matches them to holes of equal length. Standard .eh_frame_hdr
  *      function starts and direct-call targets can identify a statistically
- *      separated fragment on x86-64 and AArch64; otherwise the fragment whose
- *      center is closest to neighboring placed blocks remains the fallback.
+ *      separated fragment; otherwise the fragment whose center is closest to
+ *      neighboring placed blocks remains the fallback.
  *      The completed physical layout is checked against the SHT-derived
- *      section expectations before it may receive VALIDATED status.
+ *      section expectations. A fragmented mapping remains PROMISING because
+ *      ELF has no general integrity check for opaque displaced bytes.
  *
  * Block and file state are persisted across reassembly calls via the
  * block_get_state / block_put_state and carve_get_state / carve_put_state
@@ -185,10 +179,13 @@
 #define ELF_32_BIT 0x1
 #define ELF_64_BIT 0x2
 #define ELF_BYTES_START 0x10
-#define EM_386     3    /* 32-bit Intel (IA-32) */
-#define EM_X86_64  62   /* 64-bit x86-64 */
-#define EM_ARM     40   /* 32-bit ARM (A32/T32/Thumb share this) */
-#define EM_AARCH64 183  /* 64-bit ARMv8+ */
+#define EM_386        3    /* 32-bit Intel (IA-32) */
+#define EM_MIPS       8    /* MIPS */
+#define EM_MIPS_RS3_LE 10  /* Legacy little-endian MIPS */
+#define EM_PPC64      21   /* 64-bit PowerPC */
+#define EM_ARM        40   /* 32-bit ARM (A32/T32/Thumb share this) */
+#define EM_X86_64     62   /* 64-bit x86-64 */
+#define EM_AARCH64    183  /* 64-bit ARMv8+ */
 
 /****************************************/
 /*       Section Header Constants       */
@@ -228,6 +225,7 @@
 #define SHT_REL  9   
 // Section header index constants
 #define SHN_UNDEF         0
+#define SHN_LORESERVE     0xff00
 #define SHN_ABS           0xfff1
 #define SHN_COMMON        0xfff2
 
@@ -1904,6 +1902,85 @@ typedef struct {
 
 } ElfSeedSearchState;
 
+// Private mapping repairs must resume their scan, not just preserve the
+// candidate's last committed blockvector. Zero blocks means no repair is active.
+typedef struct {
+    uint64_t next_source;
+    int64_t best_apparent;
+    double best_score;
+    double runner_up_score;
+    int64_t semantic_best_apparent;
+    double semantic_best_generic_score;
+    double semantic_best_lower;
+    double semantic_best_upper;
+    double semantic_competitor_upper;
+    uint64_t semantic_best_matches;
+    unsigned semantic_best_tier;
+    bool have_semantic_competitor;
+} ElfOpaqueRunSearch;
+
+typedef struct {
+    uint64_t blocks;
+    uint64_t file_size;
+    uint64_t apparent_blocks;
+    uint64_t completed_repairs;
+    uint32_t blocksize;
+    bool prefer_unwind_agreement;
+    ElfOpaqueRunSearch search;
+} ElfOpaqueRepairProgress;
+
+typedef struct {
+    ElfOpaqueRepairProgress progress;
+    // Original mapping followed by the private, possibly repaired mapping.
+    int64_t *mappings;
+} ElfOpaqueRepairState;
+
+typedef struct {
+    uint64_t blocks;
+    uint64_t file_size;
+    uint64_t apparent_blocks;
+    uint64_t next_source;
+    uint64_t validating_mappings;
+    int64_t accepted_actual;
+    uint32_t blocksize;
+    uint16_t section;
+    uint16_t section_count;
+} ElfSymbolTailProgress;
+
+typedef struct {
+    ElfSymbolTailProgress progress;
+    // Baseline blockvector followed by the first validating tail mapping.
+    int64_t *mappings;
+} ElfSymbolTailState;
+
+static inline void elf_opaque_run_search_reset(ElfOpaqueRunSearch *search);
+static inline void elf_opaque_repair_clear(ElfOpaqueRepairState *state);
+static inline bool elf_opaque_repair_prepare(ElfOpaqueRepairState *state,
+    const int64_t *mapping, uint64_t blocks, uint64_t file_size,
+    uint32_t blocksize, uint64_t apparent_blocks);
+static inline void elf_symbol_tail_clear(ElfSymbolTailState *state);
+static inline bool elf_symbol_tail_prepare(ElfSymbolTailState *state,
+    const int64_t *mapping, uint64_t blocks, uint64_t file_size,
+    uint32_t blocksize, uint64_t apparent_blocks, uint16_t section_count);
+
+// Resume the interrupted solver, not the pipeline that preceded it.
+typedef enum {
+    ELF_REASSEMBLY_INITIAL_ALIGNMENT,
+    ELF_REASSEMBLY_MONOTONE,
+    ELF_REASSEMBLY_SYMBOL_TAIL,
+    ELF_REASSEMBLY_INITIAL_GALLOP,
+    ELF_REASSEMBLY_INITIAL_ENTROPY,
+    ELF_REASSEMBLY_INITIAL_RELOCATED,
+    ELF_REASSEMBLY_RELOCATED_ALIGNMENT,
+    ELF_REASSEMBLY_RELOCATED_ENTROPY,
+    ELF_REASSEMBLY_EARLY_VALIDATE,
+    ELF_REASSEMBLY_PLACE,
+    ELF_REASSEMBLY_FINAL_TEXT,
+    ELF_REASSEMBLY_FINAL_ENTROPY,
+    ELF_REASSEMBLY_FINAL_RELOCATED,
+    ELF_REASSEMBLY_FINAL_POST_ENTROPY,
+    ELF_REASSEMBLY_FINAL_VALIDATE
+} ElfReassemblyPhase;
 
 
 /**
@@ -2026,11 +2103,23 @@ typedef struct {
      * greedily extend runs; this flag ensures that pass runs exactly once
      * and is skipped on all subsequent re-entries. */
 
+    uint32_t reassembly_phase;
+    bool reassembly_reopened;
+    bool reassembly_entropy_completed;
+    bool reassembly_relocated_completed;
+    /* Phase, retry guard and solver results survive both queue returns and
+     * process restarts. A checkpoint must not insert another repair pass. */
+
     bool complete_mapping_verified;
     /* True when a complete physical mapping has passed the exact-size ELF
      * validator and the hard physical-layout contradiction checks. This
      * avoids repeating the relocated-run search while preserving the
      * independent status gate that may keep uncertain bytes PROMISING. */
+
+    bool complete_mapping_ooo_transitions_positioned;
+    /* True when every out-of-order transition in the complete mapping is
+     * bounded by exact function-target or file-reference
+     * evidence. */
 
     /* ------------------------------------------------------------------ */
     /* Scan cursor                                                          */
@@ -2097,6 +2186,14 @@ typedef struct {
      * it is serialised and copied atomically with the rest of FileState.
      * See ElfSeedSearchState for field-level documentation. */
 
+    ElfOpaqueRepairState opaque_repair;
+    /* Private staged mapping and ranked scan choices. Apparent-space changes
+     * or a different input mapping invalidate this work before reuse. */
+
+    ElfSymbolTailState symbol_tail;
+    /* A complete tail is accepted only after checking the other alternatives.
+     * Preserve that ambiguity search across checkpoints. */
+
 } FileState;
 
 
@@ -2121,11 +2218,47 @@ typedef struct {
     double competitor_file_reference_upper;
     double independent_gain;
     uint64_t reservation_pressure;
+    uint64_t positioned_lo;
+    uint64_t positioned_hi;
     bool independently_identified;
     bool identified_by_function_table;
     bool identified_by_file_reference;
+    bool positioned_range_valid;
     bool retained;
 } ElfPositionedTextRun;
+
+typedef struct {
+    uint64_t logical_start;
+    uint64_t length;
+    int64_t displacement;
+    size_t proposal_index;
+    bool occupied;
+} ElfPositionedProposalIndexEntry;
+
+typedef struct {
+    uint64_t logical_start;
+    uint64_t length;
+    uint64_t reservation_pressure;
+    size_t proposal_index;
+} ElfPositionedLogicalOrder;
+
+typedef struct {
+    int64_t physical_start;
+    uint64_t length;
+    size_t proposal_index;
+} ElfPositionedPhysicalOrder;
+
+typedef struct {
+    int64_t displacement;
+    uint64_t logical_start;
+    uint64_t logical_end;
+    size_t proposal_index;
+} ElfPositionedRetainedOrder;
+
+typedef struct {
+    ElfPositionedTextRun run;
+    size_t proposal_index;
+} ElfPositionedComponent;
 
 typedef struct {
     uint64_t file_offset;
@@ -2133,11 +2266,103 @@ typedef struct {
 } ElfFrameTarget;
 
 typedef struct {
+    uint64_t function_va;
+    uint32_t register_mask;
+    uint32_t frame_size;
+} ElfMipsPdrRecord;
+
+typedef struct {
+    uint64_t file_offset;
+    uint8_t bytes[4];
+    uint8_t length;
+    bool arm_stack_pair;
+    uint32_t arm_stack_return;
+} ElfCodeAnchor;
+
+typedef enum {
+    ELF_CODE_ANCHOR_INCONCLUSIVE,
+    ELF_CODE_ANCHOR_MATCH,
+    ELF_CODE_ANCHOR_MISMATCH
+} ElfCodeAnchorResult;
+
+typedef struct {
+    uint64_t ap_start;
+    uint64_t len;
+} ElfTextFragment;
+
+#define ELF_TEXT_MIN_DISTINCT_ANCHORS 4U
+
+typedef struct {
+    uint64_t file_offset;
+    uint8_t boundary;
+    uint8_t length;
+} ElfCodeBoundary;
+
+typedef struct {
+    uint16_t machine;
+    bool is_64;
+    bool file_is_le;
+    const FileState *layout; // Borrowed for the lifetime of this evidence.
+    bool include_linkage_stubs;
+    bool restrict_to_text_sections;
+    SegmentInfo *segments;
+    size_t num_segments;
+    uint64_t file_size;
+    uint64_t *function_starts;
+    size_t num_function_starts;
+    ElfFrameTarget *frame_targets;
+    size_t num_frame_targets;
+    ElfCodeAnchor *code_anchors;
+    size_t num_code_anchors;
+    size_t code_anchor_capacity;
+    bool code_anchors_corroborated;
+    ElfCodeBoundary *code_boundaries;
+    size_t num_code_boundaries;
+    size_t code_boundary_capacity;
+    ElfMipsPdrRecord *mips_pdr_records;
+    size_t num_mips_pdr_records;
+    uint64_t mips_pdr_file_offset;
+    uint64_t mips_pdr_size;
+    uint64_t mips_debug_line_file_offset;
+    uint64_t mips_debug_line_size;
+} ElfTextBranchEvidence;
+
+typedef struct {
+    uint64_t branches;
+    uint64_t matches;
+    uint64_t executable_matches;
+    uint64_t exact_trials;
+    uint64_t exact_matches;
+    uint32_t distinct_exact_matches;
+    uint64_t file_references;
+    uint64_t file_reference_matches;
+    double lower;
+    double upper;
+    double executable_lower;
+    double executable_upper;
+    double exact_lower;
+    double exact_upper;
+    double file_reference_lower;
+    double file_reference_upper;
+    bool usable;
+} ElfTextBranchScore;
+
+typedef struct {
     uint64_t logical_block;
     int64_t displacement;
     uint64_t exact_matches;
     bool unique;
 } ElfFrameBlockMatch;
+
+typedef struct {
+    uint64_t logical_block;
+    int64_t displacement;
+    uint64_t exact_matches;
+    uint64_t exact_trials;
+    double exact_lower;
+    double exact_upper;
+    double competitor_exact_upper;
+} ElfMipsBlockMatch;
 
 
 typedef struct ElfRelocatedRun {
@@ -2165,7 +2390,14 @@ typedef struct ElfRelocatedRun {
 } ElfRelocatedRun;
 
 typedef struct {
+    size_t observed_run_overrides;
+    size_t format_positioned_runs;
     size_t independent_runs;
+    uint64_t format_positioned_blocks;
+    uint64_t anchored_blocks;
+    double format_positioned_evidence_gain;
+    double strongest_independent_gain;
+    double independent_evidence_gain;
     double evidence_gain;
     uint64_t reservation_pressure;
 } ElfRelocatedSolutionRank;
@@ -2175,8 +2407,11 @@ typedef struct {
 * Simple helpers for file and block validation
 ***************************************************************/
 
-uint64_t align_up_u64(uint64_t x, uint64_t a);
 bool is_valid_section_type(uint32_t type);
+static bool elf_sht_short_head_matches(const uint8_t *head,
+    const uint8_t *next, uint32_t blocksize, uint64_t head_off,
+    uint64_t head_end, uint64_t next_off, uint64_t next_end,
+    bool is_64, bool need_swap, const char *cid);
 void *portable_memmem(const void *haystack, size_t haystacklen,
                       const void *needle, size_t needlelen);
 static inline int read16_at(const char *base, uint64_t length,
@@ -2188,10 +2423,35 @@ static inline int read32_at(const char *base, uint64_t length,
 static inline int read64_at(const char *base, uint64_t length,
                             const char *p, uint32_t off, int little_endian,
                             uint64_t *out);
+static inline bool elf_partial_section_extent(
+    const char *data, uint64_t length, uint64_t offset, bool wide, bool little,
+    Section_Header_Entry_64 *section);
+static inline bool elf_relocation_symbols_are_consistent(
+    const char *data, uint64_t length, uint64_t section_offset,
+    uint64_t table_offset, uint16_t table_stride, uint16_t section_count,
+    bool is_64, bool file_is_le, uint16_t machine,
+    const SegmentInfo *load_segments, size_t num_load_segments);
+static inline bool elf_relocation_block_conflicts(
+    CarveInfo *candidate, const FileState *layout,
+    uint64_t bv_index, uint32_t blocksize,
+    const uint8_t *data, uint64_t available, double *active_fraction,
+    bool *writable_targets);
+static inline uint64_t elf_partial_symbol_prefix(
+    char *data, uint64_t length, uint32_t blocksize);
+static inline bool elf_symbol_entry_matches_table(
+    const uint8_t *entry, bool is_64, bool file_is_le,
+    uint64_t symbol_index, uint64_t first_nonlocal,
+    uint16_t section_count, uint64_t string_size);
 static inline bool read_candidate_bytes(CarveInfo *candidate,
                                         uint64_t file_off,
                                         uint64_t size,
                                         uint8_t *out);
+static inline bool read_candidate_elf_header_32(
+    CarveInfo *candidate,
+    Elf_Header_32 *header);
+static inline bool read_candidate_elf_header_64(
+    CarveInfo *candidate,
+    Elf_Header_64 *header);
 static inline bool read_candidate_contiguous_baseline_bytes(
     CarveInfo *candidate,
     uint64_t file_off,
@@ -2199,6 +2459,19 @@ static inline bool read_candidate_contiguous_baseline_bytes(
     uint8_t *out);
 static inline SegmentInfo *build_segment_ranges(CarveInfo *candidate,
                                                 size_t *num_segments_out);
+static inline bool elf_build_pht_only_state(
+    FileState *state,
+    const char *pht_data,
+    uint64_t pht_data_length,
+    uint64_t pht_data_offset,
+    uint64_t pht_file_offset,
+    uint16_t pht_entry_size,
+    uint16_t pht_entries,
+    uint16_t elf_header_size,
+    bool is_64,
+    bool need_swap,
+    uint64_t file_limit,
+    uint64_t *file_size_out);
 
 
 
@@ -2237,6 +2510,8 @@ static bool elf_reassembly_init_candidate(int               id,
                         CarveInfo        **pcandidate,
                         uuid_string_t     uuidp,
                         uuid_string_t     uuidc);
+static void elf_reassembly_set_phase(CarveInfo *candidate, FileState *state,
+                                     ElfReassemblyPhase phase);
 static void elf_reassembly_prepare_for_extension(int              id,
                                                 CarveInfo       *candidate,
                                                 uint64_t         target_slot_bv_index,
@@ -2274,7 +2549,8 @@ static inline void elf_candidate_validate_layout_internal(
     bool *validates,
     uint64_t *validates_to,
     bool *promising,
-    uint64_t *first_bad_block);
+    uint64_t *first_bad_block,
+    bool ooo_transitions_positioned);
 static inline void elf_candidate_validate_layout(CarveInfo *candidate,
                                                  bool *validates,
                                                  uint64_t *validates_to,
@@ -2291,6 +2567,29 @@ static inline bool elf_layout_apparent_slot_conflicts(
     uint64_t bv_index,
     uint32_t blocksize,
     int64_t apparent);
+static inline uint32_t elf_expected_component_mask_for_bv_slot(
+    const FileState *layout,
+    uint32_t blocksize,
+    uint64_t bv_index);
+static inline bool elf_layout_apparent_slot_has_anchor_conflict(
+    CarveInfo *candidate,
+    const FileState *layout,
+    uint64_t bv_index,
+    uint32_t blocksize,
+    int64_t apparent);
+static bool elf_anchor_collision_prefers_new_pht_block(
+    CarveInfo *candidate,
+    uint64_t elf_class,
+    const Elf_Header_64 *ehdr64,
+    const Elf_Header_32 *ehdr32,
+    bool need_swap,
+    char elf_endian,
+    uint64_t bv_index,
+    int64_t existing_apparent,
+    int64_t pht_apparent,
+    const char *cid);
+static inline bool elf_apparent_block_is_unique_physical_anchor(
+    int64_t apparent);
 static inline uint64_t elf_layout_mapping_first_contradiction(
     CarveInfo *candidate,
     FileState *layout,
@@ -2302,43 +2601,107 @@ static inline double elf_relocated_block_affinity(CarveInfo *candidate,
                                                   FileState *filestate,
                                                   uint64_t bv_index,
                                                   int64_t apparent);
+static inline double elf_block_selection_adjustment(
+    BlockValidationDecision confidence,
+    int64_t reservations);
 static inline bool elf_try_monotone_gap_alignment(
     CarveInfo *candidate,
     FileState *filestate,
     int64_t header_ap,
-    uint64_t sht_bv,
-    int64_t sht_apparent,
+    uint64_t anchor_bv,
+    int64_t anchor_apparent,
     uint64_t total_blocks,
     uint64_t total_size,
     uint32_t blocksize,
-    const char *cid);
+    uint64_t mutable_from,
+    const char *cid,
+    ThreadWork *work,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle);
+static inline bool elf_try_layout_gap_alignment(
+    CarveInfo *candidate,
+    FileState *filestate,
+    int64_t header_ap,
+    uint64_t total_blocks,
+    uint64_t total_size,
+    uint32_t blocksize,
+    const char *cid,
+    ThreadWork *work,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle);
 static inline bool elf_layout_slot_requires_reassembly(
     CarveInfo *candidate,
     FileState *layout,
     uint64_t bv_index,
     uint32_t blocksize);
+static inline uint64_t elf_layout_known_bytes(const FileState *layout,
+                                              uint32_t blocksize,
+                                              uint64_t bv_index);
+static inline bool elf_actual_block_entropy(FileMirror *fm,
+                                            int64_t actual,
+                                            uint32_t blocksize,
+                                            double *entropy);
+static inline uint64_t elf_layout_first_entropy_discontinuity(
+    CarveInfo *candidate,
+    FileState *layout,
+    uint64_t blocks,
+    uint32_t blocksize,
+    const int64_t *mapping);
 static inline bool elf_validate_relocated_mapping(
     CarveInfo *candidate,
+    FileState *filestate,
     const int64_t *mapping,
     uint64_t blocks,
     uint64_t file_size,
     const char *cid,
     bool report_failure,
     uint64_t *first_bad_block);
+static inline bool elf_validate_relocated_mapping_internal(
+    CarveInfo *candidate,
+    FileState *filestate,
+    const int64_t *mapping,
+    uint64_t blocks,
+    uint64_t file_size,
+    const char *cid,
+    bool report_failure,
+    uint64_t *first_bad_block,
+    bool require_layout_validation,
+    const int64_t *unrepaired_mapping);
+static inline void elf_preserve_complete_hypothesis(
+    CarveInfo *candidate, const int64_t *mapping,
+    uint64_t blocks, uint64_t file_size);
 static inline int64_t elf_relocated_apparent_block(
     int64_t header_actual,
     uint64_t logical_block,
     int64_t displacement);
 static inline bool elf_solve_relocated_runs(
     CarveInfo *candidate,
+    const FileState *filestate,
     const ElfRelocatedRun *anchors,
     size_t nruns,
     const bool *active,
     const double *delta,
     uint64_t blocks,
     int64_t header_actual,
+    const int64_t *baseline,
     ElfRelocatedRun *solved,
     int64_t *mapping);
+static inline bool elf_relocated_run_preferred(
+    const ElfRelocatedRun *candidate,
+    const ElfRelocatedRun *current);
+static inline bool elf_relocated_mapping_transitions_positioned(
+    const int64_t *mapping,
+    uint64_t blocks,
+    int64_t header_actual,
+    const ElfRelocatedRun *solved,
+    size_t nruns,
+    const bool *active,
+    const int64_t *positioned_displacement,
+    const uint8_t *positioned_status,
+    uint64_t *first_unpositioned_block,
+    size_t *preferred_extension);
 static inline ElfRelocatedSolutionRank elf_relocated_solution_rank(
     const ElfRelocatedRun *solved,
     size_t nruns,
@@ -2352,6 +2715,9 @@ static inline void elf_consider_relocated_solution(
     const bool *active,
     const int64_t *mapping,
     uint64_t blocks,
+    int64_t header_actual,
+    const int64_t *positioned_displacement,
+    const uint8_t *positioned_status,
     bool *have_best,
     ElfRelocatedSolutionRank *best_rank,
     ElfRelocatedRun *best_solved,
@@ -2359,6 +2725,7 @@ static inline void elf_consider_relocated_solution(
     int64_t *best_mapping);
 static inline bool elf_solve_and_validate_relocated_runs(
     CarveInfo *candidate,
+    FileState *filestate,
     const ElfRelocatedRun *runs,
     size_t nruns,
     const bool *active,
@@ -2369,18 +2736,222 @@ static inline bool elf_solve_and_validate_relocated_runs(
     const char *cid,
     ElfRelocatedRun *solved,
     int64_t *mapping,
+    const int64_t *baseline,
+    const int64_t *positioned_displacement,
+    const uint8_t *positioned_status,
     size_t *validation_trials);
 static inline bool elf_positioned_text_run_stronger(
     const ElfPositionedTextRun *candidate,
     const ElfPositionedTextRun *current);
+static inline uint64_t elf_positioned_proposal_hash(
+    uint64_t logical_start,
+    uint64_t length,
+    int64_t displacement);
+static bool elf_positioned_proposal_index_reserve(
+    ElfPositionedProposalIndexEntry **entries,
+    size_t *capacity,
+    size_t required_entries);
+static size_t elf_positioned_proposal_index_find(
+    const ElfPositionedProposalIndexEntry *entries,
+    size_t capacity,
+    uint64_t logical_start,
+    uint64_t length,
+    int64_t displacement,
+    bool *found);
+static int elf_positioned_logical_order_compare(
+    const void *left,
+    const void *right);
+static int elf_positioned_physical_order_compare(
+    const void *left,
+    const void *right);
+static int elf_positioned_retained_order_compare(
+    const void *left,
+    const void *right);
+static int elf_positioned_retained_index_compare(
+    const void *left,
+    const void *right);
+static int elf_positioned_component_compare(
+    const void *left,
+    const void *right);
+static bool elf_mark_exact_positioned_proposals(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    ElfPositionedTextRun *proposals,
+    size_t num_proposals,
+    double minimum_lower,
+    bool *returned_to_idle);
+static bool elf_append_positioned_runs(
+    ElfPositionedTextRun **destination,
+    size_t *destination_count,
+    const ElfPositionedTextRun *additional,
+    size_t additional_count);
 static int elf_frame_target_compare(const void *left, const void *right);
 static int elf_frame_block_match_compare(const void *left,
                                          const void *right);
+static int elf_mips_block_match_compare(const void *left,
+                                        const void *right);
+static int elf_uint32_compare(const void *left, const void *right);
+static int elf_uint64_compare(const void *left, const void *right);
+static bool elf_mips_pdr_record_matches(
+    const uint8_t *block,
+    uint64_t block_length,
+    uint64_t block_offset,
+    bool file_is_le,
+    const uint64_t *function_starts,
+    size_t num_function_starts);
+static bool elf_mips_text_prologue_matches(
+    const uint8_t *block,
+    uint64_t block_length,
+    uint64_t block_offset,
+    uint32_t frame_size,
+    bool file_is_le);
+static uint64_t elf_mips_debug_line_address_matches(
+    const uint8_t *block,
+    uint64_t block_length,
+    bool is_64,
+    bool file_is_le,
+    const uint64_t *function_starts,
+    size_t num_function_starts,
+    uint64_t *out_records);
+static bool elf_mips_append_block_match(
+    ElfMipsBlockMatch **matches,
+    size_t *num_matches,
+    size_t *match_capacity,
+    uint64_t logical_block,
+    int64_t displacement,
+    uint64_t exact_matches,
+    uint64_t exact_trials,
+    double exact_lower,
+    double exact_upper,
+    double competitor_exact_upper);
+static bool elf_collect_symbol_function_starts(
+    CarveInfo *candidate,
+    bool is_64,
+    bool file_is_le,
+    uint16_t machine,
+    const SegmentInfo *segments,
+    size_t num_segments,
+    uint64_t file_size,
+    uint64_t **out_starts,
+    size_t *out_count,
+    ElfMipsPdrRecord **out_pdr_records,
+    size_t *out_pdr_count,
+    uint64_t *out_pdr_file_offset,
+    uint64_t *out_pdr_size,
+    uint64_t *out_debug_line_file_offset,
+    uint64_t *out_debug_line_size);
 static inline bool elf_relocated_run_time_to_checkpoint(
     ThreadWork *work,
     CarveInfo *candidate,
     uuid_string_t uuidp,
     uuid_string_t uuidc);
+static void elf_text_branch_evidence_release(
+    ElfTextBranchEvidence *evidence);
+static bool elf_text_branch_evidence_init(
+    CarveInfo *candidate,
+    const FileState *filestate,
+    ElfTextBranchEvidence *evidence);
+static bool elf_text_branch_evidence_init_mapping(
+    CarveInfo *candidate,
+    const FileState *filestate,
+    const int64_t *mapping,
+    uint64_t blocks,
+    uint64_t file_size,
+    ElfTextBranchEvidence *evidence);
+static void elf_text_score_branch_fragment(
+    CarveInfo *candidate,
+    const ElfTextBranchEvidence *evidence,
+    uint64_t hole_lo,
+    const ElfTextFragment *fragment,
+    ElfTextBranchScore *score);
+static inline void elf_text_record_exact_target(
+    ElfTextBranchScore *score,
+    uint64_t *distinct_targets,
+    uint64_t target);
+static bool elf_text_slot_overlaps_executable(
+    const ElfTextBranchEvidence *evidence,
+    const FileState *filestate,
+    uint64_t slot,
+    uint32_t blocksize);
+static uint64_t elf_layout_first_code_discontinuity(
+    CarveInfo *candidate,
+    const FileState *layout,
+    uint64_t blocks,
+    const int64_t *mapping,
+    uint64_t *run_end,
+    bool consider_uncertain);
+static bool elf_text_code_anchors_corroborate(
+    CarveInfo *candidate, const ElfTextBranchEvidence *evidence);
+static void elf_text_code_anchor_counts(
+    CarveInfo *candidate, const ElfTextBranchEvidence *evidence,
+    uint64_t slot, int64_t trial_apparent, uint64_t *trials, uint64_t *matches,
+    uint64_t *inconclusive);
+static bool elf_text_code_anchors_need_search(
+    CarveInfo *candidate, const ElfTextBranchEvidence *evidence, uint64_t slot,
+    bool weak_branch_evidence);
+static bool elf_text_code_fragment_conflicts(
+    CarveInfo *candidate, const ElfTextBranchEvidence *evidence,
+    uint64_t logical_start, int64_t apparent_start, uint64_t blocks);
+static bool elf_text_slot_has_position_evidence(
+    CarveInfo *candidate, const ElfTextBranchEvidence *evidence, uint64_t slot);
+static bool elf_x86_relative_jump_table(
+    const uint8_t *code, size_t size, uint32_t *entries,
+    uint32_t *lea_end, int32_t *displacement);
+static uint64_t elf_text_first_jump_table_discontinuity(
+    CarveInfo *candidate, const ElfTextBranchEvidence *evidence,
+    uint64_t *run_end);
+static bool elf_try_symbol_tail_completion(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle);
+static bool elf_try_monotone_zero_gap_completion(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle);
+static inline bool elf_entropy_run_score(
+    CarveInfo *candidate,
+    FileState *filestate,
+    const int64_t *mapping,
+    uint64_t run_start,
+    uint64_t run_length,
+    int64_t source_apparent,
+    const int64_t *used_actual,
+    size_t used_count,
+    const ElfTextBranchEvidence *text_evidence,
+    double *score,
+    ElfTextBranchScore *text_score);
+static bool elf_try_entropy_mapping_repairs(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    int64_t *mapping,
+    uint64_t blocks,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle);
+static bool elf_try_entropy_run_repairs(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle);
 static ElfPositionedTextRun *elf_find_positioned_text_runs(
     ThreadWork *work,
     CarveInfo *candidate,
@@ -2390,6 +2961,14 @@ static ElfPositionedTextRun *elf_find_positioned_text_runs(
     bool *returned_to_idle,
     size_t *out_count);
 static ElfPositionedTextRun *elf_find_positioned_frame_runs(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle,
+    size_t *out_count);
+static ElfPositionedTextRun *elf_find_positioned_mips_runs(
     ThreadWork *work,
     CarveInfo *candidate,
     FileState *filestate,
@@ -2576,6 +3155,94 @@ static inline void elf_print_block_state(const void *state) {
 /*         SCALPEL CARVE STATE API FUNCTION DEFINITIONS        */
 /***************************************************************/
 
+// Reset the ranking for one new run or evidence pass.
+static inline void elf_opaque_run_search_reset(ElfOpaqueRunSearch *search)
+{
+    memset(search, 0, sizeof(*search));
+    search->best_apparent = -1;
+    search->best_score = -DBL_MAX;
+    search->runner_up_score = -DBL_MAX;
+    search->semantic_best_apparent = -1;
+    search->semantic_best_generic_score = -DBL_MAX;
+}
+
+// Release speculative work without changing the candidate's committed mapping.
+static inline void elf_opaque_repair_clear(ElfOpaqueRepairState *state)
+{
+    free(state->mappings);
+    memset(state, 0, sizeof(*state));
+}
+
+// Reuse a scan only while its baseline mapping and apparent block space agree.
+static inline bool elf_opaque_repair_prepare(ElfOpaqueRepairState *state,
+    const int64_t *mapping, uint64_t blocks, uint64_t file_size,
+    uint32_t blocksize, uint64_t apparent_blocks)
+{
+    if (!state || !mapping || blocks == 0 || blocksize == 0 || file_size == 0
+        || (file_size - 1) / blocksize + 1 != blocks
+        || blocks > SIZE_MAX / (2 * sizeof(*mapping))) {
+        return false;
+    }
+    ElfOpaqueRepairProgress *progress = &state->progress;
+    if (progress->blocks == blocks && progress->file_size == file_size
+        && progress->blocksize == blocksize
+        && progress->apparent_blocks == apparent_blocks && state->mappings
+        && memcmp(state->mappings, mapping, blocks * sizeof(*mapping)) == 0) {
+        return true;
+    }
+    elf_opaque_repair_clear(state);
+    state->mappings = malloc(2 * blocks * sizeof(*mapping));
+    check_memory_allocation(state->mappings, __LINE__, __FILE__,
+                            "elf private repair mappings");
+    memcpy(state->mappings, mapping, blocks * sizeof(*mapping));
+    memcpy(state->mappings + blocks, mapping, blocks * sizeof(*mapping));
+    progress->blocks = blocks;
+    progress->file_size = file_size;
+    progress->blocksize = blocksize;
+    progress->apparent_blocks = apparent_blocks;
+    elf_opaque_run_search_reset(&progress->search);
+    return true;
+}
+
+// Discard a tail search when its input changes or the search finishes.
+static inline void elf_symbol_tail_clear(ElfSymbolTailState *state)
+{
+    free(state->mappings);
+    memset(state, 0, sizeof(*state));
+}
+
+// Saved alternatives refer to the baseline mapping and its apparent block space.
+static inline bool elf_symbol_tail_prepare(ElfSymbolTailState *state,
+    const int64_t *mapping, uint64_t blocks, uint64_t file_size,
+    uint32_t blocksize, uint64_t apparent_blocks, uint16_t section_count)
+{
+    if (!state || !mapping || blocks == 0 || blocksize == 0 || file_size == 0
+        || section_count == 0 || (file_size - 1) / blocksize + 1 != blocks
+        || blocks > SIZE_MAX / (2 * sizeof(*mapping))) {
+        return false;
+    }
+    ElfSymbolTailProgress *progress = &state->progress;
+    if (progress->blocks == blocks && progress->file_size == file_size
+        && progress->blocksize == blocksize
+        && progress->apparent_blocks == apparent_blocks
+        && progress->section_count == section_count && state->mappings
+        && memcmp(state->mappings, mapping, blocks * sizeof(*mapping)) == 0) {
+        return true;
+    }
+    elf_symbol_tail_clear(state);
+    state->mappings = calloc(2 * blocks, sizeof(*mapping));
+    check_memory_allocation(state->mappings, __LINE__, __FILE__,
+                            "elf symbol-tail mappings");
+    memcpy(state->mappings, mapping, blocks * sizeof(*mapping));
+    progress->blocks = blocks;
+    progress->file_size = file_size;
+    progress->blocksize = blocksize;
+    progress->apparent_blocks = apparent_blocks;
+    progress->section_count = section_count;
+    progress->accepted_actual = -1;
+    return true;
+}
+
 static inline bool elf_serialize_carve_state(void **state, FILE *fp, StateSerialization mode)
 {
   FileState **s = (FileState **)state;
@@ -2598,7 +3265,12 @@ static inline bool elf_serialize_carve_state(void **state, FILE *fp, StateSerial
     (*s)->strings_placed = false;
     (*s)->skeleton_initialized = false;
     (*s)->initial_gallop_done = false;
+    (*s)->reassembly_phase = ELF_REASSEMBLY_INITIAL_ALIGNMENT;
+    (*s)->reassembly_reopened = false;
+    (*s)->reassembly_entropy_completed = false;
+    (*s)->reassembly_relocated_completed = false;
     (*s)->complete_mapping_verified = false;
+    (*s)->complete_mapping_ooo_transitions_positioned = false;
     (*s)->elf_scan_slot = UINT64_MAX;
     (*s)->elf_scan_scanned = 0;
     (*s)->elf_scan_N = 0;
@@ -2611,6 +3283,8 @@ static inline bool elf_serialize_carve_state(void **state, FILE *fp, StateSerial
 
     memset(&(*s)->seed_state, 0, sizeof((*s)->seed_state));
     (*s)->seed_state.active = 0;
+    memset(&(*s)->opaque_repair, 0, sizeof((*s)->opaque_repair));
+    memset(&(*s)->symbol_tail, 0, sizeof((*s)->symbol_tail));
   }
 
   if (fb(&(*s)->num_components, sizeof((*s)->num_components), 1, fp) != 1) {
@@ -2674,6 +3348,12 @@ static inline bool elf_serialize_carve_state(void **state, FILE *fp, StateSerial
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
+  if (fb(&(*s)->complete_mapping_ooo_transitions_positioned,
+         sizeof((*s)->complete_mapping_ooo_transitions_positioned), 1, fp) != 1) {
+    perror("elf complete_mapping_ooo_transitions_positioned");
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+
   if (fb(&(*s)->elf_scan_slot, sizeof((*s)->elf_scan_slot), 1, fp) != 1) {
     perror("elf elf_scan_slot");
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
@@ -2714,6 +3394,112 @@ static inline bool elf_serialize_carve_state(void **state, FILE *fp, StateSerial
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
+  ElfOpaqueRepairState *repair = &(*s)->opaque_repair;
+  uint32_t repair_tag = UINT32_C(0x454c4652);
+  uint32_t repair_version = 2;
+  if (fb(&repair_tag, sizeof(repair_tag), 1, fp) != 1
+      || repair_tag != UINT32_C(0x454c4652)
+      || fb(&repair_version, sizeof(repair_version), 1, fp) != 1
+      || (repair_version != 1 && repair_version != 2)) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  if (mode == DESERIALIZE && repair_version == 1) {
+    // The new preference can occupy old structure padding. Never interpret
+    // those unspecified bytes as a saved search mode.
+    struct {
+      uint64_t blocks;
+      uint64_t file_size;
+      uint64_t apparent_blocks;
+      uint64_t completed_repairs;
+      uint32_t blocksize;
+      ElfOpaqueRunSearch search;
+    } previous;
+
+    if (fread(&previous, sizeof(previous), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    repair->progress.blocks = previous.blocks;
+    repair->progress.file_size = previous.file_size;
+    repair->progress.apparent_blocks = previous.apparent_blocks;
+    repair->progress.completed_repairs = previous.completed_repairs;
+    repair->progress.blocksize = previous.blocksize;
+    repair->progress.prefer_unwind_agreement = false;
+    memcpy(&repair->progress.search, &previous.search, sizeof(previous.search));
+  } else if (fb(&repair->progress, sizeof(repair->progress), 1, fp) != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  if (repair->progress.blocks > SIZE_MAX / (2 * sizeof(*repair->mappings))
+      || repair->progress.completed_repairs > repair->progress.blocks
+      || repair->progress.search.next_source > repair->progress.apparent_blocks
+      || (repair->progress.blocks != 0
+          && (repair->progress.blocksize == 0
+              || repair->progress.file_size == 0
+              || (repair->progress.file_size - 1) / repair->progress.blocksize + 1
+                     != repair->progress.blocks))) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  if (repair->progress.blocks != 0) {
+    const size_t count = (size_t)repair->progress.blocks * 2;
+    if (mode == DESERIALIZE) {
+      repair->mappings = malloc(count * sizeof(*repair->mappings));
+      check_memory_allocation(repair->mappings, __LINE__, __FILE__,
+                              "elf private repair mappings");
+    }
+    if (fb(repair->mappings, sizeof(*repair->mappings), count, fp) != count) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+  }
+
+  ElfSymbolTailState *tail = &(*s)->symbol_tail;
+  uint32_t tail_tag = UINT32_C(0x454c4653);
+  uint32_t tail_version = 2;
+  if (fb(&tail_tag, sizeof(tail_tag), 1, fp) != 1
+      || tail_tag != UINT32_C(0x454c4653)
+      || fb(&tail_version, sizeof(tail_version), 1, fp) != 1
+      || (tail_version != 1 && tail_version != 2)
+      || fb(&tail->progress, sizeof(tail->progress), 1, fp) != 1
+      || tail->progress.blocks > SIZE_MAX / (2 * sizeof(*tail->mappings))
+      || tail->progress.next_source > tail->progress.apparent_blocks
+      || tail->progress.validating_mappings > tail->progress.next_source
+      || (tail->progress.blocks != 0
+          && (tail->progress.blocksize == 0 || tail->progress.file_size == 0
+              || tail->progress.section_count == 0
+              || tail->progress.section >= tail->progress.section_count
+              || (tail->progress.file_size - 1) / tail->progress.blocksize + 1
+                     != tail->progress.blocks))) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  if (tail->progress.blocks != 0) {
+    const size_t count = (size_t)tail->progress.blocks * 2;
+    if (mode == DESERIALIZE) {
+      tail->mappings = malloc(count * sizeof(*tail->mappings));
+      check_memory_allocation(tail->mappings, __LINE__, __FILE__,
+                              "elf symbol-tail mappings");
+    }
+    if (fb(tail->mappings, sizeof(*tail->mappings), count, fp) != count) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+  }
+
+  if (tail_version >= 2) {
+    if (fb(&(*s)->reassembly_phase, sizeof((*s)->reassembly_phase), 1, fp) != 1
+        || (*s)->reassembly_phase > ELF_REASSEMBLY_FINAL_VALIDATE
+        || fb(&(*s)->reassembly_reopened,
+              sizeof((*s)->reassembly_reopened), 1, fp) != 1
+        || fb(&(*s)->reassembly_entropy_completed,
+              sizeof((*s)->reassembly_entropy_completed), 1, fp) != 1
+        || fb(&(*s)->reassembly_relocated_completed,
+              sizeof((*s)->reassembly_relocated_completed), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+  } else {
+    // Older checkpoints did not store the caller's phase or retry guard.
+    // Preserve any explicit scan; otherwise retain their initial-pass behavior.
+    if ((*s)->elf_scan_slot != UINT64_MAX) {
+      (*s)->reassembly_phase = ELF_REASSEMBLY_PLACE;
+    }
+  }
+
   return true;
 }
 
@@ -2725,9 +3511,12 @@ static inline void *elf_clone_carve_state(const void *srcstate)
   check_memory_allocation(d, __LINE__, __FILE__, "d");
 
   d->num_components = s->num_components;
-  d->components = malloc(d->num_components * sizeof(FileComponent));
-  check_memory_allocation(d->components, __LINE__, __FILE__, "d->components");
-  memcpy(d->components, s->components, d->num_components * sizeof(FileComponent));
+  d->components = NULL;
+  if (d->num_components > 0) {
+    d->components = malloc(d->num_components * sizeof(FileComponent));
+    check_memory_allocation(d->components, __LINE__, __FILE__, "d->components");
+    memcpy(d->components, s->components, d->num_components * sizeof(FileComponent));
+  }
 
   d->sht_placed = s->sht_placed;
   d->pht_placed = s->pht_placed;
@@ -2737,7 +3526,13 @@ static inline void *elf_clone_carve_state(const void *srcstate)
   d->strings_placed = s->strings_placed;
   d->skeleton_initialized = s->skeleton_initialized;
   d->initial_gallop_done = s->initial_gallop_done;
+  d->reassembly_phase = s->reassembly_phase;
+  d->reassembly_reopened = s->reassembly_reopened;
+  d->reassembly_entropy_completed = s->reassembly_entropy_completed;
+  d->reassembly_relocated_completed = s->reassembly_relocated_completed;
   d->complete_mapping_verified = s->complete_mapping_verified;
+  d->complete_mapping_ooo_transitions_positioned =
+    s->complete_mapping_ooo_transitions_positioned;
 
   d->elf_scan_slot = s->elf_scan_slot;
   d->elf_scan_scanned = s->elf_scan_scanned;
@@ -2750,6 +3545,29 @@ static inline void *elf_clone_carve_state(const void *srcstate)
   d->failed_gallop_dir = s->failed_gallop_dir;
 
   d->seed_state = s->seed_state;
+  memcpy(&d->opaque_repair.progress, &s->opaque_repair.progress,
+         sizeof(d->opaque_repair.progress));
+  d->opaque_repair.mappings = NULL;
+  if (s->opaque_repair.progress.blocks != 0) {
+    const size_t bytes = 2 * s->opaque_repair.progress.blocks
+        * sizeof(*s->opaque_repair.mappings);
+    d->opaque_repair.mappings = malloc(bytes);
+    check_memory_allocation(d->opaque_repair.mappings, __LINE__, __FILE__,
+                            "elf private repair mappings");
+    memcpy(d->opaque_repair.mappings, s->opaque_repair.mappings, bytes);
+  }
+
+  memcpy(&d->symbol_tail.progress, &s->symbol_tail.progress,
+         sizeof(d->symbol_tail.progress));
+  d->symbol_tail.mappings = NULL;
+  if (s->symbol_tail.progress.blocks != 0) {
+    const size_t bytes = 2 * s->symbol_tail.progress.blocks
+        * sizeof(*s->symbol_tail.mappings);
+    d->symbol_tail.mappings = malloc(bytes);
+    check_memory_allocation(d->symbol_tail.mappings, __LINE__, __FILE__,
+                            "elf symbol-tail mappings");
+    memcpy(d->symbol_tail.mappings, s->symbol_tail.mappings, bytes);
+  }
 
   return d;
 }
@@ -2759,6 +3577,8 @@ static inline void elf_free_carve_state(void **state)
 {
   FileState **s = (FileState **)state;
   free((*s)->components);
+  elf_opaque_repair_clear(&(*s)->opaque_repair);
+  elf_symbol_tail_clear(&(*s)->symbol_tail);
   free(*s);
   *s = NULL;
 }
@@ -2787,7 +3607,13 @@ static inline bool elf_compare_carve_state(const void *state1, const void *state
       s1->strings_placed != s2->strings_placed ||
       s1->skeleton_initialized != s2->skeleton_initialized ||
       s1->initial_gallop_done != s2->initial_gallop_done ||
-      s1->complete_mapping_verified != s2->complete_mapping_verified) {
+      s1->reassembly_phase != s2->reassembly_phase ||
+      s1->reassembly_reopened != s2->reassembly_reopened ||
+      s1->reassembly_entropy_completed != s2->reassembly_entropy_completed ||
+      s1->reassembly_relocated_completed != s2->reassembly_relocated_completed ||
+      s1->complete_mapping_verified != s2->complete_mapping_verified ||
+      s1->complete_mapping_ooo_transitions_positioned !=
+        s2->complete_mapping_ooo_transitions_positioned) {
     return false;
   }
 
@@ -2809,6 +3635,26 @@ static inline bool elf_compare_carve_state(const void *state1, const void *state
     return false;
   }
 
+  if (memcmp(&s1->opaque_repair.progress, &s2->opaque_repair.progress,
+             sizeof(s1->opaque_repair.progress)) != 0) {
+    return false;
+  }
+  if (s1->opaque_repair.progress.blocks != 0
+      && memcmp(s1->opaque_repair.mappings, s2->opaque_repair.mappings,
+                2 * s1->opaque_repair.progress.blocks * sizeof(int64_t)) != 0) {
+    return false;
+  }
+
+  if (memcmp(&s1->symbol_tail.progress, &s2->symbol_tail.progress,
+             sizeof(s1->symbol_tail.progress)) != 0) {
+    return false;
+  }
+  if (s1->symbol_tail.progress.blocks != 0
+      && memcmp(s1->symbol_tail.mappings, s2->symbol_tail.mappings,
+                2 * s1->symbol_tail.progress.blocks * sizeof(int64_t)) != 0) {
+    return false;
+  }
+
   return true;
 }
 
@@ -2825,11 +3671,14 @@ static inline void elf_print_carve_state(const void *state)
       "sht_placed=%d, pht_placed=%d, shstrtab_placed=%d, "
       "dynamic_placed=%d, relocations_placed=%d, strings_placed=%d, "
       "skeleton_initialized=%d, initial_gallop_done=%d, "
-      "complete_mapping_verified=%d, "
+      "reassembly={phase=%u, reopened=%d, entropy=%d, relocated=%d}, "
+      "complete_mapping_verified=%d, ooo_transitions_positioned=%d, "
       "scan={slot=%" PRIu64 ", scanned=%" PRIu64 ", N=%" PRIu64
       ", apparent_blocks=%" PRIu64 ", focus=%d}, "
       "failed_gallop={valid=%d, start_bv=%" PRIu64 ", dir=%d}, "
-      "seed={active=%u, bv_target=%" PRIu64 ", focus=%d, ap_pred=%" PRIu64 ", lo=%" PRIu64 ", hi=%" PRIu64 ", stage=%u, top=%u}"
+      "seed={active=%u, bv_target=%" PRIu64 ", focus=%d, ap_pred=%" PRIu64 ", lo=%" PRIu64 ", hi=%" PRIu64 ", stage=%u, top=%u}, "
+      "opaque_repair={blocks=%" PRIu64 ", completed=%" PRIu64 ", source=%" PRIu64 ", unwind=%d}, "
+      "symbol_tail={section=%u, source=%" PRIu64 ", matches=%" PRIu64 "}"
       "}\n",
       s->num_components,
       s->sht_placed,
@@ -2840,7 +3689,12 @@ static inline void elf_print_carve_state(const void *state)
       s->strings_placed,
       s->skeleton_initialized,
       s->initial_gallop_done,
+      (unsigned)s->reassembly_phase,
+      (int)s->reassembly_reopened,
+      (int)s->reassembly_entropy_completed,
+      (int)s->reassembly_relocated_completed,
       s->complete_mapping_verified,
+      s->complete_mapping_ooo_transitions_positioned,
       s->elf_scan_slot, s->elf_scan_scanned, s->elf_scan_N,
       s->elf_scan_apparent_blocks, (int)s->elf_scan_focus,
       (int)s->failed_gallop_valid,
@@ -2853,7 +3707,14 @@ static inline void elf_print_carve_state(const void *state)
       (uint64_t)s->seed_state.ap_lo,
       (uint64_t)s->seed_state.ap_hi,
       (unsigned)s->seed_state.stage,
-      (unsigned)s->seed_state.top_count
+      (unsigned)s->seed_state.top_count,
+      s->opaque_repair.progress.blocks,
+      s->opaque_repair.progress.completed_repairs,
+      s->opaque_repair.progress.search.next_source,
+      (int)s->opaque_repair.progress.prefer_unwind_agreement,
+      (unsigned)s->symbol_tail.progress.section,
+      s->symbol_tail.progress.next_source,
+      s->symbol_tail.progress.validating_mappings
     );
   }
 }
@@ -3356,25 +4217,6 @@ static inline bool allow_zero_off_sht(uint32_t sh_type, uint64_t sh_size) {
 }
 
 
-static inline bool allow_zero_size_sht64(uint32_t sht_type) {
-    switch (sht_type) {
-        case SECTION_TYPE_NULL:
-            return true;
-
-        // .tm_clone_table sometimes exists but is empty.
-        case SECTION_TYPE_PROGBITS:
-            return true;
-
-        case SECTION_TYPE_NOBITS:
-            return true;
-
-        default:
-            return false;
-    }
-}
-
-
-
 /**
  * @brief Scan a block for a 32-bit ELF Section Header Table (SHT) sequence.
  *
@@ -3442,7 +4284,6 @@ static inline bool detect_sht_component_32(char *data,
         size_t nonnull_count     = 0;
         size_t degenerate_count  = 0;
         size_t interesting_types = 0;
-        size_t empty_nonnull_count = 0;
 
         while (local_offset + entry_size <= blocksize) {
 
@@ -3466,22 +4307,15 @@ static inline bool detect_sht_component_32(char *data,
 
             if (!is_valid_section_type(sh.section_type)) break;
 
-            /* NULL entries may have align == 0; all others require pow2. */
+            /* ELF permits zero to mean that no alignment constraint applies. */
             if (sh.section_type != SECTION_TYPE_NULL) {
-                if (!is_pow2_nonzero(sh.sect_align)) break;
+                if (sh.sect_align != 0 && !is_pow2_nonzero(sh.sect_align)) break;
             }
 
             /* Unified alignment cap (matches 64-bit detector). */
             if (sh.sect_align > (1U << 20)) break;
 
             if (sh.sect_file_off == 0 && !allow_zero_off_sht(sh.section_type, sh.sect_size)) break;
-
-            /* Zero-size non-NULL sections: allow a whitelisted few under tight constraints. */
-            if (valid_count > 0 && sh.sect_size == 0 && sh.section_type != SECTION_TYPE_NULL) {
-                if (!allow_zero_size_sht64(sh.section_type)) break;
-                if (valid_count < sp->sht_empty_section_min_run) break;
-                if (++empty_nonnull_count > sp->sht_max_empty_nonnull) break;
-            }
 
             /* Field sanity bounds. */
             if (sh.sect_name_off > (1U << 20)) break;
@@ -3659,7 +4493,6 @@ static inline bool detect_sht_component_64(char *data,
             size_t nonnull_count     = 0;
             size_t degenerate_count  = 0;
             size_t interesting_types = 0;
-            size_t empty_nonnull_count = 0;
 
             while (local_offset + entry_size <= blocksize) {
 
@@ -3684,21 +4517,14 @@ static inline bool detect_sht_component_64(char *data,
 
                 if (!is_valid_section_type(sh.section_type)) break;
 
-                /* NULL entries may have align == 0; all others require pow2. */
+                /* ELF permits zero to mean that no alignment constraint applies. */
                 if (sh.section_type != SECTION_TYPE_NULL) {
-                    if (!is_pow2_nonzero(sh.sect_align)) break;
+                    if (sh.sect_align != 0 && !is_pow2_nonzero(sh.sect_align)) break;
                 }
 
                 if (sh.sect_align > (1ULL << 20)) break;
 
                 if (sh.sect_file_off == 0 && !allow_zero_off_sht(sh.section_type, sh.sect_size)) break;
-
-                /* Zero-size non-NULL sections: allow a whitelisted few under tight constraints. */
-                if (valid_count > 0 && sh.sect_size == 0 && sh.section_type != SECTION_TYPE_NULL) {
-                    if (!allow_zero_size_sht64(sh.section_type)) break;
-                    if (valid_count < sp->sht_empty_section_min_run) break;
-                    if (++empty_nonnull_count > sp->sht_max_empty_nonnull) break;
-                }
 
                 if (sh.sect_name_off > (1U << 20)) break;
                 if (sh.sect_idx > 0x10000U || sh.sect_info > 0x10000U) break;
@@ -3927,6 +4753,8 @@ static inline bool detect_pht_component_64(char *data,
                     ph.alignment     = __builtin_bswap64(ph.alignment);
                 }
 
+                if (valid_count > 0 && phdr64_is_degenerate(&ph)) break;
+
                 if (!seg_type_valid(ph.seg_type)) break;
 
                 /* Flags must be subset of allowed. */
@@ -4112,6 +4940,8 @@ static inline bool detect_pht_component_32(char *data,
                 ph.seg_mem_size  = __builtin_bswap32(ph.seg_mem_size);
                 ph.alignment     = __builtin_bswap32(ph.alignment);
             }
+
+            if (valid_count > 0 && phdr32_is_degenerate(&ph)) break;
 
             if (!seg_type_valid(ph.seg_type)) break;
 
@@ -4341,32 +5171,12 @@ static inline Section_Header_Entry_64** filter_null_64(Section_Header_Entry_64**
 }
 
 
-/* Align a 64-bit integer up to the next a-byte multiple. */
-uint64_t align_up_u64(uint64_t x, uint64_t a) {
-    if (a == 0) {
-        return x;
-    }
-
-    const uint64_t remainder = x % a;
-    if (remainder == 0) {
-        return x;
-    }
-
-    const uint64_t increment = a - remainder;
-    if (x > UINT64_MAX - increment) {
-        return UINT64_MAX;
-    }
-    return x + increment;
-}
-
-
-
 /**
  * @brief Compute the total file size of a 32-bit ELF from its Section Header Table.
  *
  * Finds the highest-reaching file-resident section in @p arr (i.e. the entry
  * with the greatest sect_file_off + sect_size) and returns that value as the
- * total file size, aligned up to the nearest 4-byte boundary.
+ * exact described file extent.
  *
  * Sections of type SHT_NOBITS (.bss) and SHT_NULL are excluded because they
  * occupy no bytes in the file. The ELF header size is used as the initial
@@ -4377,7 +5187,7 @@ uint64_t align_up_u64(uint64_t x, uint64_t a) {
  * the high-water mark calculation.
  *
  * If @p arr is NULL or @p numEntries is zero, the function falls back to the
- * ELF header size alone, aligned to 4 bytes.
+ * ELF header size alone.
  *
  * @param arr         Array of pointers to filtered 32-bit SHT entries.
  *                    May be NULL if no SHT is available. Does not need to be
@@ -4386,7 +5196,7 @@ uint64_t align_up_u64(uint64_t x, uint64_t a) {
  *                    size. Must not be NULL.
  * @param numEntries  Number of valid entries in @p arr. Treated as empty if <= 0.
  *
- * @return            Estimated total file size in bytes, aligned to 4 bytes.
+ * @return            Estimated total file size in bytes.
  *                    @c UINT64_MAX is returned if an entry range overflows.
  */
 static inline uint64_t calculate_elf_size_32(Section_Header_Entry_32 **arr,
@@ -4396,7 +5206,7 @@ static inline uint64_t calculate_elf_size_32(Section_Header_Entry_32 **arr,
     uint64_t max_end = elf_header->elf_header_size;
 
     if (numEntries <= 0 || arr == NULL) {
-        return align_up_u64(max_end, 4u);
+        return max_end;
     }
 
     for (int i = 0; i < numEntries; i++) {
@@ -4411,7 +5221,7 @@ static inline uint64_t calculate_elf_size_32(Section_Header_Entry_32 **arr,
         if (end > max_end) max_end = end;
     }
 
-    return align_up_u64(max_end, 4u);
+    return max_end;
 }
 
 
@@ -4421,7 +5231,7 @@ static inline uint64_t calculate_elf_size_32(Section_Header_Entry_32 **arr,
  *
  * Finds the highest-reaching file-resident section in @p arr (i.e. the entry
  * with the greatest sect_file_off + sect_size) and returns that value as the
- * total file size, aligned up to the nearest 8-byte boundary.
+ * exact described file extent.
  *
  * Sections of type SHT_NOBITS (.bss) and SHT_NULL are excluded because they
  * occupy no bytes in the file. The ELF header size is used as the initial
@@ -4432,7 +5242,7 @@ static inline uint64_t calculate_elf_size_32(Section_Header_Entry_32 **arr,
  * the high-water mark calculation.
  *
  * If @p arr is NULL or @p numEntries is zero, the function falls back to the
- * ELF header size alone, aligned to 8 bytes.
+ * ELF header size alone.
  *
  * @param arr         Array of pointers to filtered 64-bit SHT entries.
  *                    May be NULL if no SHT is available. Does not need to be
@@ -4441,7 +5251,7 @@ static inline uint64_t calculate_elf_size_32(Section_Header_Entry_32 **arr,
  *                    size. Must not be NULL.
  * @param numEntries  Number of valid entries in @p arr. Treated as empty if <= 0.
  *
- * @return            Estimated total file size in bytes, aligned to 8 bytes.
+ * @return            Estimated total file size in bytes.
  *                    @c UINT64_MAX is returned if an entry range overflows.
  */
 static inline uint64_t calculate_elf_size_64(Section_Header_Entry_64 **arr,
@@ -4451,7 +5261,7 @@ static inline uint64_t calculate_elf_size_64(Section_Header_Entry_64 **arr,
     uint64_t max_end = elf_header->elf_header_size;
 
     if (numEntries <= 0 || arr == NULL) {
-        return align_up_u64(max_end, 8u);
+        return max_end;
     }
 
     for (int i = 0; i < numEntries; i++) {
@@ -4466,7 +5276,7 @@ static inline uint64_t calculate_elf_size_64(Section_Header_Entry_64 **arr,
         if (end > max_end) max_end = end;
     }
 
-    return align_up_u64(max_end, 8u);
+    return max_end;
 }
 
 
@@ -5697,9 +6507,8 @@ bool is_valid_section_type(uint32_t type) {
  * initialised to the end of the ELF header and the PHT region itself, so it is
  * always at least as large as the headers even if all segments have zero filesz.
  *
- * The result is an estimation and is intentionally not rounded up to
- * any alignment boundary, unlike calculate_elf_size_32. The caller uses it
- * directly for comparison against known region endpoints.
+ * The result is an estimation and is not rounded up to an alignment boundary.
+ * The caller uses it directly for comparison against known region endpoints.
  *
  * Overflow in all bounds arithmetic is handled with __uint128_t. If any
  * segment's file extent exceeds @p length the function returns 0 immediately,
@@ -5808,9 +6617,8 @@ static inline uint64_t calculate_elf_size_from_pht_32(
  * initialised to the end of the ELF header and the PHT region itself, so it is
  * always at least as large as the headers even if all segments have zero filesz.
  *
- * The result is an estimation and is intentionally not rounded up to
- * any alignment boundary, unlike calculate_elf_size_64. The caller uses it
- * directly for comparison against known region endpoints.
+ * The result is an estimation and is not rounded up to an alignment boundary.
+ * The caller uses it directly for comparison against known region endpoints.
  *
  * Overflow in all bounds arithmetic is handled with __uint128_t. If any
  * segment's file extent exceeds @p length the function returns 0 immediately,
@@ -6700,9 +7508,16 @@ static inline bool read_candidate_bytes(CarveInfo *candidate,
                                         uint64_t file_off,
                                         uint64_t size,
                                         uint8_t *out){
-    uint64_t bs = scalpel_state.blocksize;
+    const uint64_t bs = scalpel_state.blocksize;
+    uint64_t num_blocks;
     uint64_t remaining = size;
     uint64_t pos = file_off;
+
+    if (!candidate || !candidate->b || (size > 0 && !out)
+        || bs == 0 || file_off > UINT64_MAX - size) {
+        return false;
+    }
+    num_blocks = blockvector_get_num_blocks(candidate->b);
 
     while (remaining > 0) {
         uint64_t bv_index = pos / bs;
@@ -6710,6 +7525,9 @@ static inline bool read_candidate_bytes(CarveInfo *candidate,
         uint64_t chunk = bs - in_block;
         if (chunk > remaining) {
             chunk = remaining;
+        }
+        if (bv_index >= num_blocks) {
+            return false;
         }
 
         int64_t ap = blockvector_get_apparent_blocknumber(candidate->b, bv_index);
@@ -6726,6 +7544,38 @@ static inline bool read_candidate_bytes(CarveInfo *candidate,
         remaining -= chunk;
         pos += chunk;
     }
+    return true;
+}
+
+
+// Read the multi-byte portion of an ELF header after the 16-byte identity.
+static inline bool read_candidate_elf_header_32(
+    CarveInfo *candidate,
+    Elf_Header_32 *header)
+{
+    uint8_t raw[ELF_BYTES_START + sizeof(Elf_Header_32)];
+
+    if (!header
+        || !read_candidate_bytes(candidate, 0, sizeof(raw), raw)) {
+        return false;
+    }
+    memcpy(header, raw + ELF_BYTES_START, sizeof(*header));
+    return true;
+}
+
+
+// Read the multi-byte portion of an ELF header after the 16-byte identity.
+static inline bool read_candidate_elf_header_64(
+    CarveInfo *candidate,
+    Elf_Header_64 *header)
+{
+    uint8_t raw[ELF_BYTES_START + sizeof(Elf_Header_64)];
+
+    if (!header
+        || !read_candidate_bytes(candidate, 0, sizeof(raw), raw)) {
+        return false;
+    }
+    memcpy(header, raw + ELF_BYTES_START, sizeof(*header));
     return true;
 }
 
@@ -6970,19 +7820,27 @@ read_reloc_offset(const uint8_t *p,
                   bool file_is_le){
     if (is_64) {
         if (is_rela) {
-            const Elf64_Rela *r = (const Elf64_Rela *)p;
-            return to_host_endian_64(r->r_offset, file_is_le);
+            Elf64_Rela r;
+
+            memcpy(&r, p, sizeof(r));
+            return to_host_endian_64(r.r_offset, file_is_le);
         } else {
-            const Elf64_Rel *r = (const Elf64_Rel *)p;
-            return to_host_endian_64(r->r_offset, file_is_le);
+            Elf64_Rel r;
+
+            memcpy(&r, p, sizeof(r));
+            return to_host_endian_64(r.r_offset, file_is_le);
         }
     } else {
         if (is_rela) {
-            const Elf32_Rela *r = (const Elf32_Rela *)p;
-            return (uint64_t)to_host_endian_32(r->r_offset, file_is_le);
+            Elf32_Rela r;
+
+            memcpy(&r, p, sizeof(r));
+            return (uint64_t)to_host_endian_32(r.r_offset, file_is_le);
         } else {
-            const Elf32_Rel *r = (const Elf32_Rel *)p;
-            return (uint64_t)to_host_endian_32(r->r_offset, file_is_le);
+            Elf32_Rel r;
+
+            memcpy(&r, p, sizeof(r));
+            return (uint64_t)to_host_endian_32(r.r_offset, file_is_le);
         }
     }
 }
@@ -6997,7 +7855,7 @@ get_sht_entry(CarveInfo                *cand,
 {
     if (is_64) {
         Elf_Header_64 eh;
-        if (!read_candidate_bytes(cand, 0, sizeof(eh), (uint8_t *)&eh)) {
+        if (!read_candidate_elf_header_64(cand, &eh)) {
             return false;
         }
 
@@ -7031,7 +7889,7 @@ get_sht_entry(CarveInfo                *cand,
 
     } else {
         Elf_Header_32 eh;
-        if (!read_candidate_bytes(cand, 0, sizeof(eh), (uint8_t *)&eh)) {
+        if (!read_candidate_elf_header_32(cand, &eh)) {
             return false;
         }
 
@@ -7171,9 +8029,10 @@ static inline bool parse_dynamic_view(CarveInfo *candidate,
     uint64_t off = 0;
     if (is_64) {
         while (off + sizeof(Elf64_Dyn) <= dyn_size) {
-            const Elf64_Dyn *d = (const Elf64_Dyn *)(buf + off);
-            uint64_t tag = to_host_endian_64((uint64_t)d->d_tag, file_is_le);
-            uint64_t val = to_host_endian_64((uint64_t)d->d_un.d_val, file_is_le);
+            Elf64_Dyn d;
+            memcpy(&d, buf + off, sizeof(d));
+            uint64_t tag = to_host_endian_64((uint64_t)d.d_tag, file_is_le);
+            uint64_t val = to_host_endian_64((uint64_t)d.d_un.d_val, file_is_le);
             off += sizeof(Elf64_Dyn);
 
             if (tag == DT_NULL) {
@@ -7208,9 +8067,10 @@ static inline bool parse_dynamic_view(CarveInfo *candidate,
         }
     } else {
         while (off + sizeof(Elf32_Dyn) <= dyn_size) {
-            const Elf32_Dyn *d = (const Elf32_Dyn *)(buf + off);
-            uint32_t tag = to_host_endian_32((uint32_t)d->d_tag, file_is_le);
-            uint32_t val = to_host_endian_32((uint32_t)d->d_un.d_val, file_is_le);
+            Elf32_Dyn d;
+            memcpy(&d, buf + off, sizeof(d));
+            uint32_t tag = to_host_endian_32((uint32_t)d.d_tag, file_is_le);
+            uint32_t val = to_host_endian_32((uint32_t)d.d_un.d_val, file_is_le);
             off += sizeof(Elf32_Dyn);
 
             if (tag == DT_NULL) {
@@ -7419,13 +8279,15 @@ static inline bool validate_one_dynamic_entry(const uint8_t *ptr,
     uint64_t val;
 
     if (is_64) {
-        const Elf64_Dyn *d = (const Elf64_Dyn *)ptr;
-        tag = to_host_endian_64((uint64_t)d->d_tag, file_is_le);
-        val = to_host_endian_64((uint64_t)d->d_un.d_val, file_is_le);
+        Elf64_Dyn d;
+        memcpy(&d, ptr, sizeof(d));
+        tag = to_host_endian_64((uint64_t)d.d_tag, file_is_le);
+        val = to_host_endian_64((uint64_t)d.d_un.d_val, file_is_le);
     } else {
-        const Elf32_Dyn *d = (const Elf32_Dyn *)ptr;
-        tag = (uint64_t)to_host_endian_32((uint32_t)d->d_tag, file_is_le);
-        val = (uint64_t)to_host_endian_32((uint32_t)d->d_un.d_val, file_is_le);
+        Elf32_Dyn d;
+        memcpy(&d, ptr, sizeof(d));
+        tag = (uint64_t)to_host_endian_32((uint32_t)d.d_tag, file_is_le);
+        val = (uint64_t)to_host_endian_32((uint32_t)d.d_un.d_val, file_is_le);
     }
 
     /* DT_NULL is always fine – it's the terminator */
@@ -7563,11 +8425,13 @@ static inline DynamicScanResult scan_for_valid_dynamic_entries(const uint8_t *bl
             /* check if this entry was DT_NULL so we can prefer runs that terminate */
             uint64_t tag;
             if (is_64) {
-                const Elf64_Dyn *d = (const Elf64_Dyn *)p;
-                tag = to_host_endian_64((uint64_t)d->d_tag, file_is_le);
+                Elf64_Dyn d;
+                memcpy(&d, p, sizeof(d));
+                tag = to_host_endian_64((uint64_t)d.d_tag, file_is_le);
             } else {
-                const Elf32_Dyn *d = (const Elf32_Dyn *)p;
-                tag = (uint64_t)to_host_endian_32((uint32_t)d->d_tag, file_is_le);
+                Elf32_Dyn d;
+                memcpy(&d, p, sizeof(d));
+                tag = (uint64_t)to_host_endian_32((uint32_t)d.d_tag, file_is_le);
             }
             if (tag == DT_NULL) {
                 saw_null = true;
@@ -7618,27 +8482,67 @@ static inline DynamicScanResult scan_for_valid_dynamic_entries(const uint8_t *bl
  * ------------------------------------------------------------ */
 
 static inline bool is_valid_x86_64_relocation_type(uint32_t t){
-    /* psABI set incl. 41/42; GNU VT* not used on x86-64 */
+    // Include the newer CODE_4 and CODE_6 relocation forms.
     return (t <= R_X86_64_RELATIVE64) ||
            (t == R_X86_64_GOTPCRELX)  ||
-           (t == R_X86_64_REX_GOTPCRELX);
+           (t == R_X86_64_REX_GOTPCRELX) ||
+           (t >= 43 && t <= 45) || t == 50;
 }
 
 static inline bool is_valid_x86_relocation_type(uint32_t t){
     return (t <= R_386_GOT32X);
 }
 
-static inline bool is_valid_arm64_relocation_type(uint32_t t){
-    return (t <= R_AARCH64_IRELATIVE);
+// AAELF64 assigns different relocation codes to LP64 and the older ILP32 ABI.
+// Reserved gaps must not make another architecture's records look valid.
+static inline bool is_valid_arm64_relocation_type(uint32_t t, bool is_64){
+    if (t == 0 || (t >= 0xe000 && t <= 0xffff)) {
+        return true;
+    }
+    if (!is_64) {
+        return (t >= 0x001 && t <= 0x01d)
+               || (t >= 0x050 && t <= 0x07f)
+               || (t >= 0x0b4 && t <= 0x0bc);
+    }
+    // Include both null encodings, static/TLS, PAuthABI and dynamic records.
+    return (t >= 0x100 && t <= 0x118)
+           || (t >= 0x11a && t <= 0x125)
+           || (t >= 0x12b && t <= 0x13d)
+           || (t >= 0x200 && t <= 0x23d)
+           || (t >= 0x244 && t <= 0x256)
+           || (t >= 0x400 && t <= 0x408)
+           || (t >= 0x411 && t <= 0x414);
 }
 
 static inline bool is_valid_arm_relocation_type(uint32_t t){
-    return (t == R_ARM_IRELATIVE) ||
-           (t <= R_ARM_BASE_ABS)  ||
-           (t >= R_ARM_TLS_DTPMOD32 && t <= R_ARM_RELATIVE);
+    // AAELF32 defined/private ranges, plus legacy GNU relocation values.
+    return t <= 138 || (t >= 160 && t <= 176)
+           || (t >= 249 && t <= 255);
 }
 
-static inline bool is_valid_relocation_type_for_arch(uint32_t t, uint16_t em){
+// MIPS relocation values occupy defined groups separated by reserved gaps.
+static inline bool is_valid_mips_relocation_type(uint32_t t){
+    return t <= 12 ||
+           (t >= 16 && t <= 51) ||
+           (t >= 60 && t <= 65) ||
+           (t >= 100 && t <= 113) ||
+           (t >= 126 && t <= 128) ||
+           (t >= 133 && t <= 142) ||
+           (t >= 145 && t <= 157) ||
+           (t >= 162 && t <= 166) ||
+           (t >= 169 && t <= 170) ||
+           (t >= 172 && t <= 173) ||
+           (t >= 248 && t <= 250) ||
+           (t >= 253 && t <= 254);
+}
+
+static inline bool has_relocation_type_validator(uint16_t em){
+    return em == EM_X86_64 || em == EM_386 || em == EM_AARCH64 ||
+           em == EM_ARM || em == EM_MIPS || em == EM_MIPS_RS3_LE;
+}
+
+static inline bool is_valid_relocation_type_for_arch(uint32_t t, uint16_t em,
+                                                     bool is_64){
     if (em == EM_X86_64){
         return is_valid_x86_64_relocation_type(t);
     }
@@ -7646,12 +8550,33 @@ static inline bool is_valid_relocation_type_for_arch(uint32_t t, uint16_t em){
         return is_valid_x86_relocation_type(t);
     }
     if (em == EM_AARCH64){
-        return is_valid_arm64_relocation_type(t);
+        return is_valid_arm64_relocation_type(t, is_64);
     }
     if (em == EM_ARM){
         return is_valid_arm_relocation_type(t);
     }
+    if (em == EM_MIPS || em == EM_MIPS_RS3_LE){
+        return is_valid_mips_relocation_type(t);
+    }
     return false;
+}
+
+static inline bool is_valid_relocation_info_for_arch(uint64_t info,
+                                                      bool is_64,
+                                                      uint16_t machine){
+    if (is_64 && (machine == EM_MIPS || machine == EM_MIPS_RS3_LE)) {
+        const uint32_t type1 = (uint32_t)(info & 0xffu);
+        const uint32_t type2 = (uint32_t)((info >> 8) & 0xffu);
+        const uint32_t type3 = (uint32_t)((info >> 16) & 0xffu);
+
+        return is_valid_mips_relocation_type(type1) &&
+               is_valid_mips_relocation_type(type2) &&
+               is_valid_mips_relocation_type(type3);
+    }
+
+    const uint32_t type = is_64 ? ELF64_R_TYPE(info)
+                                : ELF32_R_TYPE((uint32_t)info);
+    return is_valid_relocation_type_for_arch(type, machine, is_64);
 }
 
 
@@ -7717,11 +8642,12 @@ static inline bool validate_one_reloc_entry(const uint8_t *ptr,
                                             bool use_segments){
     if (is_64) {
         if (is_rela) {
-            const Elf64_Rela *p = (const Elf64_Rela *)ptr;
-            uint64_t r_offset = to_host_endian_64(p->r_offset, file_is_le);
-            uint64_t r_info   = to_host_endian_64(p->r_info,   file_is_le);
-            uint32_t type     = ELF64_R_TYPE(r_info);
-            if (!is_valid_relocation_type_for_arch(type, machine)) {
+            Elf64_Rela entry;
+
+            memcpy(&entry, ptr, sizeof(entry));
+            uint64_t r_offset = to_host_endian_64(entry.r_offset, file_is_le);
+            uint64_t r_info   = to_host_endian_64(entry.r_info,   file_is_le);
+            if (!is_valid_relocation_info_for_arch(r_info, true, machine)) {
                 return false;
             }
             if (use_segments && !is_valid_virtual_address(r_offset, segs, nsegs)) {
@@ -7729,11 +8655,12 @@ static inline bool validate_one_reloc_entry(const uint8_t *ptr,
             }
             return true;
         } else {
-            const Elf64_Rel *p = (const Elf64_Rel *)ptr;
-            uint64_t r_offset = to_host_endian_64(p->r_offset, file_is_le);
-            uint64_t r_info   = to_host_endian_64(p->r_info,   file_is_le);
-            uint32_t type     = ELF64_R_TYPE(r_info);
-            if (!is_valid_relocation_type_for_arch(type, machine)) {
+            Elf64_Rel entry;
+
+            memcpy(&entry, ptr, sizeof(entry));
+            uint64_t r_offset = to_host_endian_64(entry.r_offset, file_is_le);
+            uint64_t r_info   = to_host_endian_64(entry.r_info,   file_is_le);
+            if (!is_valid_relocation_info_for_arch(r_info, true, machine)) {
                 return false;
             }
             if (use_segments && !is_valid_virtual_address(r_offset, segs, nsegs)) {
@@ -7743,11 +8670,12 @@ static inline bool validate_one_reloc_entry(const uint8_t *ptr,
         }
     } else {
         if (is_rela) {
-            const Elf32_Rela *p = (const Elf32_Rela *)ptr;
-            uint32_t r_offset = to_host_endian_32(p->r_offset, file_is_le);
-            uint32_t r_info   = to_host_endian_32(p->r_info,   file_is_le);
-            uint32_t type     = ELF32_R_TYPE(r_info);
-            if (!is_valid_relocation_type_for_arch(type, machine)) {
+            Elf32_Rela entry;
+
+            memcpy(&entry, ptr, sizeof(entry));
+            uint32_t r_offset = to_host_endian_32(entry.r_offset, file_is_le);
+            uint32_t r_info   = to_host_endian_32(entry.r_info,   file_is_le);
+            if (!is_valid_relocation_info_for_arch(r_info, false, machine)) {
                 return false;
             }
             if (use_segments && !is_valid_virtual_address((uint64_t)r_offset, segs, nsegs)) {
@@ -7755,11 +8683,12 @@ static inline bool validate_one_reloc_entry(const uint8_t *ptr,
             }
             return true;
         } else {
-            const Elf32_Rel *p = (const Elf32_Rel *)ptr;
-            uint32_t r_offset = to_host_endian_32(p->r_offset, file_is_le);
-            uint32_t r_info   = to_host_endian_32(p->r_info,   file_is_le);
-            uint32_t type     = ELF32_R_TYPE(r_info);
-            if (!is_valid_relocation_type_for_arch(type, machine)) {
+            Elf32_Rel entry;
+
+            memcpy(&entry, ptr, sizeof(entry));
+            uint32_t r_offset = to_host_endian_32(entry.r_offset, file_is_le);
+            uint32_t r_info   = to_host_endian_32(entry.r_info,   file_is_le);
+            if (!is_valid_relocation_info_for_arch(r_info, false, machine)) {
                 return false;
             }
             if (use_segments && !is_valid_virtual_address((uint64_t)r_offset, segs, nsegs)) {
@@ -8054,15 +8983,27 @@ validate_relocation_run_against_dynamic(const uint8_t *slice_base,
             uint64_t r_info = 0;
             if (is_64) {
                 if (want_rela){
-                    r_info = to_host_endian_64(((const Elf64_Rela*)p)->r_info, file_is_le);
+                    Elf64_Rela entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_64(entry.r_info, file_is_le);
                 }else{
-                    r_info = to_host_endian_64(((const Elf64_Rel *)p)->r_info, file_is_le);
+                    Elf64_Rel entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_64(entry.r_info, file_is_le);
                 }
             } else {
                 if (want_rela){
-                    r_info = to_host_endian_32(((const Elf32_Rela*)p)->r_info, file_is_le);
+                    Elf32_Rela entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_32(entry.r_info, file_is_le);
                 }else{
-                    r_info = to_host_endian_32(((const Elf32_Rel *)p)->r_info, file_is_le);
+                    Elf32_Rel entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_32(entry.r_info, file_is_le);
                 }
             }
             uint32_t type = is_64 ? ELF64_R_TYPE(r_info) : ELF32_R_TYPE((uint32_t)r_info);
@@ -8086,15 +9027,31 @@ validate_relocation_run_against_dynamic(const uint8_t *slice_base,
             uint64_t r_info = 0;
 
             if (is_64) {
-                if (run_is_rela)
-                    r_info = to_host_endian_64(((const Elf64_Rela*)p)->r_info, file_is_le);
-                else
-                    r_info = to_host_endian_64(((const Elf64_Rel*)p)->r_info,  file_is_le);
+                if (run_is_rela) {
+                    Elf64_Rela entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_64(entry.r_info, file_is_le);
+                }
+                else {
+                    Elf64_Rel entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_64(entry.r_info, file_is_le);
+                }
             } else {
-                if (run_is_rela)
-                    r_info = to_host_endian_32(((const Elf32_Rela*)p)->r_info, file_is_le);
-                else
-                    r_info = to_host_endian_32(((const Elf32_Rel*)p)->r_info,  file_is_le);
+                if (run_is_rela) {
+                    Elf32_Rela entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_32(entry.r_info, file_is_le);
+                }
+                else {
+                    Elf32_Rel entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_info = to_host_endian_32(entry.r_info, file_is_le);
+                }
             }
 
             uint64_t r_sym = is_64
@@ -8197,7 +9154,7 @@ validate_reloc_run_against_sht(const uint8_t  *slice_base,
 
     if (is_64) {
         Elf_Header_64 eh;
-        if (!read_candidate_bytes(candidate, 0, sizeof(eh), (uint8_t *)&eh)) {
+        if (!read_candidate_elf_header_64(candidate, &eh)) {
             return VR_INCONCLUSIVE;
         }
         shnum     = to_host_endian_16(eh.num_sht_entries, file_is_le);
@@ -8205,7 +9162,7 @@ validate_reloc_run_against_sht(const uint8_t  *slice_base,
         shentsize = to_host_endian_16(eh.sht_entry_size,  file_is_le);
     } else {
         Elf_Header_32 eh;
-        if (!read_candidate_bytes(candidate, 0, sizeof(eh), (uint8_t *)&eh)) {
+        if (!read_candidate_elf_header_32(candidate, &eh)) {
             return VR_INCONCLUSIVE;
         }
         shnum     = to_host_endian_16(eh.num_sht_entries, file_is_le);
@@ -8266,19 +9223,27 @@ validate_reloc_run_against_sht(const uint8_t  *slice_base,
 
             if (is_64) {
                 if (run_is_rela) {
-                    const Elf64_Rela *r = (const Elf64_Rela *)p;
-                    r_off = to_host_endian_64(r->r_offset, file_is_le);
+                    Elf64_Rela entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_off = to_host_endian_64(entry.r_offset, file_is_le);
                 } else {
-                    const Elf64_Rel *r  = (const Elf64_Rel  *)p;
-                    r_off = to_host_endian_64(r->r_offset, file_is_le);
+                    Elf64_Rel entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_off = to_host_endian_64(entry.r_offset, file_is_le);
                 }
             } else {
                 if (run_is_rela) {
-                    const Elf32_Rela *r = (const Elf32_Rela *)p;
-                    r_off = (uint64_t)to_host_endian_32(r->r_offset, file_is_le);
+                    Elf32_Rela entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_off = (uint64_t)to_host_endian_32(entry.r_offset, file_is_le);
                 } else {
-                    const Elf32_Rel *r  = (const Elf32_Rel  *)p;
-                    r_off = (uint64_t)to_host_endian_32(r->r_offset, file_is_le);
+                    Elf32_Rel entry;
+
+                    memcpy(&entry, p, sizeof(entry));
+                    r_off = (uint64_t)to_host_endian_32(entry.r_offset, file_is_le);
                 }
             }
 
@@ -8404,14 +9369,15 @@ static inline bool validate_one_sym_entry(const uint8_t *ptr,
     }
 
     if (is_64bit) {
-        const Elf64_Sym *sym = (const Elf64_Sym *)ptr;
+        Elf64_Sym sym;
 
-        uint32_t st_name  = sym->st_name;
-        uint8_t  st_info  = sym->st_info;
-        uint8_t  st_other = sym->st_other;
-        uint16_t st_shndx = sym->st_shndx;
-        uint64_t st_value = sym->st_value;
-        uint64_t st_size  = sym->st_size;
+        memcpy(&sym, ptr, sizeof(sym));
+        uint32_t st_name  = sym.st_name;
+        uint8_t  st_info  = sym.st_info;
+        uint8_t  st_other = sym.st_other;
+        uint16_t st_shndx = sym.st_shndx;
+        uint64_t st_value = sym.st_value;
+        uint64_t st_size  = sym.st_size;
 
         if (!file_is_le) {
             st_name  = __builtin_bswap32(st_name);
@@ -8420,7 +9386,7 @@ static inline bool validate_one_sym_entry(const uint8_t *ptr,
             st_size  = __builtin_bswap64(st_size);
         }
 
-        if (is_all_zero_sym64(sym)) {
+        if (is_all_zero_sym64(&sym)) {
             if (is_zero_entry) {
                 *is_zero_entry = true;
             }
@@ -8449,14 +9415,15 @@ static inline bool validate_one_sym_entry(const uint8_t *ptr,
 
         return true;
     } else {
-        const Elf32_Sym *sym = (const Elf32_Sym *)ptr;
+        Elf32_Sym sym;
 
-        uint32_t st_name  = sym->st_name;
-        uint8_t  st_info  = sym->st_info;
-        uint8_t  st_other = sym->st_other;
-        uint16_t st_shndx = sym->st_shndx;
-        uint32_t st_value = sym->st_value;
-        uint32_t st_size  = sym->st_size;
+        memcpy(&sym, ptr, sizeof(sym));
+        uint32_t st_name  = sym.st_name;
+        uint8_t  st_info  = sym.st_info;
+        uint8_t  st_other = sym.st_other;
+        uint16_t st_shndx = sym.st_shndx;
+        uint32_t st_value = sym.st_value;
+        uint32_t st_size  = sym.st_size;
 
         if (!file_is_le) {
             st_name  = __builtin_bswap32(st_name);
@@ -8465,7 +9432,7 @@ static inline bool validate_one_sym_entry(const uint8_t *ptr,
             st_size  = __builtin_bswap32(st_size);
         }
 
-        if (is_all_zero_sym32(sym)) {
+        if (is_all_zero_sym32(&sym)) {
             if (is_zero_entry) {
                 *is_zero_entry = true;
             }
@@ -8771,10 +9738,12 @@ validate_dynsym_run_against_dynamic(const uint8_t    *slice_base,
             const uint8_t *p = slice_base + run_start + i * entry_size;
 
             if (is_64) {
-                const Elf64_Sym *s = (const Elf64_Sym *)p;
-                uint32_t st_name  = s->st_name;
-                uint16_t st_shndx = s->st_shndx;
-                uint64_t st_value = s->st_value;
+                Elf64_Sym entry;
+
+                memcpy(&entry, p, sizeof(entry));
+                uint32_t st_name  = entry.st_name;
+                uint16_t st_shndx = entry.st_shndx;
+                uint64_t st_value = entry.st_value;
                 if (!file_is_le) {
                     st_name  = __builtin_bswap32(st_name);
                     st_shndx = __builtin_bswap16(st_shndx);
@@ -8790,10 +9759,12 @@ validate_dynsym_run_against_dynamic(const uint8_t    *slice_base,
                     }
                 }
             } else {
-                const Elf32_Sym *s = (const Elf32_Sym *)p;
-                uint32_t st_name  = s->st_name;
-                uint16_t st_shndx = s->st_shndx;
-                uint32_t st_value = s->st_value;
+                Elf32_Sym entry;
+
+                memcpy(&entry, p, sizeof(entry));
+                uint32_t st_name  = entry.st_name;
+                uint16_t st_shndx = entry.st_shndx;
+                uint32_t st_value = entry.st_value;
                 if (!file_is_le) {
                     st_name  = __builtin_bswap32(st_name);
                     st_shndx = __builtin_bswap16(st_shndx);
@@ -8887,11 +9858,15 @@ validate_strtab_against_symtab(CarveInfo                      *cand,
 
         uint32_t st_name;
         if (is_64) {
-            const Elf64_Sym *s = (const Elf64_Sym *)buf;
-            st_name = to_host_endian_32(s->st_name, file_is_le);
+            Elf64_Sym entry;
+
+            memcpy(&entry, buf, sizeof(entry));
+            st_name = to_host_endian_32(entry.st_name, file_is_le);
         } else {
-            const Elf32_Sym *s = (const Elf32_Sym *)buf;
-            st_name = to_host_endian_32(s->st_name, file_is_le);
+            Elf32_Sym entry;
+
+            memcpy(&entry, buf, sizeof(entry));
+            st_name = to_host_endian_32(entry.st_name, file_is_le);
         }
 
         if (st_name == 0) {
@@ -9909,11 +10884,26 @@ static inline void elf_batched_block_validate(uint32_t needleidx, uint32_t block
         return;
     }
 
-    // require >= 4096 byte blocks
+    // ONYX classifies 4096 byte windows. At smaller carve block sizes, retain
+    // MoDiCo priors and leave unclassified blocks available rather than infer
+    // from inputs dominated by synthetic padding.
     if (blocksize < 4096) {
-        handle_error(SCALPEL_GENERAL_ABORT,
-                     "ELF validator requires blocksize of 4096 bytes or greater.",
-                     __LINE__, __FILE__);
+        const uint32_t filetype = needleidx;
+        uint64_t initialized = filemirror_default_unclassified_blocktypes(
+            scalpel_state.filemirror, &filetype, 1,
+            BLOCK_CONFIDENCE_VALID);
+
+        lock_fprintf(stdout,
+                     "Skipping ONYX ELF block validation for %u byte blocks; "
+                     "preserved classifier decisions and initialized %" PRIu64
+                     " unclassified blocks.\n",
+                     blocksize, initialized);
+        scalpel_log(
+            "Skipped ONYX ELF block validation for %u byte blocks; preserved "
+            "classifier decisions and initialized %" PRIu64
+            " unclassified blocks.\n",
+            blocksize, initialized);
+        return;
     }
 
     // initialize the ONNX model
@@ -11611,23 +12601,24 @@ static inline int64_t elf_validate_relative_type(uint16_t machine) {
     }
 }
 
-// verify RELATIVE relocation targets against the assembled bytes. For every
-// R_*_RELATIVE entry, the target's file offset comes from the PT_LOAD map; for RELA the
-// pointer-sized on-disk value there must be the entry's addend (linkers write the addend
-// into the slot) or zero, and for REL the slot itself carries the addend, which must be
-// zero or a mapped virtual address. Relocation targets are dense across .data.rel.ro,
-// .got, and .data, so a wrong block in those regions trips this check no matter what the
-// filler content looks like -- this is the pointwise oracle for otherwise unstructured
-// data.
+// Check RELATIVE relocation destinations against loadable memory. RELA stores
+// its addend in the relocation, not necessarily in the destination bytes.
+// Common linker contents provide supporting evidence, not a validity rule;
+// report unconventional values separately so the complete candidate survives.
 static inline bool elf_validate_relative_targets(const char *data, uint64_t length,
                                                  uint64_t sh_off, uint64_t sh_size,
                                                  uint64_t sh_entsize, bool is_rela,
                                                  bool is_64, bool need_swap,
                                                  uint16_t machine,
                                                  const SegmentInfo *segs, int nsegs,
-                                                 uint64_t va_min, uint64_t va_max) {
+                                                 uint64_t va_min, uint64_t va_max,
+                                                 bool *conventional_contents) {
     const int64_t rel_type = elf_validate_relative_type(machine);
     uint64_t entsize = sh_entsize;
+
+    if (conventional_contents) {
+        *conventional_contents = true;
+    }
 
     if (rel_type < 0 || nsegs <= 0) {
         return true;
@@ -11636,8 +12627,9 @@ static inline bool elf_validate_relative_targets(const char *data, uint64_t leng
     if (entsize == 0) {
         entsize = is_64 ? (is_rela ? 24u : 16u) : (is_rela ? 12u : 8u);
     }
-    if (sh_off + sh_size > length || entsize < (is_64 ? (is_rela ? 24u : 16u)
-                                                      : (is_rela ? 12u : 8u))) {
+    if (sh_off > length || sh_size > length - sh_off
+        || entsize < (is_64 ? (is_rela ? 24u : 16u) : (is_rela ? 12u : 8u))
+        || sh_size % entsize != 0) {
         return false;
     }
 
@@ -11694,14 +12686,40 @@ static inline bool elf_validate_relative_targets(const char *data, uint64_t leng
             continue;
         }
 
-        uint64_t toff;
-        if (! elf_validate_va_to_off(segs, nsegs, r_offset, &toff)) {
+        const uint64_t psize = is_64 ? 8u : 4u;
+        uint64_t toff = 0;
+        bool mapped = false;
+        bool stored = false;
+        for (int i = 0; i < nsegs; i++) {
+            if (r_offset < segs[i].seg_vaddr) {
+                continue;
+            }
+            const uint64_t delta = r_offset - segs[i].seg_vaddr;
+            if (delta > segs[i].seg_mem_size
+                || psize > segs[i].seg_mem_size - delta) {
+                continue;
+            }
+            mapped = true;
+            if (delta <= segs[i].seg_file_size
+                && psize <= segs[i].seg_file_size - delta) {
+                if (segs[i].seg_offset > length
+                    || delta > length - segs[i].seg_offset) {
+                    return false;
+                }
+                toff = segs[i].seg_offset + delta;
+                if (psize > length - toff) {
+                    return false;
+                }
+                stored = true;
+                break;
+            }
+        }
+        if (!mapped) {
             return false;
         }
-
-        const uint64_t psize = is_64 ? 8u : 4u;
-        if (toff + psize > length) {
-            return false;
+        // The loader can relocate zero-filled storage beyond p_filesz too.
+        if (!stored) {
+            continue;
         }
 
         uint64_t v;
@@ -11720,12 +12738,16 @@ static inline bool elf_validate_relative_targets(const char *data, uint64_t leng
 
         if (is_rela) {
             if (v != r_addend && v != 0) {
-                return false;
+                if (conventional_contents) {
+                    *conventional_contents = false;
+                }
             }
         }
         else {
             if (v != 0 && (v < va_min || v >= va_max)) {
-                return false;
+                if (conventional_contents) {
+                    *conventional_contents = false;
+                }
             }
         }
     }
@@ -11754,6 +12776,134 @@ static inline const char *elf_validate_section_name(const char *data, uint64_t l
     return "";
 }
 
+
+// Check every relocation at the section's declared record boundaries, not
+// just a plausible run found by the block classifier's sliding-window scan.
+// Architectures with other r_info layouts keep their existing checks.
+static inline bool elf_relocation_symbols_are_consistent(
+    const char *data, uint64_t length, uint64_t section_offset,
+    uint64_t table_offset, uint16_t table_stride, uint16_t section_count,
+    bool is_64, bool file_is_le, uint16_t machine,
+    const SegmentInfo *load_segments, size_t num_load_segments)
+{
+    Section_Header_Entry_64 relocations;
+    Section_Header_Entry_64 symbols;
+    uint64_t symbol_offset;
+
+    if (machine != EM_386 && machine != EM_X86_64
+        && machine != EM_ARM && machine != EM_AARCH64) {
+        return true;
+    }
+    if (!elf_partial_section_extent(data, length, section_offset,
+                                    is_64, file_is_le, &relocations)) {
+        return false;
+    }
+    if (relocations.sect_size == 0 || relocations.sect_idx == 0) {
+        return true;
+    }
+    if (relocations.sect_idx >= section_count
+        || __builtin_add_overflow(
+               table_offset, (uint64_t)relocations.sect_idx * table_stride,
+               &symbol_offset)
+        || !elf_partial_section_extent(data, length, symbol_offset,
+                                        is_64, file_is_le, &symbols)
+        || (symbols.section_type != SECTION_TYPE_SYMTAB
+            && symbols.section_type != SECTION_TYPE_DYNSYM)) {
+        return false;
+    }
+
+    const bool is_rela = relocations.section_type == SECTION_TYPE_RELA;
+    const uint64_t canonical_relocation_size =
+        is_64 ? (is_rela ? sizeof(Elf64_Rela) : sizeof(Elf64_Rel))
+              : (is_rela ? sizeof(Elf32_Rela) : sizeof(Elf32_Rel));
+    const uint64_t relocation_stride = relocations.entry_size
+                                          ? relocations.entry_size
+                                          : canonical_relocation_size;
+    const uint64_t canonical_symbol_size =
+        is_64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+    const uint64_t symbol_stride = symbols.entry_size
+                                      ? symbols.entry_size
+                                      : canonical_symbol_size;
+
+    if (relocation_stride < canonical_relocation_size
+        || relocations.sect_size % relocation_stride != 0
+        || relocations.sect_file_off > length
+        || relocations.sect_size > length - relocations.sect_file_off
+        || symbol_stride < canonical_symbol_size
+        || symbols.sect_size % symbol_stride != 0) {
+        return false;
+    }
+
+    const uint64_t symbol_count = symbols.sect_size / symbol_stride;
+    const uint64_t relocation_count = relocations.sect_size / relocation_stride;
+    uint64_t section_flags = 0;
+    if (is_64) {
+        if (!read64_at(data, length, data + section_offset, 8,
+                       file_is_le, &section_flags)) {
+            return false;
+        }
+    }
+    else {
+        uint32_t flags32;
+        if (!read32_at(data, length, data + section_offset, 8,
+                       file_is_le, &flags32)) {
+            return false;
+        }
+        section_flags = flags32;
+    }
+    uint16_t object_type = 0;
+    if (length >= 18) {
+        memcpy(&object_type, data + 16, sizeof(object_type));
+        object_type = to_host_endian_16(object_type, file_is_le);
+    }
+    const bool check_addresses = load_segments && num_load_segments != 0
+        && (section_flags & SHF_ALLOC)
+        && (object_type == 2 || object_type == 3); // ET_EXEC / ET_DYN
+    for (uint64_t index = 0; index < relocation_count; index++) {
+        const char *entry = data + relocations.sect_file_off
+                            + index * relocation_stride;
+        uint64_t symbol;
+        uint64_t address;
+        uint32_t type;
+
+        if (!validate_one_reloc_entry((const uint8_t *)entry,
+                                      is_64, is_rela, file_is_le,
+                                      machine, NULL, 0, false)) {
+            return false;
+        }
+
+        if (is_64) {
+            uint64_t info;
+            memcpy(&address, entry, sizeof(address));
+            address = to_host_endian_64(address, file_is_le);
+            memcpy(&info, entry + sizeof(uint64_t), sizeof(info));
+            info = to_host_endian_64(info, file_is_le);
+            symbol = ELF64_R_SYM(info);
+            type = ELF64_R_TYPE(info);
+        }
+        else {
+            uint32_t info;
+            uint32_t address32;
+            memcpy(&address32, entry, sizeof(address32));
+            address = to_host_endian_32(address32, file_is_le);
+            memcpy(&info, entry + sizeof(uint32_t), sizeof(info));
+            info = to_host_endian_32(info, file_is_le);
+            symbol = ELF32_R_SYM(info);
+            type = ELF32_R_TYPE(info);
+        }
+        const bool no_relocation = type == 0
+            || (is_64 && machine == EM_AARCH64 && type == 0x100);
+        // R_*_NONE and STN_UNDEF do not require a symbol lookup.
+        if (!no_relocation
+            && ((symbol != 0 && symbol >= symbol_count)
+                || (check_addresses
+                    && !is_valid_virtual_address(address, load_segments,
+                                                  num_load_segments)))) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /**
  * @brief Validate whether a contiguous buffer contains a well-formed ELF file.
@@ -11924,6 +13074,7 @@ static inline void elf_file_validate_limited(char *data,
     }
 
     uint64_t totalSize = 0;
+    bool relative_contents_match = true;
     const char width      = data[4];
     const char endianness = data[5];
 
@@ -12013,11 +13164,8 @@ static inline void elf_file_validate_limited(char *data,
             bool have_sym  = false, have_str  = false;
             bool have_dsym = false, have_dstr = false;
 
-            if (need_swap) {
-                shnum   = __builtin_bswap16((uint16_t)shnum);
-                shentsz = __builtin_bswap16((uint16_t)shentsz);
-                shoff   = __builtin_bswap32((uint32_t)shoff);
-            }
+            // ELF_header_validate_32() returns host-endian header fields. Only
+            // fields read directly from the candidate below require swapping.
 
             /* PT_LOAD image span and .shstrtab location for the late-section layers */
             uint64_t va_min = 0, va_max = 0;
@@ -12032,13 +13180,6 @@ static inline void elf_file_validate_limited(char *data,
                 uint16_t pht_entsz32 = elf_header_32->pht_entry_size;
                 uint16_t pht_num32   = elf_header_32->num_pht_entries;
                 uint16_t shstrndx    = elf_header_32->idx_section_names;
-
-                if (need_swap) {
-                    pht_off32   = __builtin_bswap32(pht_off32);
-                    pht_entsz32 = __builtin_bswap16(pht_entsz32);
-                    pht_num32   = __builtin_bswap16(pht_num32);
-                    shstrndx    = __builtin_bswap16(shstrndx);
-                }
 
                 nloads = elf_validate_load_va_span(data, length, false, need_swap,
                                                    (uint64_t)pht_off32, pht_entsz32,
@@ -12110,10 +13251,11 @@ static inline void elf_file_validate_limited(char *data,
                     }
                 }
 
-                /* relocation scan */
-                if (sh_type == SECTION_TYPE_REL || sh_type == SECTION_TYPE_RELA) {
-                    uint16_t machine = elf_header_32->isa;
-                    if (need_swap) machine = __builtin_bswap16(machine);
+                // Apply architecture-specific relocation semantics only when
+                // this validator understands that architecture's type field.
+                const uint16_t machine = elf_header_32->isa;
+                if ((sh_type == SECTION_TYPE_REL || sh_type == SECTION_TYPE_RELA) &&
+                    has_relocation_type_validator(machine)) {
 
                     RelocScanResult rr = scan_for_valid_relocation_entries(
                         (const uint8_t *)data, length,
@@ -12121,7 +13263,12 @@ static inline void elf_file_validate_limited(char *data,
                         is_64, file_is_le, machine,
                         NULL, 0, false);
 
-                    if (rr.count == 0) {
+                    if (rr.count == 0
+                        || !elf_relocation_symbols_are_consistent(
+                               data, length, entry_off, shoff, shentsz, shnum,
+                               is_64, file_is_le, machine,
+                               nloads == nsegs ? load_segs : NULL,
+                               nloads == nsegs ? (size_t)nsegs : 0)) {
 #ifdef ELF_REASSEMBLY_DEBUG
                         lock_fprintf(stderr,
                             "[ELF_VALIDATE][%s][ELF32] FAIL: reloc scan empty at sh=%u\n",
@@ -12132,14 +13279,15 @@ static inline void elf_file_validate_limited(char *data,
                         return;
                     }
 
-                    /* RELATIVE targets must carry their addend (or zero) on disk */
+                    bool conventional_contents = true;
                     if (! elf_validate_relative_targets(data, length, (uint64_t)sh_off,
                                                         (uint64_t)sh_size,
                                                         (uint64_t)sh_entsize,
                                                         sh_type == SECTION_TYPE_RELA,
                                                         is_64, need_swap, machine,
                                                         load_segs, nsegs,
-                                                        va_min, va_max)) {
+                                                        va_min, va_max,
+                                                        &conventional_contents)) {
 #ifdef ELF_REASSEMBLY_DEBUG
                         lock_fprintf(stderr,
                             "[ELF_VALIDATE][%s][ELF32] FAIL: RELATIVE reloc targets at sh=%u\n",
@@ -12149,6 +13297,7 @@ static inline void elf_file_validate_limited(char *data,
                         free(elf_header_32);
                         return;
                     }
+                    relative_contents_match &= conventional_contents;
                 }
 
                 /* symbol scan + collect for strtab cross-check */
@@ -12306,11 +13455,15 @@ static inline void elf_file_validate_limited(char *data,
 
                     uint32_t st_name = 0;
                     if (is_64) {
-                        const Elf64_Sym *s = (const Elf64_Sym *)(data + sym_off + off);
-                        st_name = s->st_name;
+                        Elf64_Sym entry;
+
+                        memcpy(&entry, data + sym_off + off, sizeof(entry));
+                        st_name = entry.st_name;
                     } else {
-                        const Elf32_Sym *s = (const Elf32_Sym *)(data + sym_off + off);
-                        st_name = s->st_name;
+                        Elf32_Sym entry;
+
+                        memcpy(&entry, data + sym_off + off, sizeof(entry));
+                        st_name = entry.st_name;
                     }
                     if (need_swap) st_name = __builtin_bswap32(st_name);
                     if (st_name == 0) continue;
@@ -12350,11 +13503,15 @@ static inline void elf_file_validate_limited(char *data,
 
                     uint32_t st_name = 0;
                     if (is_64) {
-                        const Elf64_Sym *s = (const Elf64_Sym *)(data + sym_off + off);
-                        st_name = s->st_name;
+                        Elf64_Sym entry;
+
+                        memcpy(&entry, data + sym_off + off, sizeof(entry));
+                        st_name = entry.st_name;
                     } else {
-                        const Elf32_Sym *s = (const Elf32_Sym *)(data + sym_off + off);
-                        st_name = s->st_name;
+                        Elf32_Sym entry;
+
+                        memcpy(&entry, data + sym_off + off, sizeof(entry));
+                        st_name = entry.st_name;
                     }
                     if (need_swap) st_name = __builtin_bswap32(st_name);
                     if (st_name == 0) continue;
@@ -12481,11 +13638,8 @@ static inline void elf_file_validate_limited(char *data,
             uint16_t shentsz = elf_header_64->sht_entry_size;
             uint64_t shoff   = elf_header_64->sht_off;
 
-            if (need_swap) {
-                shnum   = __builtin_bswap16(shnum);
-                shentsz = __builtin_bswap16(shentsz);
-                shoff   = __builtin_bswap64(shoff);
-            }
+            // ELF_header_validate_64() returns host-endian header fields. Only
+            // fields read directly from the candidate below require swapping.
 
             /* PT_LOAD image span and .shstrtab location for the late-section layers */
             uint64_t va_min = 0, va_max = 0;
@@ -12500,13 +13654,6 @@ static inline void elf_file_validate_limited(char *data,
                 uint16_t pht_entsz64 = elf_header_64->pht_entry_size;
                 uint16_t pht_num64   = elf_header_64->num_pht_entries;
                 uint16_t shstrndx    = elf_header_64->idx_section_names;
-
-                if (need_swap) {
-                    pht_off64   = __builtin_bswap64(pht_off64);
-                    pht_entsz64 = __builtin_bswap16(pht_entsz64);
-                    pht_num64   = __builtin_bswap16(pht_num64);
-                    shstrndx    = __builtin_bswap16(shstrndx);
-                }
 
                 nloads = elf_validate_load_va_span(data, length, true, need_swap,
                                                    pht_off64, pht_entsz64,
@@ -12585,10 +13732,11 @@ static inline void elf_file_validate_limited(char *data,
                     }
                 }
 
-                /* relocation scan */
-                if (sh_type == SECTION_TYPE_REL || sh_type == SECTION_TYPE_RELA) {
-                    uint16_t machine = elf_header_64->isa;
-                    if (need_swap) machine = __builtin_bswap16(machine);
+                // Apply architecture-specific relocation semantics only when
+                // this validator understands that architecture's type field.
+                const uint16_t machine = elf_header_64->isa;
+                if ((sh_type == SECTION_TYPE_REL || sh_type == SECTION_TYPE_RELA) &&
+                    has_relocation_type_validator(machine)) {
 
                     RelocScanResult rr = scan_for_valid_relocation_entries(
                         (const uint8_t *)data, length,
@@ -12596,7 +13744,12 @@ static inline void elf_file_validate_limited(char *data,
                         is_64, file_is_le, machine,
                         NULL, 0, false);
 
-                    if (rr.count == 0) {
+                    if (rr.count == 0
+                        || !elf_relocation_symbols_are_consistent(
+                               data, length, entry_off, shoff, shentsz, shnum,
+                               is_64, file_is_le, machine,
+                               nloads == nsegs ? load_segs : NULL,
+                               nloads == nsegs ? (size_t)nsegs : 0)) {
 #ifdef ELF_REASSEMBLY_DEBUG
                         lock_fprintf(stderr,
                             "[ELF_VALIDATE][%s][ELF64] FAIL: reloc scan empty at sh=%u\n",
@@ -12607,13 +13760,14 @@ static inline void elf_file_validate_limited(char *data,
                         return;
                     }
 
-                    /* RELATIVE targets must carry their addend (or zero) on disk */
+                    bool conventional_contents = true;
                     if (! elf_validate_relative_targets(data, length, sh_off, sh_size,
                                                         sh_entsize,
                                                         sh_type == SECTION_TYPE_RELA,
                                                         is_64, need_swap, machine,
                                                         load_segs, nsegs,
-                                                        va_min, va_max)) {
+                                                        va_min, va_max,
+                                                        &conventional_contents)) {
 #ifdef ELF_REASSEMBLY_DEBUG
                         lock_fprintf(stderr,
                             "[ELF_VALIDATE][%s][ELF64] FAIL: RELATIVE reloc targets at sh=%u\n",
@@ -12623,6 +13777,7 @@ static inline void elf_file_validate_limited(char *data,
                         free(elf_header_64);
                         return;
                     }
+                    relative_contents_match &= conventional_contents;
                 }
 
                 /* symbol scan + collect for strtab cross-check */
@@ -12772,11 +13927,15 @@ static inline void elf_file_validate_limited(char *data,
 
                     uint32_t st_name = 0;
                     if (is_64) {
-                        const Elf64_Sym *s = (const Elf64_Sym *)(data + sym_off + off);
-                        st_name = s->st_name;
+                        Elf64_Sym entry;
+
+                        memcpy(&entry, data + sym_off + off, sizeof(entry));
+                        st_name = entry.st_name;
                     } else {
-                        const Elf32_Sym *s = (const Elf32_Sym *)(data + sym_off + off);
-                        st_name = s->st_name;
+                        Elf32_Sym entry;
+
+                        memcpy(&entry, data + sym_off + off, sizeof(entry));
+                        st_name = entry.st_name;
                     }
                     if (need_swap) st_name = __builtin_bswap32(st_name);
                     if (st_name == 0) continue;
@@ -12846,14 +14005,143 @@ static inline void elf_file_validate_limited(char *data,
     }
 
     *validates_to = totalSize - 1;
-    *validates    = true;
-    *promising    = false;
+    *validates    = relative_contents_match;
+    *promising    = !relative_contents_match;
 
 #ifdef ELF_REASSEMBLY_DEBUG
     lock_fprintf(stderr,
         "[ELF_VALIDATE][%s] SUCCESS: validates_to=%" PRIu64 " totalSize=%" PRIu64 "\n",
         cand_id, *validates_to, totalSize);
 #endif
+}
+
+// Read the bounds and links from a section descriptor in either ELF class.
+static inline bool elf_partial_section_extent(
+    const char *data, uint64_t length, uint64_t offset, bool wide, bool little,
+    Section_Header_Entry_64 *section)
+{
+    const uint64_t size = wide ? sizeof(Section_Header_Entry_64)
+                               : sizeof(Section_Header_Entry_32);
+    if (offset > length || size > length - offset) {
+        return false;
+    }
+    const char *entry = data + offset;
+    memset(section, 0, sizeof(*section));
+    if (!read32_at(data, length, entry, 4, little, &section->section_type)
+        || !read32_at(data, length, entry, wide ? 40 : 24, little, &section->sect_idx)
+        || !read32_at(data, length, entry, wide ? 44 : 28, little, &section->sect_info)) {
+        return false;
+    }
+    if (wide) {
+        return read64_at(data, length, entry, 24, little, &section->sect_file_off)
+            && read64_at(data, length, entry, 32, little, &section->sect_size)
+            && read64_at(data, length, entry, 56, little, &section->entry_size);
+    }
+    uint32_t start, extent, stride;
+    if (!read32_at(data, length, entry, 16, little, &start)
+        || !read32_at(data, length, entry, 20, little, &extent)
+        || !read32_at(data, length, entry, 36, little, &stride)) {
+        return false;
+    }
+    section->sect_file_off = start;
+    section->sect_size = extent;
+    section->entry_size = stride;
+    return true;
+}
+
+// A damaged symbol table need not discard the preceding checked content.
+// Locate its first contradictory entry, then verify the earlier sections with
+// the ordinary validator. The result is only a PROMISING block prefix, never a
+// complete-file verdict; opaque section contents retain their usual uncertainty.
+static inline uint64_t elf_partial_symbol_prefix(
+    char *data, uint64_t length, uint32_t blocksize)
+{
+    if (!data || length < 64 || length > SIZE_MAX || blocksize == 0) {
+        return 0;
+    }
+    const bool wide = data[4] == ELF_64_BIT;
+    const bool little = data[5] == ELF_LITTLE_ENDIAN;
+    uint64_t shoff;
+    uint16_t stride, count;
+    if (wide) {
+        Elf_Header_64 *header = ELF_header_validate_64(
+            data, length, TARGET_ENDIANNESS, data[5]);
+        if (!header) {
+            return 0;
+        }
+        shoff = header->sht_off;
+        stride = header->sht_entry_size;
+        count = header->num_sht_entries;
+        free(header);
+    }
+    else {
+        Elf_Header_32 *header = ELF_header_validate_32(
+            data, length, TARGET_ENDIANNESS, data[5]);
+        if (!header) {
+            return 0;
+        }
+        shoff = header->sht_off;
+        stride = header->sht_entry_size;
+        count = header->num_sht_entries;
+        free(header);
+    }
+    if (count == 0 || shoff > length
+        || (uint64_t)stride * count > length - shoff) {
+        return 0;
+    }
+
+    uint64_t first_bad = length;
+    const uint64_t symbol_size = wide ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+    for (uint16_t i = 0; i < count; i++) {
+        Section_Header_Entry_64 section;
+        if (!elf_partial_section_extent(data, length, shoff + (uint64_t)i * stride,
+                                        wide, little, &section)) {
+            return 0;
+        }
+        if (section.section_type != SECTION_TYPE_SYMTAB
+            && section.section_type != SECTION_TYPE_DYNSYM) {
+            continue;
+        }
+        Section_Header_Entry_64 strings;
+        if (section.sect_idx >= count || section.entry_size < symbol_size
+            || section.sect_size % section.entry_size != 0
+            || section.sect_info > section.sect_size / section.entry_size
+            || section.sect_file_off > length
+            || section.sect_size > length - section.sect_file_off
+            || !elf_partial_section_extent(data, length,
+                    shoff + (uint64_t)section.sect_idx * stride,
+                    wide, little, &strings)
+            || strings.section_type != SECTION_TYPE_STRTAB || strings.sect_size == 0) {
+            return 0;
+        }
+        uint64_t symbols = section.sect_size / section.entry_size;
+        for (uint64_t j = 0; j < symbols; j++) {
+            if ((j & 255) == 0
+                && atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                return 0;
+            }
+            uint64_t offset = section.sect_file_off + j * section.entry_size;
+            if (!elf_symbol_entry_matches_table((const uint8_t *)data + offset,
+                    wide, little, j, section.sect_info, count, strings.sect_size)) {
+                if (offset < first_bad) {
+                    first_bad = offset;
+                }
+                break;
+            }
+        }
+    }
+    if (first_bad == length) {
+        return 0;
+    }
+    uint64_t prefix = first_bad - first_bad % blocksize;
+    if (prefix <= blocksize) {
+        return 0;
+    }
+    bool validates = false, promising = false;
+    uint64_t validates_to = 0;
+    elf_file_validate_limited(data, length, prefix, &validates, &validates_to,
+                              &promising, 0, blocksize, NULL);
+    return validates ? prefix : 0;
 }
 
 static inline void elf_file_validate(char *data,
@@ -12867,6 +14155,12 @@ static inline void elf_file_validate(char *data,
 {
     elf_file_validate_limited(data, length, UINT64_MAX, validates, validates_to,
                               promising, needleidx, blocksize, carvehashkey);
+    if (validates && promising && validates_to && !*validates && *promising) {
+        uint64_t prefix = elf_partial_symbol_prefix(data, length, blocksize);
+        if (prefix > 0 && prefix - 1 > *validates_to) {
+            *validates_to = prefix - 1;
+        }
+    }
 }
 
 
@@ -15516,17 +16810,21 @@ static bool validate_sht_piece_slice_64(const uint8_t *blk,
                  cid, delta, shift, off);
 #endif
 
-    /* If the slice can’t even hold one entry at the aligned offset, treat as non-match. */
-    if (off + ENTRY > exp_end) {
+    /* Only the canonical prefix is interpreted; bytes beyond it belong to
+       the implementation-defined extension carried by a larger stride. */
+    if (off > exp_end
+        || sizeof(Section_Header_Entry_64) > exp_end - off) {
 #ifdef ELF_REASSEMBLY_DEBUG
         lock_fprintf(stdout,
-            "[%s] [sht-slice][FAIL] tiny-slice: off+ENTRY > exp_end (off=%" PRIu64 " ENTRY=%" PRIu64 " exp_end=%" PRIu64 ")\n",
+            "[%s] [sht-slice][FAIL] no canonical entry at off=%" PRIu64
+            " stride=%" PRIu64 " exp_end=%" PRIu64 "\n",
             cid, off, ENTRY, exp_end);
 #endif
         return false;
     }
 
-    const uint64_t max_entries = (exp_end - off) / ENTRY;
+    const uint64_t max_entries =
+        1 + (exp_end - off - sizeof(Section_Header_Entry_64)) / ENTRY;
 
 #ifndef MIN_CONSECUTIVE_VALID_SHT_ENTRIES
 #define MIN_CONSECUTIVE_VALID_SHT_ENTRIES 4
@@ -15605,9 +16903,9 @@ static bool validate_sht_piece_slice_64(const uint8_t *blk,
         }
 
         if (e.section_type != SECTION_TYPE_NULL) {
-            if (!is_pow2_nonzero(e.sect_align)) {
+            if (e.sect_align != 0 && !is_pow2_nonzero(e.sect_align)) {
 #ifdef ELF_REASSEMBLY_DEBUG
-                stop_reason = "sect_align not pow2/nonzero";
+                stop_reason = "sect_align is neither zero nor a power of two";
                 stop_e = e; have_stop_e = true; stop_entry = valid_count; stop_off = off;
 
                 lock_fprintf(stdout,
@@ -15644,21 +16942,6 @@ static bool validate_sht_piece_slice_64(const uint8_t *blk,
             lock_fprintf(stdout,
                          "[%s] [sht-slice][BREAK] %s: type=%u size=%" PRIu64 " entry=%" PRIu64 "\n",
                          cid, stop_reason, (unsigned)e.section_type, (uint64_t)e.sect_size, valid_count);
-
-            sht_dbg_dump_shdr64_brief(&e, valid_count, off, cand_id,
-                                      "[sht-slice][BREAK-DUMP]");
-#endif
-            break;
-        }
-
-        if (valid_count > 0 && e.sect_size == 0 && e.section_type != SECTION_TYPE_NULL) {
-#ifdef ELF_REASSEMBLY_DEBUG
-            stop_reason = "non-NULL section size==0 after first";
-            stop_e = e; have_stop_e = true; stop_entry = valid_count; stop_off = off;
-
-            lock_fprintf(stdout,
-                         "[%s] [sht-slice][BREAK] %s: type=%u entry=%" PRIu64 "\n",
-                         cid, stop_reason, (unsigned)e.section_type, valid_count);
 
             sht_dbg_dump_shdr64_brief(&e, valid_count, off, cand_id,
                                       "[sht-slice][BREAK-DUMP]");
@@ -16184,7 +17467,7 @@ static bool validate_sht_head_fragment_64(const uint8_t *piece0_blk,
     if (!is_valid_section_type(e.section_type)) return false;
 
     if (e.section_type != SECTION_TYPE_NULL) {
-        if (!is_pow2_nonzero(e.sect_align)) return false;
+        if (e.sect_align != 0 && !is_pow2_nonzero(e.sect_align)) return false;
         if (e.sect_align > (1ULL << 20)) return false;
         if (e.sect_file_off == 0 && !allow_zero_off_sht(e.section_type, e.sect_size)) return false;
     }
@@ -16292,7 +17575,7 @@ static bool validate_sht_tail_fragment_64(const uint8_t *prev_blk,
     if (!is_valid_section_type(e.section_type)) return false;
 
     if (e.section_type != SECTION_TYPE_NULL) {
-        if (!is_pow2_nonzero(e.sect_align)) return false;
+        if (e.sect_align != 0 && !is_pow2_nonzero(e.sect_align)) return false;
         if (e.sect_align > (1ULL << 20)) return false;
         if (e.sect_file_off == 0 && !allow_zero_off_sht(e.section_type, e.sect_size)) return false;
         // size==0 is allowed for some types, but your existing logic disallows after first;
@@ -16520,15 +17803,15 @@ static inline int64_t elf_candidate_header_apparent(CarveInfo *candidate)
  * Both phases seed their block-vector scan from the apparent block index of the ELF header
  * (via @ref elf_candidate_header_apparent) to improve locality.
  *
- * Tiny-head handling: when the piece-0 slice is shorter than one SHT entry
- * (@c exp0_size_clamped < @c SHT_ENTRY_SIZE_64), the normal piece-0 anchor approach is
- * replaced by a "tiny-head" path that:
+ * Short-head handling: the first piece contains less than one entry, or a
+ * standard null entry followed by less than one standard-sized entry. This
+ * replaces the normal piece-0 anchor with a short-head path that:
  *   a. Anchors piece 1 first (component phase, then content-validation phase).
  *   b. Tries the block immediately preceding piece 1 and accepts it only when
- *      @ref validate_sht_head_fragment_64 validates the boundary entry.
- *   c. If no adjacent block validates, reconstructs the standard null entry
- *      with zero bytes and leaves piece 0 physically unassigned. A global scan
- *      cannot uniquely identify such a short all-zero prefix.
+ *      @ref elf_sht_short_head_matches validates the boundary entry.
+ *   c. If the first piece contains only standard null-entry bytes and no
+ *      adjacent block validates, reconstructs those metadata bytes while leaving
+ *      piece 0 physically unassigned for later reassembly.
  *
  * Remaining pieces (indices 2 and above, or 1 and above in the normal path) are
  * selected as follows for each slot:
@@ -16656,13 +17939,15 @@ static inline int64_t find_valid_sht_block_64(CarveInfo *candidate,
                  (unsigned)hdr.num_sht_entries);
 #endif
 
-    if (hdr.sht_entry_size != SHT_ENTRY_SIZE_64) {
+    if (hdr.sht_entry_size < SHT_ENTRY_SIZE_64
+        || hdr.sht_entry_size > blocksize) {
 #ifdef ELF_REASSEMBLY_DEBUG
         lock_fprintf(stdout,
-                     "[%s] [sht-find][FAIL] unexpected shentsize=%u (expected %u)\n",
+                     "[%s] [sht-find][FAIL] invalid shentsize=%u (range %u..%u)\n",
                      cid,
                      (unsigned)hdr.sht_entry_size,
-                     (unsigned)SHT_ENTRY_SIZE_64);
+                     (unsigned)SHT_ENTRY_SIZE_64,
+                     (unsigned)blocksize);
 #endif
         return -1;
     }
@@ -16725,7 +18010,7 @@ static inline int64_t find_valid_sht_block_64(CarveInfo *candidate,
                  first_slot, last_slot, span_blocks, blocksize);
 #endif
 
-    const uint64_t ENTRY64 = (uint64_t)SHT_ENTRY_SIZE_64;
+    const uint64_t ENTRY64 = (uint64_t)hdr.sht_entry_size;
 
     /* ---------------- piece0 expected slice ---------------- */
     const uint64_t file_block0_start = first_slot * (uint64_t)blocksize;
@@ -16750,7 +18035,11 @@ static inline int64_t find_valid_sht_block_64(CarveInfo *candidate,
                  cid, file_block0_start, exp0_off, exp0_size, exp0_size_clamped);
 #endif
 
-    const bool tiny_head = (exp0_size_clamped > 0 && exp0_size_clamped < ENTRY64);
+    const bool tiny_head =
+        exp0_size_clamped > 0
+        && (exp0_size_clamped < sizeof(Section_Header_Entry_64)
+            || (ENTRY64 == sizeof(Section_Header_Entry_64)
+                && exp0_size_clamped < 2 * ENTRY64));
 
     /* ---------------- piece1 expected slice (only meaningful for tiny_head path) ---------------- */
     uint64_t file_block1_start = 0;
@@ -17070,7 +18359,7 @@ static inline int64_t find_valid_sht_block_64(CarveInfo *candidate,
         /* Now find PIECE0 by cross-boundary head reconstruction with anchored piece1. */
         {
             const uint64_t piece0_exp_off = exp0_off;
-            const uint64_t piece0_exp_end = exp0_off + exp0_size_clamped; /* < ENTRY */
+            const uint64_t piece0_exp_end = exp0_off + exp0_size_clamped; /* short first piece */
 
             const uint64_t piece1_exp_off = exp1_off;
             const uint64_t piece1_exp_end = exp1_end;
@@ -17089,11 +18378,11 @@ static inline int64_t find_valid_sht_block_64(CarveInfo *candidate,
                         uint8_t *b1 = get_apparent_block_data(scalpel_state.filemirror, piece1_apparent);
 
                         if (b0 && b1) {
-                            bool ok = validate_sht_head_fragment_64(b0, b1,
+                            bool ok = elf_sht_short_head_matches(b0, b1,
                                                                    blocksize,
                                                                    piece0_exp_off, piece0_exp_end,
                                                                    piece1_exp_off, piece1_exp_end,
-                                                                   need_swap,
+                                                                   true, need_swap,
                                                                    cid);
                             if (ok) piece0_apparent = preferred0;
                         }
@@ -17118,11 +18407,12 @@ static inline int64_t find_valid_sht_block_64(CarveInfo *candidate,
                                             piece1_apparent);
                 const bool reconstructs =
                     zero_piece && b1
-                    && validate_sht_head_fragment_64(
+                    && exp0_size_clamped <= sizeof(Section_Header_Entry_64)
+                    && elf_sht_short_head_matches(
                         zero_piece, b1, blocksize,
                         piece0_exp_off, piece0_exp_end,
                         piece1_exp_off, piece1_exp_end,
-                        need_swap, cid);
+                        true, need_swap, cid);
 
                 free(b1);
                 free(zero_piece);
@@ -17140,7 +18430,7 @@ static inline int64_t find_valid_sht_block_64(CarveInfo *candidate,
                 scratch_comp->type        = COMPONENT_SHT;
                 scratch_comp->section     = SECTION_UNKNOWN;
                 scratch_comp->blockOffset = (uint32_t)exp0_off;
-                scratch_comp->size        = (uint32_t)exp0_size_clamped; /* < ENTRY */
+                scratch_comp->size        = (uint32_t)exp0_size_clamped; /* short first piece */
                 first_comp = scratch_comp;
             } else {
                 first_comp = NULL;
@@ -17676,16 +18966,19 @@ static bool validate_sht_piece_slice_32(const uint8_t *blk,
                  cid, delta, shift, off);
 #endif
 
-    if (off + ENTRY > exp_end) {
+    if (off > exp_end
+        || sizeof(Section_Header_Entry_32) > exp_end - off) {
 #ifdef ELF_REASSEMBLY_DEBUG
         lock_fprintf(stdout,
-            "[%s] [sht-slice][FAIL] tiny-slice: off+ENTRY > exp_end (off=%" PRIu64 " ENTRY=%" PRIu64 " exp_end=%" PRIu64 ")\n",
+            "[%s] [sht-slice][FAIL] no canonical entry at off=%" PRIu64
+            " stride=%" PRIu64 " exp_end=%" PRIu64 "\n",
             cid, off, ENTRY, exp_end);
 #endif
         return false;
     }
 
-    const uint64_t max_entries = (exp_end - off) / ENTRY;
+    const uint64_t max_entries =
+        1 + (exp_end - off - sizeof(Section_Header_Entry_32)) / ENTRY;
 
 #ifndef MIN_CONSECUTIVE_VALID_SHT_ENTRIES
 #define MIN_CONSECUTIVE_VALID_SHT_ENTRIES 4
@@ -17764,9 +19057,10 @@ static bool validate_sht_piece_slice_32(const uint8_t *blk,
         }
 
         if (e.section_type != SECTION_TYPE_NULL) {
-            if (!is_pow2_nonzero((uint64_t)e.sect_align)) {
+            if (e.sect_align != 0
+                && !is_pow2_nonzero((uint64_t)e.sect_align)) {
 #ifdef ELF_REASSEMBLY_DEBUG
-                stop_reason = "sect_align not pow2/nonzero";
+                stop_reason = "sect_align is neither zero nor a power of two";
                 stop_e = e; have_stop_e = true; stop_entry = valid_count; stop_off = off;
 
                 lock_fprintf(stdout,
@@ -17803,21 +19097,6 @@ static bool validate_sht_piece_slice_32(const uint8_t *blk,
             lock_fprintf(stdout,
                          "[%s] [sht-slice][BREAK] %s: type=%u size=%" PRIu64 " entry=%" PRIu64 "\n",
                          cid, stop_reason, (unsigned)e.section_type, (uint64_t)e.sect_size, valid_count);
-
-            sht_dbg_dump_shdr32_brief(&e, valid_count, off, cand_id,
-                                      "[sht-slice][BREAK-DUMP]");
-#endif
-            break;
-        }
-
-        if (valid_count > 0 && (uint64_t)e.sect_size == 0 && e.section_type != SECTION_TYPE_NULL) {
-#ifdef ELF_REASSEMBLY_DEBUG
-            stop_reason = "non-NULL section size==0 after first";
-            stop_e = e; have_stop_e = true; stop_entry = valid_count; stop_off = off;
-
-            lock_fprintf(stdout,
-                         "[%s] [sht-slice][BREAK] %s: type=%u entry=%" PRIu64 "\n",
-                         cid, stop_reason, (unsigned)e.section_type, valid_count);
 
             sht_dbg_dump_shdr32_brief(&e, valid_count, off, cand_id,
                                       "[sht-slice][BREAK-DUMP]");
@@ -18322,7 +19601,8 @@ static bool validate_sht_head_fragment_32(const uint8_t *piece0_blk,
     if (!is_valid_section_type(e.section_type)) return false;
 
     if (e.section_type != SECTION_TYPE_NULL) {
-        if (!is_pow2_nonzero((uint64_t)e.sect_align)) return false;
+        if (e.sect_align != 0
+            && !is_pow2_nonzero((uint64_t)e.sect_align)) return false;
         if ((uint64_t)e.sect_align > (1ULL << 20)) return false;
         if ((uint64_t)e.sect_file_off == 0 && !allow_zero_off_sht(e.section_type, (uint64_t)e.sect_size)) return false;
     }
@@ -18338,6 +19618,52 @@ static bool validate_sht_head_fragment_32(const uint8_t *piece0_blk,
     return true;
 }
 
+
+
+// The following block has already passed its table-slice checks. A short
+// first block can contain just the standard null entry and a partial entry;
+// join that partial entry before deciding whether the head is plausible.
+static bool elf_sht_short_head_matches(const uint8_t *head,
+    const uint8_t *next, uint32_t blocksize, uint64_t head_off,
+    uint64_t head_end, uint64_t next_off, uint64_t next_end,
+    bool is_64, bool need_swap, const char *cid)
+{
+    const uint64_t entry = is_64 ? SHT_ENTRY_SIZE_64 : SHT_ENTRY_SIZE_32;
+    if (!head || !next || head_off >= head_end || head_end > blocksize
+        || next_off >= next_end || next_end > blocksize) {
+        return false;
+    }
+    uint64_t head_size = head_end - head_off;
+    if (head_size >= 2 * entry) {
+        return false;
+    }
+    if (head_size >= entry) {
+        if (!is_all_zero_bytes(head + head_off, (size_t)entry)) {
+            return false;
+        }
+        head_off += entry;
+        head_size -= entry;
+        if (head_size == 0) {
+            return true;
+        }
+        uint8_t fields[8];
+        const size_t from_head = head_size < sizeof(fields)
+            ? (size_t)head_size : sizeof(fields);
+        if (next_end - next_off < sizeof(fields) - from_head) {
+            return false;
+        }
+        memcpy(fields, head + head_off, from_head);
+        memcpy(fields + from_head, next + next_off, sizeof(fields) - from_head);
+        if (is_all_zero_bytes(fields + 4, 4)) {
+            return false;
+        }
+    }
+    return is_64
+        ? validate_sht_head_fragment_64(head, next, blocksize,
+            head_off, head_end, next_off, next_end, need_swap, cid)
+        : validate_sht_head_fragment_32(head, next, blocksize,
+            head_off, head_end, next_off, next_end, need_swap, cid);
+}
 
 
 /**
@@ -18426,7 +19752,8 @@ static bool validate_sht_tail_fragment_32(const uint8_t *prev_blk,
     if (!is_valid_section_type(e.section_type)) return false;
 
     if (e.section_type != SECTION_TYPE_NULL) {
-        if (!is_pow2_nonzero((uint64_t)e.sect_align)) return false;
+        if (e.sect_align != 0
+            && !is_pow2_nonzero((uint64_t)e.sect_align)) return false;
         if ((uint64_t)e.sect_align > (1ULL << 20)) return false;
         if ((uint64_t)e.sect_file_off == 0 && !allow_zero_off_sht(e.section_type, (uint64_t)e.sect_size)) return false;
     }
@@ -18631,15 +19958,15 @@ static bool match_sht_piece_in_block_32(CarveInfo *candidate,
  * Both phases seed their block-vector scan from the apparent block index of the ELF header
  * (via @ref elf_candidate_header_apparent) to improve locality.
  *
- * Tiny-head handling: when the piece-0 slice is shorter than one SHT entry
- * (@c exp0_size_clamped < @c SHT_ENTRY_SIZE_32), the normal piece-0 anchor approach is
- * replaced by a tiny-head path that:
+ * Short-head handling: the first piece contains less than one entry, or a
+ * standard null entry followed by less than one standard-sized entry. This
+ * replaces the normal piece-0 anchor with a short-head path that:
  *   a. Anchors piece 1 first (component phase, then content-validation phase).
  *   b. Tries the block immediately preceding piece 1 and accepts it only when
- *      @ref validate_sht_head_fragment_32 validates the boundary entry.
- *   c. If no adjacent block validates, reconstructs the standard null entry
- *      with zero bytes and leaves piece 0 physically unassigned. A global scan
- *      cannot uniquely identify such a short all-zero prefix.
+ *      @ref elf_sht_short_head_matches validates the boundary entry.
+ *   c. If the first piece contains only standard null-entry bytes and no
+ *      adjacent block validates, reconstructs those metadata bytes while leaving
+ *      piece 0 physically unassigned for later reassembly.
  *
  * Remaining pieces (indices 2 and above in the tiny-head path, 1 and above otherwise) are
  * selected as follows for each slot:
@@ -18767,13 +20094,15 @@ static inline int64_t find_valid_sht_block_32(CarveInfo *candidate,
                  (unsigned)hdr.num_sht_entries);
 #endif
 
-    if (hdr.sht_entry_size != SHT_ENTRY_SIZE_32) {
+    if (hdr.sht_entry_size < SHT_ENTRY_SIZE_32
+        || hdr.sht_entry_size > blocksize) {
 #ifdef ELF_REASSEMBLY_DEBUG
         lock_fprintf(stdout,
-                     "[%s] [sht-find32][FAIL] unexpected shentsize=%u (expected %u)\n",
+                     "[%s] [sht-find32][FAIL] invalid shentsize=%u (range %u..%u)\n",
                      cid,
                      (unsigned)hdr.sht_entry_size,
-                     (unsigned)SHT_ENTRY_SIZE_32);
+                     (unsigned)SHT_ENTRY_SIZE_32,
+                     (unsigned)blocksize);
 #endif
         return -1;
     }
@@ -18836,7 +20165,7 @@ static inline int64_t find_valid_sht_block_32(CarveInfo *candidate,
                  first_slot, last_slot, span_blocks, blocksize);
 #endif
 
-    const uint64_t ENTRY32 = (uint64_t)SHT_ENTRY_SIZE_32;
+    const uint64_t ENTRY32 = (uint64_t)hdr.sht_entry_size;
 
     /* ---------------- piece0 expected slice ---------------- */
     const uint64_t file_block0_start = first_slot * (uint64_t)blocksize;
@@ -18861,7 +20190,11 @@ static inline int64_t find_valid_sht_block_32(CarveInfo *candidate,
                  cid, file_block0_start, exp0_off, exp0_size, exp0_size_clamped);
 #endif
 
-    const bool tiny_head = (exp0_size_clamped > 0 && exp0_size_clamped < ENTRY32);
+    const bool tiny_head =
+        exp0_size_clamped > 0
+        && (exp0_size_clamped < sizeof(Section_Header_Entry_32)
+            || (ENTRY32 == sizeof(Section_Header_Entry_32)
+                && exp0_size_clamped < 2 * ENTRY32));
 
     /* ---------------- piece1 expected slice (tiny_head path) ---------------- */
     uint64_t file_block1_start = 0;
@@ -19143,7 +20476,7 @@ static inline int64_t find_valid_sht_block_32(CarveInfo *candidate,
         /* Find PIECE0 by cross-boundary head reconstruction with anchored piece1. */
         {
             const uint64_t piece0_exp_off = exp0_off;
-            const uint64_t piece0_exp_end = exp0_off + exp0_size_clamped; /* < ENTRY */
+            const uint64_t piece0_exp_end = exp0_off + exp0_size_clamped; /* short first piece */
 
             const uint64_t piece1_exp_off = exp1_off;
             const uint64_t piece1_exp_end = exp1_end;
@@ -19160,11 +20493,11 @@ static inline int64_t find_valid_sht_block_32(CarveInfo *candidate,
                         uint8_t *b1 = get_apparent_block_data(scalpel_state.filemirror, piece1_apparent);
 
                         if (b0 && b1) {
-                            bool ok = validate_sht_head_fragment_32(b0, b1,
+                            bool ok = elf_sht_short_head_matches(b0, b1,
                                                                    blocksize,
                                                                    piece0_exp_off, piece0_exp_end,
                                                                    piece1_exp_off, piece1_exp_end,
-                                                                   need_swap,
+                                                                   false, need_swap,
                                                                    cid);
                             if (ok) piece0_apparent = preferred0;
                         }
@@ -19188,11 +20521,12 @@ static inline int64_t find_valid_sht_block_32(CarveInfo *candidate,
                                             piece1_apparent);
                 const bool reconstructs =
                     zero_piece && b1
-                    && validate_sht_head_fragment_32(
+                    && exp0_size_clamped <= sizeof(Section_Header_Entry_32)
+                    && elf_sht_short_head_matches(
                         zero_piece, b1, blocksize,
                         piece0_exp_off, piece0_exp_end,
                         piece1_exp_off, piece1_exp_end,
-                        need_swap, cid);
+                        false, need_swap, cid);
 
                 free(b1);
                 free(zero_piece);
@@ -19510,7 +20844,7 @@ static inline int64_t find_valid_sht_block_32(CarveInfo *candidate,
  *   - At least one non-NULL entry must be present.
  *   - NULL entries must not exceed half the valid count.
  *   - Degenerate entries must not exceed one-third of the valid count.
- *   - If six or more entries were examined, at least one must be @c PT_LOAD.
+ * Loadable segments may be in a different fragment of the table.
  *
  * @param[in] blk               Pointer to the raw block bytes.
  * @param[in] blocksize         Size of the block in bytes.
@@ -19585,7 +20919,6 @@ static bool pht_validate_piece_64_at_expected(const uint8_t *blk,
                 uint64_t valid = 0;
                 uint64_t null_count = 0;
                 uint64_t nonnull_count = 0;
-                uint64_t load_count = 0;
                 uint64_t degenerate_count = 0;
 
                 bool first_is_null = false;
@@ -19611,6 +20944,8 @@ static bool pht_validate_piece_64_at_expected(const uint8_t *blk,
                         ph.seg_physaddr  = __builtin_bswap64(ph.seg_physaddr);
                     }
 
+                    if (valid > 0 && phdr64_is_degenerate(&ph)) break;
+
                     if (!seg_type_valid(ph.seg_type)) break;
                     if (ph.flags_64 & ~allowed) break;
 
@@ -19625,7 +20960,7 @@ static bool pht_validate_piece_64_at_expected(const uint8_t *blk,
                           is_pow2_nonzero((uint64_t)ph.alignment))) {
                         break;
                     }
-                    if ((uint64_t)ph.alignment > (1ULL << 20)) break;
+                    if ((uint64_t)ph.alignment > (1ULL << 30)) break;
 
                     if (ph.seg_mem_size < ph.seg_file_size) break;
 
@@ -19650,8 +20985,6 @@ static bool pht_validate_piece_64_at_expected(const uint8_t *blk,
                         nonnull_count++;
                     }
 
-                    if (ph.seg_type == PT_LOAD) load_count++;
-
                     if (!first_is_null) {
                         if (phdr64_is_degenerate(&ph)) degenerate_count++;
                     }
@@ -19661,7 +20994,6 @@ static bool pht_validate_piece_64_at_expected(const uint8_t *blk,
                 if (nonnull_count == 0) return false;
                 if (null_count > (valid / 2ULL)) return false;
                 if (degenerate_count > (valid / 3ULL)) return false;
-                if (valid >= 6 && load_count == 0) return false;
 
                 return true;
             }
@@ -19780,7 +21112,7 @@ static bool validate_pht_tail_fragment_64(const uint8_t *prev_blk,
               is_pow2_nonzero((uint64_t)ph.alignment))) {
             return false;
         }
-        if ((uint64_t)ph.alignment > (1ULL << 20)) return false;
+        if ((uint64_t)ph.alignment > (1ULL << 30)) return false;
 
         if (ph.seg_mem_size < ph.seg_file_size) return false;
 
@@ -19909,7 +21241,7 @@ static bool validate_pht_head_fragment_64(const uint8_t *cur_blk0,
               is_pow2_nonzero((uint64_t)ph.alignment))) {
             return false;
         }
-        if ((uint64_t)ph.alignment > (1ULL << 20)) return false;
+        if ((uint64_t)ph.alignment > (1ULL << 30)) return false;
 
         if (ph.seg_mem_size < ph.seg_file_size) return false;
 
@@ -20086,6 +21418,8 @@ static bool validate_pht_piece0_fallback_strict_64(const uint8_t *blk,
                     ph.alignment     = __builtin_bswap64(ph.alignment);
                 }
 
+                if (valid0 > 0 && phdr64_is_degenerate(&ph)) break;
+
                 if (!seg_type_valid(ph.seg_type)) break;
                 if (ph.flags_64 & ~allowed) break;
 
@@ -20100,7 +21434,7 @@ static bool validate_pht_piece0_fallback_strict_64(const uint8_t *blk,
                       is_pow2_nonzero((uint64_t)ph.alignment))) {
                     break;
                 }
-                if ((uint64_t)ph.alignment > (1ULL << 20)) break;
+                if ((uint64_t)ph.alignment > (1ULL << 30)) break;
 
                 if (ph.seg_mem_size < ph.seg_file_size) break;
 
@@ -20874,7 +22208,21 @@ static inline int64_t find_valid_pht_block_64(CarveInfo *candidate,
                     }
 
                     if (header_ok) {
-                        if (piece0_exp_size >= (uint64_t)PHT_ENTRY_SIZE_64) {
+                        const __uint128_t complete_pht_end =
+                            (__uint128_t)piece0_exp_off
+                            + (__uint128_t)pht_total_size;
+
+                        // The candidate already establishes the physical block containing the
+                        // ELF header. When the complete PHT is in that block, validate exactly
+                        // the entry count declared by the header rather than treating following
+                        // file bytes as additional program headers.
+                        if (complete_pht_end <= blocksize) {
+                            pht_ok = PHT_validate_64(
+                                (char *)blk, UINT64_MAX, piece0_exp_off,
+                                hdr.pht_entry_size, hdr.num_pht_entries,
+                                target_endian, elf_endian) != 0;
+                        } else if (piece0_exp_size
+                                   >= (uint64_t)PHT_ENTRY_SIZE_64) {
                             pht_ok = validate_pht_piece0_fallback_strict_64((const uint8_t *)blk,
                                                                             blocksize,
                                                                             piece0_exp_off,
@@ -21314,7 +22662,7 @@ static inline int64_t find_valid_pht_block_64(CarveInfo *candidate,
  *   - At least one non-NULL entry must be present.
  *   - NULL entries must not exceed half the valid count.
  *   - Degenerate entries must not exceed one-third of the valid count.
- *   - If six or more entries were examined, at least one must be @c PT_LOAD.
+ * Loadable segments may be in a different fragment of the table.
  *
  * @param[in] blk               Pointer to the raw block bytes.
  * @param[in] blocksize         Size of the block in bytes.
@@ -21389,7 +22737,6 @@ static bool pht_validate_piece_32_at_expected(const uint8_t *blk,
                 uint64_t valid = 0;
                 uint64_t null_count = 0;
                 uint64_t nonnull_count = 0;
-                uint64_t load_count = 0;
                 uint64_t degenerate_count = 0;
 
                 bool first_is_null = false;
@@ -21414,6 +22761,8 @@ static bool pht_validate_piece_32_at_expected(const uint8_t *blk,
                         ph.alignment     = __builtin_bswap32(ph.alignment);
                     }
 
+                    if (valid > 0 && phdr32_is_degenerate(&ph)) break;
+
                     if (!seg_type_valid(ph.seg_type)) break;
                     if (ph.flags_32 & ~allowed) break;
 
@@ -21428,7 +22777,7 @@ static bool pht_validate_piece_32_at_expected(const uint8_t *blk,
                           is_pow2_nonzero((uint64_t)ph.alignment))) {
                         break;
                     }
-                    if ((uint64_t)ph.alignment > (1ULL << 20)) break;
+                    if ((uint64_t)ph.alignment > (1ULL << 30)) break;
 
                     if ((uint64_t)ph.seg_mem_size < (uint64_t)ph.seg_file_size) break;
 
@@ -21453,8 +22802,6 @@ static bool pht_validate_piece_32_at_expected(const uint8_t *blk,
                         nonnull_count++;
                     }
 
-                    if (ph.seg_type == PT_LOAD) load_count++;
-
                     if (!first_is_null) {
                         if (phdr32_is_degenerate(&ph)) degenerate_count++;
                     }
@@ -21464,7 +22811,6 @@ static bool pht_validate_piece_32_at_expected(const uint8_t *blk,
                 if (nonnull_count == 0) return false;
                 if (null_count > (valid / 2ULL)) return false;
                 if (degenerate_count > (valid / 3ULL)) return false;
-                if (valid >= 6 && load_count == 0) return false;
 
                 return true;
             }
@@ -21584,7 +22930,7 @@ static bool validate_pht_tail_fragment_32(const uint8_t *prev_blk,
               is_pow2_nonzero((uint64_t)ph.alignment))) {
             return false;
         }
-        if ((uint64_t)ph.alignment > (1ULL << 20)) return false;
+        if ((uint64_t)ph.alignment > (1ULL << 30)) return false;
 
         if ((uint64_t)ph.seg_mem_size < (uint64_t)ph.seg_file_size) return false;
 
@@ -21713,7 +23059,7 @@ static bool validate_pht_head_fragment_32(const uint8_t *cur_blk0,
               is_pow2_nonzero((uint64_t)ph.alignment))) {
             return false;
         }
-        if ((uint64_t)ph.alignment > (1ULL << 20)) return false;
+        if ((uint64_t)ph.alignment > (1ULL << 30)) return false;
 
         if ((uint64_t)ph.seg_mem_size < (uint64_t)ph.seg_file_size) return false;
 
@@ -21890,6 +23236,8 @@ static bool validate_pht_piece0_fallback_strict_32(const uint8_t *blk,
                     ph.alignment     = __builtin_bswap32(ph.alignment);
                 }
 
+                if (valid0 > 0 && phdr32_is_degenerate(&ph)) break;
+
                 if (!seg_type_valid(ph.seg_type)) break;
                 if (ph.flags_32 & ~allowed) break;
 
@@ -21904,7 +23252,7 @@ static bool validate_pht_piece0_fallback_strict_32(const uint8_t *blk,
                       is_pow2_nonzero((uint64_t)ph.alignment))) {
                     break;
                 }
-                if ((uint64_t)ph.alignment > (1ULL << 20)) break;
+                if ((uint64_t)ph.alignment > (1ULL << 30)) break;
 
                 if ((uint64_t)ph.seg_mem_size < (uint64_t)ph.seg_file_size) break;
 
@@ -22682,8 +24030,21 @@ static inline int64_t find_valid_pht_block_32(CarveInfo *candidate,
                     }
 
                     if (header_ok) {
-                        /* Use strict piece0 fallback guard when possible; else use regular validate. */
-                        if (piece0_exp_size >= (uint64_t)PHT_ENTRY_SIZE_32) {
+                        const __uint128_t complete_pht_end =
+                            (__uint128_t)piece0_exp_off
+                            + (__uint128_t)pht_total_size;
+
+                        // The candidate already establishes the physical block containing the
+                        // ELF header. When the complete PHT is in that block, validate exactly
+                        // the entry count declared by the header rather than treating following
+                        // file bytes as additional program headers.
+                        if (complete_pht_end <= blocksize) {
+                            pht_ok = PHT_validate_32(
+                                (char *)blk, UINT64_MAX, piece0_exp_off,
+                                hdr.pht_entry_size, hdr.num_pht_entries,
+                                target_endian, elf_endian) != 0;
+                        } else if (piece0_exp_size
+                                   >= (uint64_t)PHT_ENTRY_SIZE_32) {
                             pht_ok = validate_pht_piece0_fallback_strict_32((const uint8_t *)blk,
                                                                             blocksize,
                                                                             piece0_exp_off,
@@ -23445,6 +24806,185 @@ static inline uint64_t calculate_elf_size_from_sht_32(const char *block_data,
     free_sht_entries_32(filtered_entries, filtered);
 
     return total_size;
+}
+
+
+// Build the semantic layout available from a PHT when a valid ELF has no
+// section table. Executable LOAD segments still identify text, while the
+// remaining file-backed regions stay explicitly unknown.
+static inline bool elf_build_pht_only_state(
+    FileState *state,
+    const char *pht_data,
+    uint64_t pht_data_length,
+    uint64_t pht_data_offset,
+    uint64_t pht_file_offset,
+    uint16_t pht_entry_size,
+    uint16_t pht_entries,
+    uint16_t elf_header_size,
+    bool is_64,
+    bool need_swap,
+    uint64_t file_limit,
+    uint64_t *file_size_out)
+{
+    const uint64_t canonical_entry_size =
+        is_64 ? sizeof(Program_Header_Entry_64)
+              : sizeof(Program_Header_Entry_32);
+    uint64_t table_size = 0;
+    uint64_t table_end = 0;
+    uint64_t file_size = elf_header_size;
+
+    if (file_size_out) {
+        *file_size_out = 0;
+    }
+    if (!state || !pht_data || pht_entries == 0
+        || pht_entry_size < canonical_entry_size
+        || __builtin_mul_overflow((uint64_t)pht_entry_size,
+                                  (uint64_t)pht_entries, &table_size)
+        || pht_data_offset > pht_data_length
+        || table_size > pht_data_length - pht_data_offset
+        || __builtin_add_overflow(pht_file_offset, table_size, &table_end)
+        || (file_limit != 0 && table_end > file_limit)) {
+        return false;
+    }
+
+    if (table_end > file_size) {
+        file_size = table_end;
+    }
+
+    const size_t capacity = (size_t)pht_entries + 2u;
+    FileComponent *components =
+        (FileComponent *)calloc(capacity, sizeof(*components));
+
+    if (!components) {
+        return false;
+    }
+
+    size_t count = 0;
+    components[count++] = (FileComponent){
+        .type = COMPONENT_ELF_HEADER,
+        .section = SECTION_UNKNOWN,
+        .fileOffset = 0,
+        .size = elf_header_size,
+    };
+    components[count++] = (FileComponent){
+        .type = COMPONENT_PHT,
+        .section = SECTION_UNKNOWN,
+        .fileOffset = pht_file_offset,
+        .size = table_size,
+    };
+
+    for (uint16_t i = 0; i < pht_entries; i++) {
+        const uint64_t entry_offset =
+            pht_data_offset + (uint64_t)i * pht_entry_size;
+        uint32_t segment_type = 0;
+        uint32_t segment_flags = 0;
+        uint64_t segment_offset = 0;
+        uint64_t segment_size = 0;
+
+        if (is_64) {
+            Program_Header_Entry_64 entry = {0};
+
+            memcpy(&entry, pht_data + entry_offset, sizeof(entry));
+            segment_type = need_swap
+                               ? __builtin_bswap32(entry.seg_type)
+                               : entry.seg_type;
+            segment_flags = need_swap
+                                ? __builtin_bswap32(entry.flags_64)
+                                : entry.flags_64;
+            segment_offset = need_swap
+                                 ? __builtin_bswap64(entry.seg_offset)
+                                 : entry.seg_offset;
+            segment_size = need_swap
+                               ? __builtin_bswap64(entry.seg_file_size)
+                               : entry.seg_file_size;
+        }
+        else {
+            Program_Header_Entry_32 entry = {0};
+
+            memcpy(&entry, pht_data + entry_offset, sizeof(entry));
+            segment_type = need_swap
+                               ? __builtin_bswap32(entry.seg_type)
+                               : entry.seg_type;
+            segment_flags = need_swap
+                                ? __builtin_bswap32(entry.flags_32)
+                                : entry.flags_32;
+            segment_offset = need_swap
+                                 ? __builtin_bswap32(entry.seg_offset)
+                                 : entry.seg_offset;
+            segment_size = need_swap
+                               ? __builtin_bswap32(entry.seg_file_size)
+                               : entry.seg_file_size;
+        }
+
+        if (segment_type == PT_NULL || segment_size == 0) {
+            continue;
+        }
+
+        uint64_t segment_end = 0;
+        if (__builtin_add_overflow(segment_offset, segment_size,
+                                   &segment_end)
+            || (file_limit != 0 && segment_end > file_limit)) {
+            free(components);
+            return false;
+        }
+        if (segment_end > file_size) {
+            file_size = segment_end;
+        }
+
+        SectionDataType section = SECTION_UNKNOWN;
+        bool add_component = false;
+
+        switch (segment_type) {
+        case PT_LOAD:
+            section = (segment_flags & PF_X) != 0
+                          ? SECTION_TEXT : SECTION_UNKNOWN;
+            add_component = true;
+            break;
+        case PT_DYNAMIC:
+            section = SECTION_DYNAMIC;
+            add_component = true;
+            break;
+        case PT_INTERP:
+            section = SECTION_STRING;
+            add_component = true;
+            break;
+        case PT_NOTE:
+            section = SECTION_NOTES;
+            add_component = true;
+            break;
+        case PT_GNU_EH_FRAME:
+            section = SECTION_EH_FRAME_HEADER;
+            add_component = true;
+            break;
+        default:
+            break;
+        }
+
+        if (add_component) {
+            components[count++] = (FileComponent){
+                .type = COMPONENT_SECTION,
+                .section = section,
+                .fileOffset = segment_offset,
+                .size = segment_size,
+            };
+        }
+    }
+
+    if (file_size == 0 || (file_limit != 0 && file_size > file_limit)) {
+        free(components);
+        return false;
+    }
+
+    qsort(components, count, sizeof(*components),
+          cmp_filecomponent_offset);
+    free(state->components);
+    state->components = components;
+    state->num_components = count;
+    state->skeleton_initialized = count > 0;
+    if (file_size_out) {
+        *file_size_out = file_size;
+    }
+    return true;
 }
 
 
@@ -25652,12 +27192,12 @@ static inline void calculate_cross_validation_bonuses_for_component(
             uint16_t shnum = 0;
             if (is_64) {
                 Elf_Header_64 eh;
-                if (read_candidate_bytes(candidate, 0, sizeof(eh), (uint8_t *)&eh)) {
+                if (read_candidate_elf_header_64(candidate, &eh)) {
                     shnum = to_host_endian_16(eh.num_sht_entries, file_is_le);
                 }
             } else {
                 Elf_Header_32 eh;
-                if (read_candidate_bytes(candidate, 0, sizeof(eh), (uint8_t *)&eh)) {
+                if (read_candidate_elf_header_32(candidate, &eh)) {
                     shnum = to_host_endian_16(eh.num_sht_entries, file_is_le);
                 }
             }
@@ -25974,6 +27514,16 @@ static inline double compute_block_logit_for_section(const uint8_t       *block_
     if (coverage_out)   *coverage_out   = cs.coverage;
 
     double base_logit = coverage_to_base_logit(&cs, &sp);
+    double active_relocations = 1.0;
+    if (elf_relocation_block_conflicts(
+            candidate, filestate, bv_index, blocksize,
+            block_data, blocksize, &active_relocations, NULL)) {
+        base_logit = -INFINITY;
+    }
+    else if (focus == SECTION_RELOCATION && base_logit > 0.0) {
+        // R_*_NONE is legal, but contributes no evidence of placement.
+        base_logit *= active_relocations;
+    }
     if (base_logit_out) *base_logit_out = base_logit;
 
     /* 3) Structured CV evidence (raw logits) */
@@ -26461,6 +28011,58 @@ typedef struct ElfGapSpan {
     uint64_t gap;
 } ElfGapSpan;
 
+typedef struct ElfGapSemanticScore {
+    uint64_t branches;
+    uint64_t executable_matches;
+    uint64_t exact_trials;
+    uint64_t exact_matches;
+    uint64_t file_references;
+    uint64_t file_reference_matches;
+    double executable_lower;
+    double executable_upper;
+    double exact_lower;
+    double exact_upper;
+    double file_reference_lower;
+    double file_reference_upper;
+    bool usable;
+} ElfGapSemanticScore;
+
+static inline bool elf_gapsolve_reference_evidence_dominates(
+    const ElfGapSemanticScore *candidate,
+    const ElfGapSemanticScore *current);
+
+// Prefer corroborated placement evidence before using compression as a tie
+// breaker. Conflicting intervals remain tied rather than overriding each other.
+static inline bool elf_gapsolve_reference_evidence_dominates(
+    const ElfGapSemanticScore *candidate,
+    const ElfGapSemanticScore *current)
+{
+    const bool references_better =
+        candidate->file_reference_lower > current->file_reference_upper;
+    const bool references_worse =
+        current->file_reference_lower > candidate->file_reference_upper;
+    const bool executable_better =
+        candidate->executable_lower > current->executable_upper;
+    const bool executable_worse =
+        current->executable_lower > candidate->executable_upper;
+
+    return (references_better || executable_better)
+           && !references_worse && !executable_worse;
+}
+
+static bool elf_gapsolve_semantic_scores(
+    CarveInfo *candidate,
+    FileState *filestate,
+    int64_t header_ap,
+    const ElfGapSpan *spans,
+    int nspans,
+    int moving_span,
+    int64_t k_lo,
+    int64_t k_hi,
+    uint64_t total_blocks,
+    ElfGapSemanticScore *scores,
+    size_t score_count);
+
 // an anchor sample of the displacement function: file block 'file_block' was found on
 // disk 'disp' blocks past its contiguous position
 typedef struct ElfGapAnchor {
@@ -26473,6 +28075,13 @@ typedef struct ElfGapAnchor {
 #define ELF_GAPSOLVE_MIN_RELOC_IDS 3
 #define ELF_GAPSOLVE_GLOBAL_ANCHOR_COMPARISONS (8ULL * 1024 * 1024)
 #define ELF_GAPSOLVE_ALIGNMENT_MAX_STATES (2ULL * 1024 * 1024)
+#define ELF_GAPSOLVE_PHT_ANCHOR_MIN_BYTES 64u
+#define ELF_GAPSOLVE_PHT_ANCHOR_MIN_SCORE 2.0
+#define ELF_GAPSOLVE_PHT_ANCHOR_MIN_MARGIN 1.0
+#define ELF_GAPSOLVE_AFFINITY_TIE_MARGIN 0.01
+#define ELF_GAPSOLVE_FILLER_TIE_MARGIN 0.01
+#define ELF_GAPSOLVE_COHERENCE_MAX_SPLITS 256u
+#define ELF_GAPSOLVE_COHERENCE_TIE_BYTES 8u
 
 // cumulative displacement the span list applies to file block j
 static inline uint64_t elf_gapsolve_disp_at(const ElfGapSpan *spans, int nspans,
@@ -26516,6 +28125,104 @@ static inline bool elf_gapsolve_copy_block(CarveInfo *candidate, uint8_t *trial,
     }
     memcpy(trial + j * (uint64_t)blocksize, bdata, (size_t)want);
     return true;
+}
+
+// Measure local byte coherence for non-executable file components touched by
+// a split bracket. This is only useful after structural and control-flow
+// evidence have established an otherwise indistinguishable set of layouts.
+static inline bool elf_gapsolve_component_compression(
+    const uint8_t *trial,
+    uint64_t total_size,
+    const FileState *state,
+    int64_t k_lo,
+    int64_t k_hi,
+    uint32_t blocksize,
+    uint64_t *compressed_bytes,
+    uint64_t *source_bytes)
+{
+    uint8_t *compressed = NULL;
+    uLongf compressed_capacity = 0;
+    uint64_t total_compressed = 0;
+    uint64_t total_source = 0;
+    uint64_t bracket_start;
+    uint64_t bracket_end;
+    bool measured = false;
+
+    if (compressed_bytes) {
+        *compressed_bytes = 0;
+    }
+    if (source_bytes) {
+        *source_bytes = 0;
+    }
+    if (!trial || !state || !state->components || blocksize == 0
+        || k_lo < 0 || k_hi < k_lo
+        || __builtin_mul_overflow((uint64_t)k_lo,
+                                  (uint64_t)blocksize,
+                                  &bracket_start)
+        || __builtin_mul_overflow((uint64_t)k_hi + 1,
+                                  (uint64_t)blocksize,
+                                  &bracket_end)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < state->num_components; i++) {
+        const FileComponent *component = &state->components[i];
+        uint64_t component_end;
+
+        if (component->size == 0
+            || component->fileOffset >= total_size
+            || component->size > total_size - component->fileOffset
+            || __builtin_add_overflow(component->fileOffset,
+                                      component->size,
+                                      &component_end)
+            || component->fileOffset >= bracket_end
+            || component_end <= bracket_start
+            || component->type == COMPONENT_ELF_HEADER
+            || component->type == COMPONENT_PHT
+            || component->type == COMPONENT_SHT
+            || (component->type == COMPONENT_SECTION
+                && component->section == SECTION_TEXT)
+            || component->size > ULONG_MAX) {
+            continue;
+        }
+
+        const uLong source_length = (uLong)component->size;
+        const uLongf required = compressBound(source_length);
+
+        if (required > compressed_capacity) {
+            uint8_t *larger = (uint8_t *)realloc(compressed,
+                                                 (size_t)required);
+
+            if (!larger) {
+                free(compressed);
+                return false;
+            }
+            compressed = larger;
+            compressed_capacity = required;
+        }
+
+        uLongf result_length = compressed_capacity;
+        if (compress2(compressed, &result_length,
+                      trial + component->fileOffset, source_length,
+                      Z_BEST_SPEED) != Z_OK
+            || total_compressed > UINT64_MAX - result_length
+            || total_source > UINT64_MAX - component->size) {
+            free(compressed);
+            return false;
+        }
+        total_compressed += result_length;
+        total_source += component->size;
+        measured = true;
+    }
+
+    free(compressed);
+    if (compressed_bytes) {
+        *compressed_bytes = total_compressed;
+    }
+    if (source_bytes) {
+        *source_bytes = total_source;
+    }
+    return measured;
 }
 
 // harvest displacement anchors from RELATIVE relocations. The relocation table sits
@@ -26882,12 +28589,17 @@ static inline bool elf_try_monotone_gap_alignment(
     CarveInfo *candidate,
     FileState *filestate,
     int64_t header_ap,
-    uint64_t sht_bv,
-    int64_t sht_apparent,
+    uint64_t anchor_bv,
+    int64_t anchor_apparent,
     uint64_t total_blocks,
     uint64_t total_size,
     uint32_t blocksize,
-    const char *cid)
+    uint64_t mutable_from,
+    const char *cid,
+    ThreadWork *work,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle)
 {
     FileMirror *fm = scalpel_state.filemirror;
     const uint64_t num_apparent = filemirror_apparent_blocks(fm);
@@ -26895,10 +28607,17 @@ static inline bool elf_try_monotone_gap_alignment(
     double *current = NULL;
     uint32_t *parent = NULL;
     int64_t *mapping = NULL;
+    bool *preserve_positioned = NULL;
+    ElfPositionedTextRun *positioned = NULL;
+    size_t positioned_count = 0;
     bool result = false;
     // Preserve physical runs unless changing displacement provides enough
     // block evidence to justify another fragmentation boundary.
     const double displacement_change_cost = 0.25;
+
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
 
     if (!candidate || !candidate->b || !filestate || header_ap < 0
         || total_blocks == 0 || total_size == 0 || blocksize == 0) {
@@ -26906,8 +28625,8 @@ static inline bool elf_try_monotone_gap_alignment(
     }
 
     const __int128 terminal_displacement =
-        (__int128)sht_apparent - (__int128)header_ap
-        - (__int128)sht_bv;
+        (__int128)anchor_apparent - (__int128)header_ap
+        - (__int128)anchor_bv;
     if (terminal_displacement <= 0
         || terminal_displacement > UINT32_MAX) {
         return false;
@@ -26962,7 +28681,15 @@ static inline bool elf_try_monotone_gap_alignment(
             blockvector_get_apparent_blocknumber(candidate->b, j);
         int64_t pinned_displacement = -1;
 
-        if (bv_slot_is_placed(pinned)) {
+        if (elf_relocated_run_time_to_checkpoint(
+                work, candidate, uuidp, uuidc)) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+
+        if (j < mutable_from && bv_slot_is_placed(pinned)) {
             const __int128 displacement =
                 (__int128)pinned - (__int128)header_ap
                 - (__int128)j;
@@ -26973,9 +28700,25 @@ static inline bool elf_try_monotone_gap_alignment(
             }
             pinned_displacement = (int64_t)displacement;
         }
+        if (j == anchor_bv) {
+            if (pinned_displacement >= 0
+                && (uint64_t)pinned_displacement != max_displacement) {
+                goto done;
+            }
+            pinned_displacement = (int64_t)max_displacement;
+        }
 
         for (uint64_t d = 0; d < columns; d++) {
             const uint64_t state_index = j * columns + d;
+
+            if ((d & UINT64_C(0xff)) == 0
+                && elf_relocated_run_time_to_checkpoint(
+                       work, candidate, uuidp, uuidc)) {
+                if (returned_to_idle) {
+                    *returned_to_idle = true;
+                }
+                goto done;
+            }
 
             current[d] = -DBL_MAX;
             parent[state_index] = UINT32_MAX;
@@ -27015,7 +28758,8 @@ static inline bool elf_try_monotone_gap_alignment(
 
             const int64_t actual =
                 filemirror_actual_blocknumber(fm, apparent);
-            if (actual < 0 || filemirror_actual_block_covered(fm, actual)) {
+            if (actual < 0
+                || filemirror_actual_block_covered(fm, actual)) {
                 continue;
             }
 
@@ -27066,14 +28810,268 @@ static inline bool elf_try_monotone_gap_alignment(
         }
     }
 
-    if (!elf_validate_relocated_mapping(candidate, mapping, total_blocks,
+    // A monotone gap map and independently positioned OOO runs describe
+    // different parts of the same file. Preserve only the physical plateaus
+    // containing exact format-positioned evidence, then validate the combined
+    // mapping as one candidate.
+    if (filestate->complete_mapping_ooo_transitions_positioned) {
+        bool positioning_returned_to_idle = false;
+        positioned = elf_find_positioned_text_runs(
+            work, candidate, filestate, uuidp, uuidc,
+            &positioning_returned_to_idle, &positioned_count);
+        if (positioning_returned_to_idle) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+
+        size_t additional_count = 0;
+        ElfPositionedTextRun *additional =
+            elf_find_positioned_frame_runs(
+                work, candidate, filestate, uuidp, uuidc,
+                &positioning_returned_to_idle, &additional_count);
+        if (positioning_returned_to_idle
+            || !elf_append_positioned_runs(
+                   &positioned, &positioned_count,
+                   additional, additional_count)) {
+            free(additional);
+            if (positioning_returned_to_idle && returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+        free(additional);
+
+        additional_count = 0;
+        additional = elf_find_positioned_mips_runs(
+            work, candidate, filestate, uuidp, uuidc,
+            &positioning_returned_to_idle, &additional_count);
+        if (positioning_returned_to_idle
+            || !elf_append_positioned_runs(
+                   &positioned, &positioned_count,
+                   additional, additional_count)) {
+            free(additional);
+            if (positioning_returned_to_idle && returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+        free(additional);
+
+        preserve_positioned =
+            (bool *)calloc((size_t)total_blocks,
+                           sizeof(*preserve_positioned));
+        if (!preserve_positioned) {
+            goto done;
+        }
+
+        const int64_t header_actual =
+            filemirror_actual_blocknumber(fm, header_ap);
+        if (header_actual < 0) {
+            goto done;
+        }
+
+        for (size_t p = 0; p < positioned_count; p++) {
+            const ElfPositionedTextRun *run = &positioned[p];
+            if (!run->retained || !run->independently_identified
+                || (!run->identified_by_function_table
+                    && !run->identified_by_file_reference)
+                || run->length == 0
+                || run->logical_start >= total_blocks) {
+                continue;
+            }
+
+            const uint64_t positioned_lo =
+                run->positioned_range_valid
+                    ? run->positioned_lo
+                    : run->logical_start;
+            uint64_t positioned_hi = run->positioned_hi;
+
+            if (!run->positioned_range_valid) {
+                if (run->length - 1
+                    > UINT64_MAX - run->logical_start) {
+                    continue;
+                }
+                positioned_hi = run->logical_start + run->length - 1;
+            }
+
+            if (positioned_lo > positioned_hi
+                || positioned_hi >= total_blocks) {
+                continue;
+            }
+
+            bool current_mapping_matches = true;
+            for (uint64_t slot = positioned_lo;
+                 slot <= positioned_hi; slot++) {
+                const int64_t current_apparent =
+                    blockvector_get_apparent_blocknumber(candidate->b, slot);
+                const int64_t current_actual =
+                    filemirror_actual_blocknumber(fm, current_apparent);
+                const __int128 displacement =
+                    (__int128)current_actual - (__int128)header_actual
+                    - (__int128)slot;
+
+                if (current_actual < 0 || displacement != run->displacement) {
+                    current_mapping_matches = false;
+                    break;
+                }
+            }
+            if (!current_mapping_matches) {
+                continue;
+            }
+
+            uint64_t plateau_lo = positioned_lo;
+            while (plateau_lo > 0) {
+                const uint64_t prior = plateau_lo - 1;
+                const int64_t current_apparent =
+                    blockvector_get_apparent_blocknumber(candidate->b, prior);
+                const int64_t current_actual =
+                    filemirror_actual_blocknumber(fm, current_apparent);
+                const __int128 displacement =
+                    (__int128)current_actual - (__int128)header_actual
+                    - (__int128)prior;
+
+                if (current_actual < 0 || displacement != run->displacement) {
+                    break;
+                }
+                plateau_lo = prior;
+            }
+
+            uint64_t plateau_hi = positioned_hi;
+            while (plateau_hi + 1 < total_blocks) {
+                const uint64_t next = plateau_hi + 1;
+                const int64_t current_apparent =
+                    blockvector_get_apparent_blocknumber(candidate->b, next);
+                const int64_t current_actual =
+                    filemirror_actual_blocknumber(fm, current_apparent);
+                const __int128 displacement =
+                    (__int128)current_actual - (__int128)header_actual
+                    - (__int128)next;
+
+                if (current_actual < 0 || displacement != run->displacement) {
+                    break;
+                }
+                plateau_hi = next;
+            }
+
+            for (uint64_t slot = plateau_lo; slot <= plateau_hi; slot++) {
+                preserve_positioned[slot] = true;
+            }
+        }
+
+        for (uint64_t slot = 0; slot < total_blocks; slot++) {
+            if (preserve_positioned[slot]) {
+                mapping[slot] = blockvector_get_apparent_blocknumber(
+                    candidate->b, slot);
+            }
+        }
+    }
+
+    if (!elf_validate_relocated_mapping(candidate, filestate, mapping,
+                                        total_blocks,
                                         total_size, cid, false, NULL)) {
+        bool repair_returned_to_idle = false;
+
+        if (work && elf_try_entropy_mapping_repairs(
+                work, candidate, filestate, mapping, total_blocks,
+                total_size, cid, uuidp, uuidc,
+                &repair_returned_to_idle)) {
+            for (uint64_t j = 0; j < total_blocks; j++) {
+                ELF_DEBUG_SET_APPARENT(candidate, j, mapping[j]);
+            }
+            normalize_blockvector(candidate->b);
+            inflate_blockvector(candidate->b);
+            filestate->complete_mapping_verified = true;
+            filestate->complete_mapping_ooo_transitions_positioned = false;
+            carve_put_state(candidate->carvehashkey, filestate);
+            scalpel_log(
+                "[%s] elf monotone multi-island alignment: placed %" PRIu64
+                " blocks across independently repaired opaque runs.\n",
+                cid, total_blocks);
+            result = true;
+            goto done;
+        }
+        if (repair_returned_to_idle) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+
+        bool zero_gap_seed = true;
+        bool saw_inserted_zero = false;
+        uint64_t zero_holes = 0;
+
+        /*
+         * A monotone solve can expose displaced blocks as zero placeholders.
+         * Preserve the independently established in-order runs while leaving
+         * those contradictory slots open for checkpoint-aware completion.
+         */
+        for (uint64_t j = 1; j < total_blocks; j++) {
+            const int64_t previous_actual =
+                filemirror_actual_blocknumber(fm, mapping[j - 1]);
+            const int64_t actual =
+                filemirror_actual_blocknumber(fm, mapping[j]);
+
+            if (previous_actual < 0 || actual <= previous_actual) {
+                zero_gap_seed = false;
+                break;
+            }
+            for (int64_t skipped = previous_actual + 1;
+                 skipped < actual; skipped++) {
+                if (!filemirror_actual_block_is_zero(fm, skipped)) {
+                    zero_gap_seed = false;
+                    break;
+                }
+                saw_inserted_zero = true;
+            }
+            if (!zero_gap_seed) {
+                break;
+            }
+        }
+
+        for (uint64_t j = 1;
+             zero_gap_seed && j < total_blocks; j++) {
+            const int64_t actual =
+                filemirror_actual_blocknumber(fm, mapping[j]);
+
+            if (actual >= 0
+                && filemirror_actual_block_is_zero(fm, actual)
+                && elf_layout_known_bytes(filestate, blocksize, j) > 0) {
+                zero_holes++;
+            }
+        }
+
+        if (!zero_gap_seed || !saw_inserted_zero || zero_holes == 0
+            || zero_holes > ELF_GAPSOLVE_MAX_GAPS) {
+            goto done;
+        }
+
+        for (uint64_t j = 0; j < total_blocks; j++) {
+            const int64_t actual =
+                filemirror_actual_blocknumber(fm, mapping[j]);
+            const bool zero_hole =
+                j > 0 && actual >= 0
+                && filemirror_actual_block_is_zero(fm, actual)
+                && elf_layout_known_bytes(filestate, blocksize, j) > 0;
+
+            ELF_DEBUG_SET_APPARENT(candidate, j,
+                                   zero_hole ? -1 : mapping[j]);
+        }
+        normalize_blockvector(candidate->b);
+        scalpel_log(
+            "[%s] elf monotone zero-gap seed: retained in-order mapping "
+            "with %" PRIu64 " displaced slots open.\n",
+            cid, zero_holes);
+        result = true;
         goto done;
     }
 
     for (uint64_t j = 0; j < total_blocks; j++) {
-        if (bv_slot_is_unfilled(
-                blockvector_get_apparent_blocknumber(candidate->b, j))) {
+        if (j >= mutable_from
+            || bv_slot_is_unfilled(
+                   blockvector_get_apparent_blocknumber(candidate->b, j))) {
             ELF_DEBUG_SET_APPARENT(candidate, j, mapping[j]);
         }
     }
@@ -27085,6 +29083,8 @@ static inline bool elf_try_monotone_gap_alignment(
     result = true;
 
 done:
+    free(positioned);
+    free(preserve_positioned);
     free(mapping);
     free(parent);
     free(current);
@@ -27092,6 +29092,256 @@ done:
     return result;
 }
 
+
+// Locate the strongest late metadata block described by the candidate's ELF
+// layout, require a unique classification match, and use it as the terminal
+// anchor for exact monotone gap alignment. This also supports PHT-only files,
+// whose executable LOAD segments provide the available layout evidence.
+static inline bool elf_try_layout_gap_alignment(
+    CarveInfo *candidate,
+    FileState *filestate,
+    int64_t header_ap,
+    uint64_t total_blocks,
+    uint64_t total_size,
+    uint32_t blocksize,
+    const char *cid,
+    ThreadWork *work,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle)
+{
+    FileMirror *fm = scalpel_state.filemirror;
+    uint64_t mutable_from = UINT64_MAX;
+
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+
+    if (!candidate || !candidate->b || !filestate || !fm
+        || header_ap < 0 || total_blocks < 2 || total_size == 0
+        || blocksize == 0) {
+        return false;
+    }
+
+    {
+        for (uint64_t slot = 1; slot < total_blocks; slot++) {
+            if (bv_slot_is_unfilled(
+                    blockvector_get_apparent_blocknumber(candidate->b, slot))) {
+                mutable_from = slot;
+                break;
+            }
+        }
+
+        const char *data = blockvector_get_data_pointer(candidate->b);
+        const uint64_t placed_blocks =
+            mutable_from == UINT64_MAX ? total_blocks : mutable_from;
+        uint64_t contradiction = UINT64_MAX;
+
+        if (data && placed_blocks > 0) {
+            uint64_t placed_bytes = total_size;
+
+            if (placed_blocks <= UINT64_MAX / blocksize
+                && placed_blocks * (uint64_t)blocksize < placed_bytes) {
+                placed_bytes = placed_blocks * (uint64_t)blocksize;
+            }
+            contradiction = elf_layout_mapping_first_contradiction(
+                candidate, filestate, data, placed_bytes, NULL,
+                placed_blocks);
+            if (contradiction < mutable_from) {
+                mutable_from = contradiction;
+            }
+        }
+        for (uint64_t slot = 1; slot < placed_blocks; slot++) {
+            if (elf_layout_slot_requires_reassembly(
+                    candidate, filestate, slot, blocksize)) {
+                if (slot < mutable_from) {
+                    mutable_from = slot;
+                }
+                break;
+            }
+        }
+        const uint64_t entropy_discontinuity =
+            elf_layout_first_entropy_discontinuity(
+                candidate, filestate, placed_blocks, blocksize, NULL);
+        if (entropy_discontinuity < mutable_from) {
+            mutable_from = entropy_discontinuity;
+        }
+    }
+    if (mutable_from == UINT64_MAX) {
+        return false;
+    }
+
+    const uint64_t apparent_blocks = filemirror_apparent_blocks(fm);
+    const uint64_t maximum_columns =
+        ELF_GAPSOLVE_ALIGNMENT_MAX_STATES / total_blocks;
+    if (maximum_columns == 0 || (uint64_t)header_ap >= apparent_blocks) {
+        return false;
+    }
+
+    /*
+     * Layout initialization can already position the terminal block from a
+     * short section-table tail even when that block has too few classified
+     * bytes to qualify as a generic anchor. Treat the existing position as a
+     * hypothesis and retain it only if the completed mapping validates.
+     */
+    {
+        const uint64_t terminal = total_blocks - 1;
+        const int64_t terminal_apparent =
+            blockvector_get_apparent_blocknumber(candidate->b, terminal);
+        const __int128 terminal_displacement =
+            (__int128)terminal_apparent - (__int128)header_ap
+            - (__int128)terminal;
+
+        if (terminal >= mutable_from
+            && bv_slot_is_placed(terminal_apparent)
+            && terminal_displacement > 0
+            && terminal_displacement < maximum_columns
+            && elf_try_monotone_gap_alignment(
+                   candidate, filestate, header_ap, terminal,
+                   terminal_apparent, total_blocks, total_size, blocksize,
+                   mutable_from, cid, work, uuidp, uuidc,
+                   returned_to_idle)) {
+            scalpel_log(
+                "[%s] elf layout gap alignment: retained positioned terminal "
+                "file block %" PRIu64 " at apparent block %" PRId64
+                " after mutable block %" PRIu64 ".\n",
+                cid, terminal, terminal_apparent, mutable_from);
+            return true;
+        }
+        if (returned_to_idle && *returned_to_idle) {
+            return false;
+        }
+    }
+
+    uint64_t comparisons_remaining =
+        ELF_GAPSOLVE_GLOBAL_ANCHOR_COMPARISONS;
+
+    // Prefer late structural evidence because it spans more possible gaps. If
+    // that evidence belongs to a displaced run, earlier eligible anchors remain
+    // available under the same bounded accelerator budget.
+    for (uint64_t anchor = total_blocks; anchor-- > 1;) {
+        const uint64_t anchor_known =
+            elf_layout_known_bytes(filestate, blocksize, anchor);
+
+        if (anchor < mutable_from
+            || anchor_known < ELF_GAPSOLVE_PHT_ANCHOR_MIN_BYTES
+            || anchor >= apparent_blocks - (uint64_t)header_ap
+            || comparisons_remaining == 0) {
+            continue;
+        }
+
+        uint64_t maximum_displacement =
+            apparent_blocks - (uint64_t)header_ap - anchor - 1;
+        if (maximum_displacement >= maximum_columns) {
+            maximum_displacement = maximum_columns - 1;
+        }
+        if (maximum_displacement + 1 > comparisons_remaining) {
+            maximum_displacement = comparisons_remaining - 1;
+        }
+        comparisons_remaining -= maximum_displacement + 1;
+
+        int64_t best_apparent = -1;
+        double best_score = -DBL_MAX;
+        double runner_up_score = -DBL_MAX;
+
+        for (uint64_t displacement = 0;
+             displacement <= maximum_displacement; displacement++) {
+            if ((displacement & UINT64_C(0xff)) == 0
+                && elf_relocated_run_time_to_checkpoint(
+                       work, candidate, uuidp, uuidc)) {
+                if (returned_to_idle) {
+                    *returned_to_idle = true;
+                }
+                return false;
+            }
+
+            const __int128 apparent_wide =
+                (__int128)header_ap + (__int128)anchor
+                + (__int128)displacement;
+            if (apparent_wide < 0 || apparent_wide > INT64_MAX) {
+                continue;
+            }
+            const int64_t apparent = (int64_t)apparent_wide;
+            const int64_t actual =
+                filemirror_actual_blocknumber(fm, apparent);
+
+            if (actual < 0 || filemirror_actual_block_covered(fm, actual)) {
+                continue;
+            }
+
+            const double score = elf_relocated_block_affinity(
+                candidate, filestate, anchor, apparent);
+            if (score > best_score) {
+                runner_up_score = best_score;
+                best_score = score;
+                best_apparent = apparent;
+            }
+            else if (score > runner_up_score) {
+                runner_up_score = score;
+            }
+        }
+
+        if (best_apparent < 0
+            || best_score < ELF_GAPSOLVE_PHT_ANCHOR_MIN_SCORE
+            || (runner_up_score != -DBL_MAX
+                && best_score
+                       < runner_up_score
+                             + ELF_GAPSOLVE_PHT_ANCHOR_MIN_MARGIN)) {
+            continue;
+        }
+
+        if (!elf_try_monotone_gap_alignment(
+                candidate, filestate, header_ap, anchor, best_apparent,
+                total_blocks, total_size, blocksize, mutable_from, cid,
+                work, uuidp, uuidc, returned_to_idle)) {
+            if (returned_to_idle && *returned_to_idle) {
+                return false;
+            }
+            continue;
+        }
+
+        scalpel_log(
+            "[%s] elf layout gap alignment: file block %" PRIu64
+            " anchored at apparent block %" PRId64
+            " after mutable block %" PRIu64
+            " (score %.3f, runner-up %.3f).\n",
+            cid, anchor, best_apparent, mutable_from,
+            best_score, runner_up_score);
+        return true;
+    }
+
+    return false;
+}
+
+
+// Preserve one structurally complete hypothesis without changing the active
+// search or claiming that every byte is independently verified.
+static inline void elf_preserve_complete_hypothesis(
+    CarveInfo *candidate, const int64_t *mapping,
+    uint64_t blocks, uint64_t file_size)
+{
+    if (!scalpel_state.write_promising || !candidate || !candidate->b
+        || !mapping || blocks == 0 || file_size == 0) {
+        return;
+    }
+
+    CarveInfo snapshot = *candidate;
+    BlockVector *snapshot_vector = NULL;
+    init_blockvector(scalpel_state.filemirror, &snapshot_vector, blocks, true);
+    snapshot.b = snapshot_vector;
+    for (uint64_t i = 0; i < blocks; i++) {
+        blockvector_set_apparent_blocknumber(snapshot.b, i, mapping[i]);
+    }
+    normalize_blockvector(snapshot.b);
+    blockvector_set_data_length(snapshot.b, file_size);
+    inflate_blockvector(snapshot.b);
+    snapshot.flavor = PROMISING;
+
+    CarveInfo *preserved = &snapshot;
+    write_candidate(&preserved, true);
+    candidate->partial_artifact_written |= snapshot.partial_artifact_written;
+    free_blockvector(&snapshot_vector);
+}
 
 // arithmetic placement solve for a freshly initialized candidate. The displacement
 // between the header and the already-placed SHT is known exactly; RELATIVE-relocation
@@ -27260,7 +29510,18 @@ static inline bool elf_try_displacement_solve(CarveInfo *candidate,
         int64_t k_hi = (int64_t)anchors[b].file_block;
         int64_t k_lo = (int64_t)anchors[b - 1].file_block + 1;
         int64_t solved_k = -1;
-        double best_score = 0.0;
+        double best_layout_score = -DBL_MAX;
+        double best_excluded_score = 0.0;
+        ElfGapSemanticScore best_semantic = {0};
+        bool best_semantic_qualified = false;
+        uint64_t best_compressed_bytes = 0;
+        uint64_t best_compressed_source_bytes = 0;
+        bool best_has_compression = false;
+        double layout_score = 0.0;
+        bool layout_score_valid = true;
+        ElfGapSemanticScore *semantic_scores = NULL;
+        size_t semantic_score_count = 0;
+        bool have_semantic_scores = false;
         const uint64_t check_limit = anchors[b].file_block * (uint64_t)blocksize;
 
         if (k_lo < 1) {
@@ -27287,6 +29548,47 @@ static inline bool elf_try_displacement_solve(CarveInfo *candidate,
             return false;
         }
 
+        semantic_score_count = (size_t)(k_hi - k_lo + 1);
+        semantic_scores = (ElfGapSemanticScore *)calloc(
+            semantic_score_count, sizeof(*semantic_scores));
+        if (semantic_scores) {
+            have_semantic_scores = elf_gapsolve_semantic_scores(
+                candidate, state, header_ap, spans, nspans,
+                ncommitted, k_lo, k_hi, total_blocks,
+                semantic_scores, semantic_score_count);
+        }
+
+        // Score the logical blocks whose placement varies within this bracket.
+        // Moving the split left changes one block at a time, so subsequent
+        // hypotheses update this total in constant time.
+        for (int64_t j = k_lo; j <= k_hi; j++) {
+            int64_t apparent = blockvector_get_apparent_blocknumber(
+                candidate->b, (uint64_t)j);
+
+            if (bv_slot_is_unfilled(apparent)) {
+                const __int128 apparent_wide =
+                    (__int128)header_ap + (__int128)j
+                    + (__int128)elf_gapsolve_disp_at(
+                          spans, nspans, (uint64_t)j);
+
+                if (apparent_wide < 0 || apparent_wide > INT64_MAX
+                    || (uint64_t)apparent_wide >= num_apparent) {
+                    layout_score_valid = false;
+                    break;
+                }
+                apparent = (int64_t)apparent_wide;
+            }
+
+            const double affinity = elf_relocated_block_affinity(
+                candidate, state, (uint64_t)j, apparent);
+
+            if (affinity == -DBL_MAX) {
+                layout_score_valid = false;
+                break;
+            }
+            layout_score += affinity;
+        }
+
         for (int64_t k = k_hi; k >= k_lo; k--) {
             if (k != k_hi) {
                 // moving the split from k+1 to k changes only file block k's side
@@ -27297,11 +29599,60 @@ static inline bool elf_try_displacement_solve(CarveInfo *candidate,
                     // anchor-pinned block: identical assembly, identical verdict
                     continue;
                 }
+
+                double old_affinity = 0.0;
+                if (layout_score_valid) {
+                    const __int128 old_apparent_wide =
+                        (__int128)header_ap + (__int128)k
+                        + (__int128)elf_gapsolve_disp_at(
+                              spans, nspans, (uint64_t)k);
+
+                    if (old_apparent_wide < 0
+                        || old_apparent_wide > INT64_MAX
+                        || (uint64_t)old_apparent_wide >= num_apparent) {
+                        layout_score_valid = false;
+                    }
+                    else {
+                        old_affinity = elf_relocated_block_affinity(
+                            candidate, state, (uint64_t)k,
+                            (int64_t)old_apparent_wide);
+                        if (old_affinity == -DBL_MAX) {
+                            layout_score_valid = false;
+                        }
+                    }
+                }
+
                 spans[ncommitted].split = (uint64_t)k;
                 if (! elf_gapsolve_copy_block(candidate, trial, header_ap, total_size,
                                               blocksize, num_apparent, spans, nspans,
                                               (uint64_t)k)) {
                     break;
+                }
+
+                if (layout_score_valid) {
+                    const __int128 new_apparent_wide =
+                        (__int128)header_ap + (__int128)k
+                        + (__int128)elf_gapsolve_disp_at(
+                              spans, nspans, (uint64_t)k);
+
+                    if (new_apparent_wide < 0
+                        || new_apparent_wide > INT64_MAX
+                        || (uint64_t)new_apparent_wide >= num_apparent) {
+                        layout_score_valid = false;
+                    }
+                    else {
+                        const double new_affinity =
+                            elf_relocated_block_affinity(
+                                candidate, state, (uint64_t)k,
+                                (int64_t)new_apparent_wide);
+
+                        if (new_affinity == -DBL_MAX) {
+                            layout_score_valid = false;
+                        }
+                        else {
+                            layout_score += new_affinity - old_affinity;
+                        }
+                    }
                 }
             }
 
@@ -27326,18 +29677,151 @@ static inline bool elf_try_displacement_solve(CarveInfo *candidate,
                                           candidate->carvehashkey);
             }
             if (validates) {
-                // structure alone cannot pick between splits inside .text or
-                // unstructured data; the excluded-window score can
-                const double score = elf_gapsolve_excluded_score(
+                // Prefer the split whose included blocks best fit the ELF
+                // layout. Filler evidence breaks ties in homogeneous or
+                // otherwise unstructured regions.
+                const double excluded_score = elf_gapsolve_excluded_score(
                     header_ap, (uint64_t)k + anchors[b - 1].disp, delta,
                     candidate->needleidx, blocksize);
+                const double candidate_layout_score =
+                    layout_score_valid ? layout_score : -DBL_MAX;
+                const ElfGapSemanticScore *semantic =
+                    have_semantic_scores
+                        ? &semantic_scores[(size_t)(k - k_lo)]
+                        : NULL;
+                const bool semantic_qualified =
+                    semantic && semantic->usable
+                    && semantic->exact_matches >= 4
+                    && semantic->executable_matches >= 3
+                    && semantic->executable_lower >= 0.20;
+                uint64_t compressed_bytes = 0;
+                uint64_t compressed_source_bytes = 0;
+                const bool have_compression =
+                    semantic_qualified
+                    && semantic_score_count
+                           <= ELF_GAPSOLVE_COHERENCE_MAX_SPLITS
+                    && elf_gapsolve_component_compression(
+                           trial, total_size, state, k_lo, k_hi,
+                           blocksize, &compressed_bytes,
+                           &compressed_source_bytes);
 
-                if (solved_k < 0 || score < best_score) {
-                    best_score = score;
+                if (scalpel_state.mode_verbose) {
+                    if (semantic && semantic->usable) {
+                        scalpel_log(
+                            "[%s] elf displacement solve: validating split=%" PRId64
+                            " layout=%.6f excluded=%.6f semantic-exact=%" PRIu64
+                            "/%" PRIu64 " [%.6f,%.6f] semantic-exec=%" PRIu64
+                            "/%" PRIu64 " [%.6f,%.6f] refs=%" PRIu64
+                            "/%" PRIu64 " [%.6f,%.6f] coherence=%" PRIu64
+                            "/%" PRIu64 ".\n",
+                            cid, k, candidate_layout_score, excluded_score,
+                            semantic->exact_matches, semantic->exact_trials,
+                            semantic->exact_lower, semantic->exact_upper,
+                            semantic->executable_matches,
+                            semantic->branches,
+                            semantic->executable_lower,
+                            semantic->executable_upper,
+                            semantic->file_reference_matches,
+                            semantic->file_references,
+                            semantic->file_reference_lower,
+                            semantic->file_reference_upper,
+                            have_compression ? compressed_bytes : 0,
+                            have_compression ? compressed_source_bytes : 0);
+                    }
+                    else {
+                        scalpel_log(
+                            "[%s] elf displacement solve: validating split=%" PRId64
+                            " layout=%.6f excluded=%.6f semantic=unavailable.\n",
+                            cid, k, candidate_layout_score, excluded_score);
+                    }
+                }
+
+                bool better = solved_k < 0;
+                bool evidence_tied = false;
+
+                if (!better && semantic_qualified
+                    != best_semantic_qualified) {
+                    better = semantic_qualified;
+                }
+                else if (!better && semantic_qualified
+                         && best_semantic_qualified) {
+                    if (semantic->exact_lower
+                        > best_semantic.exact_upper) {
+                        better = true;
+                    }
+                    else if (best_semantic.exact_lower
+                             <= semantic->exact_upper) {
+                        if (elf_gapsolve_reference_evidence_dominates(
+                                semantic, &best_semantic)) {
+                            better = true;
+                        }
+                        else if (!elf_gapsolve_reference_evidence_dominates(
+                                     &best_semantic, semantic)) {
+                            evidence_tied = true;
+                        }
+                    }
+                }
+                else if (!better && !semantic_qualified
+                         && !best_semantic_qualified) {
+                    evidence_tied = true;
+                }
+
+                if (!better && evidence_tied && semantic_qualified
+                    && best_semantic_qualified
+                    && have_compression && best_has_compression
+                    && compressed_source_bytes
+                           == best_compressed_source_bytes) {
+                    if (compressed_bytes
+                            + ELF_GAPSOLVE_COHERENCE_TIE_BYTES
+                        < best_compressed_bytes) {
+                        better = true;
+                        evidence_tied = false;
+                    }
+                    else if (best_compressed_bytes
+                                 + ELF_GAPSOLVE_COHERENCE_TIE_BYTES
+                             < compressed_bytes) {
+                        evidence_tied = false;
+                    }
+                }
+
+                if (!better && evidence_tied
+                    && (candidate_layout_score
+                            > best_layout_score
+                                  + ELF_GAPSOLVE_AFFINITY_TIE_MARGIN
+                        || (fabs(candidate_layout_score
+                                 - best_layout_score)
+                                <= ELF_GAPSOLVE_AFFINITY_TIE_MARGIN
+                            && (excluded_score
+                                    < best_excluded_score
+                                          - ELF_GAPSOLVE_FILLER_TIE_MARGIN
+                                || (fabs(excluded_score
+                                         - best_excluded_score)
+                                        <= ELF_GAPSOLVE_FILLER_TIE_MARGIN
+                                    && k < solved_k))))) {
+                    better = true;
+                }
+
+                if (better) {
+                    best_layout_score = candidate_layout_score;
+                    best_excluded_score = excluded_score;
+                    if (semantic) {
+                        best_semantic = *semantic;
+                    }
+                    else {
+                        memset(&best_semantic, 0,
+                               sizeof(best_semantic));
+                    }
+                    best_semantic_qualified = semantic_qualified;
+                    best_compressed_bytes = compressed_bytes;
+                    best_compressed_source_bytes =
+                        compressed_source_bytes;
+                    best_has_compression = have_compression;
                     solved_k = k;
                 }
             }
         }
+
+        free(semantic_scores);
 
         if (solved_k < 0) {
             free(trial);
@@ -27379,8 +29863,18 @@ static inline bool elf_try_displacement_solve(CarveInfo *candidate,
                     : existing;
         }
 
-        if (!elf_validate_relocated_mapping(candidate, mapping, total_blocks,
-                                            total_size, cid, false, NULL)) {
+        const bool layout_validates = elf_validate_relocated_mapping(
+            candidate, NULL, mapping, total_blocks, total_size,
+            cid, false, NULL);
+        if (scalpel_state.write_promising
+            && (layout_validates
+                || elf_validate_relocated_mapping_internal(
+                       candidate, NULL, mapping, total_blocks, total_size,
+                       cid, false, NULL, false, NULL))) {
+            elf_preserve_complete_hypothesis(
+                candidate, mapping, total_blocks, total_size);
+        }
+        if (!layout_validates) {
             free(mapping);
             free(trial);
             scalpel_log(
@@ -27419,6 +29913,171 @@ static inline bool elf_try_displacement_solve(CarveInfo *candidate,
     }
 
     return true;
+}
+
+
+// Resolve a block shared by the SHT and PHT only when one physical block
+// satisfies both table layouts and the competing block satisfies only the SHT.
+static bool elf_anchor_collision_prefers_new_pht_block(
+    CarveInfo *candidate,
+    uint64_t elf_class,
+    const Elf_Header_64 *ehdr64,
+    const Elf_Header_32 *ehdr32,
+    bool need_swap,
+    char elf_endian,
+    uint64_t bv_index,
+    int64_t existing_apparent,
+    int64_t pht_apparent,
+    const char *cid)
+{
+    const uint32_t blocksize = scalpel_state.blocksize;
+    uint64_t sht_start;
+    uint64_t pht_start;
+    uint64_t sht_entry_size;
+    uint64_t pht_entry_size;
+    uint64_t sht_entries;
+    uint64_t pht_entries;
+    uint64_t sht_size;
+    uint64_t pht_size;
+    uint64_t sht_end;
+    uint64_t pht_end;
+    uint64_t slot_start;
+    uint64_t slot_end;
+    uint64_t sht_piece_start;
+    uint64_t sht_piece_end;
+    uint64_t pht_piece_start;
+    uint64_t pht_piece_end;
+    bool pht_block_matches_sht = false;
+    bool existing_block_matches_pht;
+    uint8_t *block_data;
+
+    if (!candidate || existing_apparent < 0 || pht_apparent < 0
+        || blocksize == 0) {
+        return false;
+    }
+
+    if (elf_class == ELF_64_BIT) {
+        if (!ehdr64) {
+            return false;
+        }
+
+        sht_start = ehdr64->sht_off;
+        pht_start = ehdr64->pht_off;
+        sht_entry_size = ehdr64->sht_entry_size;
+        pht_entry_size = ehdr64->pht_entry_size;
+        sht_entries = ehdr64->num_sht_entries;
+        pht_entries = ehdr64->num_pht_entries;
+
+        if (need_swap) {
+            sht_start = __builtin_bswap64(sht_start);
+            pht_start = __builtin_bswap64(pht_start);
+            sht_entry_size = __builtin_bswap16((uint16_t)sht_entry_size);
+            pht_entry_size = __builtin_bswap16((uint16_t)pht_entry_size);
+            sht_entries = __builtin_bswap16((uint16_t)sht_entries);
+            pht_entries = __builtin_bswap16((uint16_t)pht_entries);
+        }
+    }
+    else if (elf_class == ELF_32_BIT) {
+        if (!ehdr32) {
+            return false;
+        }
+
+        sht_start = ehdr32->sht_off;
+        pht_start = ehdr32->pht_off;
+        sht_entry_size = ehdr32->sht_entry_size;
+        pht_entry_size = ehdr32->pht_entry_size;
+        sht_entries = ehdr32->num_sht_entries;
+        pht_entries = ehdr32->num_pht_entries;
+
+        if (need_swap) {
+            sht_start = __builtin_bswap32((uint32_t)sht_start);
+            pht_start = __builtin_bswap32((uint32_t)pht_start);
+            sht_entry_size = __builtin_bswap16((uint16_t)sht_entry_size);
+            pht_entry_size = __builtin_bswap16((uint16_t)pht_entry_size);
+            sht_entries = __builtin_bswap16((uint16_t)sht_entries);
+            pht_entries = __builtin_bswap16((uint16_t)pht_entries);
+        }
+    }
+    else {
+        return false;
+    }
+
+    if (sht_entry_size == 0 || pht_entry_size == 0
+        || sht_entries == 0 || pht_entries == 0
+        || __builtin_mul_overflow(sht_entry_size, sht_entries, &sht_size)
+        || __builtin_mul_overflow(pht_entry_size, pht_entries, &pht_size)
+        || __builtin_add_overflow(sht_start, sht_size, &sht_end)
+        || __builtin_add_overflow(pht_start, pht_size, &pht_end)
+        || __builtin_mul_overflow(bv_index, (uint64_t)blocksize,
+                                  &slot_start)
+        || __builtin_add_overflow(slot_start, (uint64_t)blocksize,
+                                  &slot_end)) {
+        return false;
+    }
+
+    sht_piece_start = slot_start > sht_start ? slot_start : sht_start;
+    sht_piece_end = slot_end < sht_end ? slot_end : sht_end;
+    pht_piece_start = slot_start > pht_start ? slot_start : pht_start;
+    pht_piece_end = slot_end < pht_end ? slot_end : pht_end;
+
+    if (sht_piece_start >= sht_piece_end
+        || pht_piece_start >= pht_piece_end) {
+        return false;
+    }
+
+    block_data = get_apparent_block_data(scalpel_state.filemirror,
+                                         pht_apparent);
+    if (block_data) {
+        if (elf_class == ELF_64_BIT) {
+            pht_block_matches_sht = validate_sht_piece_slice_64(
+                block_data, blocksize,
+                sht_piece_start - slot_start,
+                sht_piece_end - slot_start,
+                sht_start, sht_piece_start, sht_entry_size, need_swap,
+                NULL, NULL, cid);
+        }
+        else {
+            pht_block_matches_sht = validate_sht_piece_slice_32(
+                block_data, blocksize,
+                sht_piece_start - slot_start,
+                sht_piece_end - slot_start,
+                sht_start, sht_piece_start, sht_entry_size, need_swap,
+                NULL, NULL, cid);
+        }
+        free(block_data);
+    }
+
+    if (!pht_block_matches_sht) {
+        return false;
+    }
+
+    if (elf_class == ELF_64_BIT) {
+        existing_block_matches_pht = match_pht_piece_in_block_64(
+            candidate, existing_apparent, blocksize,
+            pht_piece_start - slot_start,
+            pht_piece_end - pht_piece_start,
+            pht_start, pht_piece_start, TARGET_ENDIANNESS, elf_endian,
+            (size_t)pht_entry_size, NULL, NULL);
+    }
+    else {
+        existing_block_matches_pht = match_pht_piece_in_block_32(
+            candidate, existing_apparent, blocksize,
+            pht_piece_start - slot_start,
+            pht_piece_end - pht_piece_start,
+            pht_start, pht_piece_start, TARGET_ENDIANNESS, elf_endian,
+            (size_t)pht_entry_size, NULL, NULL);
+    }
+
+#ifdef ELF_REASSEMBLY_DEBUG
+    lock_fprintf(stdout,
+        "[%s] [init candidate] overlapping SHT/PHT slot=%" PRIu64
+        " existing=%" PRId64 " new=%" PRId64
+        " new_matches_sht=%d existing_matches_pht=%d\n",
+        cid, bv_index, existing_apparent, pht_apparent,
+        (int)pht_block_matches_sht, (int)existing_block_matches_pht);
+#endif
+
+    return !existing_block_matches_pht;
 }
 
 
@@ -27527,6 +30186,7 @@ static bool elf_reassembly_init_candidate(int               id,
         state->skeleton_initialized = false;
         state->relocations_placed = false;
         state->complete_mapping_verified = false;
+        state->complete_mapping_ooo_transitions_positioned = false;
 
 #ifdef ELF_REASSEMBLY_DEBUG
         lock_fprintf(stdout,
@@ -27619,6 +30279,190 @@ static bool elf_reassembly_init_candidate(int               id,
     free(header_data);
     header_data = NULL;
 
+    bool header_has_sht = false;
+    bool header_has_pht = false;
+
+    if (elf_class == ELF_64_BIT) {
+        uint64_t sht_off = ehdr64.sht_off;
+        uint64_t pht_off = ehdr64.pht_off;
+        uint16_t sht_entry_size = ehdr64.sht_entry_size;
+        uint16_t pht_entry_size = ehdr64.pht_entry_size;
+        uint16_t num_sht_entries = ehdr64.num_sht_entries;
+        uint16_t num_pht_entries = ehdr64.num_pht_entries;
+
+        if (need_swap) {
+            sht_off = __builtin_bswap64(sht_off);
+            pht_off = __builtin_bswap64(pht_off);
+            sht_entry_size = __builtin_bswap16(sht_entry_size);
+            pht_entry_size = __builtin_bswap16(pht_entry_size);
+            num_sht_entries = __builtin_bswap16(num_sht_entries);
+            num_pht_entries = __builtin_bswap16(num_pht_entries);
+        }
+        header_has_sht =
+            sht_off != 0 && num_sht_entries != 0
+            && sht_entry_size >= SHT_ENTRY_SIZE_64;
+        header_has_pht =
+            pht_off != 0 && num_pht_entries != 0
+            && pht_entry_size >= PHT_ENTRY_SIZE_64;
+    }
+    else if (elf_class == ELF_32_BIT) {
+        uint32_t sht_off = ehdr32.sht_off;
+        uint32_t pht_off = ehdr32.pht_off;
+        uint16_t sht_entry_size = ehdr32.sht_entry_size;
+        uint16_t pht_entry_size = ehdr32.pht_entry_size;
+        uint16_t num_sht_entries = ehdr32.num_sht_entries;
+        uint16_t num_pht_entries = ehdr32.num_pht_entries;
+
+        if (need_swap) {
+            sht_off = __builtin_bswap32(sht_off);
+            pht_off = __builtin_bswap32(pht_off);
+            sht_entry_size = __builtin_bswap16(sht_entry_size);
+            pht_entry_size = __builtin_bswap16(pht_entry_size);
+            num_sht_entries = __builtin_bswap16(num_sht_entries);
+            num_pht_entries = __builtin_bswap16(num_pht_entries);
+        }
+        header_has_sht =
+            sht_off != 0 && num_sht_entries != 0
+            && sht_entry_size >= SHT_ENTRY_SIZE_32;
+        header_has_pht =
+            pht_off != 0 && num_pht_entries != 0
+            && pht_entry_size >= PHT_ENTRY_SIZE_32;
+    }
+    else {
+        goto fail;
+    }
+
+    if (!header_has_sht && !header_has_pht) {
+        goto fail;
+    }
+
+    if (!header_has_sht) {
+        BlockComponent pht_scratch = {0};
+        BlockComponent *pht_component = NULL;
+        int64_t pht_apparent = -1;
+
+        if (elf_class == ELF_64_BIT) {
+            pht_apparent = find_valid_pht_block_64(
+                candidate, &ehdr64, TARGET_ENDIANNESS, elf_endian, NULL,
+                &pht_scratch, &pht_component, &pht_block_data,
+                &pht_block_bytes, &pht_blocks, &pht_nblocks);
+        }
+        else {
+            pht_apparent = find_valid_pht_block_32(
+                candidate, &ehdr32, TARGET_ENDIANNESS, elf_endian, NULL,
+                &pht_scratch, &pht_component, &pht_block_data,
+                &pht_block_bytes, &pht_blocks, &pht_nblocks);
+        }
+
+        if (pht_apparent < 0 || !pht_block_data
+            || !pht_blocks || pht_nblocks == 0) {
+            goto fail;
+        }
+
+        uint64_t pht_file_offset = 0;
+        uint16_t pht_entry_size = 0;
+        uint16_t pht_entries = 0;
+        uint16_t elf_header_size = 0;
+
+        if (elf_class == ELF_64_BIT) {
+            pht_file_offset = ehdr64.pht_off;
+            pht_entry_size = ehdr64.pht_entry_size;
+            pht_entries = ehdr64.num_pht_entries;
+            elf_header_size = ehdr64.elf_header_size;
+            if (need_swap) {
+                pht_file_offset = __builtin_bswap64(pht_file_offset);
+                pht_entry_size = __builtin_bswap16(pht_entry_size);
+                pht_entries = __builtin_bswap16(pht_entries);
+                elf_header_size = __builtin_bswap16(elf_header_size);
+            }
+        }
+        else {
+            uint32_t pht_file_offset_32 = ehdr32.pht_off;
+
+            pht_entry_size = ehdr32.pht_entry_size;
+            pht_entries = ehdr32.num_pht_entries;
+            elf_header_size = ehdr32.elf_header_size;
+            if (need_swap) {
+                pht_file_offset_32 =
+                    __builtin_bswap32(pht_file_offset_32);
+                pht_entry_size = __builtin_bswap16(pht_entry_size);
+                pht_entries = __builtin_bswap16(pht_entries);
+                elf_header_size = __builtin_bswap16(elf_header_size);
+            }
+            pht_file_offset = pht_file_offset_32;
+        }
+
+        uint64_t image_limit = 0;
+        const uint64_t apparent_blocks =
+            filemirror_apparent_blocks(scalpel_state.filemirror);
+        if (__builtin_mul_overflow(apparent_blocks,
+                                  (uint64_t)scalpel_state.blocksize,
+                                  &image_limit)) {
+            image_limit = UINT64_MAX;
+        }
+
+        uint64_t total_size = 0;
+        if (!elf_build_pht_only_state(
+                state, (const char *)pht_block_data, pht_block_bytes,
+                pht_file_offset % scalpel_state.blocksize, pht_file_offset,
+                pht_entry_size, pht_entries, elf_header_size,
+                elf_class == ELF_64_BIT, need_swap, image_limit,
+                &total_size)
+            || total_size == 0) {
+            goto fail;
+        }
+
+        const uint64_t total_blocks =
+            CEILDIV(total_size, scalpel_state.blocksize);
+        const uint64_t pht_bv_index =
+            pht_file_offset / scalpel_state.blocksize;
+        if (total_blocks == 0 || pht_bv_index >= total_blocks) {
+            goto fail;
+        }
+
+        resize_blockvector(candidate->b, total_blocks);
+        blockvector_set_data_length(candidate->b, total_size);
+
+        for (size_t i = 0; i < pht_nblocks; i++) {
+            const uint64_t target = pht_bv_index + (uint64_t)i;
+            const int64_t apparent = pht_blocks[i];
+
+            if (target >= total_blocks || apparent < 0) {
+                continue;
+            }
+
+            const int64_t existing =
+                blockvector_get_apparent_blocknumber(candidate->b, target);
+            if (existing == apparent) {
+                continue;
+            }
+            if (bv_slot_is_unfilled(existing)) {
+                ELF_DEBUG_SET_APPARENT(candidate, target, apparent);
+            }
+            else {
+                blockvector_add_choice(candidate->b, target, apparent);
+                int64_t actual = filemirror_actual_blocknumber(
+                    scalpel_state.filemirror, apparent);
+
+                add_to_queue(candidate->best_choices, &actual, 0);
+            }
+        }
+
+        state->sht_placed = true;
+        state->shstrtab_placed = true;
+        state->pht_placed = true;
+        normalize_blockvector(candidate->b);
+        carve_put_state(candidate->carvehashkey, state);
+        state_new = false;
+
+        free(pht_block_data);
+        pht_block_data = NULL;
+        free(pht_blocks);
+        pht_blocks = NULL;
+        elf_free_carve_state((void **)&state);
+        return true;
+    }
+
     uint64_t placed_blocks = 0;
     uint64_t num_blocks = blockvector_get_num_blocks(candidate->b);
     for (uint64_t i = 0; i < num_blocks; ++i) {
@@ -27675,8 +30519,9 @@ static bool elf_reassembly_init_candidate(int               id,
     }
 
     bool sht_has_synthetic_piece = false;
-    for (size_t pi = 0; pi < sht_nblocks; pi++) {
-        if (sht_blocks[pi] < 0) {
+
+    for (size_t piece = 0; piece < sht_nblocks; piece++) {
+        if (sht_blocks[piece] < 0) {
             sht_has_synthetic_piece = true;
             break;
         }
@@ -27686,7 +30531,8 @@ static bool elf_reassembly_init_candidate(int               id,
     lock_fprintf(stdout,
         "[%s] [init candidate] SHT found: anchor_apparent=%" PRId64
         " span_blocks=%zu synthetic_piece=%d\n",
-        cid, sht_apparent, sht_nblocks, (int)sht_has_synthetic_piece);
+        cid, sht_apparent, sht_nblocks,
+        (int)sht_has_synthetic_piece);
 #endif
 
     uint64_t bv_index = 0;
@@ -27737,6 +30583,7 @@ static bool elf_reassembly_init_candidate(int               id,
 #endif
 
     resize_blockvector(candidate->b, total_blocks);
+    blockvector_set_data_length(candidate->b, total_size);
 
 #ifdef ELF_REASSEMBLY_DEBUG
     lock_fprintf(stdout,
@@ -27796,10 +30643,11 @@ static bool elf_reassembly_init_candidate(int               id,
         cid, sht_nblocks, bv_index);
 #endif
 
-    int64_t pht_apparent = -1;
-    BlockComponent  pht_scratch;
-    BlockComponent *pht_component = NULL;
-    memset(&pht_scratch, 0, sizeof(pht_scratch));
+    if (header_has_pht) {
+        int64_t pht_apparent = -1;
+        BlockComponent  pht_scratch;
+        BlockComponent *pht_component = NULL;
+        memset(&pht_scratch, 0, sizeof(pht_scratch));
 
 #ifdef ELF_REASSEMBLY_DEBUG
     lock_fprintf(stdout, "[%s] [init candidate] Starting PHT search...\n", cid);
@@ -27896,14 +30744,30 @@ static bool elf_reassembly_init_candidate(int               id,
             continue;
         }
 
+        if (elf_anchor_collision_prefers_new_pht_block(
+                candidate, elf_class, &ehdr64, &ehdr32, need_swap,
+                elf_endian, idx, existing, ap, cid)) {
+            blockvector_add_choice(candidate->b, idx, existing);
+            ELF_DEBUG_SET_APPARENT(candidate, idx, ap);
+            normalize_blockvector(candidate->b);
+            continue;
+        }
+
         blockvector_add_choice(candidate->b, idx, ap);
 
         int64_t act = filemirror_actual_blocknumber(scalpel_state.filemirror, ap);
         add_to_queue(candidate->best_choices, &act, 0);
     }
 
-    state->pht_placed = true;
-    carve_put_state(candidate->carvehashkey, state);
+        state->pht_placed = true;
+        carve_put_state(candidate->carvehashkey, state);
+    }
+    else {
+        /* A zero PHT count is valid for relocatable ELF objects. Treat the
+           absent table as a satisfied anchor rather than abandoning the file. */
+        state->pht_placed = true;
+        carve_put_state(candidate->carvehashkey, state);
+    }
 
     int64_t shstrtab_ap = -1;
     uint64_t shstrtab_offset = 0;
@@ -28140,29 +31004,10 @@ static bool elf_reassembly_init_candidate(int               id,
                                  total_size);
     }
 
-    // A physical SHT piece supplies an exact terminal displacement even when
-    // another piece remains ambiguous. Try the general in-order alignment
-    // before the narrower relocation-anchor arithmetic path.
-    bool monotone_solved = false;
-    for (size_t pi = sht_nblocks; pi-- > 0;) {
-        if (sht_blocks[pi] < 0
-            || bv_index + (uint64_t)pi >= total_blocks) {
-            continue;
-        }
-
-        monotone_solved = elf_try_monotone_gap_alignment(
-            candidate, state, elf_candidate_header_apparent(candidate),
-            bv_index + (uint64_t)pi, sht_blocks[pi],
-            total_blocks, total_size, scalpel_state.blocksize, cid);
-        if (monotone_solved) {
-            state->complete_mapping_verified = true;
-        }
-        break;
-    }
-
-    // The relocation-anchor solver requires every SHT piece because its
-    // prefix trials directly assemble those bytes.
-    if (!monotone_solved && !sht_has_synthetic_piece) {
+    // Complete SHT evidence permits the bounded displacement solver to seed
+    // an in-order gap hypothesis. Opaque runs are audited independently
+    // before the mapping can be accepted.
+    if (!sht_has_synthetic_piece) {
         uint16_t solve_machine;
         uint64_t solve_pht_off;
         uint16_t solve_pht_entsize;
@@ -28176,63 +31021,58 @@ static bool elf_reassembly_init_candidate(int               id,
             if (need_swap) {
                 solve_machine = __builtin_bswap16(solve_machine);
                 solve_pht_off = __builtin_bswap64(solve_pht_off);
-                solve_pht_entsize = __builtin_bswap16(solve_pht_entsize);
+                solve_pht_entsize =
+                    __builtin_bswap16(solve_pht_entsize);
                 solve_pht_num = __builtin_bswap16(solve_pht_num);
             }
         }
         else {
-            uint32_t poff32 = ehdr32.pht_off;
+            uint32_t solve_pht_off32 = ehdr32.pht_off;
 
             solve_machine = ehdr32.isa;
             solve_pht_entsize = ehdr32.pht_entry_size;
             solve_pht_num = ehdr32.num_pht_entries;
             if (need_swap) {
                 solve_machine = __builtin_bswap16(solve_machine);
-                poff32 = __builtin_bswap32(poff32);
-                solve_pht_entsize = __builtin_bswap16(solve_pht_entsize);
+                solve_pht_off32 = __builtin_bswap32(solve_pht_off32);
+                solve_pht_entsize =
+                    __builtin_bswap16(solve_pht_entsize);
                 solve_pht_num = __builtin_bswap16(solve_pht_num);
             }
-            solve_pht_off = poff32;
+            solve_pht_off = solve_pht_off32;
         }
 
-        if (elf_try_displacement_solve(
-                candidate, state, elf_candidate_header_apparent(candidate),
+        const bool displacement_solved = elf_try_displacement_solve(
+                candidate, state,
+                elf_candidate_header_apparent(candidate),
                 bv_index, sht_apparent, total_blocks, total_size,
                 scalpel_state.blocksize, elf_class == ELF_64_BIT,
-                need_swap, solve_machine, solve_pht_off, solve_pht_entsize,
-                solve_pht_num, cid)) {
-            bool mapping_is_monotone = true;
-            bool mapping_has_gap = false;
-            int64_t previous_apparent =
-                blockvector_get_apparent_blocknumber(candidate->b, 0);
+                need_swap, solve_machine, solve_pht_off,
+                solve_pht_entsize, solve_pht_num, cid);
 
-            for (uint64_t j = 1; j < total_blocks; j++) {
-                const int64_t apparent =
-                    blockvector_get_apparent_blocknumber(candidate->b, j);
-
-                if (previous_apparent < 0
-                    || apparent <= previous_apparent) {
-                    mapping_is_monotone = false;
-                    break;
-                }
-                if (apparent != previous_apparent + 1) {
-                    mapping_has_gap = true;
-                }
-                previous_apparent = apparent;
-            }
-            state->complete_mapping_verified =
-                mapping_is_monotone && mapping_has_gap;
+        if (displacement_solved) {
+            state->complete_mapping_verified = false;
+            state->complete_mapping_ooo_transitions_positioned = false;
+        }
+        else if (elf_try_monotone_gap_alignment(
+                     candidate, state,
+                     elf_candidate_header_apparent(candidate),
+                     bv_index, sht_apparent, total_blocks, total_size,
+                     scalpel_state.blocksize, UINT64_MAX, cid,
+                     NULL, NULL, NULL, NULL)) {
+            state->complete_mapping_verified = false;
+            state->complete_mapping_ooo_transitions_positioned = false;
+        }
+        else if (elf_try_layout_gap_alignment(
+                     candidate, state,
+                     elf_candidate_header_apparent(candidate),
+                     total_blocks, total_size,
+                     scalpel_state.blocksize, cid,
+                     NULL, NULL, NULL, NULL)) {
+            state->complete_mapping_verified = false;
+            state->complete_mapping_ooo_transitions_positioned = false;
         }
     }
-#ifdef ELF_REASSEMBLY_DEBUG
-    else if (!monotone_solved) {
-        lock_fprintf(
-            stdout,
-            "[%s] [init candidate] skipping displacement solve because "
-            "one SHT block remains physically ambiguous\n",
-            cid);
-    }
-#endif
 
     normalize_blockvector(candidate->b);
     carve_put_state(candidate->carvehashkey, state);
@@ -28279,27 +31119,22 @@ fail:
  * block search and writes it to @c candidate->block_choice_start.
  * It also resets @c candidate->fastpath and @c candidate->newblock.
  *
- * The function handles three distinct situations:
+ * Saved searches resume in the caller without invoking this function.
+ * It handles two distinct situations:
  *
- *  1. **Preemption resume** (@c candidate->no_initial_block_extension is
- *     set): a prior evaluation was interrupted mid-pass (e.g. checkpoint
- *     or return-to-idle). The existing @c block_choice_start is kept
- *     unchanged and the function returns immediately after clearing the
- *     flag.
- *
- *  2. **Init pass** (@p is_init is @c true): the candidate is being set up
+ *  1. **Init pass** (@p is_init is @c true): the candidate is being set up
  *     for the very first extension search. @c block_choice_start is placed
  *     immediately after the apparent block number of the first placed slot
  *     (preferring slot 0, then the lowest placed slot found). If no slot is
  *     placed yet, the search starts at apparent block 0.
  *
- *  3. **New-slot pass** (@p is_init is @c false): a new unfilled slot has
+ *  2. **New-slot pass** (@p is_init is @c false): a new unfilled slot has
  *     been identified and the search window must be anchored to context
  *     already placed nearby. The function scans leftward from
  *     @p target_slot_bv_index for the nearest placed slot and positions
  *     @c block_choice_start immediately after its apparent block number.
  *     If no left neighbor is placed, it falls back to the header anchor
- *     used in case 2, and finally to 0 if nothing is placed at all.
+ *     used in case 1, and finally to 0 if nothing is placed at all.
  *
  * In all cases the computed start is taken modulo the total number of
  * apparent blocks so that wrap-around searches are handled correctly.
@@ -28344,37 +31179,11 @@ static void elf_reassembly_prepare_for_extension(int              id,
     candidate->fastpath = false;
     candidate->newblock = -1;
 
-    /* We no longer use retry_same_slot / blocks_evaluated_last here,
-     * except for the early-return below.
-     * WINDOW_EMPTY handling is now done in elf_reassembly itself.
-     */
+    /* Saved searches bypass prepare(). This is a fresh slot, even if the
+     * preceding search resumed after a checkpoint. Always compute its hint. */
+    candidate->no_initial_block_extension = false;
+    (void)retry_same_slot;
     (void)blocks_evaluated_last;
-
-    /* If we were preempted mid-eval (checkpoint / return-to-idle),
-     * resume with prior hint.
-     */
-    if (candidate->no_initial_block_extension) {
-        candidate->no_initial_block_extension = false;
-#ifdef ELF_REASSEMBLY_DEBUG
-        lock_fprintf(stdout,
-            "[ELF-prepare] T#%d cand=%p UUID %s/%s preempt-resume: keep block_choice_start=%" PRId64 "\n",
-            id, candidate, uuidp, uuidc, (int64_t)candidate->block_choice_start);
-#endif
-        return;
-    }
-
-
-//     if (!is_init && retry_same_slot) {
-// #ifdef ELF_REASSEMBLY_DEBUG
-//         lock_fprintf(stdout,
-//             "[ELF-prepare] T#%d cand=%p UUID %s/%s RETRY target_slot=%" PRIu64
-//             " keep block_choice_start=%" PRId64 "\n",
-//             id, candidate, uuidp, uuidc,
-//             target_slot_bv_index,
-//             (int64_t)candidate->block_choice_start);
-// #endif
-//         return;
-//     }
 
     const int64_t N = (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
     if (N <= 0) {
@@ -28504,6 +31313,24 @@ static void elf_reassembly_prepare_for_extension(int              id,
 }
 
 
+// Duplicate content can satisfy an ELF structure but cannot identify which
+// physical copy is contiguous with the current candidate.
+static inline bool elf_apparent_block_is_unique_physical_anchor(
+    int64_t apparent)
+{
+    if (apparent < 0) {
+        return false;
+    }
+
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent);
+
+    return actual >= 0
+           && filemirror_actual_block_reference_count(
+                  scalpel_state.filemirror, actual) <= 1;
+}
+
+
 
 /**
  * @brief Find the nearest placed block-vector slot to the left or right of
@@ -28551,7 +31378,8 @@ static inline bool elf_find_nearest_placed_bv_anchor(const CarveInfo *cand,
         if (bv_target == 0) return false;
         for (int64_t bv = (int64_t)bv_target - 1; bv >= 0; --bv) {
             int64_t ap = blockvector_get_apparent_blocknumber(cand->b, (uint64_t)bv);
-            if (bv_slot_is_placed(ap)) {
+            if (bv_slot_is_placed(ap)
+                && elf_apparent_block_is_unique_physical_anchor(ap)) {
                 *out_bv_anchor = (uint64_t)bv;
                 *out_ap_anchor = (uint64_t)ap;
                 return true;
@@ -28560,7 +31388,8 @@ static inline bool elf_find_nearest_placed_bv_anchor(const CarveInfo *cand,
     } else {
         for (uint64_t bv = bv_target + 1; bv < n; ++bv) {
             int64_t ap = blockvector_get_apparent_blocknumber(cand->b, bv);
-            if (bv_slot_is_placed(ap)) {
+            if (bv_slot_is_placed(ap)
+                && elf_apparent_block_is_unique_physical_anchor(ap)) {
                 *out_bv_anchor = bv;
                 *out_ap_anchor = (uint64_t)ap;
                 return true;
@@ -28630,7 +31459,8 @@ static inline bool elf_compute_ap_pred_from_anchor(uint64_t bv_target,
  * window as follows:
  *
  *  - **Both anchors available**: window spans [@p predL, @p predR] (or the
- *    reverse if predR < predL); @p ap_pred is set to the midpoint.
+ *    reverse if predR < predL); @p ap_pred follows the logically nearer
+ *    anchor, using the midpoint only when both anchors are equally near.
  *  - **One anchor available**: @p ap_pred is that prediction; the window is
  *    centered on it with a half-width of @p initial_radius, clamped to
  *    [@p ap_min, @p ap_max].
@@ -28689,7 +31519,18 @@ static inline void elf_compute_anchor_pred_window(const CarveInfo *cand,
     if (okL && okR) {
         ap_lo = (predL < predR) ? predL : predR;
         ap_hi = (predL < predR) ? predR : predL;
-        ap_pred = ap_lo + (ap_hi - ap_lo) / 2;
+        const uint64_t distance_left = bv_target - bvL;
+        const uint64_t distance_right = bvR - bv_target;
+
+        if (distance_left < distance_right) {
+            ap_pred = predL;
+        }
+        else if (distance_right < distance_left) {
+            ap_pred = predR;
+        }
+        else {
+            ap_pred = ap_lo + (ap_hi - ap_lo) / 2;
+        }
     } else if (okL) {
         ap_pred = predL;
         const uint64_t d = (uint64_t)initial_radius;
@@ -29113,6 +31954,46 @@ static inline SectionDataType elf_predicted_section_from_blockstate(const BlockS
 }
 
 
+// Summarize the coarse ELF structures expected in one logical file block.
+// Unlike section masks, this preserves header and table ownership evidence.
+static inline uint32_t elf_expected_component_mask_for_bv_slot(
+    const FileState *layout,
+    uint32_t blocksize,
+    uint64_t bv_index)
+{
+    uint64_t slot_start;
+    uint64_t slot_end;
+    uint32_t mask = 0;
+
+    if (!layout || !layout->components || layout->num_components == 0
+        || blocksize == 0
+        || __builtin_mul_overflow(bv_index, (uint64_t)blocksize,
+                                  &slot_start)
+        || __builtin_add_overflow(slot_start, (uint64_t)blocksize,
+                                  &slot_end)) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < layout->num_components; i++) {
+        const FileComponent *component = &layout->components[i];
+        uint64_t component_end;
+
+        if ((unsigned)component->type >= 32
+            || __builtin_add_overflow(component->fileOffset,
+                                      component->size,
+                                      &component_end)) {
+            continue;
+        }
+        if (component_end <= slot_start
+            || component->fileOffset >= slot_end) {
+            continue;
+        }
+        mask |= UINT32_C(1) << (unsigned)component->type;
+    }
+    return mask;
+}
+
+
 
 /**
  * @brief Return the single-bit mask corresponding to a @c SectionDataType
@@ -29354,9 +32235,13 @@ static inline bool elf_build_validation_layout(const char *data, uint64_t length
         uint64_t shoff;
         uint64_t shstr_off;
         uint64_t shstr_size;
+        uint64_t phoff;
         uint16_t shentsize;
         uint16_t shnum;
         uint16_t shstrndx;
+        uint16_t phentsize;
+        uint16_t phnum;
+        uint16_t ehsize;
         uint64_t sht_bytes;
         uint64_t shstr_entry_off;
 
@@ -29369,14 +32254,30 @@ static inline bool elf_build_validation_layout(const char *data, uint64_t length
         shentsize = ehdr.sht_entry_size;
         shnum = ehdr.num_sht_entries;
         shstrndx = ehdr.idx_section_names;
+        phoff = ehdr.pht_off;
+        phentsize = ehdr.pht_entry_size;
+        phnum = ehdr.num_pht_entries;
+        ehsize = ehdr.elf_header_size;
         if (need_swap) {
             shoff = __builtin_bswap64(shoff);
             shentsize = __builtin_bswap16(shentsize);
             shnum = __builtin_bswap16(shnum);
             shstrndx = __builtin_bswap16(shstrndx);
+            phoff = __builtin_bswap64(phoff);
+            phentsize = __builtin_bswap16(phentsize);
+            phnum = __builtin_bswap16(phnum);
+            ehsize = __builtin_bswap16(ehsize);
         }
 
-        if (shnum == 0 || shstrndx >= shnum
+        if (shnum == 0) {
+            uint64_t pht_file_size = 0;
+
+            return elf_build_pht_only_state(
+                layout, data, length, phoff, phoff, phentsize, phnum,
+                ehsize, true, need_swap, length, &pht_file_size);
+        }
+
+        if (shstrndx >= shnum
             || shentsize < sizeof(Section_Header_Entry_64)
             || __builtin_mul_overflow((uint64_t)shentsize, (uint64_t)shnum,
                                       &sht_bytes)
@@ -29401,6 +32302,32 @@ static inline bool elf_build_validation_layout(const char *data, uint64_t length
             return false;
         }
 
+        layout->components =
+            (FileComponent *)calloc(3, sizeof(*layout->components));
+        if (!layout->components) {
+            return false;
+        }
+        layout->components[layout->num_components++] = (FileComponent){
+            .type = COMPONENT_ELF_HEADER,
+            .section = SECTION_UNKNOWN,
+            .fileOffset = 0,
+            .size = ehsize,
+        };
+        if (phnum > 0) {
+            layout->components[layout->num_components++] = (FileComponent){
+                .type = COMPONENT_PHT,
+                .section = SECTION_UNKNOWN,
+                .fileOffset = phoff,
+                .size = (uint64_t)phentsize * phnum,
+            };
+        }
+        layout->components[layout->num_components++] = (FileComponent){
+            .type = COMPONENT_SHT,
+            .section = SECTION_UNKNOWN,
+            .fileOffset = shoff,
+            .size = (uint64_t)shentsize * shnum,
+        };
+
         build_candidate_state_64(layout, data, length, shoff,
                                  data, length, shstr_off,
                                  (size_t)shstr_size, &ehdr,
@@ -29412,9 +32339,13 @@ static inline bool elf_build_validation_layout(const char *data, uint64_t length
         uint32_t shoff32;
         uint32_t shstr_off32;
         uint32_t shstr_size32;
+        uint32_t phoff32;
         uint16_t shentsize;
         uint16_t shnum;
         uint16_t shstrndx;
+        uint16_t phentsize;
+        uint16_t phnum;
+        uint16_t ehsize;
         uint64_t sht_bytes;
         uint64_t shstr_entry_off;
 
@@ -29427,15 +32358,32 @@ static inline bool elf_build_validation_layout(const char *data, uint64_t length
         shentsize = ehdr.sht_entry_size;
         shnum = ehdr.num_sht_entries;
         shstrndx = ehdr.idx_section_names;
+        phoff32 = ehdr.pht_off;
+        phentsize = ehdr.pht_entry_size;
+        phnum = ehdr.num_pht_entries;
+        ehsize = ehdr.elf_header_size;
         if (need_swap) {
             shoff32 = __builtin_bswap32(shoff32);
             shentsize = __builtin_bswap16(shentsize);
             shnum = __builtin_bswap16(shnum);
             shstrndx = __builtin_bswap16(shstrndx);
+            phoff32 = __builtin_bswap32(phoff32);
+            phentsize = __builtin_bswap16(phentsize);
+            phnum = __builtin_bswap16(phnum);
+            ehsize = __builtin_bswap16(ehsize);
+        }
+
+        if (shnum == 0) {
+            uint64_t pht_file_size = 0;
+            const uint64_t phoff = phoff32;
+
+            return elf_build_pht_only_state(
+                layout, data, length, phoff, phoff, phentsize, phnum,
+                ehsize, false, need_swap, length, &pht_file_size);
         }
 
         const uint64_t shoff = shoff32;
-        if (shnum == 0 || shstrndx >= shnum
+        if (shstrndx >= shnum
             || shentsize < sizeof(Section_Header_Entry_32)
             || __builtin_mul_overflow((uint64_t)shentsize, (uint64_t)shnum,
                                       &sht_bytes)
@@ -29462,6 +32410,32 @@ static inline bool elf_build_validation_layout(const char *data, uint64_t length
             || data[shstr_off + shstr_size - 1] != '\0') {
             return false;
         }
+
+        layout->components =
+            (FileComponent *)calloc(3, sizeof(*layout->components));
+        if (!layout->components) {
+            return false;
+        }
+        layout->components[layout->num_components++] = (FileComponent){
+            .type = COMPONENT_ELF_HEADER,
+            .section = SECTION_UNKNOWN,
+            .fileOffset = 0,
+            .size = ehsize,
+        };
+        if (phnum > 0) {
+            layout->components[layout->num_components++] = (FileComponent){
+                .type = COMPONENT_PHT,
+                .section = SECTION_UNKNOWN,
+                .fileOffset = phoff32,
+                .size = (uint64_t)phentsize * phnum,
+            };
+        }
+        layout->components[layout->num_components++] = (FileComponent){
+            .type = COMPONENT_SHT,
+            .section = SECTION_UNKNOWN,
+            .fileOffset = shoff,
+            .size = (uint64_t)shentsize * shnum,
+        };
 
         build_candidate_state_32(layout, data, length, shoff,
                                  data, length, shstr_off,
@@ -29503,6 +32477,311 @@ static inline bool elf_layout_slot_expects_text(const FileState *layout,
     return (expected & (1u << (uint32_t)SECTION_TEXT)) != 0;
 }
 
+static inline bool elf_relocation_slot_conflicts(
+    CarveInfo *candidate, const FileState *layout,
+    uint64_t bv_index, uint32_t blocksize, int64_t apparent,
+    bool *writable_targets);
+
+// Check complete relocation records at the offsets declared by the recovered
+// section table. A generic block classification does not establish the record
+// alignment or distinguish REL from RELA. Missing anchors remain inconclusive.
+static inline bool elf_relocation_block_conflicts(
+    CarveInfo *candidate, const FileState *layout,
+    uint64_t bv_index, uint32_t blocksize,
+    const uint8_t *data, uint64_t available, double *active_fraction,
+    bool *writable_targets)
+{
+    bool is_64 = false;
+    bool file_is_le = true;
+    uint16_t machine = 0;
+    uint16_t section_count = 0;
+    uint16_t program_count = 0;
+    uint16_t object_type = 0;
+    uint64_t slot_start;
+    uint64_t slot_end;
+    uint64_t records = 0;
+    uint64_t active_records = 0;
+    uint64_t writable_records = 0;
+
+    if (active_fraction) {
+        *active_fraction = 1.0;
+    }
+    if (writable_targets) {
+        *writable_targets = false;
+    }
+    if (!candidate || !candidate->b || !layout || !layout->sht_placed
+        || blocksize == 0 || !data
+        || !(elf_expected_section_mask_for_bv_slot(layout, blocksize,
+                                                    bv_index)
+             & sec_bit(SECTION_RELOCATION))
+        || !get_elf_identity(candidate, &is_64, &file_is_le, &machine)
+        || (machine != EM_386 && machine != EM_X86_64
+            && machine != EM_ARM && machine != EM_AARCH64)
+        || __builtin_mul_overflow(bv_index, (uint64_t)blocksize,
+                                  &slot_start)
+        || __builtin_add_overflow(slot_start, (uint64_t)blocksize,
+                                  &slot_end)) {
+        return false;
+    }
+    if (is_64) {
+        Elf_Header_64 header;
+        if (!read_candidate_elf_header_64(candidate, &header)) {
+            return false;
+        }
+        section_count = to_host_endian_16(header.num_sht_entries,
+                                          file_is_le);
+        program_count = to_host_endian_16(header.num_pht_entries,
+                                          file_is_le);
+        object_type = to_host_endian_16(header.exec_type, file_is_le);
+    }
+    else {
+        Elf_Header_32 header;
+        if (!read_candidate_elf_header_32(candidate, &header)) {
+            return false;
+        }
+        section_count = to_host_endian_16(header.num_sht_entries,
+                                          file_is_le);
+        program_count = to_host_endian_16(header.num_pht_entries,
+                                          file_is_le);
+        object_type = to_host_endian_16(header.exec_type, file_is_le);
+    }
+
+    if (available < blocksize) {
+        slot_end = slot_start + available;
+    }
+    size_t segment_count = 0;
+    SegmentInfo *segments = NULL;
+    bool check_addresses = false;
+    if (layout->pht_placed && program_count != 0
+        && program_count != ELF_PN_XNUM
+        && (object_type == 2 || object_type == 3)) { // ET_EXEC / ET_DYN
+        segments = build_segment_ranges(candidate, &segment_count);
+        if (segments && segment_count == program_count) {
+            for (size_t i = 0; i < segment_count; i++) {
+                if (segments[i].seg_type == PT_LOAD
+                    && segments[i].seg_mem_size != 0) {
+                    check_addresses = true;
+                }
+                if (segments[i].seg_vaddr
+                    > UINT64_MAX - segments[i].seg_mem_size) {
+                    check_addresses = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (uint16_t i = 0; i < section_count; i++) {
+        Section_Header_Entry_64 section;
+        uint64_t section_end;
+        if (!get_sht_entry(candidate, i, is_64, file_is_le, &section)
+            || (section.section_type != SECTION_TYPE_REL
+                && section.section_type != SECTION_TYPE_RELA)
+            || __builtin_add_overflow(section.sect_file_off,
+                                      section.sect_size, &section_end)
+            || section.sect_file_off >= slot_end
+            || section_end <= slot_start) {
+            continue;
+        }
+        const bool is_rela = section.section_type == SECTION_TYPE_RELA;
+        const uint64_t canonical =
+            is_64 ? (is_rela ? sizeof(Elf64_Rela) : sizeof(Elf64_Rel))
+                  : (is_rela ? sizeof(Elf32_Rela) : sizeof(Elf32_Rel));
+        const uint64_t stride = section.entry_size ? section.entry_size
+                                                    : canonical;
+        if (stride < canonical || section.sect_size % stride != 0) {
+            continue;
+        }
+        uint64_t symbol_count = 0;
+        bool check_symbols = false;
+        Section_Header_Entry_64 symbols;
+        if (section.sect_idx != 0 && section.sect_idx < section_count
+            && get_sht_entry(candidate, (uint16_t)section.sect_idx,
+                              is_64, file_is_le, &symbols)
+            && (symbols.section_type == SECTION_TYPE_SYMTAB
+                || symbols.section_type == SECTION_TYPE_DYNSYM)) {
+            const uint64_t symbol_stride = symbols.entry_size
+                ? symbols.entry_size
+                : (is_64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym));
+            if (symbol_stride >= (is_64 ? sizeof(Elf64_Sym)
+                                       : sizeof(Elf32_Sym))
+                && symbols.sect_size % symbol_stride == 0) {
+                symbol_count = symbols.sect_size / symbol_stride;
+                check_symbols = machine == EM_386 || machine == EM_X86_64
+                                || machine == EM_ARM || machine == EM_AARCH64;
+            }
+        }
+        const uint64_t lo = slot_start > section.sect_file_off
+                                ? slot_start : section.sect_file_off;
+        const uint64_t hi = slot_end < section_end ? slot_end : section_end;
+        const uint64_t remainder = (lo - section.sect_file_off) % stride;
+        const uint64_t skip = remainder ? stride - remainder : 0;
+        if (skip > hi - lo) {
+            continue;
+        }
+        uint64_t offset = lo + skip;
+        while (canonical <= hi - offset) {
+            const uint8_t *entry = data + offset - slot_start;
+            if (!validate_one_reloc_entry(entry,
+                                          is_64, is_rela, file_is_le,
+                                          machine, NULL, 0, false)) {
+                free(segments);
+                return true;
+            }
+            uint32_t type;
+            uint64_t symbol;
+            uint64_t address;
+            if (is_64) {
+                uint64_t info;
+                uint64_t offset_value;
+                memcpy(&info, entry + sizeof(uint64_t), sizeof(info));
+                memcpy(&offset_value, entry, sizeof(offset_value));
+                info = to_host_endian_64(info, file_is_le);
+                type = ELF64_R_TYPE(info);
+                symbol = ELF64_R_SYM(info);
+                address = to_host_endian_64(offset_value, file_is_le);
+            }
+            else {
+                uint32_t info;
+                uint32_t offset_value;
+                memcpy(&info, entry + sizeof(uint32_t), sizeof(info));
+                memcpy(&offset_value, entry, sizeof(offset_value));
+                info = to_host_endian_32(info, file_is_le);
+                type = ELF32_R_TYPE(info);
+                symbol = ELF32_R_SYM(info);
+                address = to_host_endian_32(offset_value, file_is_le);
+            }
+            records++;
+            if (type != 0
+                && !(is_64 && machine == EM_AARCH64 && type == 0x100)) {
+                // Allocated relocations in executables/shared objects address
+                // mapped memory, including the zero-filled part of PT_LOAD.
+                if ((check_addresses && (section.flags & SHF_ALLOC)
+                     && !is_valid_virtual_address(address, segments,
+                                                   segment_count))
+                    || (check_symbols && symbol != 0
+                        && symbol >= symbol_count)) {
+                    free(segments);
+                    return true;
+                }
+                active_records++;
+                if (writable_targets && check_addresses
+                    && (section.flags & SHF_ALLOC)) {
+                    for (size_t j = 0; j < segment_count; j++) {
+                        if (segments[j].seg_type == PT_LOAD
+                            && (segments[j].seg_flags & PF_W)
+                            && address >= segments[j].seg_vaddr
+                            && address - segments[j].seg_vaddr
+                                   < segments[j].seg_mem_size) {
+                            writable_records++;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (stride > hi - offset) {
+                break;
+            }
+            offset += stride;
+        }
+    }
+    if (active_fraction && records != 0) {
+        *active_fraction = (double)active_records / (double)records;
+    }
+    if (writable_targets) {
+        // Text relocations are legal. This is positive ranking evidence,
+        // never an exclusion or a declaration of file identity.
+        *writable_targets = active_records != 0
+                            && writable_records == active_records;
+    }
+    free(segments);
+    return false;
+}
+
+static inline bool elf_relocation_slot_conflicts(
+    CarveInfo *candidate, const FileState *layout,
+    uint64_t bv_index, uint32_t blocksize, int64_t apparent,
+    bool *writable_targets)
+{
+    if (writable_targets) {
+        *writable_targets = false;
+    }
+    if (apparent < 0) {
+        return false;
+    }
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent);
+    uint64_t available = 0;
+    const uint8_t *data = (const uint8_t *)filemirror_actual_block_data_pointer(
+        scalpel_state.filemirror, actual, &available);
+    return elf_relocation_block_conflicts(
+        candidate, layout, bv_index, blocksize, data, available, NULL,
+        writable_targets);
+}
+
+// Return whether a block carries a positively identified ELF table or header
+// that cannot occur at the proposed file position.
+static inline bool elf_layout_apparent_slot_has_anchor_conflict(
+    CarveInfo *candidate,
+    const FileState *layout,
+    uint64_t bv_index,
+    uint32_t blocksize,
+    int64_t apparent)
+{
+    if (!candidate || !layout || blocksize == 0 || apparent < 0) {
+        return false;
+    }
+
+    const uint32_t expected_components =
+        elf_expected_component_mask_for_bv_slot(layout, blocksize,
+                                                 bv_index);
+    int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent);
+    if (actual < 0) {
+        return false;
+    }
+
+    const int64_t exemplar = filemirror_get_exemplar(
+        scalpel_state.filemirror, actual);
+    if (exemplar >= 0) {
+        actual = exemplar;
+    }
+
+    char hashkey[BLOCK_HASH_KEY_SIZE];
+    BlockState *observed = NULL;
+
+    if (gen_block_hash_key(hashkey, candidate->needleidx, actual)) {
+        observed = (BlockState *)block_get_state(hashkey);
+    }
+    if (!observed || !observed->components) {
+        elf_free_block_state((void **)&observed);
+        return false;
+    }
+
+    bool conflict = false;
+
+    for (size_t i = 0; i < observed->num_components; i++) {
+        const BlockComponent *component = &observed->components[i];
+
+        if (component->size == 0
+            || (component->type != COMPONENT_ELF_HEADER
+                && component->type != COMPONENT_PHT
+                && component->type != COMPONENT_SHT)) {
+            continue;
+        }
+
+        const uint32_t component_bit =
+            UINT32_C(1) << (unsigned)component->type;
+        if ((expected_components & component_bit) == 0) {
+            conflict = true;
+            break;
+        }
+    }
+
+    elf_free_block_state((void **)&observed);
+    return conflict;
+}
+
 // compare one claimed physical block with the semantic section types expected
 // at its file position.
 static inline bool elf_layout_apparent_slot_contradicts(
@@ -29513,7 +32792,7 @@ static inline bool elf_layout_apparent_slot_contradicts(
     int64_t apparent)
 {
     if (!candidate || !layout || blocksize == 0
-        || !elf_layout_slot_expects_text(layout, bv_index, blocksize)) {
+        || elf_layout_known_bytes(layout, blocksize, bv_index) == 0) {
         return false;
     }
 
@@ -29556,12 +32835,13 @@ static inline bool elf_layout_apparent_slot_conflicts(
     uint32_t blocksize,
     int64_t apparent)
 {
-    if (!candidate || !layout || blocksize == 0
-        || !elf_layout_slot_expects_text(layout, bv_index, blocksize)
-        || apparent < 0) {
+    if (!candidate || !layout || blocksize == 0 || apparent < 0) {
         return false;
     }
 
+    const uint32_t expected_components =
+        elf_expected_component_mask_for_bv_slot(layout, blocksize,
+                                                 bv_index);
     const uint32_t expected =
         elf_mask_nonunk(elf_expected_section_mask_for_bv_slot(layout,
                                                                blocksize,
@@ -29580,11 +32860,38 @@ static inline bool elf_layout_apparent_slot_conflicts(
     }
     const uint32_t observed_mask =
         elf_mask_nonunk(elf_observed_section_mask_eval(observed, blocksize));
+    bool structural_conflict = false;
+
+    if (observed && observed->components) {
+        for (size_t i = 0; i < observed->num_components; i++) {
+            const BlockComponent *component = &observed->components[i];
+
+            if (component->size == 0
+                || (component->type != COMPONENT_ELF_HEADER
+                    && component->type != COMPONENT_PHT
+                    && component->type != COMPONENT_SHT)) {
+                continue;
+            }
+            const uint32_t component_bit =
+                UINT32_C(1) << (unsigned)component->type;
+
+            if ((expected_components & component_bit) == 0) {
+                structural_conflict = true;
+                break;
+            }
+        }
+    }
 
     if (observed) {
         elf_free_block_state((void **)&observed);
     }
-    return observed_mask != 0 && (expected & observed_mask) == 0;
+    // Section classification is probabilistic and one block can legitimately
+    // span section boundaries. Reject semantic evidence only when none of the
+    // observed section types agrees with the expected file position; scoring
+    // below can rank mixed but compatible predictions.
+    return structural_conflict
+           || (expected != 0 && observed_mask != 0
+               && (expected & observed_mask) == 0);
 }
 
 static inline bool elf_layout_slot_contradicts(CarveInfo *candidate,
@@ -29642,6 +32949,7 @@ static inline bool elf_actual_block_entropy(FileMirror *fm, int64_t actual,
 
 #define ELF_LAYOUT_HIGH_ENTROPY 7.5
 #define ELF_LAYOUT_STRONG_CONTRADICTION -1.0
+#define ELF_LAYOUT_OPAQUE_MIN_AFFINITY 0.5
 
 // return whether one proposed physical block has enough contradictory evidence
 // to require alternate placement search. The candidate bytes remain intact
@@ -29655,6 +32963,13 @@ static inline bool elf_layout_apparent_slot_requires_reassembly(
 {
     if (!candidate || !candidate->b || !layout || blocksize == 0) {
         return false;
+    }
+    const int64_t apparent_blocks =
+        filemirror_apparent_blocks(scalpel_state.filemirror);
+
+    if (apparent < 0 || apparent_blocks <= 0
+        || apparent >= apparent_blocks) {
+        return true;
     }
 
     const int64_t actual =
@@ -29670,6 +32985,11 @@ static inline bool elf_layout_apparent_slot_requires_reassembly(
     if (elf_layout_apparent_slot_contradicts(
             candidate, layout, bv_index, blocksize, apparent)) {
         return apparent < 0 || actual < 0 || high_entropy;
+    }
+
+    if (elf_layout_known_bytes(layout, blocksize, bv_index) == 0) {
+        return high_entropy
+               && affinity < ELF_LAYOUT_OPAQUE_MIN_AFFINITY;
     }
 
     return affinity < ELF_LAYOUT_STRONG_CONTRADICTION
@@ -29690,6 +33010,75 @@ static inline bool elf_layout_slot_requires_reassembly(
     return elf_layout_apparent_slot_requires_reassembly(
         candidate, layout, bv_index, blocksize,
         blockvector_get_apparent_blocknumber(candidate->b, bv_index));
+}
+
+
+// Return the first internal run whose near-random bytes have weak placement
+// evidence. This is not proof that the bytes are unrelated, but it identifies
+// a complete run for alternate placement search and prevents immediate
+// promotion of an unsupported mapping.
+static inline uint64_t elf_layout_first_entropy_discontinuity(
+    CarveInfo *candidate,
+    FileState *layout,
+    uint64_t blocks,
+    uint32_t blocksize,
+    const int64_t *mapping)
+{
+    if (!candidate || !candidate->b || !layout || blocks < 5
+        || blocksize == 0) {
+        return UINT64_MAX;
+    }
+
+    uint64_t i = 1;
+
+    while (i + 1 < blocks) {
+        const int64_t apparent = mapping
+                                     ? mapping[i]
+                                     : blockvector_get_apparent_blocknumber(
+                                           candidate->b, i);
+        const int64_t actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror, apparent);
+        const double affinity = elf_relocated_block_affinity(
+            candidate, layout, i, apparent);
+        double entropy = 0.0;
+
+        if (!elf_actual_block_entropy(scalpel_state.filemirror, actual,
+                                      blocksize, &entropy)
+            || entropy < ELF_LAYOUT_HIGH_ENTROPY
+            || affinity >= ELF_LAYOUT_OPAQUE_MIN_AFFINITY) {
+            i++;
+            continue;
+        }
+
+        const uint64_t run_start = i;
+
+        do {
+            i++;
+            if (i + 1 >= blocks) {
+                break;
+            }
+
+            const int64_t next_apparent = mapping
+                                              ? mapping[i]
+                                              : blockvector_get_apparent_blocknumber(
+                                                    candidate->b, i);
+            const int64_t next_actual = filemirror_actual_blocknumber(
+                scalpel_state.filemirror, next_apparent);
+            const double next_affinity = elf_relocated_block_affinity(
+                candidate, layout, i, next_apparent);
+
+            if (!elf_actual_block_entropy(scalpel_state.filemirror,
+                                          next_actual, blocksize, &entropy)
+                || entropy < ELF_LAYOUT_HIGH_ENTROPY
+                || next_affinity >= ELF_LAYOUT_OPAQUE_MIN_AFFINITY) {
+                break;
+            }
+        } while (true);
+
+        return run_start;
+    }
+
+    return UINT64_MAX;
 }
 
 // return the first file block whose physical mapping has corroborated evidence
@@ -29756,7 +33145,8 @@ static inline void elf_candidate_validate_layout_internal(
     bool *validates,
     uint64_t *validates_to,
     bool *promising,
-    uint64_t *first_bad_block)
+    uint64_t *first_bad_block,
+    bool ooo_transitions_positioned)
 {
     if (first_bad_block) {
         *first_bad_block = UINT64_MAX;
@@ -29797,9 +33187,9 @@ static inline void elf_candidate_validate_layout_internal(
     bool status_only_downgrade = false;
     bool unsupported_only_downgrade = false;
 
-    // Unsupported high-entropy text identifies a physical slot for reassembly
-    // to reconsider. Keep the structural validation extent intact so the
-    // current bytes remain available if no alternate mapping can be proven.
+    // Unsupported high-entropy text identifies the first physical slot that
+    // reassembly must reconsider. This evidence lowers the verdict to
+    // PROMISING but does not contradict the structurally valid bytes.
     for (uint64_t i = 0; i < blocks && first_bad == UINT64_MAX; i++) {
         if (elf_layout_slot_requires_reassembly(
                 candidate, &layout, i, scalpel_state.blocksize)) {
@@ -29809,26 +33199,39 @@ static inline void elf_candidate_validate_layout_internal(
         }
     }
 
-    // a decreasing displacement proves that at least one fragment was
-    // relocated out of file order. ELF has no general integrity check for
-    // opaque bytes inside that run, so structural validation cannot promote
-    // the complete candidate beyond PROMISING.
-    int64_t previous_disp = 0;
+    if (first_bad == UINT64_MAX) {
+        first_bad = elf_layout_first_entropy_discontinuity(
+            candidate, &layout, blocks, scalpel_state.blocksize, NULL);
+        if (first_bad != UINT64_MAX) {
+            status_only_downgrade = true;
+            unsupported_only_downgrade = true;
+        }
+    }
 
-    for (uint64_t i = 0; i < blocks && first_bad == UINT64_MAX; i++) {
+    if (first_bad == UINT64_MAX) {
+        first_bad = elf_layout_first_code_discontinuity(
+            candidate, &layout, blocks, NULL, NULL, true);
+        if (first_bad != UINT64_MAX) {
+            status_only_downgrade = true;
+            unsupported_only_downgrade = true;
+        }
+    }
+
+    // Positioning evidence can reconstruct a fragmented mapping, but ELF has
+    // no general integrity check for opaque bytes across a physical fragment
+    // boundary. Preserve the complete mapping while reporting it as
+    // PROMISING rather than claiming that every recovered byte is validated.
+    for (uint64_t i = 1; i < blocks && first_bad == UINT64_MAX; i++) {
+        const int64_t previous =
+            blockvector_get_apparent_blocknumber(candidate->b, i - 1);
         const int64_t apparent =
             blockvector_get_apparent_blocknumber(candidate->b, i);
 
-        if (apparent < 0) {
-            continue;
-        }
-        const int64_t disp = apparent - (int64_t)i;
-        if (i > 0 && disp < previous_disp) {
+        if (previous >= 0 && apparent >= 0
+            && (previous == INT64_MAX || apparent != previous + 1)) {
             first_bad = i;
             status_only_downgrade = true;
-            break;
         }
-        previous_disp = disp;
     }
 
     free(layout.components);
@@ -29837,17 +33240,25 @@ static inline void elf_candidate_validate_layout_internal(
         return;
     }
 
-    if (first_bad_block
-        && (!status_only_downgrade || unsupported_only_downgrade)) {
+    if (first_bad_block) {
         *first_bad_block = first_bad;
     }
     *validates = false;
     *promising = true;
-    if (!status_only_downgrade) {
+    if (first_bad_block && !status_only_downgrade) {
         *validates_to = first_bad == 0
                         ? 0
                         : first_bad
                               * (uint64_t)scalpel_state.blocksize - 1;
+    }
+    if (status_only_downgrade && *validates_to != UINT64_MAX
+        && *validates_to < available) {
+        // The byte validator established the full extent. A confidence-only
+        // downgrade must not send its partial last block through the generic
+        // promising-prefix rounding path.
+        blockvector_set_data_length(candidate->b, *validates_to + 1);
+        resize_blockvector(candidate->b,
+                           CEILDIV(*validates_to + 1, scalpel_state.blocksize));
     }
 
     scalpel_log(
@@ -29856,7 +33267,9 @@ static inline void elf_candidate_validate_layout_internal(
         unsupported_only_downgrade
             ? "unsupported section evidence in"
             : status_only_downgrade
-                  ? "an out-of-order transition before"
+                  ? ooo_transitions_positioned
+                        ? "a positioned fragment boundary before"
+                        : "a fragment boundary before"
                   : "contradictory",
         first_bad);
 }
@@ -29866,39 +33279,14 @@ static inline void elf_candidate_validate_layout(CarveInfo *candidate,
                                                  uint64_t *validates_to,
                                                  bool *promising)
 {
-    bool physically_contiguous = false;
-    int64_t previous_actual = -1;
-
     // The byte-structural validator provides the complete decision in
     // contiguous-only mode; physical-layout evidence is used for reassembly.
     if (scalpel_state.no_defrag) {
         return;
     }
 
-    // A structurally valid candidate backed by one physical run does not need
-    // reassembly-layout arbitration.
-    if (candidate && candidate->b) {
-        const uint64_t blocks =
-            blockvector_get_num_blocks(candidate->b);
-
-        physically_contiguous = blocks > 0;
-        for (uint64_t i = 0; i < blocks && physically_contiguous; i++) {
-            const int64_t actual =
-                blockvector_get_actual_blocknumber(candidate->b, i);
-
-            if (actual < 0
-                || (i > 0 && previous_actual + 1 != actual)) {
-                physically_contiguous = false;
-            }
-            previous_actual = actual;
-        }
-    }
-    if (physically_contiguous) {
-        return;
-    }
-
     elf_candidate_validate_layout_internal(candidate, validates, validates_to,
-                                           promising, NULL);
+                                           promising, NULL, false);
 }
 
 static inline void elf_clear_failed_gallop(FileState *fs);
@@ -29907,6 +33295,24 @@ static inline void elf_clear_failed_gallop(FileState *fs);
 // SHT-derived section agreement carries most of the weight where it exists;
 // byte entropy and classifier metadata provide evidence in padding and other
 // regions for which no section classifier is available.
+static inline double elf_block_selection_adjustment(
+    BlockValidationDecision confidence,
+    int64_t reservations)
+{
+    const double confidence_prior =
+        0.05 * (double)confidence / (double)BLOCK_CONFIDENCE_VALID;
+    double reservation_penalty = 0.0;
+
+    if (reservations > 0) {
+        const int64_t additional = reservations > 6 ? 5 : reservations - 1;
+
+        reservation_penalty = 0.05 + 0.01 * (double)additional;
+    }
+
+    return confidence_prior - reservation_penalty;
+}
+
+
 static inline double elf_relocated_block_affinity(CarveInfo *candidate,
                                                   FileState *filestate,
                                                   uint64_t bv_index,
@@ -29928,9 +33334,14 @@ static inline double elf_relocated_block_affinity(CarveInfo *candidate,
 
     const BlockValidationDecision confidence =
         filemirror_get_blocktype(fm, actual, candidate->needleidx);
-    if (confidence == BLOCK_CONFIDENCE_INVALID) {
-        return -DBL_MAX;
-    }
+
+    // A block with no standalone ELF evidence can still be required padding
+    // or zero-filled content in a structurally identified ELF region.
+
+    const int64_t reservations =
+        scalpel_state.reservations
+            ? filemirror_actual_block_reserved(fm, actual)
+            : 0;
 
     int64_t state_actual = filemirror_get_exemplar(fm, actual);
     if (state_actual < 0) {
@@ -29974,10 +33385,18 @@ static inline double elf_relocated_block_affinity(CarveInfo *candidate,
     }
     compute_coverage_stats(&expected, observed, blocksize, &coverage, &scoring);
 
+    const uint32_t expected_mask =
+        elf_mask_nonunk(elf_expected_section_mask_for_bv_slot(
+            filestate, blocksize, bv_index));
+    const uint32_t observed_mask =
+        elf_mask_nonunk(elf_observed_section_mask_eval(observed,
+                                                        blocksize));
     const double known_fraction =
         (double)coverage.expected_known_bytes / (double)blocksize;
     const double known_score =
-        known_fraction * (8.0 * coverage.known_cov - 4.0);
+        observed_mask == 0
+            ? 0.0
+            : known_fraction * (8.0 * coverage.known_cov - 4.0);
 
     double entropy = 8.0;
     (void)elf_actual_block_entropy(fm, actual, blocksize, &entropy);
@@ -29991,13 +33410,20 @@ static inline double elf_relocated_block_affinity(CarveInfo *candidate,
     if (content_score > 4.0) {
         content_score = 4.0;
     }
-    if (observed && observed->num_components > 0) {
-        content_score += 1.0;
+    if (observed_mask != 0) {
+        if (expected_mask != 0 && (expected_mask & observed_mask) != 0) {
+            content_score += 1.0;
+        }
+        else {
+            content_score -= 1.0;
+        }
     }
 
     elf_free_block_state((void **)&observed);
     free(expected_heap);
-    return known_score + unknown_fraction * content_score;
+    return known_score + unknown_fraction * content_score
+           + 10.0 * elf_block_selection_adjustment(confidence,
+                                                    reservations);
 }
 
 static inline int elf_compare_int64(const void *left, const void *right)
@@ -30036,20 +33462,256 @@ static inline int64_t elf_relocated_apparent_block(
     return filemirror_apparent_blocknumber(fm, (int64_t)actual);
 }
 
+// Cross-check symbol values against the exact sections named by st_shndx.
+// For relocatable objects st_value is section-relative; for executables and
+// shared objects it is a virtual address. TLS and reserved section indices
+// have distinct ABI semantics and are left to their specialized validators.
+static inline bool elf_flat_symbol_sections_are_consistent(
+    const uint8_t *data,
+    uint64_t length)
+{
+    Section_Header_Entry_64 *sections = NULL;
+    uint64_t section_offset = 0;
+    uint16_t section_entry_size = 0;
+    uint16_t section_count = 0;
+    uint16_t object_type = 0;
+    bool is_64 = false;
+    bool file_is_le = true;
+    bool result = false;
 
-// assemble and validate one complete physical mapping without mutating the
-// candidate. The mapping must be one-to-one, uncovered, and validate through
-// the exact file size derived from the ELF skeleton. Reservations are not a
-// hard gate here: sibling reassembly candidates can temporarily reserve
-// different parts of the same exact mapping, and the full validator below is
-// the structural acceptance gate.
-static inline bool elf_validate_relocated_mapping(CarveInfo *candidate,
-                                                  const int64_t *mapping,
-                                                  uint64_t blocks,
-                                                  uint64_t file_size,
-                                                  const char *cid,
-                                                  bool report_failure,
-                                                  uint64_t *first_bad_block)
+    if (!data || length < ELF_BYTES_START + sizeof(Elf_Header_32)
+        || memcmp(data, "\x7f" "ELF", 4) != 0
+        || (data[4] != ELF_32_BIT && data[4] != ELF_64_BIT)
+        || (data[5] != ELF_LITTLE_ENDIAN
+            && data[5] != ELF_BIG_ENDIAN)) {
+        return false;
+    }
+
+    is_64 = data[4] == ELF_64_BIT;
+    file_is_le = data[5] == ELF_LITTLE_ENDIAN;
+    if (is_64) {
+        Elf_Header_64 header;
+
+        if (length < ELF_BYTES_START + sizeof(header)) {
+            return false;
+        }
+        memcpy(&header, data + ELF_BYTES_START, sizeof(header));
+        object_type = to_host_endian_16(header.exec_type, file_is_le);
+        section_offset = to_host_endian_64(header.sht_off, file_is_le);
+        section_entry_size =
+            to_host_endian_16(header.sht_entry_size, file_is_le);
+        section_count =
+            to_host_endian_16(header.num_sht_entries, file_is_le);
+    }
+    else {
+        Elf_Header_32 header;
+
+        memcpy(&header, data + ELF_BYTES_START, sizeof(header));
+        object_type = to_host_endian_16(header.exec_type, file_is_le);
+        section_offset =
+            to_host_endian_32(header.sht_off, file_is_le);
+        section_entry_size =
+            to_host_endian_16(header.sht_entry_size, file_is_le);
+        section_count =
+            to_host_endian_16(header.num_sht_entries, file_is_le);
+    }
+
+    const uint64_t canonical_section_size =
+        is_64 ? sizeof(Section_Header_Entry_64)
+              : sizeof(Section_Header_Entry_32);
+    uint64_t section_table_size;
+
+    if (section_count == 0 && section_offset == 0) {
+        return true;
+    }
+
+    if (section_count == 0 || section_offset == 0
+        || section_entry_size < canonical_section_size
+        || __builtin_mul_overflow((uint64_t)section_entry_size,
+                                  (uint64_t)section_count,
+                                  &section_table_size)
+        || section_offset > length
+        || section_table_size > length - section_offset) {
+        return false;
+    }
+
+    sections = (Section_Header_Entry_64 *)calloc(
+        section_count, sizeof(*sections));
+    if (!sections) {
+        return false;
+    }
+
+    for (uint16_t i = 0; i < section_count; i++) {
+        const uint64_t offset =
+            section_offset + (uint64_t)i * section_entry_size;
+
+        if (is_64) {
+            Section_Header_Entry_64 raw;
+
+            memcpy(&raw, data + offset, sizeof(raw));
+            sections[i].sect_name_off =
+                to_host_endian_32(raw.sect_name_off, file_is_le);
+            sections[i].section_type =
+                to_host_endian_32(raw.section_type, file_is_le);
+            sections[i].flags =
+                to_host_endian_64(raw.flags, file_is_le);
+            sections[i].sect_mem_addr =
+                to_host_endian_64(raw.sect_mem_addr, file_is_le);
+            sections[i].sect_file_off =
+                to_host_endian_64(raw.sect_file_off, file_is_le);
+            sections[i].sect_size =
+                to_host_endian_64(raw.sect_size, file_is_le);
+            sections[i].sect_idx =
+                to_host_endian_32(raw.sect_idx, file_is_le);
+            sections[i].sect_info =
+                to_host_endian_32(raw.sect_info, file_is_le);
+            sections[i].sect_align =
+                to_host_endian_64(raw.sect_align, file_is_le);
+            sections[i].entry_size =
+                to_host_endian_64(raw.entry_size, file_is_le);
+        }
+        else {
+            Section_Header_Entry_32 raw;
+
+            memcpy(&raw, data + offset, sizeof(raw));
+            sections[i].sect_name_off =
+                to_host_endian_32(raw.sect_name_off, file_is_le);
+            sections[i].section_type =
+                to_host_endian_32(raw.section_type, file_is_le);
+            sections[i].flags =
+                to_host_endian_32(raw.flags, file_is_le);
+            sections[i].sect_mem_addr =
+                to_host_endian_32(raw.sect_mem_addr, file_is_le);
+            sections[i].sect_file_off =
+                to_host_endian_32(raw.sect_file_off, file_is_le);
+            sections[i].sect_size =
+                to_host_endian_32(raw.sect_size, file_is_le);
+            sections[i].sect_idx =
+                to_host_endian_32(raw.sect_idx, file_is_le);
+            sections[i].sect_info =
+                to_host_endian_32(raw.sect_info, file_is_le);
+            sections[i].sect_align =
+                to_host_endian_32(raw.sect_align, file_is_le);
+            sections[i].entry_size =
+                to_host_endian_32(raw.entry_size, file_is_le);
+        }
+    }
+
+    for (uint16_t section = 0; section < section_count; section++) {
+        const Section_Header_Entry_64 *symbols = &sections[section];
+
+        if (symbols->section_type != SECTION_TYPE_SYMTAB
+            && symbols->section_type != SECTION_TYPE_DYNSYM) {
+            continue;
+        }
+
+        const uint64_t canonical_symbol_size =
+            is_64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+        const uint64_t entry_size = symbols->entry_size;
+        uint64_t symbol_end;
+
+        if (symbols->sect_idx >= section_count
+            || sections[symbols->sect_idx].section_type
+                   != SECTION_TYPE_STRTAB
+            || entry_size < canonical_symbol_size
+            || symbols->sect_size % entry_size != 0
+            || __builtin_add_overflow(symbols->sect_file_off,
+                                      symbols->sect_size, &symbol_end)
+            || symbol_end > length) {
+            goto done;
+        }
+
+        const uint64_t entry_count = symbols->sect_size / entry_size;
+        if (symbols->sect_info > entry_count) {
+            goto done;
+        }
+
+        for (uint64_t i = 0; i < entry_count; i++) {
+            const uint64_t offset =
+                symbols->sect_file_off + i * entry_size;
+            uint16_t section_index = 0;
+            uint8_t symbol_type = 0;
+            uint64_t value = 0;
+            uint64_t size = 0;
+
+            if (is_64) {
+                Elf64_Sym symbol;
+
+                memcpy(&symbol, data + offset, sizeof(symbol));
+                section_index = to_host_endian_16(
+                    symbol.st_shndx, file_is_le);
+                symbol_type = (uint8_t)(symbol.st_info & 0x0fu);
+                value = to_host_endian_64(symbol.st_value, file_is_le);
+                size = to_host_endian_64(symbol.st_size, file_is_le);
+            }
+            else {
+                Elf32_Sym symbol;
+
+                memcpy(&symbol, data + offset, sizeof(symbol));
+                section_index = to_host_endian_16(
+                    symbol.st_shndx, file_is_le);
+                symbol_type = (uint8_t)(symbol.st_info & 0x0fu);
+                value = to_host_endian_32(symbol.st_value, file_is_le);
+                size = to_host_endian_32(symbol.st_size, file_is_le);
+            }
+
+            // Zero-sized linker boundary symbols do not describe a byte
+            // range and may legally sit just outside their named section.
+            if (size == 0
+                || section_index == SHN_UNDEF
+                || section_index >= SHN_LORESERVE
+                || symbol_type == STT_TLS
+                || (object_type != 1 && object_type != 2
+                    && object_type != 3)) {
+                continue;
+            }
+            if (section_index >= section_count) {
+                goto done;
+            }
+
+            const Section_Header_Entry_64 *target =
+                &sections[section_index];
+            const uint64_t base =
+                object_type == 1 ? 0 : target->sect_mem_addr;
+            uint64_t target_end;
+            uint64_t symbol_end_value;
+
+            if (__builtin_add_overflow(base, target->sect_size,
+                                       &target_end)
+                || value < base || value > target_end
+                || __builtin_add_overflow(value, size,
+                                          &symbol_end_value)
+                || symbol_end_value > target_end) {
+                goto done;
+            }
+        }
+    }
+
+    result = true;
+
+done:
+    free(sections);
+    return result;
+}
+
+
+// Validate a physical mapping without mutating the candidate. Complete mappings
+// must be one-to-one, uncovered and valid through the skeleton-derived length.
+// Intermediate private repairs can defer unchanged missing/covered positions
+// supplied by unrepaired_mapping; they still undergo structural validation.
+// Reservations are not a hard gate: sibling candidates can reserve the same
+// viable bytes. Only the strict complete-mapping check permits commitment.
+static inline bool elf_validate_relocated_mapping_internal(
+    CarveInfo *candidate,
+    FileState *filestate,
+    const int64_t *mapping,
+    uint64_t blocks,
+    uint64_t file_size,
+    const char *cid,
+    bool report_failure,
+    uint64_t *first_bad_block,
+    bool require_layout_validation,
+    const int64_t *unrepaired_mapping)
 {
     FileMirror *fm = scalpel_state.filemirror;
     const uint32_t blocksize = scalpel_state.blocksize;
@@ -30063,7 +33725,8 @@ static inline bool elf_validate_relocated_mapping(CarveInfo *candidate,
     }
     if (!candidate || !candidate->b || !mapping || blocks == 0
         || file_size == 0 || blocksize == 0
-        || file_size > SIZE_MAX) {
+        || file_size > SIZE_MAX
+        || CEILDIV(file_size, blocksize) != blocks) {
         return false;
     }
 
@@ -30076,15 +33739,72 @@ static inline bool elf_validate_relocated_mapping(CarveInfo *candidate,
     qsort(sorted, blocks, sizeof(*sorted), elf_compare_int64);
 
     for (uint64_t i = 0; i < blocks; i++) {
-        if (sorted[i] < 0 || (uint64_t)sorted[i] >= num_apparent
-            || (i > 0 && sorted[i] == sorted[i - 1])) {
+        if (sorted[i] < 0 && !require_layout_validation && unrepaired_mapping) {
+            // Each missing position is checked against the baseline below.
+            continue;
+        }
+        if (sorted[i] < 0 || (uint64_t)sorted[i] >= num_apparent) {
             if (report_failure) {
                 scalpel_log(
-                    "[%s] elf relocated-run trial: invalid or duplicate "
-                    "apparent block at sorted position %" PRIu64 ".\n",
-                    cid, i);
+                    "[%s] elf relocated-run trial: invalid apparent block "
+                    "%" PRId64 " at sorted position %" PRIu64 ".\n",
+                    cid, sorted[i], i);
             }
             goto done;
+        }
+        if (i > 0 && sorted[i] == sorted[i - 1]) {
+            uint64_t duplicate_logical = UINT64_MAX;
+
+            // A relocated interval can meet the contiguous baseline at the
+            // same physical block. Report the later logical slot so the
+            // caller can extend an independently positioned run across that
+            // boundary before retrying the complete mapping.
+            for (uint64_t logical = 0; logical < blocks; logical++) {
+                if (mapping[logical] == sorted[i]
+                    && (duplicate_logical == UINT64_MAX
+                        || logical > duplicate_logical)) {
+                    duplicate_logical = logical;
+                }
+            }
+            if (first_bad_block) {
+                *first_bad_block = duplicate_logical;
+            }
+            if (report_failure) {
+                scalpel_log(
+                    "[%s] elf relocated-run trial: duplicate apparent "
+                    "block %" PRId64 " at sorted position %" PRIu64 ".\n",
+                    cid, sorted[i], i);
+                for (uint64_t logical = 0;
+                     logical < blocks; logical++) {
+                    if (mapping[logical] == sorted[i]) {
+                        scalpel_log(
+                            "[%s] elf relocated-run trial: file block "
+                            "%" PRIu64 " contributes duplicate apparent "
+                            "block %" PRId64 ".\n",
+                            cid, logical, sorted[i]);
+                    }
+                }
+            }
+            goto done;
+        }
+    }
+
+    for (uint64_t i = 0; i < blocks; i++) {
+        const uint64_t offset = i * (uint64_t)blocksize;
+        uint64_t wanted = file_size - offset;
+        if (wanted > blocksize) {
+            wanted = blocksize;
+        }
+        const bool pending_repair = !require_layout_validation
+            && unrepaired_mapping && mapping[i] == unrepaired_mapping[i];
+        if (mapping[i] < 0) {
+            if (!pending_repair) {
+                goto done;
+            }
+            // Missing bytes are placeholders only in this private trial.
+            // Metadata must still parse; final validation permits no holes.
+            memset(trial + offset, 0, (size_t)wanted);
+            continue;
         }
 
         const int64_t actual =
@@ -30099,7 +33819,11 @@ static inline bool elf_validate_relocated_mapping(CarveInfo *candidate,
             goto done;
         }
 
-        if (filemirror_actual_block_covered(fm, actual)) {
+        // Private incremental repairs may still contain covered blocks from
+        // the original, incorrect mapping. Do not let an unrelated pending
+        // repair veto this one. Replacements and complete mappings remain
+        // subject to the coverage check.
+        if (filemirror_actual_block_covered(fm, actual) && !pending_repair) {
             if (report_failure) {
                 scalpel_log(
                     "[%s] elf relocated-run trial: file block %" PRIu64
@@ -30112,12 +33836,6 @@ static inline bool elf_validate_relocated_mapping(CarveInfo *candidate,
         uint64_t available = 0;
         const char *data =
             filemirror_actual_block_data_pointer(fm, actual, &available);
-        const uint64_t offset = i * (uint64_t)blocksize;
-        uint64_t wanted = file_size - offset;
-
-        if (wanted > blocksize) {
-            wanted = blocksize;
-        }
         if (!data || available < wanted) {
             if (report_failure) {
                 scalpel_log(
@@ -30141,24 +33859,52 @@ static inline bool elf_validate_relocated_mapping(CarveInfo *candidate,
                           candidate->needleidx, blocksize,
                           candidate->carvehashkey);
         ok = validates && validates_to != UINT64_MAX
-             && validates_to + 1 == file_size;
-        if (ok) {
-            FileState layout = {0};
+             && validates_to + 1 == file_size
+             && elf_flat_symbol_sections_are_consistent(trial,
+                                                         file_size);
+        if (ok && require_layout_validation) {
+            FileState rebuilt_layout = {0};
+            FileState *placement_layout = filestate;
 
-            if (elf_build_validation_layout(
-                    (const char *)trial, file_size, &layout)) {
-                const uint64_t first_bad =
-                    elf_layout_mapping_first_contradiction(
-                        candidate, &layout, (const char *)trial,
-                        file_size, mapping, blocks);
+            if (!placement_layout
+                && elf_build_validation_layout(
+                       (const char *)trial, file_size, &rebuilt_layout)) {
+                placement_layout = &rebuilt_layout;
+            }
 
-                free(layout.components);
-                if (first_bad != UINT64_MAX) {
-                    if (first_bad_block) {
-                        *first_bad_block = first_bad;
-                    }
-                    ok = false;
+            uint64_t first_bad =
+                placement_layout
+                    ? elf_layout_mapping_first_contradiction(
+                          candidate, placement_layout, (const char *)trial,
+                          file_size, mapping, blocks)
+                    : UINT64_MAX;
+
+            if (placement_layout && first_bad == UINT64_MAX) {
+                first_bad = elf_layout_first_entropy_discontinuity(
+                    candidate, placement_layout, blocks, blocksize, mapping);
+            }
+
+            // A partially repaired mapping may still disagree elsewhere.
+            // Protect an already consistent full mapping without blocking
+            // incremental repairs of a candidate that is still incomplete.
+            if (placement_layout && first_bad == UINT64_MAX
+                && elf_bv_is_full(candidate)
+                && blockvector_get_num_blocks(candidate->b) == blocks
+                && elf_layout_first_code_discontinuity(
+                       candidate, placement_layout, blocks, NULL, NULL, true)
+                       == UINT64_MAX) {
+                // Unknown instruction forms may motivate another search, but
+                // cannot by themselves veto a structurally valid trial.
+                first_bad = elf_layout_first_code_discontinuity(
+                    candidate, placement_layout, blocks, mapping, NULL, false);
+            }
+
+            free(rebuilt_layout.components);
+            if (first_bad != UINT64_MAX) {
+                if (first_bad_block) {
+                    *first_bad_block = first_bad;
                 }
+                ok = false;
             }
         }
         if (!ok && report_failure) {
@@ -30184,6 +33930,20 @@ done:
     return ok;
 }
 
+static inline bool elf_validate_relocated_mapping(CarveInfo *candidate,
+                                                  FileState *filestate,
+                                                  const int64_t *mapping,
+                                                  uint64_t blocks,
+                                                  uint64_t file_size,
+                                                  const char *cid,
+                                                  bool report_failure,
+                                                  uint64_t *first_bad_block)
+{
+    return elf_validate_relocated_mapping_internal(
+        candidate, filestate, mapping, blocks, file_size, cid, report_failure,
+        first_bad_block, true, NULL);
+}
+
 // report whether a signed displacement belongs to an active run hypothesis.
 static inline bool elf_relocated_disp_is_active(
     const ElfRelocatedRun *runs,
@@ -30199,22 +33959,62 @@ static inline bool elf_relocated_disp_is_active(
     return false;
 }
 
-// solve the active relocated-run hypotheses without changing the candidate.
-// pins belonging to an inactive hypothesis are deliberately ignored so the
-// full validator can arbitrate one contradictory placement.
+// Resolve competing ownership of one logical slot. Evidence tied to an exact
+// file position outranks statistical placement, which outranks an observed
+// run retained from an earlier speculative layout.
+static inline bool elf_relocated_run_preferred(
+    const ElfRelocatedRun *candidate,
+    const ElfRelocatedRun *current)
+{
+    if (!candidate || !current) {
+        return candidate != NULL;
+    }
+
+    const bool candidate_format_positioned =
+        candidate->independently_identified
+        && (candidate->identified_by_function_table
+            || candidate->identified_by_file_reference);
+    const bool current_format_positioned =
+        current->independently_identified
+        && (current->identified_by_function_table
+            || current->identified_by_file_reference);
+
+    if (candidate_format_positioned != current_format_positioned) {
+        return candidate_format_positioned;
+    }
+    if (candidate->independently_identified
+            != current->independently_identified) {
+        return candidate->independently_identified;
+    }
+    if (candidate->independently_identified
+        && fabs(candidate->independent_gain
+                - current->independent_gain) > 1.0e-9) {
+        return candidate->independent_gain > current->independent_gain;
+    }
+    if (candidate->exact_matches != current->exact_matches) {
+        return candidate->exact_matches > current->exact_matches;
+    }
+    return false;
+}
+
+// Solve the active relocated-run hypotheses without changing the candidate.
+// Inactive hypotheses leave the caller's baseline mapping intact so the full
+// validator can arbitrate contradictory placements.
 static inline bool elf_solve_relocated_runs(
     CarveInfo *candidate,
+    const FileState *filestate,
     const ElfRelocatedRun *anchors,
     size_t nruns,
     const bool *active,
     const double *delta,
     uint64_t blocks,
     int64_t header_actual,
+    const int64_t *baseline,
     ElfRelocatedRun *solved,
     int64_t *mapping)
 {
-    if (!candidate || !candidate->b || !anchors || !active
-        || !delta || !solved || !mapping || nruns == 0
+    if (!candidate || !candidate->b || !filestate || !anchors || !active
+        || !delta || !baseline || !solved || !mapping || nruns == 0
         || header_actual < 0) {
         return false;
     }
@@ -30236,6 +34036,24 @@ static inline bool elf_solve_relocated_runs(
             const int64_t apparent =
                 blockvector_get_apparent_blocknumber(candidate->b, i);
             int64_t pinned_disp = 0;
+            bool overridden_by_positioned_run = false;
+
+            if (!run->independently_identified) {
+                for (size_t other = 0; other < nruns; other++) {
+                    if (other == r || !active[other]
+                        || !anchors[other].independently_identified
+                        || anchors[other].disp == run->disp
+                        || i < anchors[other].anchor_lo
+                        || i > anchors[other].anchor_hi) {
+                        continue;
+                    }
+                    overridden_by_positioned_run = true;
+                    break;
+                }
+            }
+            if (overridden_by_positioned_run) {
+                continue;
+            }
 
             if (apparent >= 0) {
                 const int64_t actual =
@@ -30276,16 +34094,33 @@ static inline bool elf_solve_relocated_runs(
             }
         }
         if (run->positioned_hypothesis
+            && !run->independently_identified
             && (!have_positioned_gain || positioned_gain <= 0.0)) {
             return false;
         }
         run->anchor_gain += run->independent_gain;
         if (run->anchor_gain <= 0.0) {
-            return false;
+            if (!run->positioned_hypothesis && run->anchors >= 2) {
+                run->anchor_gain = log1p((double)run->anchors);
+            }
+            else {
+                return false;
+            }
         }
 
         run->solved_lo = run->anchor_lo;
         run->solved_hi = run->anchor_hi;
+
+        // Position-specific control-flow or metadata evidence establishes the
+        // run's exact logical extent. Do not widen it from byte affinity alone;
+        // elf_solve_and_validate_relocated_runs() may still extend the range
+        // when the complete validator identifies an adjoining failing block.
+        if (run->independently_identified) {
+            run->left_gain = 0.0;
+            run->right_gain = 0.0;
+            continue;
+        }
+
         // Retain the interval that maximizes the relocated layout's evidence.
         // A corroborated physical run gives its immediate neighbors a bounded
         // continuity prior; later support may outweigh weak intervening blocks.
@@ -30298,6 +34133,39 @@ static inline bool elf_solve_relocated_runs(
 
         for (uint64_t i = run->anchor_lo; i-- > 1;) {
             bool boundary = false;
+            const int64_t relocated_apparent =
+                elf_relocated_apparent_block(
+                    header_actual, i, run->disp);
+
+            if (!run->independently_identified
+                && (relocated_apparent < 0
+                    || blockvector_choice_is_excluded(
+                           candidate->b, i,
+                           relocated_apparent))) {
+                break;
+            }
+
+            // An active run with a different displacement owns its anchor
+            // range even when reopening has temporarily emptied those slots.
+            // Independently positioned evidence may still override a weaker
+            // observed run, as it does in the overlap resolution below.
+            for (size_t other = 0; other < nruns; other++) {
+                if (other == r || !active[other]
+                    || anchors[other].disp == run->disp
+                    || i < anchors[other].anchor_lo
+                    || i > anchors[other].anchor_hi) {
+                    continue;
+                }
+                if (!run->independently_identified
+                    || anchors[other].independently_identified) {
+                    boundary = true;
+                    break;
+                }
+            }
+            if (boundary) {
+                break;
+            }
+
             const int64_t apparent =
                 blockvector_get_apparent_blocknumber(candidate->b, i);
             int64_t pinned_disp = 0;
@@ -30315,7 +34183,15 @@ static inline bool elf_solve_relocated_runs(
                     return false;
                 }
                 pinned_disp = (int64_t)displacement;
-                if (pinned_disp != 0 && pinned_disp != run->disp) {
+                if (pinned_disp == 0
+                    && !run->positioned_hypothesis
+                    && !elf_layout_slot_contradicts(
+                           candidate, filestate, i,
+                           scalpel_state.blocksize)) {
+                    boundary = true;
+                }
+                else if (pinned_disp != 0
+                         && pinned_disp != run->disp) {
                     boundary =
                         elf_relocated_disp_is_active(
                             anchors, nruns, active, pinned_disp);
@@ -30340,6 +34216,35 @@ static inline bool elf_solve_relocated_runs(
         for (uint64_t i = run->anchor_hi + 1;
              i < blocks; i++) {
             bool boundary = false;
+            const int64_t relocated_apparent =
+                elf_relocated_apparent_block(
+                    header_actual, i, run->disp);
+
+            if (!run->independently_identified
+                && (relocated_apparent < 0
+                    || blockvector_choice_is_excluded(
+                           candidate->b, i,
+                           relocated_apparent))) {
+                break;
+            }
+
+            for (size_t other = 0; other < nruns; other++) {
+                if (other == r || !active[other]
+                    || anchors[other].disp == run->disp
+                    || i < anchors[other].anchor_lo
+                    || i > anchors[other].anchor_hi) {
+                    continue;
+                }
+                if (!run->independently_identified
+                    || anchors[other].independently_identified) {
+                    boundary = true;
+                    break;
+                }
+            }
+            if (boundary) {
+                break;
+            }
+
             const int64_t apparent =
                 blockvector_get_apparent_blocknumber(candidate->b, i);
             int64_t pinned_disp = 0;
@@ -30357,7 +34262,15 @@ static inline bool elf_solve_relocated_runs(
                     return false;
                 }
                 pinned_disp = (int64_t)displacement;
-                if (pinned_disp != 0 && pinned_disp != run->disp) {
+                if (pinned_disp == 0
+                    && !run->positioned_hypothesis
+                    && !elf_layout_slot_contradicts(
+                           candidate, filestate, i,
+                           scalpel_state.blocksize)) {
+                    boundary = true;
+                }
+                else if (pinned_disp != 0
+                         && pinned_disp != run->disp) {
                     boundary =
                         elf_relocated_disp_is_active(
                             anchors, nruns, active, pinned_disp);
@@ -30386,26 +34299,143 @@ static inline bool elf_solve_relocated_runs(
             if (!active[right]) {
                 continue;
             }
-            if (solved[left].solved_lo <= solved[right].solved_hi
-                && solved[right].solved_lo <= solved[left].solved_hi) {
+            if (solved[left].solved_lo > solved[right].solved_hi
+                || solved[right].solved_lo > solved[left].solved_hi) {
+                continue;
+            }
+            if (solved[left].disp == solved[right].disp) {
+                continue;
+            }
+
+            // At least one position-specific hypothesis is required to
+            // arbitrate overlapping mappings. The stronger exact hypothesis
+            // owns each shared slot, and the complete validator decides
+            // whether that ownership boundary is valid.
+            if (!solved[left].independently_identified
+                && !solved[right].independently_identified) {
                 return false;
             }
         }
     }
 
     for (uint64_t i = 0; i < blocks; i++) {
-        int64_t displacement = 0;
+        size_t selected = SIZE_MAX;
 
         for (size_t r = 0; r < nruns; r++) {
             if (active[r] && i >= solved[r].solved_lo
                 && i <= solved[r].solved_hi) {
-                displacement = solved[r].disp;
-                break;
+                if (selected == SIZE_MAX
+                    || elf_relocated_run_preferred(
+                           &solved[r], &solved[selected])) {
+                    selected = r;
+                }
             }
         }
-        mapping[i] = elf_relocated_apparent_block(
-            header_actual, i, displacement);
+        mapping[i] = selected == SIZE_MAX
+                         ? baseline[i]
+                         : elf_relocated_apparent_block(
+                               header_actual, i, solved[selected].disp);
     }
+    return true;
+}
+
+// A decrease in signed displacement is a physical-order reversal. The first
+// block after that reversal must have position-specific format evidence, or
+// follow the validated end of an independently positioned run. If neither is
+// true, the complete validator may extend the preceding exact run and move the
+// boundary forward.
+static inline bool elf_relocated_mapping_transitions_positioned(
+    const int64_t *mapping,
+    uint64_t blocks,
+    int64_t header_actual,
+    const ElfRelocatedRun *solved,
+    size_t nruns,
+    const bool *active,
+    const int64_t *positioned_displacement,
+    const uint8_t *positioned_status,
+    uint64_t *first_unpositioned_block,
+    size_t *preferred_extension)
+{
+    int64_t previous_displacement = 0;
+    size_t previous_owner = SIZE_MAX;
+
+    if (first_unpositioned_block) {
+        *first_unpositioned_block = UINT64_MAX;
+    }
+    if (preferred_extension) {
+        *preferred_extension = SIZE_MAX;
+    }
+    if (!mapping || !solved || !active || header_actual < 0) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < blocks; i++) {
+        const int64_t actual =
+            filemirror_actual_blocknumber(
+                scalpel_state.filemirror, mapping[i]);
+        const __int128 displacement_wide =
+            (__int128)actual - (__int128)header_actual - (__int128)i;
+
+        if (actual < 0 || displacement_wide < INT64_MIN
+            || displacement_wide > INT64_MAX) {
+            return false;
+        }
+        const int64_t displacement = (int64_t)displacement_wide;
+        size_t owner = SIZE_MAX;
+
+        for (size_t r = 0; r < nruns; r++) {
+            if (!active[r] || solved[r].disp != displacement
+                || i < solved[r].solved_lo
+                || i > solved[r].solved_hi) {
+                continue;
+            }
+            if (owner == SIZE_MAX
+                || elf_relocated_run_preferred(
+                       &solved[r], &solved[owner])) {
+                owner = r;
+            }
+        }
+
+        if (i > 0 && displacement < previous_displacement) {
+            const bool directly_positioned =
+                positioned_status && positioned_displacement
+                && positioned_status[i] == 1
+                && positioned_displacement[i] == displacement;
+            const bool owned_by_format_evidence =
+                owner != SIZE_MAX
+                && solved[owner].independently_identified
+                && (solved[owner].identified_by_function_table
+                    || solved[owner].identified_by_file_reference);
+            const bool follows_positioned_run =
+                previous_owner != SIZE_MAX
+                && solved[previous_owner].independently_identified
+                && (solved[previous_owner].identified_by_function_table
+                    || solved[previous_owner].identified_by_file_reference)
+                && solved[previous_owner].solved_hi != UINT64_MAX
+                && i == solved[previous_owner].solved_hi + 1;
+
+            if (!directly_positioned && !owned_by_format_evidence
+                && !follows_positioned_run) {
+                if (first_unpositioned_block) {
+                    *first_unpositioned_block = i;
+                }
+                if (preferred_extension
+                    && previous_owner != SIZE_MAX
+                    && solved[previous_owner].independently_identified
+                    && (solved[previous_owner]
+                            .identified_by_function_table
+                        || solved[previous_owner]
+                            .identified_by_file_reference)) {
+                    *preferred_extension = previous_owner;
+                }
+                return false;
+            }
+        }
+
+        previous_displacement = displacement;
+        previous_owner = owner;
+    }
+
     return true;
 }
 
@@ -30415,6 +34445,7 @@ static inline bool elf_solve_relocated_runs(
 // boundary and the complete validator arbitrates each expanded mapping.
 static inline bool elf_solve_and_validate_relocated_runs(
     CarveInfo *candidate,
+    FileState *filestate,
     const ElfRelocatedRun *runs,
     size_t nruns,
     const bool *active,
@@ -30425,24 +34456,38 @@ static inline bool elf_solve_and_validate_relocated_runs(
     const char *cid,
     ElfRelocatedRun *solved,
     int64_t *mapping,
+    const int64_t *baseline,
+    const int64_t *positioned_displacement,
+    const uint8_t *positioned_status,
     size_t *validation_trials)
 {
-    if (!elf_solve_relocated_runs(candidate, runs, nruns, active, delta,
-                                  blocks, header_actual,
+    if (!elf_solve_relocated_runs(candidate, filestate, runs, nruns, active,
+                                  delta, blocks, header_actual, baseline,
                                   solved, mapping)) {
         return false;
     }
 
     for (;;) {
         uint64_t first_bad = UINT64_MAX;
+        size_t preferred_extend = SIZE_MAX;
+        bool transition_failure = false;
 
         if (validation_trials) {
             (*validation_trials)++;
         }
         if (elf_validate_relocated_mapping(
-                candidate, mapping, blocks, file_size, cid, false,
+                candidate, filestate, mapping, blocks, file_size, cid, false,
                 &first_bad)) {
-            return true;
+            transition_failure = true;
+            if (elf_relocated_mapping_transitions_positioned(
+                    mapping, blocks, header_actual, solved, nruns, active,
+                    positioned_displacement, positioned_status,
+                    &first_bad, &preferred_extend)) {
+                return true;
+            }
+            if (preferred_extend == SIZE_MAX) {
+                return false;
+            }
         }
         if (first_bad == UINT64_MAX) {
             return false;
@@ -30453,6 +34498,7 @@ static inline bool elf_solve_and_validate_relocated_runs(
 
         for (size_t r = 0; r < nruns; r++) {
             if (!active[r] || !runs[r].independently_identified
+                || (transition_failure && r != preferred_extend)
                 || (first_bad >= solved[r].solved_lo
                     && first_bad <= solved[r].solved_hi)) {
                 continue;
@@ -30478,6 +34524,13 @@ static inline bool elf_solve_and_validate_relocated_runs(
                 }
                 if (proposed_lo <= solved[other].solved_hi
                     && solved[other].solved_lo <= proposed_hi) {
+                    // Stronger placement evidence owns an overlapping slot.
+                    // Complete mapping validation still arbitrates every
+                    // one-block extension before it can be retained.
+                    if (elf_relocated_run_preferred(
+                            &solved[r], &solved[other])) {
+                        continue;
+                    }
                     overlaps = true;
                     break;
                 }
@@ -30499,24 +34552,30 @@ static inline bool elf_solve_and_validate_relocated_runs(
         }
 
         for (uint64_t i = 0; i < blocks; i++) {
-            int64_t displacement = 0;
+            size_t selected = SIZE_MAX;
 
             for (size_t r = 0; r < nruns; r++) {
                 if (active[r] && i >= solved[r].solved_lo
                     && i <= solved[r].solved_hi) {
-                    displacement = solved[r].disp;
-                    break;
+                    if (selected == SIZE_MAX
+                        || elf_relocated_run_preferred(
+                               &solved[r], &solved[selected])) {
+                        selected = r;
+                    }
                 }
             }
-            mapping[i] = elf_relocated_apparent_block(
-                header_actual, i, displacement);
+            mapping[i] = selected == SIZE_MAX
+                             ? baseline[i]
+                             : elf_relocated_apparent_block(
+                                   header_actual, i,
+                                   solved[selected].disp);
         }
     }
 }
 
-// Prefer a complete mapping that does not compete with another candidate,
-// then compare aggregate placement evidence. The number of independently
-// positioned runs breaks otherwise equal ties.
+// Prefer complete mappings supported by the most independent placement
+// evidence. Earlier speculative placements break ties only after the exact
+// evidence has been compared.
 static inline ElfRelocatedSolutionRank elf_relocated_solution_rank(
     const ElfRelocatedRun *solved,
     size_t nruns,
@@ -30526,13 +34585,43 @@ static inline ElfRelocatedSolutionRank elf_relocated_solution_rank(
 
     for (size_t r = 0; r < nruns; r++) {
         if (active[r]) {
-            if (solved[r].independently_identified) {
-                rank.independent_runs++;
-            }
-            rank.evidence_gain +=
+            const double run_gain =
                 solved[r].anchor_gain
                 + solved[r].left_gain
                 + solved[r].right_gain;
+
+            if (rank.anchored_blocks
+                    > UINT64_MAX - solved[r].anchors) {
+                rank.anchored_blocks = UINT64_MAX;
+            }
+            else {
+                rank.anchored_blocks += solved[r].anchors;
+            }
+
+            const bool format_positioned =
+                solved[r].independently_identified
+                && (solved[r].identified_by_function_table
+                    || solved[r].identified_by_file_reference);
+
+            if (format_positioned) {
+                rank.format_positioned_runs++;
+                if (rank.format_positioned_blocks
+                        > UINT64_MAX - solved[r].anchors) {
+                    rank.format_positioned_blocks = UINT64_MAX;
+                }
+                else {
+                    rank.format_positioned_blocks += solved[r].anchors;
+                }
+                rank.format_positioned_evidence_gain += run_gain;
+            }
+            if (solved[r].independently_identified) {
+                rank.independent_runs++;
+                rank.independent_evidence_gain += run_gain;
+                if (run_gain > rank.strongest_independent_gain) {
+                    rank.strongest_independent_gain = run_gain;
+                }
+            }
+            rank.evidence_gain += run_gain;
             if (rank.reservation_pressure
                     > UINT64_MAX - solved[r].reservation_pressure) {
                 rank.reservation_pressure = UINT64_MAX;
@@ -30543,6 +34632,26 @@ static inline ElfRelocatedSolutionRank elf_relocated_solution_rank(
             }
         }
     }
+
+    for (size_t positioned = 0; positioned < nruns; positioned++) {
+        if (!active[positioned]
+            || !solved[positioned].independently_identified) {
+            continue;
+        }
+        for (size_t observed = 0; observed < nruns; observed++) {
+            if (!active[observed]
+                || solved[observed].independently_identified
+                || solved[positioned].disp == solved[observed].disp) {
+                continue;
+            }
+            if (solved[positioned].solved_lo
+                    <= solved[observed].anchor_hi
+                && solved[observed].anchor_lo
+                       <= solved[positioned].solved_hi) {
+                rank.observed_run_overrides++;
+            }
+        }
+    }
     return rank;
 }
 
@@ -30550,6 +34659,42 @@ static inline bool elf_relocated_solution_is_better(
     const ElfRelocatedSolutionRank *trial,
     const ElfRelocatedSolutionRank *best)
 {
+    if (trial->format_positioned_runs
+            != best->format_positioned_runs) {
+        return trial->format_positioned_runs
+               > best->format_positioned_runs;
+    }
+    if (trial->format_positioned_blocks
+            != best->format_positioned_blocks) {
+        return trial->format_positioned_blocks
+               > best->format_positioned_blocks;
+    }
+    if (fabs(trial->format_positioned_evidence_gain
+             - best->format_positioned_evidence_gain) > 1.0e-9) {
+        return trial->format_positioned_evidence_gain
+               > best->format_positioned_evidence_gain;
+    }
+    if (trial->observed_run_overrides
+            != best->observed_run_overrides) {
+        return trial->observed_run_overrides
+               < best->observed_run_overrides;
+    }
+    if (trial->independent_runs != best->independent_runs) {
+        return trial->independent_runs > best->independent_runs;
+    }
+    if (fabs(trial->strongest_independent_gain
+             - best->strongest_independent_gain) > 1.0e-9) {
+        return trial->strongest_independent_gain
+               > best->strongest_independent_gain;
+    }
+    if (fabs(trial->independent_evidence_gain
+             - best->independent_evidence_gain) > 1.0e-9) {
+        return trial->independent_evidence_gain
+               > best->independent_evidence_gain;
+    }
+    if (trial->anchored_blocks != best->anchored_blocks) {
+        return trial->anchored_blocks > best->anchored_blocks;
+    }
     if (trial->reservation_pressure
             != best->reservation_pressure) {
         return trial->reservation_pressure
@@ -30558,7 +34703,7 @@ static inline bool elf_relocated_solution_is_better(
     if (fabs(trial->evidence_gain - best->evidence_gain) > 1.0e-9) {
         return trial->evidence_gain > best->evidence_gain;
     }
-    return trial->independent_runs > best->independent_runs;
+    return false;
 }
 
 static inline void elf_consider_relocated_solution(
@@ -30567,12 +34712,21 @@ static inline void elf_consider_relocated_solution(
     const bool *active,
     const int64_t *mapping,
     uint64_t blocks,
+    int64_t header_actual,
+    const int64_t *positioned_displacement,
+    const uint8_t *positioned_status,
     bool *have_best,
     ElfRelocatedSolutionRank *best_rank,
     ElfRelocatedRun *best_solved,
     bool *best_active,
     int64_t *best_mapping)
 {
+    if (!elf_relocated_mapping_transitions_positioned(
+            mapping, blocks, header_actual, solved, nruns, active,
+            positioned_displacement, positioned_status, NULL, NULL)) {
+        return;
+    }
+
     const ElfRelocatedSolutionRank trial_rank =
         elf_relocated_solution_rank(solved, nruns, active);
 
@@ -30602,6 +34756,1326 @@ static inline bool elf_relocated_run_time_to_checkpoint(
                                             uuidp, uuidc);
 }
 
+static inline bool elf_read_actual_run_bytes(
+    int64_t actual_start,
+    uint64_t run_offset,
+    uint8_t *destination,
+    uint64_t length)
+{
+    FileMirror *fm = scalpel_state.filemirror;
+    const uint32_t blocksize = scalpel_state.blocksize;
+
+    if (!fm || !destination || actual_start < 0 || blocksize == 0) {
+        return false;
+    }
+
+    while (length > 0) {
+        const uint64_t block_delta = run_offset / blocksize;
+        const uint64_t block_offset = run_offset % blocksize;
+        const __int128 actual_wide =
+            (__int128)actual_start + (__int128)block_delta;
+
+        if (actual_wide < 0 || actual_wide > INT64_MAX) {
+            return false;
+        }
+
+        uint64_t available = 0;
+        const char *data = filemirror_actual_block_data_pointer(
+            fm, (int64_t)actual_wide, &available);
+
+        if (!data || available <= block_offset) {
+            return false;
+        }
+
+        uint64_t amount = available - block_offset;
+        if (amount > blocksize - block_offset) {
+            amount = blocksize - block_offset;
+        }
+        if (amount > length) {
+            amount = length;
+        }
+        memcpy(destination, data + block_offset, (size_t)amount);
+        destination += amount;
+        run_offset += amount;
+        length -= amount;
+    }
+    return true;
+}
+
+static inline bool elf_symbol_entry_matches_table(
+    const uint8_t *entry,
+    bool is_64,
+    bool file_is_le,
+    uint64_t symbol_index,
+    uint64_t first_nonlocal,
+    uint16_t section_count,
+    uint64_t string_size)
+{
+    bool is_zero = false;
+
+    if (!entry
+        || !validate_one_sym_entry(entry, is_64, file_is_le,
+                                   NULL, 0, false, &is_zero)
+        || (is_zero && symbol_index != 0)) {
+        return false;
+    }
+
+    uint32_t name = 0;
+    uint8_t info = 0;
+    uint16_t section_index = 0;
+
+    if (is_64) {
+        Elf64_Sym symbol;
+
+        memcpy(&symbol, entry, sizeof(symbol));
+        name = to_host_endian_32(symbol.st_name, file_is_le);
+        info = symbol.st_info;
+        section_index = to_host_endian_16(symbol.st_shndx, file_is_le);
+    }
+    else {
+        Elf32_Sym symbol;
+
+        memcpy(&symbol, entry, sizeof(symbol));
+        name = to_host_endian_32(symbol.st_name, file_is_le);
+        info = symbol.st_info;
+        section_index = to_host_endian_16(symbol.st_shndx, file_is_le);
+    }
+
+    const uint8_t binding = (uint8_t)(info >> 4);
+    const bool binding_matches =
+        symbol_index < first_nonlocal
+            ? binding == STB_LOCAL
+            : binding != STB_LOCAL;
+
+    return (uint64_t)name < string_size
+           && binding_matches
+           && (section_index < section_count
+               || section_index >= SHN_LORESERVE);
+}
+
+static inline bool elf_symbol_tail_probe_matches(
+    int64_t actual_start,
+    uint64_t split_offset,
+    const Section_Header_Entry_64 *symbol_table,
+    bool is_64,
+    bool file_is_le,
+    uint16_t section_count,
+    uint64_t string_size)
+{
+    const uint64_t canonical_size =
+        is_64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+    const uint64_t entry_size = symbol_table->entry_size;
+    uint64_t symbol_end;
+
+    if (!symbol_table || entry_size < canonical_size
+        || symbol_table->sect_size < entry_size
+        || __builtin_add_overflow(symbol_table->sect_file_off,
+                                  symbol_table->sect_size, &symbol_end)) {
+        return false;
+    }
+
+    uint64_t first_entry = symbol_table->sect_file_off;
+    if (first_entry < split_offset) {
+        uint64_t consumed = split_offset - first_entry;
+        const uint64_t entries = CEILDIV(consumed, entry_size);
+
+        if (__builtin_mul_overflow(entries, entry_size, &consumed)
+            || __builtin_add_overflow(first_entry, consumed,
+                                      &first_entry)) {
+            return false;
+        }
+    }
+    if (first_entry >= symbol_end) {
+        return false;
+    }
+
+    const uint64_t remaining_entries =
+        (symbol_end - first_entry) / entry_size;
+    const uint64_t probe_entries =
+        remaining_entries < 32 ? remaining_entries : 32;
+    const uint64_t minimum_entries =
+        remaining_entries < 8 ? remaining_entries : 8;
+
+    if (minimum_entries < 4) {
+        return false;
+    }
+
+    uint8_t entry[sizeof(Elf64_Sym)];
+    const uint64_t first_index =
+        (first_entry - symbol_table->sect_file_off) / entry_size;
+
+    for (uint64_t i = 0; i < probe_entries; i++) {
+        uint64_t entry_offset;
+
+        if (__builtin_mul_overflow(i, entry_size, &entry_offset)
+            || __builtin_add_overflow(first_entry, entry_offset,
+                                      &entry_offset)
+            || entry_offset < split_offset
+            || !elf_read_actual_run_bytes(
+                   actual_start, entry_offset - split_offset,
+                   entry, canonical_size)
+            || !elf_symbol_entry_matches_table(
+                   entry, is_64, file_is_le, first_index + i,
+                   symbol_table->sect_info, section_count,
+                   string_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline bool elf_mapping_suffix_bytes_equal(
+    const int64_t *left,
+    const int64_t *right,
+    uint64_t split_block,
+    uint64_t blocks,
+    uint64_t file_size)
+{
+    FileMirror *fm = scalpel_state.filemirror;
+    const uint32_t blocksize = scalpel_state.blocksize;
+
+    if (!fm || !left || !right || blocksize == 0
+        || split_block >= blocks) {
+        return false;
+    }
+
+    for (uint64_t i = split_block; i < blocks; i++) {
+        const int64_t left_actual =
+            filemirror_actual_blocknumber(fm, left[i]);
+        const int64_t right_actual =
+            filemirror_actual_blocknumber(fm, right[i]);
+        uint64_t left_available = 0;
+        uint64_t right_available = 0;
+        const char *left_data = filemirror_actual_block_data_pointer(
+            fm, left_actual, &left_available);
+        const char *right_data = filemirror_actual_block_data_pointer(
+            fm, right_actual, &right_available);
+        const uint64_t offset = i * (uint64_t)blocksize;
+        uint64_t wanted = file_size - offset;
+
+        if (wanted > blocksize) {
+            wanted = blocksize;
+        }
+        if (!left_data || !right_data || left_available < wanted
+            || right_available < wanted
+            || memcmp(left_data, right_data, (size_t)wanted) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A static symbol table and its linked string table provide a strong anchor
+// when a physically contiguous suffix is displaced after the section table.
+// Candidate starts are filtered by exact ELF symbol-record constraints, then
+// the complete byte mapping must pass the ordinary validator. Distinct valid
+// byte sequences are left unresolved rather than selected heuristically.
+static bool elf_try_symbol_tail_completion(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle)
+{
+    FileMirror *fm = scalpel_state.filemirror;
+    const uint32_t blocksize = scalpel_state.blocksize;
+    const uint64_t blocks = CEILDIV(file_size, blocksize);
+    bool is_64 = false;
+    bool file_is_le = true;
+    uint16_t machine = 0;
+    uint16_t section_count = 0;
+    int64_t header_apparent;
+    int64_t header_actual;
+    int64_t *mapping = NULL;
+    int64_t *best_mapping = NULL;
+    bool result = false;
+    bool checkpointed = false;
+    ElfSymbolTailState *tail = NULL;
+
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+    if (!work || !candidate || !candidate->b || !filestate || !fm
+        || file_size == 0 || blocksize == 0 || blocks < 2
+        || blocks != blockvector_get_num_blocks(candidate->b)
+        || !filestate->sht_placed
+        || !get_elf_identity(candidate, &is_64, &file_is_le, &machine)) {
+        return false;
+    }
+    (void)machine;
+
+    if (is_64) {
+        Elf_Header_64 header;
+
+        if (!read_candidate_elf_header_64(candidate, &header)) {
+            return false;
+        }
+        section_count = to_host_endian_16(
+            header.num_sht_entries, file_is_le);
+    }
+    else {
+        Elf_Header_32 header;
+
+        if (!read_candidate_elf_header_32(candidate, &header)) {
+            return false;
+        }
+        section_count = to_host_endian_16(
+            header.num_sht_entries, file_is_le);
+    }
+    if (section_count == 0) {
+        return false;
+    }
+
+    header_apparent = elf_candidate_header_apparent(candidate);
+    header_actual = filemirror_actual_blocknumber(fm, header_apparent);
+    if (header_apparent < 0 || header_actual < 0
+        || blocks > SIZE_MAX / sizeof(*mapping)) {
+        return false;
+    }
+
+    mapping = (int64_t *)malloc((size_t)blocks * sizeof(*mapping));
+    check_memory_allocation(mapping, __LINE__, __FILE__, "elf symbol-tail trial");
+    for (uint64_t i = 0; i < blocks; i++) {
+        mapping[i] = blockvector_get_apparent_blocknumber(candidate->b, i);
+    }
+    tail = &filestate->symbol_tail;
+    if (!elf_symbol_tail_prepare(tail, mapping, blocks, file_size, blocksize,
+                                 filemirror_apparent_blocks(fm), section_count)) {
+        goto done;
+    }
+    ElfSymbolTailProgress *progress = &tail->progress;
+    best_mapping = tail->mappings + blocks;
+    if (scalpel_state.mode_verbose && progress->next_source != 0) {
+        scalpel_log("[%s] elf symbol-tail resumed section %u at source %" PRIu64
+                    " with %" PRIu64 " matching tails.\n", cid,
+                    (unsigned)progress->section, progress->next_source,
+                    progress->validating_mappings);
+    }
+
+    for (uint16_t section = progress->section; section < section_count; section++) {
+        if (progress->section != section) {
+            progress->section = section;
+            progress->next_source = 0;
+            progress->validating_mappings = 0;
+            progress->accepted_actual = -1;
+        }
+        Section_Header_Entry_64 symbols = {0};
+        Section_Header_Entry_64 strings = {0};
+        uint64_t symbol_end;
+        uint64_t string_end;
+        uint64_t entry_size;
+        uint64_t entry_count;
+        uint64_t first_bad = UINT64_MAX;
+
+        if (!get_sht_entry(candidate, section, is_64, file_is_le,
+                           &symbols)
+            || symbols.section_type != SECTION_TYPE_SYMTAB
+            || symbols.sect_idx >= section_count
+            || !get_sht_entry(candidate, (uint16_t)symbols.sect_idx,
+                              is_64, file_is_le, &strings)
+            || strings.section_type != SECTION_TYPE_STRTAB
+            || strings.sect_size == 0
+            || __builtin_add_overflow(symbols.sect_file_off,
+                                      symbols.sect_size, &symbol_end)
+            || __builtin_add_overflow(strings.sect_file_off,
+                                      strings.sect_size, &string_end)
+            || symbol_end > file_size || string_end > file_size) {
+            continue;
+        }
+
+        entry_size = symbols.entry_size;
+        const uint64_t canonical_size =
+            is_64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+        if (entry_size < canonical_size
+            || symbols.sect_size < entry_size
+            || symbols.sect_size % entry_size != 0) {
+            continue;
+        }
+        entry_count = symbols.sect_size / entry_size;
+        if (symbols.sect_info > entry_count) {
+            continue;
+        }
+
+        uint8_t entry[sizeof(Elf64_Sym)];
+        for (uint64_t i = 0; i < entry_count; i++) {
+            uint64_t file_offset;
+
+            if (__builtin_mul_overflow(i, entry_size, &file_offset)
+                || __builtin_add_overflow(symbols.sect_file_off,
+                                          file_offset, &file_offset)
+                || !elf_read_actual_run_bytes(
+                       header_actual, file_offset, entry, canonical_size)
+                || !elf_symbol_entry_matches_table(
+                       entry, is_64, file_is_le, i, symbols.sect_info,
+                       section_count, strings.sect_size)) {
+                first_bad = i;
+                break;
+            }
+        }
+        if (first_bad == UINT64_MAX) {
+            continue;
+        }
+
+        uint64_t bad_offset;
+        if (__builtin_mul_overflow(first_bad, entry_size, &bad_offset)
+            || __builtin_add_overflow(symbols.sect_file_off,
+                                      bad_offset, &bad_offset)) {
+            continue;
+        }
+        const uint64_t split_block = bad_offset / blocksize;
+        const uint64_t split_offset = split_block * (uint64_t)blocksize;
+        if (split_block == 0 || split_block >= blocks) {
+            continue;
+        }
+
+        const uint64_t apparent_blocks = filemirror_apparent_blocks(fm);
+        uint64_t validating_mappings = progress->validating_mappings;
+        bool ambiguous = false;
+        int64_t accepted_actual = progress->accepted_actual;
+
+        for (uint64_t apparent = progress->next_source;
+             apparent < apparent_blocks; apparent++) {
+            if ((apparent & 0xffu) == 0
+                && atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                progress->next_source = apparent;
+                progress->validating_mappings = validating_mappings;
+                progress->accepted_actual = accepted_actual;
+                carve_put_state(candidate->carvehashkey, filestate);
+                if (elf_relocated_run_time_to_checkpoint(work, candidate, uuidp, uuidc)) {
+                    checkpointed = true;
+                    if (returned_to_idle) {
+                        *returned_to_idle = true;
+                    }
+                    goto done;
+                }
+            }
+
+            const int64_t suffix_actual =
+                filemirror_actual_blocknumber(fm, (int64_t)apparent);
+            if (suffix_actual < 0
+                || !elf_symbol_tail_probe_matches(
+                       suffix_actual, split_offset, &symbols,
+                       is_64, file_is_le, section_count,
+                       strings.sect_size)) {
+                continue;
+            }
+
+            for (uint64_t i = 0; i < split_block; i++) {
+                const int64_t existing =
+                    blockvector_get_apparent_blocknumber(candidate->b, i);
+
+                mapping[i] = bv_slot_is_placed(existing)
+                                 ? existing
+                                 : elf_relocated_apparent_block(
+                                       header_actual, i, 0);
+            }
+            for (uint64_t i = split_block; i < blocks; i++) {
+                const __int128 actual_wide =
+                    (__int128)suffix_actual
+                    + (__int128)(i - split_block);
+
+                mapping[i] =
+                    actual_wide < 0 || actual_wide > INT64_MAX
+                        ? -1
+                        : filemirror_apparent_blocknumber(
+                              fm, (int64_t)actual_wide);
+            }
+
+            if (!elf_validate_relocated_mapping(
+                    candidate, filestate, mapping, blocks, file_size,
+                    cid, false, NULL)) {
+                continue;
+            }
+
+            if (scalpel_state.mode_verbose) {
+                scalpel_log(
+                    "[%s] elf symbol-tail completion: validating suffix "
+                    "candidate at file block %" PRIu64
+                    " from actual block %" PRId64 ".\n",
+                    cid, split_block, suffix_actual);
+            }
+
+            validating_mappings++;
+            if (validating_mappings == 1) {
+                memcpy(best_mapping, mapping,
+                       (size_t)blocks * sizeof(*best_mapping));
+                accepted_actual = suffix_actual;
+            }
+            else if (!elf_mapping_suffix_bytes_equal(
+                         best_mapping, mapping, split_block,
+                         blocks, file_size)) {
+                ambiguous = true;
+                break;
+            }
+        }
+
+        if (validating_mappings == 0 || ambiguous) {
+            if (ambiguous) {
+                scalpel_log(
+                    "[%s] elf symbol-tail completion: multiple distinct "
+                    "suffixes passed validation at file block %" PRIu64
+                    "; left unresolved.\n",
+                    cid, split_block);
+            }
+            continue;
+        }
+
+        for (uint64_t i = 0; i < blocks; i++) {
+            ELF_DEBUG_SET_APPARENT(candidate, i, best_mapping[i]);
+        }
+        normalize_blockvector(candidate->b);
+        inflate_blockvector(candidate->b);
+        filestate->complete_mapping_verified = true;
+        filestate->complete_mapping_ooo_transitions_positioned = false;
+        scalpel_log(
+            "[%s] elf symbol-tail completion: placed suffix at file "
+            "block %" PRIu64 " from actual block %" PRId64
+            " using %" PRIu64 " byte-equivalent validating mapping%s.\n",
+            cid, split_block, accepted_actual, validating_mappings,
+            validating_mappings == 1 ? "" : "s");
+        result = true;
+        goto done;
+    }
+
+done:
+    if (tail && !checkpointed) {
+        elf_symbol_tail_clear(tail);
+        carve_put_state(candidate->carvehashkey, filestate);
+    }
+    free(mapping);
+    return result;
+}
+
+
+static bool elf_apparent_runs_have_same_bytes(
+    FileMirror *fm,
+    int64_t left_apparent,
+    int64_t right_apparent,
+    uint64_t run_length)
+{
+    if (!fm || left_apparent < 0 || right_apparent < 0) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < run_length; i++) {
+        if (i > (uint64_t)INT64_MAX
+            || left_apparent > INT64_MAX - (int64_t)i
+            || right_apparent > INT64_MAX - (int64_t)i) {
+            return false;
+        }
+        const int64_t left_actual = filemirror_actual_blocknumber(
+            fm, left_apparent + (int64_t)i);
+        const int64_t right_actual = filemirror_actual_blocknumber(
+            fm, right_apparent + (int64_t)i);
+        uint64_t left_length = 0;
+        uint64_t right_length = 0;
+        const char *left = filemirror_actual_block_data_pointer(
+            fm, left_actual, &left_length);
+        const char *right = filemirror_actual_block_data_pointer(
+            fm, right_actual, &right_length);
+
+        if (!left || !right || left_length != right_length
+            || memcmp(left, right, left_length) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// Return the strongest independently checkable evidence represented by a
+// candidate-specific executable run. Confidence intervals are compared by the
+// caller, so a large but noisy match count cannot defeat a better alternative.
+static unsigned elf_text_run_evidence_tier(
+    const ElfTextBranchScore *score,
+    double *lower,
+    double *upper,
+    uint64_t *matches)
+{
+    static const double minimum_lower = 0.20;
+
+    if (lower) {
+        *lower = 0.0;
+    }
+    if (upper) {
+        *upper = 1.0;
+    }
+    if (matches) {
+        *matches = 0;
+    }
+    if (!score || !score->usable) {
+        return 0;
+    }
+
+    if (score->distinct_exact_matches >= ELF_TEXT_MIN_DISTINCT_ANCHORS
+        && score->exact_lower >= minimum_lower) {
+        if (lower) {
+            *lower = score->exact_lower;
+        }
+        if (upper) {
+            *upper = score->exact_upper;
+        }
+        if (matches) {
+            *matches = score->exact_matches;
+        }
+        return 3;
+    }
+
+    if (score->file_reference_matches >= 4
+        && score->file_reference_lower >= minimum_lower) {
+        if (lower) {
+            *lower = score->file_reference_lower;
+        }
+        if (upper) {
+            *upper = score->file_reference_upper;
+        }
+        if (matches) {
+            *matches = score->file_reference_matches;
+        }
+        return 2;
+    }
+
+    if (score->matches >= 3 && score->executable_matches >= 3
+        && score->lower >= minimum_lower
+        && score->executable_lower >= minimum_lower) {
+        if (lower) {
+            *lower = score->lower * score->executable_lower;
+        }
+        if (upper) {
+            *upper = score->upper * score->executable_upper;
+        }
+        if (matches) {
+            *matches = score->matches;
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
+
+// Score one physically contiguous source run for an opaque logical region.
+// Non-executable data uses section affinity and short boundary samples.
+// Executable data also receives candidate-architecture control-flow evidence.
+static inline bool elf_entropy_run_score(
+    CarveInfo *candidate,
+    FileState *filestate,
+    const int64_t *mapping,
+    uint64_t run_start,
+    uint64_t run_length,
+    int64_t source_apparent,
+    const int64_t *used_actual,
+    size_t used_count,
+    const ElfTextBranchEvidence *text_evidence,
+    double *score,
+    ElfTextBranchScore *text_score)
+{
+    static const uint64_t seam_bytes = 64;
+    FileMirror *fm = scalpel_state.filemirror;
+    const uint32_t blocksize = scalpel_state.blocksize;
+
+    if (text_score) {
+        memset(text_score, 0, sizeof(*text_score));
+    }
+    if (!candidate || !candidate->b || !filestate || !mapping || !score
+        || source_apparent < 0 || run_length == 0
+        || run_start == 0 || blocksize < seam_bytes
+        || run_start + run_length
+               >= blockvector_get_num_blocks(candidate->b)) {
+        return false;
+    }
+
+    double total = 0.0;
+    int64_t first_actual = -1;
+    int64_t last_actual = -1;
+
+    for (uint64_t i = 0; i < run_length; i++) {
+        if ((uint64_t)source_apparent > INT64_MAX - i) {
+            return false;
+        }
+        const int64_t apparent = source_apparent + (int64_t)i;
+        const int64_t actual = filemirror_actual_blocknumber(fm, apparent);
+        if (actual < 0
+            || (i > 0 && actual != last_actual + 1)
+            || filemirror_actual_block_covered(fm, actual)
+            || elf_layout_apparent_slot_conflicts(
+                   candidate, filestate, run_start + i, blocksize,
+                   apparent)
+            || (used_actual && bsearch(&actual, used_actual, used_count,
+                                       sizeof(*used_actual),
+                                       elf_compare_int64))) {
+            return false;
+        }
+
+        // Provisional candidates reserve speculative contiguous spans. Treat
+        // that pressure as ranking evidence below, never as proof that this
+        // structurally viable run is unavailable.
+        const BlockValidationDecision confidence =
+            filemirror_get_blocktype(fm, actual, candidate->needleidx);
+        const int64_t reservations =
+            scalpel_state.reservations
+                ? filemirror_actual_block_reserved(fm, actual)
+                : 0;
+        double affinity = elf_relocated_block_affinity(
+            candidate, filestate, run_start + i, apparent);
+
+        if (affinity == -DBL_MAX) {
+            return false;
+        }
+
+        // Full candidate validation decides whether an opaque replacement is
+        // usable. Remove the scheduling-dependent reservation penalty while
+        // preserving the block type confidence contribution.
+        affinity += 10.0
+                    * (elf_block_selection_adjustment(confidence, 0)
+                       - elf_block_selection_adjustment(confidence,
+                                                        reservations));
+        total += affinity;
+        if (i == 0) {
+            first_actual = actual;
+        }
+        last_actual = actual;
+    }
+
+    const int64_t left_apparent = mapping[run_start - 1];
+    const int64_t right_apparent = mapping[run_start + run_length];
+    const int64_t left_actual =
+        filemirror_actual_blocknumber(fm, left_apparent);
+    const int64_t right_actual =
+        filemirror_actual_blocknumber(fm, right_apparent);
+    uint64_t left_length = 0;
+    uint64_t right_length = 0;
+    uint64_t first_length = 0;
+    uint64_t last_length = 0;
+    const unsigned char *left =
+        (const unsigned char *)filemirror_actual_block_data_pointer(
+            fm, left_actual, &left_length);
+    const unsigned char *right =
+        (const unsigned char *)filemirror_actual_block_data_pointer(
+            fm, right_actual, &right_length);
+    const unsigned char *first =
+        (const unsigned char *)filemirror_actual_block_data_pointer(
+            fm, first_actual, &first_length);
+    const unsigned char *last =
+        (const unsigned char *)filemirror_actual_block_data_pointer(
+            fm, last_actual, &last_length);
+
+    if (!left || !right || !first || !last
+        || left_length < seam_bytes || right_length < seam_bytes
+        || first_length < seam_bytes || last_length < seam_bytes) {
+        return false;
+    }
+
+    uint64_t seam_matches = 0;
+
+    for (uint64_t i = 0; i < seam_bytes; i++) {
+        seam_matches += left[left_length - seam_bytes + i] == first[i];
+        seam_matches += last[last_length - seam_bytes + i] == right[i];
+    }
+
+    total += (double)seam_matches / 16.0;
+    *score = total;
+
+    if (text_evidence && text_score) {
+        const ElfTextFragment fragment = {
+            .ap_start = (uint64_t)source_apparent,
+            .len = run_length,
+        };
+
+        elf_text_score_branch_fragment(candidate, text_evidence, run_start,
+                                       &fragment, text_score);
+    }
+    return true;
+}
+
+
+static bool elf_try_entropy_mapping_run_repair_internal(
+    ThreadWork *work, CarveInfo *candidate, FileState *filestate,
+    int64_t *mapping, uint64_t blocks, uint64_t file_size, const char *cid,
+    uuid_string_t uuidp, uuid_string_t uuidc, bool *returned_to_idle,
+    bool prefer_unwind_agreement);
+static bool elf_try_entropy_mapping_run_repair(
+    ThreadWork *work, CarveInfo *candidate, FileState *filestate,
+    int64_t *mapping, uint64_t blocks, uint64_t file_size, const char *cid,
+    uuid_string_t uuidp, uuid_string_t uuidc, bool *returned_to_idle);
+
+// Stage one localized replacement in a private mapping. A source
+// run must have a clear score advantage over both the current bytes and every
+// byte-distinct alternative, and the resulting bytes must remain a valid ELF.
+static bool elf_try_entropy_mapping_run_repair_internal(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    int64_t *mapping,
+    uint64_t blocks,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle,
+    bool prefer_unwind_agreement)
+{
+    static const double minimum_gain = 4.0;
+    static const double minimum_margin = 0.1;
+    static const double minimum_score_per_block = 3.0;
+    FileMirror *fm = scalpel_state.filemirror;
+    const uint32_t blocksize = scalpel_state.blocksize;
+    bool is_64 = false;
+    bool file_is_le = false;
+    uint16_t machine = 0;
+
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+    if (!work || !candidate || !candidate->b || !filestate || !mapping
+        || !fm || blocksize == 0 || blocks < 5 || file_size == 0
+        || CEILDIV(file_size, blocksize) != blocks) {
+        return false;
+    }
+
+    // Big-endian files use the architecture-specific relocated-run solvers.
+    // Byte-level opaque-run ranking is not strong enough to replace those
+    // mappings safely when several structurally similar files are present.
+    if (!get_elf_identity(candidate, &is_64, &file_is_le, &machine)
+        || !file_is_le) {
+        return false;
+    }
+    (void)is_64;
+    (void)machine;
+
+    const int64_t first_apparent = mapping[0];
+    const int64_t last_apparent = mapping[blocks - 1];
+
+    // A complete baseline may already include one or more solved gaps. The
+    // score comparison and full mapping validation below decide whether an
+    // independently relocated opaque run can safely replace its weak span.
+    if (first_apparent < 0 || last_apparent < 0) {
+        return false;
+    }
+
+    uint64_t run_start = UINT64_MAX;
+    uint64_t code_run_end = UINT64_MAX;
+
+    // Checkpoint blockmap updates can remove an incorrect old placement.
+    // Treat that hole as pending work rather than skipping the repair pass.
+    for (uint64_t i = 1; i + 1 < blocks; i++) {
+        if (mapping[i] < 0) {
+            run_start = i;
+            break;
+        }
+    }
+    if (run_start == UINT64_MAX) {
+        run_start = elf_layout_first_entropy_discontinuity(
+            candidate, filestate, blocks, blocksize, mapping);
+    }
+    if (run_start == UINT64_MAX) {
+        run_start = elf_layout_first_code_discontinuity(
+            candidate, filestate, blocks, mapping, &code_run_end, true);
+    }
+
+    if (run_start == UINT64_MAX) {
+        return false;
+    }
+
+    uint64_t run_end = run_start;
+
+    while (run_end < blocks) {
+        const int64_t apparent = mapping[run_end];
+
+        if (code_run_end != UINT64_MAX) {
+            run_end = code_run_end;
+            break;
+        }
+        if (!elf_layout_apparent_slot_requires_reassembly(
+                candidate, filestate, run_end, blocksize, apparent)) {
+            break;
+        }
+        run_end++;
+    }
+
+    const uint64_t run_length = run_end - run_start;
+    const uint64_t apparent_blocks = filemirror_apparent_blocks(fm);
+
+    if (run_length == 0 || run_end >= blocks
+        || run_length > apparent_blocks
+        || blocks > SIZE_MAX / sizeof(int64_t)) {
+        return false;
+    }
+
+    int64_t *used_actual =
+        (int64_t *)malloc((blocks - run_length) * sizeof(*used_actual));
+    int64_t *original_run =
+        (int64_t *)malloc(run_length * sizeof(*original_run));
+
+    if (!used_actual || !original_run) {
+        free(original_run);
+        free(used_actual);
+        return false;
+    }
+
+    size_t used_count = 0;
+
+    for (uint64_t i = 0; i < blocks; i++) {
+        if (i < run_start || i >= run_end) {
+            if (mapping[i] < 0) {
+                continue;
+            }
+            const int64_t actual =
+                filemirror_actual_blocknumber(fm, mapping[i]);
+
+            if (actual < 0) {
+                free(original_run);
+                free(used_actual);
+                return false;
+            }
+            used_actual[used_count++] = actual;
+        }
+    }
+    qsort(used_actual, used_count, sizeof(*used_actual), elf_compare_int64);
+
+    ElfTextBranchEvidence text_evidence = {0};
+    const bool text_evidence_ready =
+        elf_text_branch_evidence_init_mapping(
+            candidate, filestate, mapping, blocks, file_size, &text_evidence);
+    // Repeated calls to one linker stub are not independent position evidence.
+    // The evidence tier below also requires distinct call targets.
+    text_evidence.include_linkage_stubs = true;
+    text_evidence.restrict_to_text_sections = true;
+    bool executable_run = false;
+
+    if (text_evidence_ready) {
+        for (uint64_t slot = run_start; slot < run_end; slot++) {
+            if (elf_text_slot_overlaps_executable(
+                    &text_evidence, filestate, slot, blocksize)) {
+                executable_run = true;
+                break;
+            }
+        }
+    }
+
+    const int64_t baseline_apparent = mapping[run_start];
+    double baseline_score = -DBL_MAX;
+
+    (void)elf_entropy_run_score(
+        candidate, filestate, mapping, run_start, run_length,
+        baseline_apparent, used_actual, used_count, NULL, &baseline_score,
+        NULL);
+
+    ElfOpaqueRunSearch *search = &filestate->opaque_repair.progress.search;
+    int64_t best_apparent = search->best_apparent;
+    double best_score = search->best_score;
+    double runner_up_score = search->runner_up_score;
+    int64_t semantic_best_apparent = search->semantic_best_apparent;
+    double semantic_best_generic_score = search->semantic_best_generic_score;
+    double semantic_best_lower = search->semantic_best_lower;
+    double semantic_best_upper = search->semantic_best_upper;
+    double semantic_competitor_upper = search->semantic_competitor_upper;
+    uint64_t semantic_best_matches = search->semantic_best_matches;
+    unsigned semantic_best_tier = search->semantic_best_tier;
+    bool have_semantic_competitor = search->have_semantic_competitor;
+
+    for (uint64_t source = search->next_source;
+         source + run_length <= apparent_blocks; source++) {
+        if ((source & UINT64_C(0xff)) == 0
+            && atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            search->next_source = source;
+            search->best_apparent = best_apparent;
+            search->best_score = best_score;
+            search->runner_up_score = runner_up_score;
+            search->semantic_best_apparent = semantic_best_apparent;
+            search->semantic_best_generic_score = semantic_best_generic_score;
+            search->semantic_best_lower = semantic_best_lower;
+            search->semantic_best_upper = semantic_best_upper;
+            search->semantic_competitor_upper = semantic_competitor_upper;
+            search->semantic_best_matches = semantic_best_matches;
+            search->semantic_best_tier = semantic_best_tier;
+            search->have_semantic_competitor = have_semantic_competitor;
+            // Persist before queue return; another phase may then own the candidate.
+            carve_put_state(candidate->carvehashkey, filestate);
+            if (elf_relocated_run_time_to_checkpoint(work, candidate, uuidp, uuidc)) {
+                if (returned_to_idle) {
+                    *returned_to_idle = true;
+                }
+                elf_text_branch_evidence_release(&text_evidence);
+                free(original_run);
+                free(used_actual);
+                return false;
+            }
+        }
+
+        double trial_score = 0.0;
+        ElfTextBranchScore text_score = {0};
+
+        if (prefer_unwind_agreement && executable_run
+            && elf_text_code_fragment_conflicts(candidate, &text_evidence,
+                                                 run_start, (int64_t)source,
+                                                 run_length)) {
+            continue;
+        }
+
+        if (!elf_entropy_run_score(
+                candidate, filestate, mapping, run_start, run_length,
+                (int64_t)source, used_actual, used_count,
+                executable_run ? &text_evidence : NULL,
+                &trial_score, &text_score)) {
+            continue;
+        }
+
+        if (trial_score > best_score + 1.0e-12) {
+            if (best_apparent >= 0) {
+                runner_up_score = best_score;
+            }
+            best_apparent = (int64_t)source;
+            best_score = trial_score;
+        }
+        else if (!elf_apparent_runs_have_same_bytes(
+                     fm, best_apparent, (int64_t)source, run_length)
+                 && trial_score > runner_up_score) {
+            runner_up_score = trial_score;
+        }
+
+        if (executable_run) {
+            double semantic_lower = 0.0;
+            double semantic_upper = 1.0;
+            uint64_t semantic_matches = 0;
+            const unsigned semantic_tier = elf_text_run_evidence_tier(
+                &text_score, &semantic_lower, &semantic_upper,
+                &semantic_matches);
+
+            if (semantic_tier > 0) {
+                const bool same_semantic_bytes =
+                    semantic_best_apparent >= 0
+                    && elf_apparent_runs_have_same_bytes(
+                           fm, semantic_best_apparent, (int64_t)source,
+                           run_length);
+                const bool stronger =
+                    semantic_tier > semantic_best_tier
+                    || (semantic_tier == semantic_best_tier
+                        && (semantic_lower
+                                > semantic_best_lower + 1.0e-12
+                            || (fabs(semantic_lower
+                                     - semantic_best_lower)
+                                    <= 1.0e-12
+                                && semantic_matches
+                                       > semantic_best_matches)
+                            || (fabs(semantic_lower
+                                     - semantic_best_lower)
+                                    <= 1.0e-12
+                                && semantic_matches
+                                       == semantic_best_matches
+                                && trial_score
+                                       > semantic_best_generic_score
+                                             + 1.0e-12)));
+
+                if (stronger) {
+                    if (semantic_tier > semantic_best_tier) {
+                        semantic_competitor_upper = 0.0;
+                        have_semantic_competitor = false;
+                    }
+                    else if (semantic_best_apparent >= 0
+                             && !same_semantic_bytes) {
+                        if (semantic_best_upper
+                                > semantic_competitor_upper) {
+                            semantic_competitor_upper =
+                                semantic_best_upper;
+                        }
+                        have_semantic_competitor = true;
+                    }
+                    semantic_best_apparent = (int64_t)source;
+                    semantic_best_generic_score = trial_score;
+                    semantic_best_lower = semantic_lower;
+                    semantic_best_upper = semantic_upper;
+                    semantic_best_matches = semantic_matches;
+                    semantic_best_tier = semantic_tier;
+                }
+                else if (semantic_tier == semantic_best_tier
+                         && !same_semantic_bytes) {
+                    if (semantic_upper > semantic_competitor_upper) {
+                        semantic_competitor_upper = semantic_upper;
+                    }
+                    have_semantic_competitor = true;
+                }
+            }
+        }
+    }
+
+    if (scalpel_state.mode_verbose) {
+        scalpel_log(
+            "[%s] elf opaque-run repair: file blocks %" PRIu64 "..%" PRIu64
+            " baseline=%.3f best=%.3f runner-up=%.3f source=%" PRId64 ".\n",
+            cid, run_start, run_end - 1, baseline_score, best_score,
+            runner_up_score, best_apparent);
+    }
+
+    if (executable_run) {
+        const bool semantic_qualified =
+            semantic_best_apparent >= 0
+            && semantic_best_tier > 0
+            && (!have_semantic_competitor
+                || semantic_best_lower
+                       > semantic_competitor_upper + 1.0e-12);
+
+        if (scalpel_state.mode_verbose) {
+            scalpel_log(
+                "[%s] elf opaque executable-run evidence: tier=%u "
+                "matches=%" PRIu64 " lower=%.3f competitor upper=%.3f "
+                "source=%" PRId64 ".\n",
+                cid, semantic_best_tier, semantic_best_matches,
+                semantic_best_lower, semantic_competitor_upper,
+                semantic_best_apparent);
+        }
+        if (!semantic_qualified
+            || elf_apparent_runs_have_same_bytes(
+                   fm, semantic_best_apparent, baseline_apparent,
+                   run_length)) {
+            elf_text_branch_evidence_release(&text_evidence);
+            free(original_run);
+            free(used_actual);
+            return false;
+        }
+        best_apparent = semantic_best_apparent;
+        best_score = semantic_best_generic_score;
+    }
+    else if (best_apparent < 0 || baseline_score == -DBL_MAX
+             || best_score < baseline_score + minimum_gain
+             || best_score
+                    < minimum_score_per_block * (double)run_length
+             || (runner_up_score != -DBL_MAX
+                 && best_score < runner_up_score + minimum_margin)) {
+        elf_text_branch_evidence_release(&text_evidence);
+        free(original_run);
+        free(used_actual);
+        return false;
+    }
+
+    memcpy(original_run, mapping + run_start,
+           run_length * sizeof(*original_run));
+    for (uint64_t i = 0; i < run_length; i++) {
+        mapping[run_start + i] = best_apparent + (int64_t)i;
+    }
+
+    if (!elf_validate_relocated_mapping_internal(
+            candidate, filestate, mapping, blocks, file_size, cid,
+            scalpel_state.mode_verbose, NULL,
+            false, filestate->opaque_repair.mappings)) {
+        memcpy(mapping + run_start, original_run,
+               run_length * sizeof(*original_run));
+        elf_text_branch_evidence_release(&text_evidence);
+        free(original_run);
+        free(used_actual);
+        return false;
+    }
+
+    scalpel_log(
+        "[%s] elf opaque-run repair staged: file blocks %" PRIu64
+        "..%" PRIu64 " selected apparent blocks %" PRId64 "..%" PRId64
+        " (score %.3f, prior %.3f).\n",
+        cid, run_start, run_end - 1, best_apparent,
+        best_apparent + (int64_t)run_length - 1,
+        best_score, baseline_score);
+
+    elf_text_branch_evidence_release(&text_evidence);
+    free(original_run);
+    free(used_actual);
+    return true;
+}
+
+// Keep the original repair ordering. If it cannot distinguish a replacement,
+// try again without competitors contradicted by the current unwind evidence.
+// Successful intermediate placements may support later, larger repairs.
+static bool elf_try_entropy_mapping_run_repair(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    int64_t *mapping,
+    uint64_t blocks,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle)
+{
+    bool interrupted = false;
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+    ElfOpaqueRepairProgress *progress = &filestate->opaque_repair.progress;
+    if (!progress->prefer_unwind_agreement) {
+        if (elf_try_entropy_mapping_run_repair_internal(
+                work, candidate, filestate, mapping, blocks, file_size, cid,
+                uuidp, uuidc, &interrupted, false)) {
+            return true;
+        }
+        if (interrupted) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            return false;
+        }
+        progress->prefer_unwind_agreement = true;
+        elf_opaque_run_search_reset(&progress->search);
+    }
+    return elf_try_entropy_mapping_run_repair_internal(
+        work, candidate, filestate, mapping, blocks, file_size, cid,
+        uuidp, uuidc, returned_to_idle, true);
+}
+
+// Repair all independently supported opaque runs in a private mapping. The
+// final mapping must pass both byte validation and physical layout validation;
+// otherwise every staged change is discarded by the caller.
+static bool elf_try_entropy_mapping_repairs(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    int64_t *mapping,
+    uint64_t blocks,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle)
+{
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+    if (!work || !candidate || !candidate->b || !filestate || !mapping
+        || blocks == 0) {
+        return false;
+    }
+
+    ElfOpaqueRepairState *repair_state = &filestate->opaque_repair;
+    if (!elf_opaque_repair_prepare(repair_state, mapping, blocks, file_size,
+                                  scalpel_state.blocksize,
+                                  filemirror_apparent_blocks(scalpel_state.filemirror))) {
+        return false;
+    }
+    ElfOpaqueRepairProgress *progress = &repair_state->progress;
+    int64_t *staged_mapping = repair_state->mappings + blocks;
+    if (scalpel_state.mode_verbose && progress->search.next_source != 0) {
+        scalpel_log("[%s] elf private repair resumed at source %" PRIu64
+                    " after %" PRIu64 " staged repairs (unwind=%d).\n",
+                    cid, progress->search.next_source,
+                    progress->completed_repairs,
+                    (int)progress->prefer_unwind_agreement);
+    }
+
+    for (; progress->completed_repairs < blocks; progress->completed_repairs++) {
+        bool repair_returned_to_idle = false;
+
+        if (!elf_try_entropy_mapping_run_repair(
+                work, candidate, filestate, staged_mapping, blocks, file_size, cid,
+                uuidp, uuidc, &repair_returned_to_idle)) {
+            if (repair_returned_to_idle) {
+                if (returned_to_idle) {
+                    *returned_to_idle = true;
+                }
+                // The candidate is queued; do not validate or commit staged repairs.
+                return false;
+            }
+            break;
+        }
+        progress->prefer_unwind_agreement = false;
+        elf_opaque_run_search_reset(&progress->search);
+    }
+
+    const bool repaired = progress->completed_repairs != 0
+        && elf_validate_relocated_mapping(candidate, filestate, staged_mapping,
+                                          blocks, file_size, cid, false, NULL);
+    // The caller may continue searching from this scratch mapping even when
+    // final validation fails. Only a checkpoint return leaves it untouched;
+    // applying it to the candidate still requires successful validation.
+    memcpy(mapping, staged_mapping, blocks * sizeof(*mapping));
+    elf_opaque_repair_clear(repair_state);
+    carve_put_state(candidate->carvehashkey, filestate);
+    return repaired;
+}
+
+// Atomically apply a complete set of opaque-run repairs to the candidate.
+// Checkpoints and failed final validation leave the blockvector untouched.
+static bool elf_try_entropy_run_repairs(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    FileState *filestate,
+    uint64_t file_size,
+    const char *cid,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    bool *returned_to_idle)
+{
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+    if (!work || !candidate || !candidate->b || !filestate) {
+        return false;
+    }
+
+    const uint64_t blocks = blockvector_get_num_blocks(candidate->b);
+    if (blocks == 0 || blocks > SIZE_MAX / sizeof(int64_t)) {
+        return false;
+    }
+
+    int64_t *mapping = (int64_t *)malloc(blocks * sizeof(*mapping));
+    if (!mapping) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < blocks; i++) {
+        mapping[i] =
+            blockvector_get_apparent_blocknumber(candidate->b, i);
+        if (mapping[i] < 0) {
+            uint32_t sections = 0;
+            const uint32_t structures = elf_expected_component_mask_for_bv_slot(
+                filestate, scalpel_state.blocksize, i);
+            (void)elf_expected_slot_summary(
+                filestate, scalpel_state.blocksize, i, &sections);
+            // This pass repairs code using already placed metadata. Let the
+            // ordinary anchor search recover missing structured sections first.
+            if ((sections & sec_bit(SECTION_TEXT)) == 0
+                || (sections & ~(sec_bit(SECTION_TEXT) | sec_bit(SECTION_UNKNOWN))) != 0
+                || (structures & ~(UINT32_C(1) << COMPONENT_SECTION)) != 0) {
+                free(mapping);
+                return false;
+            }
+        }
+    }
+
+    bool mapping_returned_to_idle = false;
+    const bool repaired = elf_try_entropy_mapping_repairs(
+        work, candidate, filestate, mapping, blocks, file_size, cid,
+        uuidp, uuidc, &mapping_returned_to_idle);
+
+    if (mapping_returned_to_idle) {
+        if (returned_to_idle) {
+            *returned_to_idle = true;
+        }
+        free(mapping);
+        return false;
+    }
+    if (!repaired) {
+        free(mapping);
+        return false;
+    }
+
+    for (uint64_t i = 0; i < blocks; i++) {
+        ELF_DEBUG_SET_APPARENT(candidate, i, mapping[i]);
+    }
+    normalize_blockvector(candidate->b);
+    inflate_blockvector(candidate->b);
+    filestate->complete_mapping_verified = true;
+    filestate->complete_mapping_ooo_transitions_positioned = false;
+    carve_put_state(candidate->carvehashkey, filestate);
+    scalpel_log(
+        "[%s] elf opaque-run repairs committed after complete mapping "
+        "validation.\n",
+        cid);
+
+    free(mapping);
+    return true;
+}
+
 // Complete relocated runs after ordinary ELF placement has found at least one
 // block at each signed physical displacement. Storage grows with the number of
 // observed runs and candidate blocks, so fragmentation count and file size are
@@ -30617,6 +36091,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
                                              bool *returned_to_idle)
 {
     ElfRelocatedRun *runs = NULL;
+    int64_t *positioned_displacement = NULL;
+    uint8_t *positioned_status = NULL;
     size_t nruns = 0;
     size_t run_capacity = 0;
     bool result = false;
@@ -30682,6 +36158,7 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
     }
 
     filestate->complete_mapping_verified = false;
+    filestate->complete_mapping_ooo_transitions_positioned = false;
 
     size_t previous_run = SIZE_MAX;
 
@@ -30704,6 +36181,14 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             free(runs);
             return false;
         }
+        const uint64_t available_copies =
+            filemirror_actual_block_reference_count(
+                scalpel_state.filemirror, actual);
+        const bool physical_anchor = available_copies <= 1;
+
+        // Duplicate bytes do not establish physical locality, but they remain
+        // part of a displacement span established by adjacent unique blocks.
+        // They therefore extend the interval without increasing its evidence.
         const int64_t disp = (int64_t)displacement;
         if (disp == 0) {
             previous_run = SIZE_MAX;
@@ -30744,105 +36229,50 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         if (i > runs[r].anchor_hi) {
             runs[r].anchor_hi = i;
         }
-        runs[r].anchors++;
+        if (physical_anchor) {
+            runs[r].anchors++;
+        }
         previous_run = r;
     }
 
-    const size_t observed_runs = nruns;
-    bool observed_runs_corroborated = observed_runs > 1;
+    size_t merged_observed_runs = 0;
 
-    for (size_t r = 0; r < observed_runs; r++) {
-        if (runs[r].anchors < 2) {
-            observed_runs_corroborated = false;
-            break;
+    for (size_t r = 0; r < nruns; r++) {
+        size_t matching = SIZE_MAX;
+
+        if (runs[r].anchors == 0) {
+            continue;
         }
-        for (size_t previous = 0; previous < r; previous++) {
-            if (runs[previous].disp == runs[r].disp) {
-                observed_runs_corroborated = false;
+
+        for (size_t existing = 0;
+             existing < merged_observed_runs; existing++) {
+            if (runs[existing].disp == runs[r].disp) {
+                matching = existing;
                 break;
             }
         }
-        if (!observed_runs_corroborated) {
-            break;
+        if (matching == SIZE_MAX) {
+            if (merged_observed_runs != r) {
+                runs[merged_observed_runs] = runs[r];
+            }
+            merged_observed_runs++;
+            continue;
+        }
+
+        if (runs[r].anchor_lo < runs[matching].anchor_lo) {
+            runs[matching].anchor_lo = runs[r].anchor_lo;
+        }
+        if (runs[r].anchor_hi > runs[matching].anchor_hi) {
+            runs[matching].anchor_hi = runs[r].anchor_hi;
+        }
+        if (runs[matching].anchors > UINT64_MAX - runs[r].anchors) {
+            runs[matching].anchors = UINT64_MAX;
+        }
+        else {
+            runs[matching].anchors += runs[r].anchors;
         }
     }
-
-    if (observed_runs_corroborated
-        && blocks <= SIZE_MAX / sizeof(int64_t)) {
-        int64_t *observed_mapping =
-            (int64_t *)malloc(blocks * sizeof(*observed_mapping));
-
-        if (observed_mapping) {
-            bool mapping_complete = true;
-
-            for (uint64_t i = 0; i < blocks; i++) {
-                int64_t displacement = 0;
-
-                if ((i & 0xffu) == 0
-                    && elf_relocated_run_time_to_checkpoint(
-                           work, candidate, uuidp, uuidc)) {
-                    if (returned_to_idle) {
-                        *returned_to_idle = true;
-                    }
-                    free(observed_mapping);
-                    free(runs);
-                    return false;
-                }
-
-                for (size_t r = 0; r < observed_runs; r++) {
-                    if (i >= runs[r].anchor_lo
-                        && i <= runs[r].anchor_hi) {
-                        displacement = runs[r].disp;
-                        break;
-                    }
-                }
-                observed_mapping[i] =
-                    elf_relocated_apparent_block(
-                        header_actual, i, displacement);
-                if (observed_mapping[i] < 0) {
-                    mapping_complete = false;
-                    break;
-                }
-            }
-
-            if (mapping_complete
-                && elf_validate_relocated_mapping(
-                       candidate, observed_mapping, blocks, file_size,
-                       cid, false, NULL)) {
-                for (uint64_t i = 0; i < blocks; i++) {
-                    ELF_DEBUG_SET_APPARENT(
-                        candidate, i, observed_mapping[i]);
-                }
-                normalize_blockvector(candidate->b);
-                inflate_blockvector(candidate->b);
-
-                for (size_t r = 0; r < observed_runs; r++) {
-                    lock_fprintf(
-                        stdout,
-                        "elf: completed relocated fragment %zu of %zu at "
-                        "file blocks %" PRIu64 "..%" PRIu64
-                        " (signed displacement %" PRId64 " blocks).\n",
-                        r + 1, observed_runs,
-                        runs[r].anchor_lo, runs[r].anchor_hi,
-                        runs[r].disp);
-                    scalpel_log(
-                        "[%s] elf relocated-run completion: retained exact "
-                        "observed run=%zu/%zu displacement=%" PRId64
-                        " anchors=%" PRIu64 " range=%" PRIu64
-                        "..%" PRIu64 ".\n",
-                        cid, r + 1, observed_runs, runs[r].disp,
-                        runs[r].anchors, runs[r].anchor_lo,
-                        runs[r].anchor_hi);
-                }
-
-                filestate->complete_mapping_verified = true;
-                free(observed_mapping);
-                free(runs);
-                return true;
-            }
-            free(observed_mapping);
-        }
-    }
+    nruns = merged_observed_runs;
 
     size_t positioned_count = 0;
     bool positioned_returned_to_idle = false;
@@ -30875,48 +36305,59 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         }
         return false;
     }
-    if (frame_count > 0) {
-        if (positioned_count > SIZE_MAX - frame_count
-            || positioned_count + frame_count
-                   > SIZE_MAX / sizeof(*positioned)) {
-            free(frame_runs);
-            free(positioned);
-            free(runs);
-            return false;
-        }
-        ElfPositionedTextRun *combined =
-            (ElfPositionedTextRun *)realloc(
-                positioned,
-                (positioned_count + frame_count)
-                    * sizeof(*positioned));
-
-        if (!combined) {
-            free(frame_runs);
-            free(positioned);
-            free(runs);
-            return false;
-        }
-        positioned = combined;
-        memcpy(positioned + positioned_count, frame_runs,
-               frame_count * sizeof(*frame_runs));
-        for (size_t added = 0; added < frame_count; added++) {
-            size_t insert = positioned_count + added;
-
-            while (insert > 0
-                   && elf_positioned_text_run_stronger(
-                          &positioned[insert],
-                          &positioned[insert - 1])) {
-                const ElfPositionedTextRun previous =
-                    positioned[insert - 1];
-
-                positioned[insert - 1] = positioned[insert];
-                positioned[insert] = previous;
-                insert--;
-            }
-        }
-        positioned_count += frame_count;
+    if (!elf_append_positioned_runs(
+            &positioned, &positioned_count,
+            frame_runs, frame_count)) {
+        free(frame_runs);
+        free(positioned);
+        free(runs);
+        return false;
     }
     free(frame_runs);
+
+    size_t mips_count = 0;
+    bool mips_returned_to_idle = false;
+    ElfPositionedTextRun *mips_runs =
+        elf_find_positioned_mips_runs(
+            work, candidate, filestate, uuidp, uuidc,
+            &mips_returned_to_idle, &mips_count);
+
+    if (mips_returned_to_idle) {
+        free(mips_runs);
+        free(positioned);
+        free(runs);
+        if (returned_to_idle) {
+            *returned_to_idle = true;
+        }
+        return false;
+    }
+    if (!elf_append_positioned_runs(
+            &positioned, &positioned_count,
+            mips_runs, mips_count)) {
+        free(mips_runs);
+        free(positioned);
+        free(runs);
+        return false;
+    }
+    free(mips_runs);
+
+    if (blocks > SIZE_MAX / sizeof(*positioned_displacement)
+        || blocks > SIZE_MAX / sizeof(*positioned_status)) {
+        free(positioned);
+        free(runs);
+        return false;
+    }
+    positioned_displacement =
+        (int64_t *)malloc(blocks * sizeof(*positioned_displacement));
+    positioned_status =
+        (uint8_t *)calloc(blocks, sizeof(*positioned_status));
+    if (!positioned_displacement || !positioned_status) {
+        free(positioned_status);
+        free(positioned_displacement);
+        free(positioned);
+        free(runs);
+        return false;
+    }
 
     for (size_t p = 0; p < positioned_count; p++) {
         const ElfPositionedTextRun *identified = &positioned[p];
@@ -30929,6 +36370,47 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         const uint64_t identified_hi =
             identified->logical_start + identified->length - 1;
         uint64_t reservation_pressure = 0;
+
+        if (identified->independently_identified
+            && (identified->identified_by_function_table
+                || identified->identified_by_file_reference)) {
+            const uint64_t positioned_lo =
+                identified->positioned_range_valid
+                    ? identified->positioned_lo
+                    : identified->logical_start;
+            const uint64_t positioned_hi =
+                identified->positioned_range_valid
+                    ? identified->positioned_hi
+                    : identified_hi;
+
+            if (positioned_lo <= positioned_hi
+                && positioned_hi < blocks) {
+                for (uint64_t logical = positioned_lo;
+                     logical <= positioned_hi; logical++) {
+                    if ((logical & 0xffu) == 0
+                        && elf_relocated_run_time_to_checkpoint(
+                               work, candidate, uuidp, uuidc)) {
+                        if (returned_to_idle) {
+                            *returned_to_idle = true;
+                        }
+                        free(positioned_status);
+                        free(positioned_displacement);
+                        free(positioned);
+                        free(runs);
+                        return false;
+                    }
+                    if (positioned_status[logical] == 0) {
+                        positioned_status[logical] = 1;
+                        positioned_displacement[logical] =
+                            identified->displacement;
+                    }
+                    else if (positioned_displacement[logical]
+                                 != identified->displacement) {
+                        positioned_status[logical] = 2;
+                    }
+                }
+            }
+        }
 
         if (scalpel_state.reservations) {
             for (uint64_t logical = identified->logical_start;
@@ -30961,7 +36443,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         size_t r = SIZE_MAX;
 
         for (size_t existing = 0; existing < nruns; existing++) {
-            if (runs[existing].disp == identified->displacement
+            if (runs[existing].positioned_hypothesis
+                && runs[existing].disp == identified->displacement
                 && runs[existing].anchor_lo <= identified_hi
                 && identified->logical_start
                        <= runs[existing].anchor_hi) {
@@ -30977,6 +36460,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
 
                 if (new_capacity < run_capacity
                     || new_capacity > SIZE_MAX / sizeof(*runs)) {
+                    free(positioned_status);
+                    free(positioned_displacement);
                     free(positioned);
                     free(runs);
                     return false;
@@ -30986,6 +36471,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
                         runs, new_capacity * sizeof(*runs));
 
                 if (!larger) {
+                    free(positioned_status);
+                    free(positioned_displacement);
                     free(positioned);
                     free(runs);
                     return false;
@@ -30997,37 +36484,64 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             runs[r] = (ElfRelocatedRun){0};
         }
 
+        const bool extends_positioned_run =
+            runs[r].positioned_hypothesis;
+        const uint64_t positioned_lo = runs[r].anchor_lo;
+        const uint64_t positioned_hi = runs[r].anchor_hi;
+
         runs[r].disp = identified->displacement;
-        runs[r].anchor_lo = identified->logical_start;
-        runs[r].anchor_hi = identified_hi;
-        runs[r].anchors = identified->length;
-        runs[r].independent_gain = identified->independent_gain;
-        runs[r].branches = identified->branches;
-        runs[r].matches = identified->matches;
-        runs[r].executable_matches =
-            identified->executable_matches;
-        runs[r].exact_matches = identified->exact_matches;
-        runs[r].file_references = identified->file_references;
-        runs[r].file_reference_matches =
-            identified->file_reference_matches;
-        runs[r].reservation_pressure = reservation_pressure;
+        runs[r].anchor_lo =
+            extends_positioned_run
+                && positioned_lo < identified->logical_start
+                ? positioned_lo
+                : identified->logical_start;
+        runs[r].anchor_hi =
+            extends_positioned_run && positioned_hi > identified_hi
+                ? positioned_hi
+                : identified_hi;
+        runs[r].anchors =
+            runs[r].anchor_hi - runs[r].anchor_lo + 1;
+        if (!extends_positioned_run
+            || identified->independent_gain
+                   > runs[r].independent_gain) {
+            runs[r].independent_gain = identified->independent_gain;
+            runs[r].branches = identified->branches;
+            runs[r].matches = identified->matches;
+            runs[r].executable_matches =
+                identified->executable_matches;
+            runs[r].exact_matches = identified->exact_matches;
+            runs[r].file_references = identified->file_references;
+            runs[r].file_reference_matches =
+                identified->file_reference_matches;
+        }
+        if (!extends_positioned_run
+            || reservation_pressure < runs[r].reservation_pressure) {
+            runs[r].reservation_pressure = reservation_pressure;
+        }
         runs[r].independently_identified =
-            identified->independently_identified;
+            runs[r].independently_identified
+            || identified->independently_identified;
         runs[r].identified_by_function_table =
-            identified->identified_by_function_table;
+            runs[r].identified_by_function_table
+            || identified->identified_by_function_table;
         runs[r].identified_by_file_reference =
-            identified->identified_by_file_reference;
+            runs[r].identified_by_file_reference
+            || identified->identified_by_file_reference;
         runs[r].positioned_hypothesis = true;
     }
     free(positioned);
 
     if (nruns == 0) {
+        free(positioned_status);
+        free(positioned_displacement);
         free(runs);
         return false;
     }
 
     if (blocks > SIZE_MAX / sizeof(double)
         || nruns > SIZE_MAX / (blocks * sizeof(double))) {
+        free(positioned_status);
+        free(positioned_displacement);
         free(runs);
         return false;
     }
@@ -31036,6 +36550,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         (double *)malloc(blocks * sizeof(*base_affinity));
     double *delta =
         (double *)malloc(nruns * blocks * sizeof(*delta));
+    int64_t *baseline =
+        (int64_t *)malloc(blocks * sizeof(*baseline));
     int64_t *mapping = (int64_t *)malloc(blocks * sizeof(*mapping));
     int64_t *best_mapping =
         (int64_t *)malloc(blocks * sizeof(*best_mapping));
@@ -31046,7 +36562,7 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
     bool *active = (bool *)malloc(nruns * sizeof(*active));
     bool *best_active = (bool *)malloc(nruns * sizeof(*best_active));
 
-    if (!base_affinity || !delta || !mapping || !best_mapping
+    if (!base_affinity || !delta || !baseline || !mapping || !best_mapping
         || !solved || !best_solved || !active || !best_active) {
         free(best_active);
         free(active);
@@ -31054,10 +36570,23 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         free(solved);
         free(best_mapping);
         free(mapping);
+        free(baseline);
         free(delta);
         free(base_affinity);
+        free(positioned_status);
+        free(positioned_displacement);
         free(runs);
         return false;
+    }
+
+    for (uint64_t i = 0; i < blocks; i++) {
+        const int64_t apparent =
+            blockvector_get_apparent_blocknumber(candidate->b, i);
+
+        baseline[i] = apparent >= 0
+                          ? apparent
+                          : elf_relocated_apparent_block(
+                                header_actual, i, 0);
     }
 
     for (uint64_t i = 1; i < blocks; i++) {
@@ -31069,8 +36598,7 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             }
             goto done;
         }
-        const int64_t apparent =
-            elf_relocated_apparent_block(header_actual, i, 0);
+        const int64_t apparent = baseline[i];
         base_affinity[i] =
             apparent < 0
                 ? -DBL_MAX
@@ -31150,24 +36678,27 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             active[right] = true;
 
             if (!elf_solve_and_validate_relocated_runs(
-                    candidate, runs, nruns, active, delta, blocks,
-                    header_actual, file_size, cid, solved, mapping,
+                    candidate, filestate, runs, nruns, active, delta, blocks,
+                    header_actual, file_size, cid, solved, mapping, baseline,
+                    positioned_displacement, positioned_status,
                     &validation_trials)) {
                 continue;
             }
 
             elf_consider_relocated_solution(
                 solved, nruns, active, mapping, blocks,
+                header_actual, positioned_displacement,
+                positioned_status,
                 &have_accepted, &accepted_rank, best_solved,
                 best_active, best_mapping);
         }
     }
 
     /*
-     * Independently positioned runs and runs already represented by physical
-     * anchors can describe different fragments of the same file. Try their
-     * strongest non-overlapping combination before considering weaker
-     * alternatives one at a time.
+     * Exact format-positioned runs and runs already represented by physical
+     * anchors can describe different fragments of the same file. Try that
+     * combination before broader statistical placements. Overlapping exact
+     * evidence is retained for the complete validator to arbitrate.
      */
     bool have_seeded_combination = false;
 
@@ -31180,6 +36711,9 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
                 const bool eligible =
                     pass == 0
                         ? runs[r].independently_identified
+                              && (runs[r].identified_by_function_table
+                                  || runs[r]
+                                      .identified_by_file_reference)
                         : !runs[r].positioned_hypothesis;
                 const __int128 physical_lo =
                     (__int128)runs[r].anchor_lo
@@ -31204,13 +36738,26 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
                         (__int128)runs[selected].anchor_hi
                         + (__int128)runs[selected].disp;
 
-                    if ((runs[r].anchor_lo
-                             <= runs[selected].anchor_hi
-                         && runs[selected].anchor_lo
-                                <= runs[r].anchor_hi)
-                        || (physical_lo <= selected_physical_hi
-                            && selected_physical_lo
-                                   <= physical_hi)) {
+                    const bool logical_overlap =
+                        runs[r].anchor_lo <= runs[selected].anchor_hi
+                        && runs[selected].anchor_lo
+                               <= runs[r].anchor_hi;
+                    const bool physical_overlap =
+                        physical_lo <= selected_physical_hi
+                        && selected_physical_lo <= physical_hi;
+                    const bool positioned_arbitration =
+                        logical_overlap
+                        && runs[r].disp != runs[selected].disp
+                        && (runs[r].independently_identified
+                            || runs[selected].independently_identified);
+                    const bool physical_conflict =
+                        physical_overlap
+                        && runs[r].disp != runs[selected].disp;
+
+                    if (physical_conflict
+                        || (logical_overlap
+                            && runs[r].disp != runs[selected].disp
+                            && !positioned_arbitration)) {
                         overlaps = true;
                         break;
                     }
@@ -31250,11 +36797,14 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
     }
     if (have_seeded_combination
         && elf_solve_and_validate_relocated_runs(
-               candidate, runs, nruns, active, delta, blocks, header_actual,
-               file_size, cid, solved, mapping,
+               candidate, filestate, runs, nruns, active, delta, blocks,
+               header_actual, file_size, cid, solved, mapping, baseline,
+               positioned_displacement, positioned_status,
                &validation_trials)) {
         elf_consider_relocated_solution(
             solved, nruns, active, mapping, blocks,
+            header_actual, positioned_displacement,
+            positioned_status,
             &have_accepted, &accepted_rank, best_solved,
             best_active, best_mapping);
     }
@@ -31290,14 +36840,17 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             active[observed_run] = true;
 
             if (!elf_solve_and_validate_relocated_runs(
-                    candidate, runs, nruns, active, delta, blocks,
-                    header_actual, file_size, cid, solved, mapping,
+                    candidate, filestate, runs, nruns, active, delta, blocks,
+                    header_actual, file_size, cid, solved, mapping, baseline,
+                    positioned_displacement, positioned_status,
                     &validation_trials)) {
                 continue;
             }
 
             elf_consider_relocated_solution(
                 solved, nruns, active, mapping, blocks,
+                header_actual, positioned_displacement,
+                positioned_status,
                 &have_accepted, &accepted_rank, best_solved,
                 best_active, best_mapping);
         }
@@ -31323,17 +36876,21 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
 
         memset(active, 0, nruns * sizeof(*active));
         active[r] = true;
-        if (!elf_solve_relocated_runs(candidate, runs, nruns, active,
-                                      delta, blocks, header_actual,
+        if (!elf_solve_relocated_runs(candidate, filestate,
+                                      runs, nruns, active,
+                                      delta, blocks, header_actual, baseline,
                                       solved, mapping)) {
             continue;
         }
 
         validation_trials++;
-        if (elf_validate_relocated_mapping(candidate, mapping, blocks,
-                                           file_size, cid, false, NULL)) {
+        if (elf_validate_relocated_mapping(candidate, filestate, mapping,
+                                           blocks, file_size, cid, false,
+                                           NULL)) {
             elf_consider_relocated_solution(
                 solved, nruns, active, mapping, blocks,
+                header_actual, positioned_displacement,
+                positioned_status,
                 &have_accepted, &accepted_rank, best_solved,
                 best_active, best_mapping);
         }
@@ -31356,10 +36913,7 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         bool run_accepted = false;
 
         for (;;) {
-            for (uint64_t i = 0; i < blocks; i++) {
-                mapping[i] =
-                    elf_relocated_apparent_block(header_actual, i, 0);
-            }
+            memcpy(mapping, baseline, blocks * sizeof(*mapping));
             for (uint64_t i = trial_lo; i <= trial_hi; i++) {
                 mapping[i] = elf_relocated_apparent_block(
                     header_actual, i, runs[r].disp);
@@ -31369,7 +36923,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
 
             validation_trials++;
             if (elf_validate_relocated_mapping(
-                    candidate, mapping, blocks, file_size, cid, false,
+                    candidate, filestate, mapping, blocks, file_size, cid,
+                    false,
                     &first_bad)) {
                 const double *run_delta = delta + r * blocks;
                 double placement_gain = 0.0;
@@ -31393,6 +36948,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
                 solved[r].right_gain = 0.0;
                 elf_consider_relocated_solution(
                     solved, nruns, active, mapping, blocks,
+                    header_actual, positioned_displacement,
+                    positioned_status,
                     &have_accepted, &accepted_rank, best_solved,
                     best_active, best_mapping);
                 break;
@@ -31418,17 +36975,21 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
 
         memset(active, 0, nruns * sizeof(*active));
         active[r] = true;
-        if (!elf_solve_relocated_runs(candidate, runs, nruns, active,
-                                      delta, blocks, header_actual,
+        if (!elf_solve_relocated_runs(candidate, filestate,
+                                      runs, nruns, active,
+                                      delta, blocks, header_actual, baseline,
                                       solved, mapping)) {
             continue;
         }
 
         validation_trials++;
-        if (elf_validate_relocated_mapping(candidate, mapping, blocks,
-                                           file_size, cid, false, NULL)) {
+        if (elf_validate_relocated_mapping(candidate, filestate, mapping,
+                                           blocks, file_size, cid, false,
+                                           NULL)) {
             elf_consider_relocated_solution(
                 solved, nruns, active, mapping, blocks,
+                header_actual, positioned_displacement,
+                positioned_status,
                 &have_accepted, &accepted_rank, best_solved,
                 best_active, best_mapping);
         }
@@ -31449,10 +37010,7 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             continue;
         }
 
-        for (uint64_t i = 0; i < blocks; i++) {
-            mapping[i] =
-                elf_relocated_apparent_block(header_actual, i, 0);
-        }
+        memcpy(mapping, baseline, blocks * sizeof(*mapping));
         for (uint64_t i = runs[r].anchor_lo;
              i <= runs[r].anchor_hi; i++) {
             mapping[i] = elf_relocated_apparent_block(
@@ -31460,8 +37018,9 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         }
 
         validation_trials++;
-        if (elf_validate_relocated_mapping(candidate, mapping, blocks,
-                                           file_size, cid, false, NULL)) {
+        if (elf_validate_relocated_mapping(candidate, filestate, mapping,
+                                           blocks, file_size, cid, false,
+                                           NULL)) {
             const double *run_delta = delta + r * blocks;
             double trial_gain = runs[r].independent_gain;
 
@@ -31481,6 +37040,8 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             solved[r].right_gain = 0.0;
             elf_consider_relocated_solution(
                 solved, nruns, active, mapping, blocks,
+                header_actual, positioned_displacement,
+                positioned_status,
                 &have_accepted, &accepted_rank, best_solved,
                 best_active, best_mapping);
         }
@@ -31499,8 +37060,9 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             goto done;
         }
         const bool solved_ok =
-            elf_solve_relocated_runs(candidate, runs, nruns, active,
-                                     delta, blocks, header_actual,
+            elf_solve_relocated_runs(candidate, filestate,
+                                     runs, nruns, active,
+                                     delta, blocks, header_actual, baseline,
                                      solved, mapping);
 
         if (solved_ok) {
@@ -31511,11 +37073,14 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
                 || elf_relocated_solution_is_better(
                        &trial_rank, &accepted_rank)) {
                 validation_trials++;
-                if (elf_validate_relocated_mapping(candidate, mapping, blocks,
+                if (elf_validate_relocated_mapping(candidate, filestate,
+                                                   mapping, blocks,
                                                    file_size, cid, true,
                                                    NULL)) {
                     elf_consider_relocated_solution(
                         solved, nruns, active, mapping, blocks,
+                        header_actual, positioned_displacement,
+                        positioned_status,
                         &have_accepted, &accepted_rank, best_solved,
                         best_active, best_mapping);
                 }
@@ -31591,8 +37156,9 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         memset(active, 0, nruns * sizeof(*active));
         active[singleton] = true;
 
-        if (!elf_solve_relocated_runs(candidate, runs, nruns, active,
-                                      delta, blocks, header_actual,
+        if (!elf_solve_relocated_runs(candidate, filestate,
+                                      runs, nruns, active,
+                                      delta, blocks, header_actual, baseline,
                                       solved, mapping)) {
             continue;
         }
@@ -31607,10 +37173,13 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
         }
 
         validation_trials++;
-        if (elf_validate_relocated_mapping(candidate, mapping, blocks,
-                                           file_size, cid, false, NULL)) {
+        if (elf_validate_relocated_mapping(candidate, filestate, mapping,
+                                           blocks, file_size, cid, false,
+                                           NULL)) {
             elf_consider_relocated_solution(
                 solved, nruns, active, mapping, blocks,
+                header_actual, positioned_displacement,
+                positioned_status,
                 &have_accepted, &accepted_rank, best_solved,
                 best_active, best_mapping);
         }
@@ -31672,10 +37241,21 @@ static bool elf_try_relocated_run_completion(ThreadWork *work,
             run->anchor_gain, run->left_gain, run->right_gain);
     }
 
+    const bool ooo_transitions_positioned =
+        elf_relocated_mapping_transitions_positioned(
+            best_mapping, blocks, header_actual,
+            best_solved, nruns, best_active,
+            positioned_displacement, positioned_status,
+            NULL, NULL);
+
     filestate->complete_mapping_verified = true;
+    filestate->complete_mapping_ooo_transitions_positioned =
+        ooo_transitions_positioned;
     result = true;
 
 done:
+    free(positioned_status);
+    free(positioned_displacement);
     free(base_affinity);
     free(best_active);
     free(active);
@@ -31683,6 +37263,7 @@ done:
     free(solved);
     free(best_mapping);
     free(mapping);
+    free(baseline);
     free(delta);
     free(runs);
     return result;
@@ -31693,6 +37274,7 @@ static inline void elf_reset_reopened_layout(CarveInfo *candidate,
                                              FileState *filestate)
 {
     filestate->complete_mapping_verified = false;
+    filestate->complete_mapping_ooo_transitions_positioned = false;
     normalize_blockvector(candidate->b);
     inflate_blockvector(candidate->b);
     elf_clear_scan_and_seed_state(filestate);
@@ -31729,22 +37311,24 @@ static inline uint64_t elf_reopen_rejected_layout(CarveInfo *candidate,
             first = 1;
         }
     }
-    if (first + 1 >= blocks) {
+    if (first >= blocks) {
         return 0;
     }
 
     uint64_t cleared = 0;
 
-    // clear localized high-entropy text contradictions first. This preserves
-    // correct later placements and presents the final text-fragment matcher
-    // with the actual logical hole instead of an unnecessarily broad suffix.
-    for (uint64_t i = first; i + 1 < blocks; i++) {
+    // Clear directly contradicted slots first, then reopen the remaining
+    // unverified suffix. A displaced run can leave plausible bytes shifted
+    // into neighboring slots, so retaining those placements would preserve
+    // the rejected layout.
+    for (uint64_t i = first; i < blocks; i++) {
         const int64_t apparent =
             blockvector_get_apparent_blocknumber(candidate->b, i);
 
         if (apparent < 0
-            || !elf_layout_slot_contradicts(candidate, filestate, i,
-                                            scalpel_state.blocksize)) {
+            || !elf_layout_slot_requires_reassembly(
+                   candidate, filestate, i,
+                   scalpel_state.blocksize)) {
             continue;
         }
 
@@ -31756,6 +37340,10 @@ static inline uint64_t elf_reopen_rejected_layout(CarveInfo *candidate,
         if (elf_actual_block_entropy(scalpel_state.filemirror, actual,
                                      scalpel_state.blocksize, &entropy)
             && entropy >= ELF_LAYOUT_HIGH_ENTROPY) {
+            if (!filemirror_actual_block_covered(
+                    scalpel_state.filemirror, actual)) {
+                blockvector_remove_choice(candidate->b, i, apparent);
+            }
             ELF_DEBUG_SET_APPARENT(candidate, i, -1);
             cleared++;
         }
@@ -31766,7 +37354,7 @@ static inline uint64_t elf_reopen_rejected_layout(CarveInfo *candidate,
         return cleared;
     }
 
-    for (uint64_t i = first; i + 1 < blocks; i++) {
+    for (uint64_t i = first; i < blocks; i++) {
         const int64_t apparent =
             blockvector_get_apparent_blocknumber(candidate->b, i);
         if (apparent < 0) {
@@ -31800,6 +37388,14 @@ static inline uint64_t elf_reopen_rejected_layout(CarveInfo *candidate,
         }
 
         if (!keep) {
+            const int64_t actual = filemirror_actual_blocknumber(
+                scalpel_state.filemirror, apparent);
+
+            if (actual >= 0
+                && !filemirror_actual_block_covered(
+                       scalpel_state.filemirror, actual)) {
+                blockvector_remove_choice(candidate->b, i, apparent);
+            }
             ELF_DEBUG_SET_APPARENT(candidate, i, -1);
             cleared++;
         }
@@ -32196,7 +37792,6 @@ static inline bool preview_score_seed(CarveInfo           *candidate,
     const char *cand_id =
         carvehashkey_fp_hex(candidate ? (const char *)candidate->carvehashkey : NULL,
                             cand_id_buf, sizeof(cand_id_buf));
-
     const ElfTunables sp = params_opt ? *params_opt : default_tunables();
 
     memset(out, 0, sizeof(*out));
@@ -32310,6 +37905,7 @@ static inline bool preview_score_seed(CarveInfo           *candidate,
 
             if ((exp_mask & obs_mask) == 0) {
                 free(block_data);
+                elf_free_block_state((void **)&observed);
                 out->stop_reason = PREVIEW_STOP_MASK_INCOMPATIBLE;
                 out->stop_bv = bv;
                 out->stop_ap = ap;
@@ -32329,6 +37925,7 @@ static inline bool preview_score_seed(CarveInfo           *candidate,
             /* Strict “Case A hard stop” */
             if (exp_nonunk != 0 && observed_all_unknown) {
                 free(block_data);
+                elf_free_block_state((void **)&observed);
                 out->stop_reason = PREVIEW_STOP_ALL_UNKNOWN_FOR_KNOWN_EXPECTED;
                 out->stop_bv = bv;
                 out->stop_ap = ap;
@@ -32364,6 +37961,7 @@ static inline bool preview_score_seed(CarveInfo           *candidate,
 
                     if (!dual_ok) {
                         free(block_data);
+                        elf_free_block_state((void **)&observed);
                         out->stop_reason = PREVIEW_STOP_MASK_INCOMPATIBLE;
                         out->stop_bv = bv;
                         out->stop_ap = ap;
@@ -32396,6 +37994,7 @@ static inline bool preview_score_seed(CarveInfo           *candidate,
         {
             const double tau_boundary = sp.tau_boundary;
             if (step == 0 && p < tau_boundary) {
+                elf_free_block_state((void **)&observed);
                 out->stop_reason = PREVIEW_STOP_P_BELOW_STOP;
                 out->stop_bv = bv;
                 out->stop_ap = ap;
@@ -32420,6 +38019,7 @@ static inline bool preview_score_seed(CarveInfo           *candidate,
 #endif
 
         /* Stop rule: p below preview threshold */
+        elf_free_block_state((void **)&observed);
         if (p_stop > 0.0 && p < p_stop) {
             out->stop_reason = PREVIEW_STOP_P_BELOW_STOP;
             out->stop_bv = bv;
@@ -32942,7 +38542,9 @@ static inline int64_t elf_next_seed_in_window_ring_nomut(BlockVector *bv,
  * @param[in,out] ss       Seed search state containing the top-M array and
  *                         current count. No-op if NULL.
  * @param[in]     ap_seed  Apparent block number of the seed candidate.
- * @param[in]     score    Composite score used for ranking. Higher is better.
+ * @param[in]     score    Structural score used for ranking. Higher is better.
+ * @param[in]     confidence File type confidence for the seed block.
+ * @param[in]     reservations Number of active reservations for the seed block.
  * @param[in]     pr       Preview result from which @c avg_p, @c tail_p,
  *                         @c run_len, and @c boundary_hit are copied into
  *                         the stored entry. No-op if NULL.
@@ -32950,12 +38552,17 @@ static inline int64_t elf_next_seed_in_window_ring_nomut(BlockVector *bv,
 static inline void elf_seed_topm_insert(ElfSeedSearchState *ss,
                                         uint64_t ap_seed,
                                         double score,
+                                        BlockValidationDecision confidence,
                                         int64_t reservations,
                                         const PreviewResult *pr)
 {
     if (!ss || !pr) {
         return;
     }
+
+    // Another candidate's tentative claim is not contrary content evidence.
+    // Use reservations only to break ties between equally scored previews.
+    score += elf_block_selection_adjustment(confidence, 0);
 
     const uint32_t M = (uint32_t)((ss->top_count < ELF_SEED_TOPM_MAX) ? (ELF_SEED_TOPM_MAX) : ELF_SEED_TOPM_MAX);
     (void)M;
@@ -33229,6 +38836,44 @@ static ElfChoiceResult elf_reassembly_get_block_choice(int                  id,
         ss->fallback_confidence = BLOCK_CONFIDENCE_INVALID;
         ss->fallback_reservations = INT64_MAX;
 
+        // Deduplicated enumeration returns only exemplar blocks. Preserve an
+        // uncovered physical duplicate at the predicted position as the
+        // evidence-free fallback so repeated data remains recoverable without
+        // expanding the full search to every duplicate block.
+        {
+            const int64_t physical_ap = (int64_t)ap_pred;
+            const int64_t physical_actual = filemirror_actual_blocknumber(
+                scalpel_state.filemirror, physical_ap);
+            const int64_t physical_exemplar =
+                physical_actual >= 0
+                    ? filemirror_get_exemplar(scalpel_state.filemirror,
+                                              physical_actual)
+                    : -1;
+
+            if (physical_actual >= 0
+                && physical_exemplar >= 0
+                && physical_actual != physical_exemplar
+                && !apparent_block_in_blockvector(candidate->b, physical_ap)
+                && !filemirror_actual_block_covered(
+                       scalpel_state.filemirror, physical_actual)
+                && !blockvector_choice_is_excluded(
+                       candidate->b, slot_bv_index, physical_ap)
+                && !elf_layout_apparent_slot_has_anchor_conflict(
+                       candidate, filestate, slot_bv_index,
+                       scalpel_state.blocksize, physical_ap)) {
+                ss->fallback_valid = 1;
+                ss->fallback_ap = ap_pred;
+                ss->fallback_confidence = filemirror_get_blocktype(
+                    scalpel_state.filemirror, physical_actual,
+                    candidate->needleidx);
+                ss->fallback_reservations =
+                    scalpel_state.reservations
+                        ? filemirror_actual_block_reserved(
+                              scalpel_state.filemirror, physical_actual)
+                        : 0;
+            }
+        }
+
         filestate->elf_scan_slot    = slot_bv_index;
         filestate->elf_scan_scanned = 0;
         filestate->elf_scan_N       = (uint64_t)last_apparent;
@@ -33310,6 +38955,17 @@ static ElfChoiceResult elf_reassembly_get_block_choice(int                  id,
                                                actual)) {
             continue;
         }
+        const bool anchor_conflict =
+            elf_layout_apparent_slot_has_anchor_conflict(
+                candidate, filestate, slot_bv_index,
+                scalpel_state.blocksize, ap_seed);
+        if (anchor_conflict
+            || elf_relocation_slot_conflicts(candidate, filestate,
+                                             slot_bv_index,
+                                             scalpel_state.blocksize,
+                                             ap_seed, NULL)) {
+            continue;
+        }
 
         const int64_t reserved =
             scalpel_state.reservations
@@ -33317,8 +38973,11 @@ static ElfChoiceResult elf_reassembly_get_block_choice(int                  id,
                                                    actual)
                 : 0;
 
-        if (!ss->fallback_valid
-            || reserved < ss->fallback_reservations) {
+        // The ring visits blocks nearest the predicted physical position
+        // first. Preserve that first legal block for the evidence-free
+        // fallback. Structural previews rank stronger candidates by content
+        // evidence and reservation pressure above.
+        if (!ss->fallback_valid) {
             ss->fallback_valid = 1;
             ss->fallback_ap = (uint64_t)ap_seed;
             ss->fallback_confidence = confidence;
@@ -33420,8 +39079,8 @@ static ElfChoiceResult elf_reassembly_get_block_choice(int                  id,
                 pr_best.tail_p);
 #endif
 
-            elf_seed_topm_insert(ss, (uint64_t)ap_seed, score, reserved,
-                                 &pr_best);
+            elf_seed_topm_insert(ss, (uint64_t)ap_seed, score, confidence,
+                                 reserved, &pr_best);
             carve_put_state(candidate->carvehashkey, filestate);
         }
 
@@ -33492,12 +39151,38 @@ static ElfChoiceResult elf_reassembly_get_block_choice(int                  id,
     // slot's future choices. Merely scoring a block is non-destructive.
     {
         uint64_t final_evaluated = 0;
-        const int64_t final_choice =
-            best_seed < (uint64_t)last_apparent
-                ? blockvector_get_choice(candidate->b, slot_bv_index,
-                                         (int64_t)best_seed, 1,
-                                         &final_evaluated)
-                : -1;
+        int64_t final_choice = -1;
+
+        if (!preview_choice && best_seed < (uint64_t)last_apparent) {
+            const int64_t physical_ap = (int64_t)best_seed;
+            const int64_t physical_actual = filemirror_actual_blocknumber(
+                scalpel_state.filemirror, physical_ap);
+            const int64_t physical_exemplar =
+                physical_actual >= 0
+                    ? filemirror_get_exemplar(scalpel_state.filemirror,
+                                              physical_actual)
+                    : -1;
+
+            if (physical_actual >= 0
+                && physical_exemplar >= 0
+                && physical_actual != physical_exemplar
+                && !apparent_block_in_blockvector(candidate->b, physical_ap)
+                && !filemirror_actual_block_covered(
+                       scalpel_state.filemirror, physical_actual)
+                && !blockvector_choice_is_excluded(
+                       candidate->b, slot_bv_index, physical_ap)
+                && !elf_layout_apparent_slot_has_anchor_conflict(
+                       candidate, filestate, slot_bv_index,
+                       scalpel_state.blocksize, physical_ap)) {
+                final_choice = physical_ap;
+            }
+        }
+
+        if (final_choice < 0 && best_seed < (uint64_t)last_apparent) {
+            final_choice = blockvector_get_choice(
+                candidate->b, slot_bv_index, (int64_t)best_seed, 1,
+                &final_evaluated);
+        }
 
         if (final_choice != (int64_t)best_seed) {
             elf_clear_scan_and_seed_state(filestate);
@@ -33656,6 +39341,11 @@ gallop_score_block_as_strong(int                  id,
 
     const int64_t ac = filemirror_actual_blocknumber(scalpel_state.filemirror, ap);
     if (ac < 0) return false;
+
+    if (elf_relocation_slot_conflicts(candidate, filestate, (uint64_t)bv_i64,
+                                      scalpel_state.blocksize, ap, NULL)) {
+        return false;
+    }
 
     char hashkey[BLOCK_HASH_KEY_SIZE];
     gen_block_hash_key(hashkey, candidate->needleidx, ac);
@@ -33885,7 +39575,7 @@ static inline void elf_record_gallop_resume(FileState *fs,
  *    (equals @p tau_place).
  *  - @c tau_continue: minimum score to continue committing once a run has
  *    started (@c tau_enter - @c sp.gallop_tau_hyst).
- *  - @c tau_stop: score below which the walk stops unconditionally
+ *  - @c tau_stop: lower score band for provisional weak placements
  *    (@c tau_continue - @c sp.gallop_tau_stop_margin).
  *
  * **Per-step logic**
@@ -33896,8 +39586,8 @@ static inline void elf_record_gallop_resume(FileState *fs,
  *  2. Skips UNKNOWN-only expected slots (no scoring, no placement, streak
  *     reset).
  *  3. Rejects duplicate APs already present in the block vector, invalid
- *     or covered actual blocks, and blocks with no evidence for a
- *     known-expected slot.
+ *     or covered actual blocks, malformed relocation records, and blocks with
+ *     no evidence for a known-expected slot.
  *  4. Scores the block via @c compute_block_logit_for_section, fetching raw
  *     block data only for section types that require it.
  *  5. Classifies the score as **strong** (>= @c tau_active), **weak**
@@ -33905,7 +39595,7 @@ static inline void elf_record_gallop_resume(FileState *fs,
  *
  * **Staging and commitment**
  *
- * Weak blocks are not committed immediately; instead they are held in a
+ * Non-strong blocks are not committed immediately; instead they are held in a
  * staging buffer of up to @c sp.weak_streak_max entries. If a subsequent
  * strong block is encountered:
  *  - Each staged block is re-validated (section mask compatibility checked
@@ -34165,6 +39855,13 @@ static uint64_t elf_reassembly_gallop(int                  id,
                 "[%s][ELF-gallop][STOP] actual covered step=%" PRIu64 " ap=%" PRId64 " ac=%" PRId64 " bv=%" PRId64 "\n",
                 cand_id, steps, ap, ac, bv_i64);
 #endif
+            break;
+        }
+
+        // Contradictory relocation records cannot be rescued by a later
+        // strong model match, including in mixed code/table blocks.
+        if (elf_relocation_slot_conflicts(candidate, filestate, (uint64_t)bv_i64,
+                                          scalpel_state.blocksize, ap, NULL)) {
             break;
         }
 
@@ -34868,43 +40565,6 @@ typedef struct {
     uint64_t len;
 } ElfTextHole;
 
-typedef struct {
-    uint64_t ap_start;
-    uint64_t len;
-} ElfTextFragment;
-
-
-typedef struct {
-    uint16_t machine;
-    bool file_is_le;
-    SegmentInfo *segments;
-    size_t num_segments;
-    uint64_t file_size;
-    uint64_t *function_starts;
-    size_t num_function_starts;
-    ElfFrameTarget *frame_targets;
-    size_t num_frame_targets;
-} ElfTextBranchEvidence;
-
-
-typedef struct {
-    uint64_t branches;
-    uint64_t matches;
-    uint64_t executable_matches;
-    uint64_t exact_matches;
-    uint64_t file_references;
-    uint64_t file_reference_matches;
-    double lower;
-    double upper;
-    double executable_lower;
-    double executable_upper;
-    double exact_lower;
-    double exact_upper;
-    double file_reference_lower;
-    double file_reference_upper;
-    bool usable;
-} ElfTextBranchScore;
-
 
 static bool
 elf_text_add_signed_offset(uint64_t base, int64_t displacement, uint64_t *out)
@@ -35071,7 +40731,9 @@ elf_text_has_function_start(const ElfTextBranchEvidence *evidence, uint64_t va)
     size_t lo = 0;
     size_t hi;
 
-    if (!evidence || !evidence->function_starts) return false;
+    if (!evidence) {
+        return false;
+    }
     hi = evidence->num_function_starts;
 
     while (lo < hi) {
@@ -35086,8 +40748,27 @@ elf_text_has_function_start(const ElfTextBranchEvidence *evidence, uint64_t va)
         }
     }
 
-    return lo < evidence->num_function_starts
-           && evidence->function_starts[lo] == va;
+    if (lo < evidence->num_function_starts
+        && evidence->function_starts[lo] == va) {
+        return true;
+    }
+
+    // Linker stubs are valid call destinations even when unwind tables and
+    // symbols describe only application functions.
+    uint64_t offset;
+    if (evidence->include_linkage_stubs && evidence->layout
+        && elf_text_va_to_file_offset(evidence, va, &offset)) {
+        for (size_t i = 0; i < evidence->layout->num_components; i++) {
+            const FileComponent *component = &evidence->layout->components[i];
+            if (component->type == COMPONENT_SECTION
+                && component->section == SECTION_PLT
+                && offset >= component->fileOffset
+                && offset - component->fileOffset < component->size) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 
@@ -35098,7 +40779,1183 @@ elf_text_branch_evidence_release(ElfTextBranchEvidence *evidence)
     free(evidence->segments);
     free(evidence->function_starts);
     free(evidence->frame_targets);
+    free(evidence->code_anchors);
+    free(evidence->code_boundaries);
+    free(evidence->mips_pdr_records);
     memset(evidence, 0, sizeof(*evidence));
+}
+
+
+typedef struct {
+    uint64_t offset;
+    uint64_t code_alignment;
+    uint8_t fde_encoding;
+    bool x86_entry_cfa;
+    bool arm_entry_cfa;
+} ElfEhFrameCie;
+
+static bool elf_code_anchor_append(ElfTextBranchEvidence *evidence,
+                                    const ElfCodeAnchor *anchor);
+static bool elf_code_boundary_append(ElfTextBranchEvidence *evidence,
+                                     const ElfCodeBoundary *boundary);
+static int elf_code_boundary_compare(const void *left, const void *right);
+static size_t elf_x86_prologue_instruction_length(const uint8_t *data,
+                                                  size_t available);
+static bool elf_code_boundary_conflicts(const ElfCodeBoundary *boundary,
+                                        const uint8_t *actual);
+static bool elf_text_code_boundaries_disagree(CarveInfo *candidate,
+                                              const ElfTextBranchEvidence *evidence,
+                                              uint64_t slot, int64_t trial_apparent);
+static bool elf_code_anchor_matches(const ElfCodeAnchor *anchor,
+                                     const uint8_t *actual);
+static ElfCodeAnchorResult elf_code_anchor_evaluate(
+    const ElfCodeAnchor *anchor, const uint8_t *actual);
+static bool elf_eh_frame_arm_stack_return(CarveInfo *candidate,
+                                          const uint8_t *data,
+                                          uint64_t value_position,
+                                          uint64_t record_end,
+                                          const ElfEhFrameCie *cie,
+                                          uint64_t function_va,
+                                          ElfTextBranchEvidence *evidence);
+static bool elf_eh_frame_advance(const uint8_t *data, uint64_t *position,
+                                 uint64_t end, uint64_t alignment,
+                                 uint64_t *advance);
+static bool elf_eh_frame_arm_code_anchor(CarveInfo *candidate,
+                                        const uint8_t *data,
+                                        uint64_t value_position,
+                                        uint64_t record_end,
+                                        const ElfEhFrameCie *cie,
+                                        uint64_t function_va,
+                                        ElfTextBranchEvidence *evidence);
+
+
+static bool
+elf_eh_frame_skip_encoded_value(const uint8_t *data,
+                                uint64_t *position,
+                                uint64_t end,
+                                uint8_t encoding,
+                                bool is_64)
+{
+    const uint8_t format = encoding & 0x0fu;
+    uint64_t width = 0;
+
+    if (!data || !position || *position > end) {
+        return false;
+    }
+    if (encoding == 0xffu) {
+        return true;
+    }
+    if ((encoding & 0x70u) == 0x50u) {
+        return false;
+    }
+
+    switch (format) {
+        case 0x00:
+            width = is_64 ? sizeof(uint64_t) : sizeof(uint32_t);
+            break;
+        case 0x01:
+        case 0x09: {
+            uint64_t ignored = 0;
+
+            return elf_validate_uleb((const char *)data, position, end,
+                                     &ignored);
+        }
+        case 0x02:
+        case 0x0a:
+            width = sizeof(uint16_t);
+            break;
+        case 0x03:
+        case 0x0b:
+            width = sizeof(uint32_t);
+            break;
+        case 0x04:
+        case 0x0c:
+            width = sizeof(uint64_t);
+            break;
+        default:
+            return false;
+    }
+
+    if (width > end - *position) {
+        return false;
+    }
+    *position += width;
+    return true;
+}
+
+
+// Extract the FDE pointer encoding from one CIE. Unsupported augmentation
+// fields make this CIE unavailable as positioning evidence without affecting
+// ordinary ELF validation or reassembly.
+static bool
+elf_eh_frame_cie_encoding(const uint8_t *data,
+                          uint64_t body,
+                          uint64_t record_end,
+                          bool is_64,
+                          ElfEhFrameCie *cie)
+{
+    uint64_t position;
+    uint64_t augmentation_start;
+    uint64_t augmentation_end;
+    uint64_t ignored = 0;
+    uint64_t augmentation_length = 0;
+    uint64_t augmentation_data_end;
+    uint8_t version;
+    uint64_t code_alignment = 0;
+    uint64_t return_register = UINT64_MAX;
+    bool data_alignment_is_minus_eight = false;
+
+    if (cie) {
+        cie->x86_entry_cfa = false;
+        cie->arm_entry_cfa = false;
+        cie->code_alignment = 0;
+        cie->fde_encoding = 0;
+    }
+
+    if (!data || !cie || body > record_end
+        || record_end - body < 6) {
+        return false;
+    }
+
+    position = body + sizeof(uint32_t);
+    version = data[position++];
+    if (version < 1 || version > 4) {
+        return false;
+    }
+
+    augmentation_start = position;
+    while (position < record_end && data[position] != 0) {
+        position++;
+    }
+    if (position >= record_end) {
+        return false;
+    }
+    augmentation_end = position++;
+
+    if (version == 4) {
+        if (record_end - position < 2
+            || data[position] != (is_64 ? 8 : 4)
+            || data[position + 1] != 0) {
+            return false;
+        }
+        position += 2;
+    }
+    if (augmentation_start == augmentation_end
+        || data[augmentation_start] != 'z') {
+        return true;
+    }
+
+    if (!elf_validate_uleb((const char *)data, &position, record_end,
+                           &code_alignment)) {
+        return false;
+    }
+    const uint64_t data_alignment_position = position;
+    if (!elf_validate_uleb((const char *)data, &position, record_end,
+                            &ignored)) {
+        return false;
+    }
+    data_alignment_is_minus_eight = position == data_alignment_position + 1
+        && data[data_alignment_position] == 0x78u;
+    if (version == 1) {
+        if (position >= record_end) {
+            return false;
+        }
+        return_register = data[position++];
+    }
+    else if (!elf_validate_uleb((const char *)data, &position, record_end,
+                                &return_register)) {
+        return false;
+    }
+    if (!elf_validate_uleb((const char *)data, &position, record_end,
+                           &augmentation_length)
+        || augmentation_length > record_end - position) {
+        return false;
+    }
+    augmentation_data_end = position + augmentation_length;
+
+    for (uint64_t index = augmentation_start + 1;
+         index < augmentation_end; index++) {
+        switch (data[index]) {
+            case 'R':
+                if (position >= augmentation_data_end) {
+                    return false;
+                }
+                cie->fde_encoding = data[position++];
+                break;
+            case 'L':
+                if (position >= augmentation_data_end) {
+                    return false;
+                }
+                position++;
+                break;
+            case 'P': {
+                if (position >= augmentation_data_end) {
+                    return false;
+                }
+                const uint8_t personality_encoding = data[position++];
+
+                if (!elf_eh_frame_skip_encoded_value(
+                        data, &position, augmentation_data_end,
+                        personality_encoding, is_64)) {
+                    return false;
+                }
+                break;
+            }
+            case 'S':
+            case 'B':
+            case 'G':
+                break;
+            default:
+                return false;
+        }
+    }
+
+    // Recognize canonical entry states only. Other CFI remains usable for
+    // function positioning, but not for these instruction anchors.
+    cie->code_alignment = code_alignment;
+    static const uint8_t entry_cfa[] = {0x0c, 7, 8, 0x90, 1};
+    if (is_64 && (version == 1 || version == 3 || version == 4)
+        && code_alignment == 1 && data_alignment_is_minus_eight
+        && return_register == 16 && position <= augmentation_data_end
+        && sizeof(entry_cfa) <= record_end - augmentation_data_end
+        && memcmp(data + augmentation_data_end, entry_cfa, sizeof(entry_cfa)) == 0) {
+        uint64_t tail = augmentation_data_end + sizeof(entry_cfa);
+        while (tail < record_end && data[tail] == 0) {
+            tail++;
+        }
+        cie->x86_entry_cfa = tail == record_end;
+    }
+    static const uint8_t arm_cfa[] = {0x0c, 31, 0};
+    if (is_64 && (version == 1 || version == 3 || version == 4)
+        && (code_alignment == 1 || code_alignment == 4)
+        && data_alignment_is_minus_eight && return_register == 30
+        && position <= augmentation_data_end
+        && sizeof(arm_cfa) <= record_end - augmentation_data_end
+        && memcmp(data + augmentation_data_end, arm_cfa, sizeof(arm_cfa)) == 0) {
+        uint64_t tail = augmentation_data_end + sizeof(arm_cfa);
+        while (tail < record_end && data[tail] == 0) {
+            tail++;
+        }
+        cie->arm_entry_cfa = tail == record_end;
+    }
+    return position <= augmentation_data_end;
+}
+
+// Append an instruction constraint derived from validated unwind metadata.
+static bool
+elf_code_anchor_append(ElfTextBranchEvidence *evidence,
+                        const ElfCodeAnchor *anchor)
+{
+    if (evidence->num_code_anchors == evidence->code_anchor_capacity) {
+        const size_t capacity = evidence->code_anchor_capacity == 0
+            ? 256 : evidence->code_anchor_capacity * 2;
+        if (capacity < evidence->code_anchor_capacity
+            || capacity > SIZE_MAX / sizeof(*evidence->code_anchors)) {
+            return false;
+        }
+        ElfCodeAnchor *larger = realloc(evidence->code_anchors,
+                                         capacity * sizeof(*larger));
+        if (!larger) {
+            return false;
+        }
+        evidence->code_anchors = larger;
+        evidence->code_anchor_capacity = capacity;
+    }
+    evidence->code_anchors[evidence->num_code_anchors++] = *anchor;
+    return true;
+}
+
+// Store the first CFI row boundary, not an expected opcode or byte sequence.
+static bool
+elf_code_boundary_append(ElfTextBranchEvidence *evidence,
+                          const ElfCodeBoundary *boundary)
+{
+    if (evidence->num_code_boundaries == evidence->code_boundary_capacity) {
+        const size_t capacity = evidence->code_boundary_capacity == 0
+            ? 256 : evidence->code_boundary_capacity * 2;
+        if (capacity < evidence->code_boundary_capacity
+            || capacity > SIZE_MAX / sizeof(*evidence->code_boundaries)) {
+            return false;
+        }
+        ElfCodeBoundary *larger = realloc(evidence->code_boundaries,
+                                           capacity * sizeof(*larger));
+        check_memory_allocation(larger, __LINE__, __FILE__, "ELF code boundaries");
+        evidence->code_boundaries = larger;
+        evidence->code_boundary_capacity = capacity;
+    }
+    evidence->code_boundaries[evidence->num_code_boundaries++] = *boundary;
+    return true;
+}
+
+// Sort constraints by their function entry's file position.
+static int
+elf_code_boundary_compare(const void *left, const void *right)
+{
+    const ElfCodeBoundary *a = left;
+    const ElfCodeBoundary *b = right;
+    return (a->file_offset > b->file_offset) - (a->file_offset < b->file_offset);
+}
+
+// Read one relative CFI location advance. Other location rules are inconclusive.
+static bool
+elf_eh_frame_advance(const uint8_t *data, uint64_t *position,
+                     uint64_t end, uint64_t alignment, uint64_t *advance)
+{
+    if (*position >= end || alignment == 0) {
+        return false;
+    }
+    const uint8_t opcode = data[(*position)++];
+    uint64_t units = 0;
+    if ((opcode & 0xc0u) == 0x40u) {
+        units = opcode & 0x3fu;
+    }
+    else if (opcode >= 0x02u && opcode <= 0x04u) {
+        const unsigned width = 1u << (opcode - 2u);
+        if (width > end - *position) {
+            return false;
+        }
+        for (unsigned byte = 0; byte < width; byte++) {
+            units |= (uint64_t)data[(*position)++] << (8u * byte);
+        }
+    }
+    else {
+        return false;
+    }
+    return units > 0 && !__builtin_mul_overflow(units, alignment, advance);
+}
+
+// Unwind rows that advance by precisely one PUSH instruction and record its
+// stack/register effect supply code anchors without disassembly. Follow only
+// simple stack-pointer prologues; unsupported CFI and epilogues end the scan.
+static bool
+elf_eh_frame_x86_code_anchor(CarveInfo *candidate,
+                             const uint8_t *data,
+                             uint64_t value_position,
+                             uint64_t record_end,
+                             const ElfEhFrameCie *cie,
+                             uint64_t function_va,
+                             ElfTextBranchEvidence *evidence)
+{
+    if (!candidate || !cie || !evidence || !cie->x86_entry_cfa
+        || evidence->machine != EM_X86_64 || !evidence->is_64
+        || !evidence->file_is_le || cie->fde_encoding != 0x1bu
+        || value_position > record_end || record_end - value_position < 8) {
+        return true;
+    }
+    uint32_t extent_raw;
+    memcpy(&extent_raw, data + value_position + 4, sizeof(extent_raw));
+    const uint32_t extent = to_host_endian_32(extent_raw, true);
+    uint64_t position = value_position + 8;
+    uint64_t augmentation_length = 0;
+    if (!elf_validate_uleb((const char *)data, &position, record_end,
+                            &augmentation_length)
+        || augmentation_length > record_end - position) {
+        return true;
+    }
+    position += augmentation_length;
+    static const uint8_t encodings[8] = {0x50, 0x52, 0x51, 0x53, 0x56, 0x57, 0x55, 0x54};
+    uint64_t pc = 0;
+    uint64_t cfa_offset = 8;
+    uint32_t saved_registers = 0;
+
+    while (position < record_end) {
+        while (position < record_end && data[position] == 0) {
+            position++;
+        }
+        if (position == record_end) {
+            break;
+        }
+        uint64_t advance = 0;
+        if (!elf_eh_frame_advance(data, &position, record_end, 1, &advance)
+            || pc >= extent || advance >= extent - pc) {
+            return true;
+        }
+        const uint64_t next_pc = pc + advance;
+        uint64_t next_cfa = cfa_offset;
+        uint64_t saved_offset = 0;
+        unsigned reg = 16;
+        bool cfa_changed = false;
+
+        // Inspect the entire row before deriving an instruction from it.
+        while (position < record_end) {
+            const uint8_t rule = data[position];
+            if ((rule & 0xc0u) == 0x40u || (rule >= 0x02u && rule <= 0x04u)) {
+                break;
+            }
+            position++;
+            if (rule == 0) {
+                continue;
+            }
+            if (rule == 0x0eu && !cfa_changed) {
+                if (!elf_validate_uleb((const char *)data, &position, record_end, &next_cfa)
+                    || next_cfa < cfa_offset) {
+                    return true;
+                }
+                cfa_changed = true;
+            }
+            else if ((rule & 0xc0u) == 0x80u && reg == 16) {
+                reg = rule & 0x3fu;
+                if (reg >= 16 || reg == 7
+                    || !elf_validate_uleb((const char *)data, &position, record_end, &saved_offset)) {
+                    return true;
+                }
+            }
+            else {
+                return true;
+            }
+        }
+
+        // Bound decoding cost to a short prologue. Unsupported or longer
+        // prologues remain inconclusive, and successful decoding is not proof
+        // that a block belongs to this executable.
+        if (pc == 0 && cfa_changed && next_cfa > cfa_offset && next_pc <= 128) {
+            const uint64_t length = extent < next_pc + 15 ? extent : next_pc + 15;
+            uint64_t start = 0;
+            uint64_t last = 0;
+            if (function_va <= UINT64_MAX - (length - 1)
+                && elf_text_va_to_file_offset(evidence, function_va, &start)
+                && elf_text_va_to_file_offset(evidence, function_va + length - 1, &last)
+                && last >= start && last - start == length - 1
+                && start <= evidence->file_size && length <= evidence->file_size - start) {
+                const ElfCodeBoundary boundary = {
+                    .file_offset = start, .boundary = (uint8_t)next_pc,
+                    .length = (uint8_t)length
+                };
+                if (!elf_code_boundary_append(evidence, &boundary)) {
+                    return false;
+                }
+            }
+        }
+        const bool push_row = reg < 16 && cfa_offset <= UINT64_MAX - 8
+            && next_cfa == cfa_offset + 8 && next_cfa % 8 == 0
+            && saved_offset == next_cfa / 8
+            && (saved_registers & (UINT32_C(1) << reg)) == 0;
+        ElfCodeAnchor anchor = {0};
+        bool usable = false;
+        if (push_row) {
+            anchor.length = reg < 8 ? 1 : 2;
+            anchor.bytes[0] = reg < 8 ? encodings[reg] : 0x41;
+            anchor.bytes[1] = reg < 8 ? 0 : 0x50u + reg - 8;
+            usable = advance == anchor.length;
+            if (!usable && pc == 0 && advance == (uint64_t)anchor.length + 4) {
+                uint64_t start = 0;
+                uint8_t prefix[4];
+                static const uint8_t endbr64[4] = {0xf3, 0x0f, 0x1e, 0xfa};
+                usable = elf_text_va_to_file_offset(evidence, function_va, &start)
+                    && read_candidate_bytes(candidate, start, sizeof(prefix), prefix)
+                    && memcmp(prefix, endbr64, sizeof(prefix)) == 0;
+            }
+        }
+        if (usable) {
+            const uint64_t relative = next_pc - anchor.length;
+            if (function_va > UINT64_MAX - relative
+                || !elf_text_va_to_file_offset(evidence, function_va + relative, &anchor.file_offset)
+                || anchor.file_offset > evidence->file_size
+                || anchor.length > evidence->file_size - anchor.file_offset) {
+                return true;
+            }
+            if (!elf_code_anchor_append(evidence, &anchor)) {
+                return false;
+            }
+        }
+        if (reg < 16) {
+            saved_registers |= UINT32_C(1) << reg;
+        }
+        cfa_offset = next_cfa;
+        pc = next_pc;
+    }
+    return true;
+}
+
+// The first ARM64 stack allocation can identify one paired register store.
+// Stop at unsupported rules or a stack change that does not identify a pair.
+static bool
+elf_eh_frame_arm_code_anchor(CarveInfo *candidate,
+                             const uint8_t *data,
+                             uint64_t value_position,
+                             uint64_t record_end,
+                             const ElfEhFrameCie *cie,
+                             uint64_t function_va,
+                             ElfTextBranchEvidence *evidence)
+{
+    if (!candidate || !cie || !evidence || !cie->arm_entry_cfa
+        || evidence->machine != EM_AARCH64 || !evidence->is_64
+        || !evidence->file_is_le || cie->fde_encoding != 0x1bu
+        || (cie->code_alignment != 1 && cie->code_alignment != 4)
+        || function_va % 4 != 0
+        || value_position > record_end || record_end - value_position < 8) {
+        return true;
+    }
+    uint32_t extent_raw;
+    memcpy(&extent_raw, data + value_position + 4, sizeof(extent_raw));
+    const uint32_t extent = to_host_endian_32(extent_raw, true);
+    uint64_t position = value_position + 8;
+    uint64_t augmentation_length = 0;
+    if (!elf_validate_uleb((const char *)data, &position, record_end,
+                            &augmentation_length)
+        || augmentation_length > record_end - position) {
+        return true;
+    }
+    position += augmentation_length;
+    uint64_t pc = 0;
+    while (position < record_end) {
+        while (position < record_end && data[position] == 0) {
+            position++;
+        }
+        uint64_t advance = 0;
+        if (!elf_eh_frame_advance(data, &position, record_end,
+                                  cie->code_alignment, &advance)
+            || advance % 4 != 0 || pc >= extent || advance >= extent - pc) {
+            return true;
+        }
+        uint64_t stack = 0;
+        uint64_t offsets[2] = {0};
+        unsigned regs[2] = {0};
+        unsigned saved = 0;
+        bool cfa_changed = false;
+        bool ra_state_changed = false;
+        while (position < record_end) {
+            const uint8_t rule = data[position];
+            if ((rule & 0xc0u) == 0x40u || (rule >= 0x02u && rule <= 0x04u)) {
+                break;
+            }
+            position++;
+            if (rule == 0) {
+                continue;
+            }
+            if (rule == 0x2du && !ra_state_changed) {
+                ra_state_changed = true;
+            }
+            else if (rule == 0x0eu && !cfa_changed) {
+                if (!elf_validate_uleb((const char *)data, &position, record_end, &stack)) {
+                    return true;
+                }
+                cfa_changed = true;
+            }
+            else if ((rule & 0xc0u) == 0x80u && saved < 2) {
+                regs[saved] = rule & 0x3fu;
+                if (regs[saved] > 30
+                    || !elf_validate_uleb((const char *)data, &position,
+                                           record_end, &offsets[saved])) {
+                    return true;
+                }
+                saved++;
+            }
+            else {
+                return true;
+            }
+        }
+        if (cfa_changed || saved != 0) {
+            if (!cfa_changed || ra_state_changed || advance != 4 || saved != 2
+                || regs[0] == regs[1] || stack < 16 || stack > 512 || stack % 8 != 0) {
+                return true;
+            }
+            unsigned first;
+            if (offsets[0] == stack / 8 && offsets[1] == stack / 8 - 1) {
+                first = 0;
+            }
+            else if (offsets[1] == stack / 8 && offsets[0] == stack / 8 - 1) {
+                first = 1;
+            }
+            else {
+                return true;
+            }
+            ElfCodeAnchor anchor = {.length = 4, .arm_stack_pair = true};
+            if (function_va > UINT64_MAX - pc
+                || !elf_text_va_to_file_offset(evidence, function_va + pc, &anchor.file_offset)
+                || anchor.file_offset > evidence->file_size
+                || anchor.length > evidence->file_size - anchor.file_offset) {
+                return true;
+            }
+            const uint32_t word = UINT32_C(0xa98003e0)
+                | ((uint32_t)(128 - stack / 8) << 15)
+                | (regs[1 - first] << 10) | regs[first];
+            for (unsigned byte = 0; byte < 4; byte++) {
+                anchor.bytes[byte] = (uint8_t)(word >> (8u * byte));
+            }
+            return elf_code_anchor_append(evidence, &anchor);
+        }
+        pc += advance;
+    }
+    return true;
+}
+
+// Use the first explicit return to the entry stack height. State restoration
+// and unsupported CFA rules end the scan rather than implying an instruction.
+static bool
+elf_eh_frame_arm_stack_return(CarveInfo *candidate,
+                               const uint8_t *data,
+                               uint64_t value_position,
+                               uint64_t record_end,
+                               const ElfEhFrameCie *cie,
+                               uint64_t function_va,
+                               ElfTextBranchEvidence *evidence)
+{
+    if (!candidate || !data || !cie || !evidence || !cie->arm_entry_cfa
+        || evidence->machine != EM_AARCH64 || !evidence->is_64
+        || !evidence->file_is_le || cie->fde_encoding != 0x1bu
+        || (cie->code_alignment != 1 && cie->code_alignment != 4)
+        || function_va % 4 != 0 || value_position > record_end
+        || record_end - value_position < 8) {
+        return true;
+    }
+    uint32_t extent_raw;
+    memcpy(&extent_raw, data + value_position + 4, sizeof(extent_raw));
+    const uint32_t extent = to_host_endian_32(extent_raw, true);
+    uint64_t position = value_position + 8;
+    uint64_t augmentation_length;
+    if (!elf_validate_uleb((const char *)data, &position, record_end,
+                           &augmentation_length)
+        || augmentation_length > record_end - position) {
+        return true;
+    }
+    position += augmentation_length;
+    uint64_t pc = 0;
+    uint64_t stack = 0;
+    uint64_t return_stack = 0;
+    unsigned row_cfa_updates = 0;
+    while (position < record_end) {
+        const uint8_t rule = data[position];
+        if ((rule & 0xc0u) == 0x40u || (rule >= 2 && rule <= 4)) {
+            if (return_stack != 0) {
+                break;
+            }
+            uint64_t advance;
+            if (!elf_eh_frame_advance(data, &position, record_end,
+                                       cie->code_alignment, &advance)
+                || advance % 4 != 0 || pc > extent || advance > extent - pc) {
+                return true;
+            }
+            pc += advance;
+            row_cfa_updates = 0;
+            continue;
+        }
+        position++;
+        uint64_t operand;
+        if (rule == 0 || rule == 0x0au || rule == 0x2du
+            || (rule & 0xc0u) == 0xc0u) {
+            continue;
+        }
+        if (rule == 0x0eu) {
+            if (++row_cfa_updates != 1
+                || !elf_validate_uleb((const char *)data, &position, record_end,
+                                   &operand)) {
+                return true;
+            }
+            if (operand == 0 && stack > 0) {
+                return_stack = stack;
+            }
+            stack = operand;
+        }
+        else if (rule == 0x0cu || rule == 0x0du) {
+            if (++row_cfa_updates != 1
+                || !elf_validate_uleb((const char *)data, &position, record_end,
+                                   &operand) || operand != 31) {
+                return true;
+            }
+            if (rule == 0x0cu
+                && !elf_validate_uleb((const char *)data, &position, record_end,
+                                      &stack)) {
+                return true;
+            }
+        }
+        else if ((rule & 0xc0u) == 0x80u
+                 || (rule >= 5 && rule <= 9)) {
+            if (!elf_validate_uleb((const char *)data, &position, record_end,
+                                   &operand)) {
+                return true;
+            }
+            if ((rule == 5 || rule == 9)
+                && !elf_validate_uleb((const char *)data, &position, record_end,
+                                      &operand)) {
+                return true;
+            }
+        }
+        else {
+            return true;
+        }
+    }
+    if (return_stack != 0) {
+        ElfCodeAnchor anchor = {.length = 4};
+        if (pc < 4 || return_stack > UINT32_MAX
+            || function_va > UINT64_MAX - (pc - 4)
+            || !elf_text_va_to_file_offset(evidence, function_va + pc - 4,
+                                           &anchor.file_offset)
+            || anchor.file_offset > evidence->file_size
+            || anchor.length > evidence->file_size - anchor.file_offset) {
+            return true;
+        }
+        anchor.arm_stack_return = (uint32_t)return_stack;
+        return elf_code_anchor_append(evidence, &anchor);
+    }
+    return true;
+}
+
+// Stack-return constraints can be inconclusive after a control transfer or a
+// register-based stack adjustment. Neither is positive identity evidence.
+static ElfCodeAnchorResult
+elf_code_anchor_evaluate(const ElfCodeAnchor *anchor, const uint8_t *actual)
+{
+    if (!anchor || !actual || anchor->length == 0 || anchor->length > 4) {
+        return ELF_CODE_ANCHOR_INCONCLUSIVE;
+    }
+    if (anchor->arm_stack_return != 0) {
+        if (anchor->length != 4) {
+            return ELF_CODE_ANCHOR_INCONCLUSIVE;
+        }
+        uint32_t word;
+        memcpy(&word, actual, sizeof(word));
+        word = to_host_endian_32(word, true);
+        int64_t adjustment = 0;
+        bool identified = false;
+        if ((word & UINT32_C(0xff8003ff)) == UINT32_C(0x910003ff)) {
+            adjustment = (int64_t)((word >> 10) & 4095u)
+                << ((word & (UINT32_C(1) << 22)) ? 12 : 0);
+            identified = true;
+        }
+        unsigned scale = 0;
+        switch (word & UINT32_C(0xffc003e0)) {
+        case UINT32_C(0x28c003e0):
+        case UINT32_C(0x68c003e0):
+        case UINT32_C(0x2cc003e0):
+            scale = 4;
+            break;
+        case UINT32_C(0xa8c003e0):
+        case UINT32_C(0x6cc003e0):
+            scale = 8;
+            break;
+        case UINT32_C(0xacc003e0):
+            scale = 16;
+            break;
+        }
+        if (scale != 0) {
+            const int64_t immediate = (word >> 15) & 127u;
+            adjustment = (immediate >= 64 ? immediate - 128 : immediate) * scale;
+            identified = true;
+        }
+        if ((word & UINT32_C(0xffe00fe0)) == UINT32_C(0xf84007e0)
+            || (word & UINT32_C(0xffe00fe0)) == UINT32_C(0xfc4007e0)) {
+            const int64_t immediate = (word >> 12) & 511u;
+            adjustment = immediate >= 256 ? immediate - 512 : immediate;
+            identified = true;
+        }
+        if (identified) {
+            return adjustment == anchor->arm_stack_return
+                ? ELF_CODE_ANCHOR_MATCH : ELF_CODE_ANCHOR_MISMATCH;
+        }
+        // Other legal stack adjustments are not decoded here. Missing
+        // decoder coverage cannot contradict the unwind information.
+        return ELF_CODE_ANCHOR_INCONCLUSIVE;
+    }
+    if (memcmp(actual, anchor->bytes, anchor->length) == 0) {
+        return ELF_CODE_ANCHOR_MATCH;
+    }
+    if (!anchor->arm_stack_pair || anchor->length != 4) {
+        return ELF_CODE_ANCHOR_MISMATCH;
+    }
+    uint32_t expected = 0;
+    uint32_t observed = 0;
+    for (unsigned byte = 0; byte < 4; byte++) {
+        expected |= (uint32_t)anchor->bytes[byte] << (8u * byte);
+        observed |= (uint32_t)actual[byte] << (8u * byte);
+    }
+    const uint32_t stack = (128u - ((expected >> 15) & 0x7fu)) * 8u;
+    const uint32_t tagged = UINT32_C(0x69800000) | (expected & 0x7fffu)
+        | ((128u - stack / 16u) << 15);
+    // STGP can save the same pair as STP while also writing allocation tags.
+    return stack % 16u == 0 && observed == tagged
+        ? ELF_CODE_ANCHOR_MATCH : ELF_CODE_ANCHOR_MISMATCH;
+}
+
+static bool
+elf_code_anchor_matches(const ElfCodeAnchor *anchor, const uint8_t *actual)
+{
+    return elf_code_anchor_evaluate(anchor, actual) == ELF_CODE_ANCHOR_MATCH;
+}
+
+static int elf_code_anchor_compare(const void *left, const void *right)
+{
+    const ElfCodeAnchor *a = left;
+    const ElfCodeAnchor *b = right;
+    return a->file_offset < b->file_offset ? -1 : a->file_offset > b->file_offset;
+}
+
+
+static bool
+elf_eh_frame_decode_function_start(const uint8_t *data,
+                                   uint64_t position,
+                                   uint64_t record_end,
+                                   uint8_t encoding,
+                                   bool is_64,
+                                   bool file_is_le,
+                                   uint64_t field_va,
+                                   uint64_t *function_va)
+{
+    const uint8_t application = encoding & 0x70u;
+    const uint8_t format = encoding & 0x0fu;
+    uint64_t unsigned_value = 0;
+    int64_t signed_value = 0;
+    bool value_is_signed = false;
+
+    if (!data || !function_va || encoding == 0xffu
+        || (encoding & 0x80u) != 0
+        || (application != 0x00u && application != 0x10u)) {
+        return false;
+    }
+
+    switch (format) {
+        case 0x00:
+            if (is_64) {
+                uint64_t raw;
+
+                if (sizeof(raw) > record_end - position) {
+                    return false;
+                }
+                memcpy(&raw, data + position, sizeof(raw));
+                unsigned_value = to_host_endian_64(raw, file_is_le);
+            }
+            else {
+                uint32_t raw;
+
+                if (sizeof(raw) > record_end - position) {
+                    return false;
+                }
+                memcpy(&raw, data + position, sizeof(raw));
+                unsigned_value = to_host_endian_32(raw, file_is_le);
+            }
+            break;
+        case 0x03: {
+            uint32_t raw;
+
+            if (sizeof(raw) > record_end - position) {
+                return false;
+            }
+            memcpy(&raw, data + position, sizeof(raw));
+            unsigned_value = to_host_endian_32(raw, file_is_le);
+            break;
+        }
+        case 0x04: {
+            uint64_t raw;
+
+            if (sizeof(raw) > record_end - position) {
+                return false;
+            }
+            memcpy(&raw, data + position, sizeof(raw));
+            unsigned_value = to_host_endian_64(raw, file_is_le);
+            break;
+        }
+        case 0x0b: {
+            uint32_t raw;
+
+            if (sizeof(raw) > record_end - position) {
+                return false;
+            }
+            memcpy(&raw, data + position, sizeof(raw));
+            signed_value = (int32_t)to_host_endian_32(raw, file_is_le);
+            value_is_signed = true;
+            break;
+        }
+        case 0x0c: {
+            uint64_t raw;
+
+            if (sizeof(raw) > record_end - position) {
+                return false;
+            }
+            memcpy(&raw, data + position, sizeof(raw));
+            signed_value = (int64_t)to_host_endian_64(raw, file_is_le);
+            value_is_signed = true;
+            break;
+        }
+        default:
+            return false;
+    }
+
+    if (application == 0x10u) {
+        if (value_is_signed) {
+            return elf_text_add_signed_offset(field_va, signed_value,
+                                              function_va);
+        }
+        if (field_va > UINT64_MAX - unsigned_value) {
+            return false;
+        }
+        *function_va = field_va + unsigned_value;
+        return true;
+    }
+
+    if (value_is_signed) {
+        if (signed_value < 0) {
+            return false;
+        }
+        *function_va = (uint64_t)signed_value;
+    }
+    else {
+        *function_va = unsigned_value;
+    }
+    return true;
+}
+
+
+// Collect exact function starts from a structurally valid .eh_frame section.
+// This covers stripped executables that omit .eh_frame_hdr and symbol tables.
+// Every retained address must map into an executable file backed segment.
+static bool
+elf_collect_eh_frame_function_starts(
+    CarveInfo *candidate,
+    const FileState *filestate,
+    ElfTextBranchEvidence *evidence,
+    uint64_t **out_starts,
+    size_t *out_count)
+{
+    uint64_t *starts = NULL;
+    size_t start_count = 0;
+    size_t start_capacity = 0;
+    bool found_valid_section = false;
+
+    if (out_starts) {
+        *out_starts = NULL;
+    }
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!candidate || !candidate->b || !filestate || !evidence
+        || !out_starts || !out_count) {
+        return false;
+    }
+
+    for (size_t component_index = 0;
+         component_index < filestate->num_components; component_index++) {
+        const FileComponent *component =
+            &filestate->components[component_index];
+        uint64_t component_va = 0;
+
+        if (component->type != COMPONENT_SECTION
+            || component->section != SECTION_EH_FRAME
+            || component->size < 8 || component->size > SIZE_MAX
+            || component->fileOffset > evidence->file_size
+            || component->size
+                   > evidence->file_size - component->fileOffset
+            || !elf_text_file_range_to_va(
+                   evidence, component->fileOffset, component->size,
+                   &component_va)) {
+            continue;
+        }
+
+        uint8_t *data = (uint8_t *)malloc((size_t)component->size);
+
+        if (!data) {
+            free(starts);
+            return false;
+        }
+        if (!read_candidate_bytes(candidate, component->fileOffset,
+                                  component->size, data)) {
+            free(data);
+            continue;
+        }
+
+        const bool need_swap =
+            TARGET_ENDIANNESS == LITTLE
+                ? !evidence->file_is_le
+                : evidence->file_is_le;
+
+        if (!elf_validate_eh_frame((const char *)data, component->size,
+                                   0, component->size, need_swap)) {
+            free(data);
+            continue;
+        }
+        found_valid_section = true;
+
+        const size_t maximum_records =
+            component->size / 8 > SIZE_MAX
+                ? SIZE_MAX
+                : (size_t)(component->size / 8);
+        ElfEhFrameCie *cies = maximum_records == 0
+            ? NULL
+            : (ElfEhFrameCie *)malloc(maximum_records * sizeof(*cies));
+        size_t cie_count = 0;
+        uint64_t position = 0;
+
+        if (maximum_records > 0 && !cies) {
+            free(data);
+            free(starts);
+            return false;
+        }
+
+        while (position <= component->size
+               && component->size - position >= sizeof(uint32_t)) {
+            const uint64_t record_start = position;
+            uint32_t length_raw;
+
+            memcpy(&length_raw, data + position, sizeof(length_raw));
+            const uint32_t record_length =
+                to_host_endian_32(length_raw, evidence->file_is_le);
+
+            if (record_length == 0) {
+                break;
+            }
+            if (record_length == UINT32_MAX) {
+                break;
+            }
+
+            const uint64_t body = position + sizeof(uint32_t);
+            if (record_length < sizeof(uint32_t)
+                || record_length > component->size - body) {
+                break;
+            }
+            const uint64_t record_end = body + record_length;
+            uint32_t id_raw;
+
+            memcpy(&id_raw, data + body, sizeof(id_raw));
+            const uint32_t id =
+                to_host_endian_32(id_raw, evidence->file_is_le);
+
+            if (id == 0) {
+                ElfEhFrameCie parsed = {.offset = record_start};
+
+                if (cie_count < maximum_records
+                    && elf_eh_frame_cie_encoding(
+                           data, body, record_end, evidence->is_64,
+                           &parsed)) {
+                    cies[cie_count++] = parsed;
+                }
+            }
+            else if ((uint64_t)id <= body) {
+                const uint64_t cie_offset = body - (uint64_t)id;
+                const ElfEhFrameCie *cie = NULL;
+
+                for (size_t cie_index = 0;
+                     cie_index < cie_count; cie_index++) {
+                    if (cies[cie_index].offset == cie_offset) {
+                        cie = &cies[cie_index];
+                        break;
+                    }
+                }
+
+                const uint64_t value_position =
+                    body + sizeof(uint32_t);
+                uint64_t field_va = 0;
+                uint64_t function_va = 0;
+
+                if (cie
+                    && component_va <= UINT64_MAX - value_position) {
+                    field_va = component_va + value_position;
+                    if (elf_eh_frame_decode_function_start(
+                            data, value_position, record_end,
+                            cie->fde_encoding, evidence->is_64,
+                            evidence->file_is_le, field_va,
+                            &function_va)
+                        && elf_text_va_is_executable(evidence,
+                                                     function_va)) {
+                        if (start_count == start_capacity) {
+                            const size_t new_capacity =
+                                start_capacity == 0
+                                    ? 256
+                                    : start_capacity * 2;
+
+                            if (new_capacity < start_capacity
+                                || new_capacity
+                                       > SIZE_MAX / sizeof(*starts)) {
+                                free(cies);
+                                free(data);
+                                free(starts);
+                                return false;
+                            }
+                            uint64_t *larger = (uint64_t *)realloc(
+                                starts, new_capacity * sizeof(*starts));
+
+                            if (!larger) {
+                                free(cies);
+                                free(data);
+                                free(starts);
+                                return false;
+                            }
+                            starts = larger;
+                            start_capacity = new_capacity;
+                        }
+                        starts[start_count++] = function_va;
+                        if (!elf_eh_frame_x86_code_anchor(candidate, data,
+                                value_position, record_end, cie, function_va, evidence)
+                            || !elf_eh_frame_arm_code_anchor(candidate, data,
+                                value_position, record_end, cie, function_va, evidence)
+                            || !elf_eh_frame_arm_stack_return(candidate, data,
+                                value_position, record_end, cie, function_va, evidence)) {
+                            free(cies);
+                            free(data);
+                            free(starts);
+                            free(evidence->code_anchors);
+                            evidence->code_anchors = NULL;
+                            evidence->num_code_anchors = 0;
+                            evidence->code_anchor_capacity = 0;
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            position = record_end;
+        }
+
+        free(cies);
+        free(data);
+    }
+
+    if (start_count == 0) {
+        free(starts);
+        return found_valid_section;
+    }
+
+    qsort(starts, start_count, sizeof(*starts), elf_uint64_compare);
+    size_t unique = 1;
+
+    for (size_t index = 1; index < start_count; index++) {
+        if (starts[index] != starts[unique - 1]) {
+            starts[unique++] = starts[index];
+        }
+    }
+
+    if (evidence->num_code_boundaries > 1) {
+        qsort(evidence->code_boundaries, evidence->num_code_boundaries,
+               sizeof(*evidence->code_boundaries), elf_code_boundary_compare);
+        size_t count = 0;
+        for (size_t i = 0; i < evidence->num_code_boundaries;) {
+            const ElfCodeBoundary boundary = evidence->code_boundaries[i++];
+            bool consistent = true;
+            while (i < evidence->num_code_boundaries
+                   && evidence->code_boundaries[i].file_offset == boundary.file_offset) {
+                consistent = consistent
+                    && evidence->code_boundaries[i].boundary == boundary.boundary
+                    && evidence->code_boundaries[i].length == boundary.length;
+                i++;
+            }
+            if (consistent) {
+                evidence->code_boundaries[count++] = boundary;
+            }
+        }
+        evidence->num_code_boundaries = count;
+    }
+    *out_starts = starts;
+    *out_count = unique;
+    if (evidence->num_code_anchors > 1) {
+        qsort(evidence->code_anchors, evidence->num_code_anchors,
+               sizeof(*evidence->code_anchors), elf_code_anchor_compare);
+        size_t count = 0;
+        for (size_t i = 0; i < evidence->num_code_anchors;) {
+            const ElfCodeAnchor anchor = evidence->code_anchors[i++];
+            bool consistent = true;
+            while (i < evidence->num_code_anchors
+                   && evidence->code_anchors[i].file_offset == anchor.file_offset) {
+                consistent = consistent && evidence->code_anchors[i].length == anchor.length
+                    && evidence->code_anchors[i].arm_stack_pair == anchor.arm_stack_pair
+                    && evidence->code_anchors[i].arm_stack_return == anchor.arm_stack_return
+                    && memcmp(evidence->code_anchors[i].bytes, anchor.bytes, anchor.length) == 0;
+                i++;
+            }
+            if (consistent) {
+                evidence->code_anchors[count++] = anchor;
+            }
+        }
+        evidence->num_code_anchors = count;
+    }
+    return true;
 }
 
 
@@ -35148,6 +42005,727 @@ elf_frame_block_match_compare(const void *left, const void *right)
 }
 
 
+static int
+elf_mips_block_match_compare(const void *left, const void *right)
+{
+    const ElfMipsBlockMatch *a =
+        (const ElfMipsBlockMatch *)left;
+    const ElfMipsBlockMatch *b =
+        (const ElfMipsBlockMatch *)right;
+
+    if (a->displacement < b->displacement) {
+        return -1;
+    }
+    if (a->displacement > b->displacement) {
+        return 1;
+    }
+    if (a->logical_block < b->logical_block) {
+        return -1;
+    }
+    if (a->logical_block > b->logical_block) {
+        return 1;
+    }
+    return 0;
+}
+
+
+static int
+elf_uint32_compare(const void *left, const void *right)
+{
+    const uint32_t a = *(const uint32_t *)left;
+    const uint32_t b = *(const uint32_t *)right;
+
+    return (a > b) - (a < b);
+}
+
+
+static int
+elf_uint64_compare(const void *left, const void *right)
+{
+    const uint64_t a = *(const uint64_t *)left;
+    const uint64_t b = *(const uint64_t *)right;
+
+    return (a > b) - (a < b);
+}
+
+
+// A MIPS procedure descriptor ties one aligned metadata record to a function
+// owned by this ELF file. Register and frame fields provide independent
+// structural checks so symbol-table bytes alone cannot mimic a descriptor.
+static bool
+elf_mips_pdr_record_matches(
+    const uint8_t *block,
+    uint64_t block_length,
+    uint64_t block_offset,
+    bool file_is_le,
+    const uint64_t *function_starts,
+    size_t num_function_starts)
+{
+    uint32_t raw[8];
+    uint32_t values[8];
+    size_t lo = 0;
+    size_t hi = num_function_starts;
+
+    if (!block || !function_starts || num_function_starts == 0
+        || block_offset > block_length
+        || sizeof(raw) > block_length - block_offset) {
+        return false;
+    }
+
+    memcpy(raw, block + block_offset, sizeof(raw));
+    for (size_t field = 0;
+         field < sizeof(values) / sizeof(values[0]); field++) {
+        values[field] = to_host_endian_32(raw[field], file_is_le);
+    }
+
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+
+        if (function_starts[mid] < values[0]) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
+        }
+    }
+
+    const int32_t register_offset = (int32_t)values[2];
+    const int32_t floating_register_offset = (int32_t)values[4];
+
+    return lo < num_function_starts
+           && function_starts[lo] == values[0]
+           && values[6] < 32 && values[7] < 32
+           && (values[5] & 7u) == 0
+           && register_offset <= 0
+           && floating_register_offset <= 0
+           && (register_offset & 3) == 0
+           && (floating_register_offset & 3) == 0;
+}
+
+
+// A PDR frame size determines the immediate used by the standard MIPS stack
+// allocation instructions. Searching a short prologue window accommodates
+// entry guards and PIC setup while preserving exact logical positioning.
+static bool
+elf_mips_text_prologue_matches(
+    const uint8_t *block,
+    uint64_t block_length,
+    uint64_t block_offset,
+    uint32_t frame_size,
+    bool file_is_le)
+{
+    if (!block || frame_size == 0 || frame_size > INT16_MAX
+        || (frame_size & 7u) != 0 || block_offset > block_length
+        || sizeof(uint32_t) > block_length - block_offset) {
+        return false;
+    }
+
+    const uint16_t expected_immediate =
+        (uint16_t)(0u - (uint16_t)frame_size);
+
+    for (uint64_t instruction_index = 0;
+         instruction_index < 8; instruction_index++) {
+        const uint64_t instruction_offset =
+            block_offset + instruction_index * sizeof(uint32_t);
+        uint32_t raw;
+
+        if (instruction_offset > block_length
+            || sizeof(raw) > block_length - instruction_offset) {
+            break;
+        }
+        memcpy(&raw, block + instruction_offset, sizeof(raw));
+        const uint32_t instruction =
+            to_host_endian_32(raw, file_is_le);
+        const uint32_t operation = instruction & UINT32_C(0xffff0000);
+
+        if ((operation == UINT32_C(0x27bd0000)
+             || operation == UINT32_C(0x67bd0000))
+            && (uint16_t)instruction == expected_immediate) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+// DW_LNE_set_address records associate a line program with exact executable
+// addresses from this file. They provide ownership evidence for a metadata
+// block adjacent to an independently positioned MIPS procedure table block.
+static uint64_t
+elf_mips_debug_line_address_matches(
+    const uint8_t *block,
+    uint64_t block_length,
+    bool is_64,
+    bool file_is_le,
+    const uint64_t *function_starts,
+    size_t num_function_starts,
+    uint64_t *out_records)
+{
+    const uint64_t address_size =
+        is_64 ? sizeof(uint64_t) : sizeof(uint32_t);
+    const uint8_t extended_length = (uint8_t)(address_size + 1);
+    const uint64_t record_size = 3 + address_size;
+    uint64_t matches = 0;
+
+    if (out_records) {
+        *out_records = 0;
+    }
+
+    if (!block || !function_starts || num_function_starts == 0
+        || block_length < record_size) {
+        return 0;
+    }
+
+    for (uint64_t offset = 0;
+         offset <= block_length - record_size; offset++) {
+        if (block[offset] != 0
+            || block[offset + 1] != extended_length
+            || block[offset + 2] != 2) {
+            continue;
+        }
+        if (out_records) {
+            (*out_records)++;
+        }
+
+        uint64_t address = 0;
+        if (is_64) {
+            uint64_t raw;
+
+            memcpy(&raw, block + offset + 3, sizeof(raw));
+            address = to_host_endian_64(raw, file_is_le);
+        }
+        else {
+            uint32_t raw;
+
+            memcpy(&raw, block + offset + 3, sizeof(raw));
+            address = to_host_endian_32(raw, file_is_le);
+        }
+
+        size_t lo = 0;
+        size_t hi = num_function_starts;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+
+            if (function_starts[mid] < address) {
+                lo = mid + 1;
+            }
+            else {
+                hi = mid;
+            }
+        }
+        if (lo < num_function_starts
+            && function_starts[lo] == address) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
+
+static bool
+elf_mips_append_block_match(
+    ElfMipsBlockMatch **matches,
+    size_t *num_matches,
+    size_t *match_capacity,
+    uint64_t logical_block,
+    int64_t displacement,
+    uint64_t exact_matches,
+    uint64_t exact_trials,
+    double exact_lower,
+    double exact_upper,
+    double competitor_exact_upper)
+{
+    if (!matches || !num_matches || !match_capacity) {
+        return false;
+    }
+
+    if (*num_matches == *match_capacity) {
+        const size_t new_capacity =
+            *match_capacity == 0 ? 16 : *match_capacity * 2;
+
+        if (new_capacity < *match_capacity
+            || new_capacity > SIZE_MAX / sizeof(**matches)) {
+            return false;
+        }
+        ElfMipsBlockMatch *larger =
+            (ElfMipsBlockMatch *)realloc(
+                *matches, new_capacity * sizeof(**matches));
+
+        if (!larger) {
+            return false;
+        }
+        *matches = larger;
+        *match_capacity = new_capacity;
+    }
+
+    (*matches)[(*num_matches)++] = (ElfMipsBlockMatch){
+        .logical_block = logical_block,
+        .displacement = displacement,
+        .exact_matches = exact_matches,
+        .exact_trials = exact_trials,
+        .exact_lower = exact_lower,
+        .exact_upper = exact_upper,
+        .competitor_exact_upper = competitor_exact_upper,
+    };
+    return true;
+}
+
+
+// Collect exact executable function addresses from intact symbol tables. The
+// table is optional evidence: unreadable or incomplete sections are skipped,
+// while every retained address must belong to an executable PT_LOAD segment.
+static bool
+elf_collect_symbol_function_starts(
+    CarveInfo *candidate,
+    bool is_64,
+    bool file_is_le,
+    uint16_t machine,
+    const SegmentInfo *segments,
+    size_t num_segments,
+    uint64_t file_size,
+    uint64_t **out_starts,
+    size_t *out_count,
+    ElfMipsPdrRecord **out_pdr_records,
+    size_t *out_pdr_count,
+    uint64_t *out_pdr_file_offset,
+    uint64_t *out_pdr_size,
+    uint64_t *out_debug_line_file_offset,
+    uint64_t *out_debug_line_size)
+{
+    uint64_t *starts = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    uint16_t section_count = 0;
+    uint16_t section_name_index = 0;
+    Section_Header_Entry_64 section_names = {0};
+    bool have_section_names = false;
+    Section_Header_Entry_64 mips_pdr_section = {0};
+    bool have_mips_pdr_section = false;
+    bool ambiguous_mips_pdr_section = false;
+    Section_Header_Entry_64 mips_debug_line_section = {0};
+    bool have_mips_debug_line_section = false;
+    bool ambiguous_mips_debug_line_section = false;
+
+    if (out_starts) {
+        *out_starts = NULL;
+    }
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (out_pdr_records) {
+        *out_pdr_records = NULL;
+    }
+    if (out_pdr_count) {
+        *out_pdr_count = 0;
+    }
+    if (out_pdr_file_offset) {
+        *out_pdr_file_offset = 0;
+    }
+    if (out_pdr_size) {
+        *out_pdr_size = 0;
+    }
+    if (out_debug_line_file_offset) {
+        *out_debug_line_file_offset = 0;
+    }
+    if (out_debug_line_size) {
+        *out_debug_line_size = 0;
+    }
+    if (!candidate || !candidate->b || !segments
+        || num_segments == 0 || file_size == 0
+        || !out_starts || !out_count || !out_pdr_records
+        || !out_pdr_count || !out_pdr_file_offset
+        || !out_pdr_size || !out_debug_line_file_offset
+        || !out_debug_line_size) {
+        return false;
+    }
+
+    if (is_64) {
+        Elf_Header_64 header;
+
+        if (!read_candidate_elf_header_64(candidate, &header)) {
+            return false;
+        }
+        section_count =
+            to_host_endian_16(header.num_sht_entries, file_is_le);
+        section_name_index =
+            to_host_endian_16(header.idx_section_names, file_is_le);
+    }
+    else {
+        Elf_Header_32 header;
+
+        if (!read_candidate_elf_header_32(candidate, &header)) {
+            return false;
+        }
+        section_count =
+            to_host_endian_16(header.num_sht_entries, file_is_le);
+        section_name_index =
+            to_host_endian_16(header.idx_section_names, file_is_le);
+    }
+
+    have_section_names = section_name_index < section_count
+        && get_sht_entry(candidate, section_name_index, is_64,
+                         file_is_le, &section_names)
+        && section_names.sect_file_off <= file_size
+        && section_names.sect_size
+               <= file_size - section_names.sect_file_off;
+
+    for (uint16_t section_index = 0;
+         section_index < section_count; section_index++) {
+        Section_Header_Entry_64 section;
+
+        if (!get_sht_entry(candidate, section_index, is_64,
+                           file_is_le, &section)) {
+            continue;
+        }
+
+        bool is_ppc64_opd = false;
+        bool is_mips_pdr = false;
+        bool is_mips_debug_line = false;
+        if (((machine == EM_PPC64 && is_64)
+             || machine == EM_MIPS
+             || machine == EM_MIPS_RS3_LE)
+            && have_section_names
+            && section.sect_name_off < section_names.sect_size) {
+            char section_name[16] = {0};
+            const uint64_t name_offset =
+                section_names.sect_file_off + section.sect_name_off;
+            const uint64_t available_name_bytes =
+                section_names.sect_size - section.sect_name_off;
+            const uint64_t read_length =
+                available_name_bytes < sizeof(section_name) - 1
+                    ? available_name_bytes
+                    : sizeof(section_name) - 1;
+
+            if (read_length >= 5
+                && read_candidate_bytes(
+                       candidate, name_offset, read_length,
+                       (uint8_t *)section_name)
+                ) {
+                is_ppc64_opd =
+                    machine == EM_PPC64 && is_64
+                    && strcmp(section_name, ".opd") == 0;
+                is_mips_pdr =
+                    (machine == EM_MIPS
+                     || machine == EM_MIPS_RS3_LE)
+                    && strcmp(section_name, ".pdr") == 0;
+                is_mips_debug_line =
+                    (machine == EM_MIPS
+                     || machine == EM_MIPS_RS3_LE)
+                    && strcmp(section_name, ".debug_line") == 0;
+            }
+        }
+
+        if (is_mips_pdr) {
+            if (have_mips_pdr_section) {
+                ambiguous_mips_pdr_section = true;
+            }
+            else if (section.section_type == SECTION_TYPE_PROGBITS
+                     && section.sect_file_off <= file_size
+                     && section.sect_size
+                            <= file_size - section.sect_file_off
+                     && section.sect_size >= 32) {
+                mips_pdr_section = section;
+                have_mips_pdr_section = true;
+            }
+        }
+
+        if (is_mips_debug_line) {
+            if (have_mips_debug_line_section) {
+                ambiguous_mips_debug_line_section = true;
+            }
+            else if (section.sect_file_off <= file_size
+                     && section.sect_size
+                            <= file_size - section.sect_file_off
+                     && section.sect_size >= 8) {
+                mips_debug_line_section = section;
+                have_mips_debug_line_section = true;
+            }
+        }
+
+        if (is_ppc64_opd) {
+            const uint64_t descriptor_size = 3 * sizeof(uint64_t);
+
+            if (section.section_type != SECTION_TYPE_PROGBITS
+                || section.sect_file_off > file_size
+                || section.sect_size > file_size - section.sect_file_off) {
+                continue;
+            }
+
+            for (uint64_t offset = 0;
+                 offset <= section.sect_size
+                 && descriptor_size <= section.sect_size - offset;
+                 offset += descriptor_size) {
+                uint64_t value_raw = 0;
+
+                if (!read_candidate_bytes(
+                        candidate, section.sect_file_off + offset,
+                        sizeof(value_raw), (uint8_t *)&value_raw)) {
+                    break;
+                }
+                const uint64_t value =
+                    to_host_endian_64(value_raw, file_is_le);
+                bool executable = false;
+
+                for (size_t segment_index = 0;
+                     segment_index < num_segments; segment_index++) {
+                    const SegmentInfo *segment = &segments[segment_index];
+
+                    if (segment->seg_type == PT_LOAD
+                        && (segment->seg_flags & PF_X) != 0
+                        && value >= segment->seg_vaddr
+                        && value - segment->seg_vaddr
+                               < segment->seg_file_size) {
+                        executable = true;
+                        break;
+                    }
+                }
+                if (!executable) {
+                    continue;
+                }
+
+                if (count == capacity) {
+                    const size_t new_capacity =
+                        capacity == 0 ? 256 : capacity * 2;
+
+                    if (new_capacity < capacity
+                        || new_capacity > SIZE_MAX / sizeof(*starts)) {
+                        free(starts);
+                        return false;
+                    }
+                    uint64_t *larger =
+                        (uint64_t *)realloc(
+                            starts, new_capacity * sizeof(*starts));
+
+                    if (!larger) {
+                        free(starts);
+                        return false;
+                    }
+                    starts = larger;
+                    capacity = new_capacity;
+                }
+                starts[count++] = value;
+            }
+            continue;
+        }
+
+        if (section.section_type != SECTION_TYPE_SYMTAB
+            && section.section_type != SECTION_TYPE_DYNSYM) {
+            continue;
+        }
+
+        const uint64_t canonical_size =
+            is_64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+        const uint64_t entry_size =
+            section.entry_size ? section.entry_size : canonical_size;
+
+        if (entry_size < canonical_size
+            || section.sect_file_off > file_size
+            || section.sect_size
+                   > file_size - section.sect_file_off) {
+            continue;
+        }
+
+        for (uint64_t offset = 0;
+             offset <= section.sect_size
+             && canonical_size <= section.sect_size - offset;
+             offset += entry_size) {
+            uint8_t raw[sizeof(Elf64_Sym)] = {0};
+            uint64_t value = 0;
+            uint16_t section_number = SHN_UNDEF;
+            uint8_t info = 0;
+
+            if (entry_size > section.sect_size - offset
+                || !read_candidate_bytes(
+                       candidate, section.sect_file_off + offset,
+                       canonical_size, raw)) {
+                break;
+            }
+
+            if (is_64) {
+                Elf64_Sym symbol;
+
+                memcpy(&symbol, raw, sizeof(symbol));
+                value = to_host_endian_64(symbol.st_value,
+                                          file_is_le);
+                section_number =
+                    to_host_endian_16(symbol.st_shndx, file_is_le);
+                info = symbol.st_info;
+            }
+            else {
+                Elf32_Sym symbol;
+
+                memcpy(&symbol, raw, sizeof(symbol));
+                value = to_host_endian_32(symbol.st_value,
+                                          file_is_le);
+                section_number =
+                    to_host_endian_16(symbol.st_shndx, file_is_le);
+                info = symbol.st_info;
+            }
+
+            if ((info & 0x0fu) != STT_FUNC || value == 0
+                || section_number == SHN_UNDEF
+                || section_number == SHN_ABS
+                || section_number == SHN_COMMON) {
+                continue;
+            }
+
+            bool executable = false;
+            for (size_t segment_index = 0;
+                 segment_index < num_segments; segment_index++) {
+                const SegmentInfo *segment = &segments[segment_index];
+
+                if (segment->seg_type == PT_LOAD
+                    && (segment->seg_flags & PF_X) != 0
+                    && value >= segment->seg_vaddr
+                    && value - segment->seg_vaddr
+                           < segment->seg_file_size) {
+                    executable = true;
+                    break;
+                }
+            }
+            if (!executable) {
+                continue;
+            }
+
+            if (count == capacity) {
+                const size_t new_capacity =
+                    capacity == 0 ? 256 : capacity * 2;
+
+                if (new_capacity < capacity
+                    || new_capacity > SIZE_MAX / sizeof(*starts)) {
+                    free(starts);
+                    return false;
+                }
+                uint64_t *larger =
+                    (uint64_t *)realloc(
+                        starts, new_capacity * sizeof(*starts));
+
+                if (!larger) {
+                    free(starts);
+                    return false;
+                }
+                starts = larger;
+                capacity = new_capacity;
+            }
+            starts[count++] = value;
+        }
+    }
+
+    if (count == 0) {
+        free(starts);
+        return false;
+    }
+
+    qsort(starts, count, sizeof(*starts), elf_uint64_compare);
+    size_t unique = 1;
+    for (size_t i = 1; i < count; i++) {
+        if (starts[i] != starts[unique - 1]) {
+            starts[unique++] = starts[i];
+        }
+    }
+
+    if (have_mips_debug_line_section
+        && !ambiguous_mips_debug_line_section) {
+        *out_debug_line_file_offset =
+            mips_debug_line_section.sect_file_off;
+        *out_debug_line_size = mips_debug_line_section.sect_size;
+    }
+
+    if (have_mips_pdr_section && !ambiguous_mips_pdr_section) {
+        ElfMipsPdrRecord *records = NULL;
+        size_t record_count = 0;
+        size_t record_capacity = 0;
+        const uint64_t record_size = 8 * sizeof(uint32_t);
+
+        *out_pdr_file_offset = mips_pdr_section.sect_file_off;
+        *out_pdr_size = mips_pdr_section.sect_size;
+
+        for (uint64_t offset = 0;
+             offset <= mips_pdr_section.sect_size
+             && record_size
+                    <= mips_pdr_section.sect_size - offset;
+             offset += record_size) {
+            uint32_t raw[8];
+            uint32_t values[8];
+            size_t lo = 0;
+            size_t hi = unique;
+
+            if (!read_candidate_bytes(
+                    candidate,
+                    mips_pdr_section.sect_file_off + offset,
+                    sizeof(raw), (uint8_t *)raw)) {
+                continue;
+            }
+            for (size_t field = 0;
+                 field < sizeof(values) / sizeof(values[0]); field++) {
+                values[field] =
+                    to_host_endian_32(raw[field], file_is_le);
+            }
+
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+
+                if (starts[mid] < values[0]) {
+                    lo = mid + 1;
+                }
+                else {
+                    hi = mid;
+                }
+            }
+
+            const int32_t register_offset = (int32_t)values[2];
+            const int32_t floating_register_offset =
+                (int32_t)values[4];
+            if (lo >= unique || starts[lo] != values[0]
+                || values[6] >= 32 || values[7] >= 32
+                || (values[5] & 7u) != 0
+                || register_offset > 0
+                || floating_register_offset > 0
+                || (register_offset & 3) != 0
+                || (floating_register_offset & 3) != 0) {
+                continue;
+            }
+
+            if (record_count == record_capacity) {
+                const size_t new_capacity =
+                    record_capacity == 0 ? 256 : record_capacity * 2;
+
+                if (new_capacity < record_capacity
+                    || new_capacity > SIZE_MAX / sizeof(*records)) {
+                    free(records);
+                    free(starts);
+                    return false;
+                }
+                ElfMipsPdrRecord *larger =
+                    (ElfMipsPdrRecord *)realloc(
+                        records, new_capacity * sizeof(*records));
+
+                if (!larger) {
+                    free(records);
+                    free(starts);
+                    return false;
+                }
+                records = larger;
+                record_capacity = new_capacity;
+            }
+            records[record_count++] = (ElfMipsPdrRecord){
+                .function_va = values[0],
+                .register_mask = values[1],
+                .frame_size = values[5],
+            };
+        }
+
+        *out_pdr_records = records;
+        *out_pdr_count = record_count;
+    }
+
+    *out_starts = starts;
+    *out_count = unique;
+    return true;
+}
+
+
 /*
  * Initialize position-dependent direct-call evidence from executable PT_LOAD
  * ranges. A standard .eh_frame_hdr search table, when present and complete,
@@ -35173,6 +42751,7 @@ elf_text_branch_evidence_init(CarveInfo *candidate,
     uint64_t table_size;
     uint32_t count_raw;
     uint32_t count;
+    bool is_64;
 
     if (!evidence) {
         return false;
@@ -35189,20 +42768,29 @@ elf_text_branch_evidence_init(CarveInfo *candidate,
         || elf_header[1] != 'E'
         || elf_header[2] != 'L'
         || elf_header[3] != 'F'
-        || elf_header[4] != ELF_64_BIT
-        || elf_header[5] != ELF_LITTLE_ENDIAN) {
+        || (elf_header[4] != ELF_32_BIT
+            && elf_header[4] != ELF_64_BIT)
+        || (elf_header[5] != ELF_LITTLE_ENDIAN
+            && elf_header[5] != ELF_BIG_ENDIAN)) {
         return false;
     }
 
-    evidence->file_is_le = true;
+    is_64 = elf_header[4] == ELF_64_BIT;
+    evidence->layout = filestate;
+    evidence->is_64 = is_64;
+    evidence->file_is_le =
+        elf_header[5] == ELF_LITTLE_ENDIAN;
     evidence->machine =
-        get_elf_machine_type(elf_header, true, evidence->file_is_le);
+        get_elf_machine_type(elf_header, is_64,
+                             evidence->file_is_le);
 
-    if (evidence->machine != EM_X86_64
-        && evidence->machine != EM_AARCH64) {
-        return false;
-    }
-    if (!evidence->file_is_le) {
+    if (evidence->machine != EM_386
+        && evidence->machine != EM_X86_64
+        && evidence->machine != EM_AARCH64
+        && evidence->machine != EM_MIPS
+        && evidence->machine != EM_MIPS_RS3_LE
+        && evidence->machine != EM_PPC64
+        && evidence->machine != EM_ARM) {
         return false;
     }
 
@@ -35231,6 +42819,74 @@ elf_text_branch_evidence_init(CarveInfo *candidate,
         elf_text_branch_evidence_release(evidence);
         return false;
     }
+
+    (void)elf_collect_symbol_function_starts(
+        candidate, is_64, evidence->file_is_le,
+        evidence->machine,
+        evidence->segments, evidence->num_segments,
+        evidence->file_size, &evidence->function_starts,
+        &evidence->num_function_starts,
+        &evidence->mips_pdr_records,
+        &evidence->num_mips_pdr_records,
+        &evidence->mips_pdr_file_offset,
+        &evidence->mips_pdr_size,
+        &evidence->mips_debug_line_file_offset,
+        &evidence->mips_debug_line_size);
+
+    uint64_t *frame_function_starts = NULL;
+    size_t frame_function_count = 0;
+
+    const bool have_frame_functions = elf_collect_eh_frame_function_starts(
+            candidate, filestate, evidence,
+            &frame_function_starts, &frame_function_count);
+    if (!have_frame_functions) {
+        free(evidence->code_boundaries);
+        evidence->code_boundaries = NULL;
+        evidence->num_code_boundaries = 0;
+        evidence->code_boundary_capacity = 0;
+        free(evidence->code_anchors);
+        evidence->code_anchors = NULL;
+        evidence->num_code_anchors = 0;
+        evidence->code_anchor_capacity = 0;
+    }
+    if (have_frame_functions && frame_function_count > 0) {
+        if (evidence->num_function_starts == 0) {
+            evidence->function_starts = frame_function_starts;
+            evidence->num_function_starts = frame_function_count;
+            frame_function_starts = NULL;
+        }
+        else if (frame_function_count
+                     <= SIZE_MAX - evidence->num_function_starts
+                 && evidence->num_function_starts + frame_function_count
+                        <= SIZE_MAX / sizeof(*frame_function_starts)) {
+            const size_t combined_count =
+                evidence->num_function_starts + frame_function_count;
+            uint64_t *combined = (uint64_t *)malloc(
+                combined_count * sizeof(*combined));
+
+            if (combined) {
+                memcpy(combined, evidence->function_starts,
+                       evidence->num_function_starts * sizeof(*combined));
+                memcpy(combined + evidence->num_function_starts,
+                       frame_function_starts,
+                       frame_function_count * sizeof(*combined));
+                qsort(combined, combined_count, sizeof(*combined),
+                      elf_uint64_compare);
+
+                size_t unique = 1;
+
+                for (size_t index = 1; index < combined_count; index++) {
+                    if (combined[index] != combined[unique - 1]) {
+                        combined[unique++] = combined[index];
+                    }
+                }
+                free(evidence->function_starts);
+                evidence->function_starts = combined;
+                evidence->num_function_starts = unique;
+            }
+        }
+    }
+    free(frame_function_starts);
 
     for (size_t i = 0; i < evidence->num_segments; i++) {
         const SegmentInfo *segment = &evidence->segments[i];
@@ -35474,13 +43130,84 @@ elf_text_branch_evidence_init(CarveInfo *candidate,
         frame_targets = NULL;
     }
 
-    evidence->function_starts = function_starts;
-    evidence->num_function_starts = count;
+    if (evidence->num_function_starts == 0) {
+        evidence->function_starts = function_starts;
+        evidence->num_function_starts = count;
+        function_starts = NULL;
+    }
+    else if ((size_t)count
+                 <= SIZE_MAX - evidence->num_function_starts
+             && evidence->num_function_starts + (size_t)count
+                    <= SIZE_MAX / sizeof(*function_starts)) {
+        const size_t combined_count =
+            evidence->num_function_starts + (size_t)count;
+        uint64_t *combined =
+            (uint64_t *)realloc(
+                evidence->function_starts,
+                combined_count * sizeof(*combined));
+
+        if (combined) {
+            memcpy(combined + evidence->num_function_starts,
+                   function_starts,
+                   (size_t)count * sizeof(*function_starts));
+            qsort(combined, combined_count, sizeof(*combined),
+                  elf_uint64_compare);
+
+            size_t unique = 1;
+            for (size_t i = 1; i < combined_count; i++) {
+                if (combined[i] != combined[unique - 1]) {
+                    combined[unique++] = combined[i];
+                }
+            }
+            evidence->function_starts = combined;
+            evidence->num_function_starts = unique;
+        }
+    }
+    free(function_starts);
     evidence->frame_targets = frame_targets;
     evidence->num_frame_targets = num_frame_targets;
     return true;
 }
 
+
+// Read function/linkage evidence from the proposed file, not the candidate's
+// earlier mapping. Evidence owns its tables; the temporary vector is discarded.
+static bool
+elf_text_branch_evidence_init_mapping(CarveInfo *candidate,
+                                      const FileState *filestate,
+                                      const int64_t *mapping,
+                                      uint64_t blocks,
+                                      uint64_t file_size,
+                                      ElfTextBranchEvidence *evidence)
+{
+    BlockVector *vector = NULL;
+
+    if (!evidence) {
+        return false;
+    }
+    memset(evidence, 0, sizeof(*evidence));
+    if (!candidate || !candidate->b || !mapping || blocks == 0
+        || scalpel_state.blocksize == 0 || file_size == 0
+        || CEILDIV(file_size, scalpel_state.blocksize) != blocks) {
+        return false;
+    }
+
+    CarveInfo hypothesis = *candidate;
+    init_blockvector(scalpel_state.filemirror, &vector, blocks, true);
+    for (uint64_t slot = 0; slot < blocks; slot++) {
+        blockvector_set_apparent_blocknumber(vector, slot, mapping[slot]);
+    }
+    blockvector_set_data_length(vector, file_size);
+    hypothesis.b = vector;
+    const bool ready = elf_text_branch_evidence_init(
+        &hypothesis, filestate, evidence);
+    if (ready) {
+        evidence->code_anchors_corroborated =
+            elf_text_code_anchors_corroborate(&hypothesis, evidence);
+    }
+    free_blockvector(&vector);
+    return ready;
+}
 
 static void
 elf_text_wilson_interval(uint64_t matches, uint64_t trials,
@@ -35509,11 +43236,31 @@ elf_text_wilson_interval(uint64_t matches, uint64_t trials,
 }
 
 
+// Record call diversity without changing the compatibility score used by the
+// discontinuity checks. Saturation bounds scratch space, not the search.
+static inline void
+elf_text_record_exact_target(ElfTextBranchScore *score,
+                             uint64_t *distinct_targets,
+                             uint64_t target)
+{
+    score->exact_matches++;
+    if (score->distinct_exact_matches >= ELF_TEXT_MIN_DISTINCT_ANCHORS) {
+        return;
+    }
+    for (uint32_t i = 0; i < score->distinct_exact_matches; i++) {
+        if (distinct_targets[i] == target) {
+            return;
+        }
+    }
+    distinct_targets[score->distinct_exact_matches++] = target;
+}
+
+
 /*
- * Score direct calls after interpreting a fragment at its proposed file
- * offset. Calls that remain within the proposed logical run provide the
- * primary position-specific evidence. Executable PT_LOAD targets and exact
- * .eh_frame_hdr function starts provide supporting evidence.
+ * Score relative control flow after interpreting a fragment at its proposed
+ * file offset. Branches that remain within the proposed logical run establish
+ * code ownership. Call targets that match known function starts provide
+ * position-specific evidence.
  */
 static void
 elf_text_score_branch_fragment(CarveInfo *candidate,
@@ -35528,6 +43275,7 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
     uint64_t logical_start;
     uint64_t logical_bytes;
     uint64_t logical_end;
+    uint64_t distinct_targets[ELF_TEXT_MIN_DISTINCT_ANCHORS] = {0};
 
     if (!score) return;
     memset(score, 0, sizeof(*score));
@@ -35626,13 +43374,50 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
             continue;
         }
 
+        // Executable segments can also contain data and ELF tables. Prefer
+        // section boundaries when available rather than interpreting that
+        // material as instructions.
+        bool have_text_sections = false;
+        uint64_t best_start = 0;
+        uint64_t best_bytes = 0;
+        if (evidence->restrict_to_text_sections && evidence->layout) {
+            for (size_t i = 0; i < evidence->layout->num_components; i++) {
+                const FileComponent *component = &evidence->layout->components[i];
+                uint64_t end;
+                if (component->type != COMPONENT_SECTION
+                    || component->section != SECTION_TEXT
+                    || __builtin_add_overflow(component->fileOffset,
+                                              component->size, &end)) {
+                    continue;
+                }
+                have_text_sections = true;
+                const uint64_t start = component->fileOffset > file_offset + scan_offset
+                    ? component->fileOffset : file_offset + scan_offset;
+                const uint64_t stop = end < file_offset + scan_offset + scan_bytes
+                    ? end : file_offset + scan_offset + scan_bytes;
+                if (stop > start && stop - start > best_bytes) {
+                    best_start = start;
+                    best_bytes = stop - start;
+                }
+            }
+        }
+        if (have_text_sections) {
+            if (best_bytes == 0) {
+                continue;
+            }
+            source_va += best_start - file_offset - scan_offset;
+            scan_offset = best_start - file_offset;
+            scan_bytes = best_bytes;
+        }
+
         block = get_apparent_block_data(scalpel_state.filemirror,
                                         (int64_t)apparent);
         if (!block) {
             return;
         }
 
-        if (evidence->machine == EM_X86_64) {
+        if (evidence->machine == EM_386
+            || evidence->machine == EM_X86_64) {
             const uint64_t scan_end = scan_offset + scan_bytes;
 
             for (uint64_t j = scan_offset;
@@ -35646,6 +43431,7 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
 
                 if (block[j] != 0xe8) continue;
                 score->branches++;
+                score->exact_trials++;
 
                 memcpy(&displacement_raw, block + j + 1,
                        sizeof(displacement_raw));
@@ -35673,13 +43459,15 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
                         score->matches++;
                     }
                     if (elf_text_has_function_start(evidence, target_va)) {
-                        score->exact_matches++;
+                        elf_text_record_exact_target(score, distinct_targets,
+                                                       target_va);
                     }
                 }
             }
 
             for (uint64_t j = scan_offset;
-                 j + 6 <= scan_end;
+                 evidence->machine == EM_X86_64
+                     && j + 6 <= scan_end;
                  j++) {
                 uint64_t modrm_offset = 0;
                 bool has_modrm = false;
@@ -35793,7 +43581,7 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
                 }
             }
         }
-        else {
+        else if (evidence->machine == EM_AARCH64) {
             const uint64_t scan_end = scan_offset + scan_bytes;
             uint64_t j =
                 scan_offset + ((4 - (source_va & 3)) & 3);
@@ -35814,6 +43602,7 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
                     continue;
                 }
                 score->branches++;
+                score->exact_trials++;
 
                 displacement =
                     (int64_t)(instruction & 0x03ffffffu);
@@ -35839,8 +43628,224 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
                         score->matches++;
                     }
                     if (elf_text_has_function_start(evidence, target_va)) {
-                        score->exact_matches++;
+                        elf_text_record_exact_target(score, distinct_targets,
+                                                       target_va);
                     }
+                }
+            }
+        }
+        else if (evidence->machine == EM_MIPS
+                 || evidence->machine == EM_MIPS_RS3_LE) {
+            const uint64_t scan_end = scan_offset + scan_bytes;
+            uint64_t j =
+                scan_offset + ((4 - (source_va & 3)) & 3);
+
+            for (; j + 4 <= scan_end; j += 4) {
+                uint32_t instruction_raw;
+                uint32_t instruction;
+                int64_t displacement;
+                uint64_t source_instruction_va;
+                uint64_t target_va;
+                uint64_t target_file_offset;
+                bool call_branch = false;
+
+                memcpy(&instruction_raw, block + j,
+                       sizeof(instruction_raw));
+                instruction =
+                    to_host_endian_32(instruction_raw,
+                                      evidence->file_is_le);
+
+                const uint32_t opcode = instruction >> 26;
+                bool relative_branch =
+                    opcode >= 4 && opcode <= 7;
+
+                if (opcode >= 20 && opcode <= 23) {
+                    relative_branch = true;
+                }
+                if (opcode == 1) {
+                    const uint32_t rt = (instruction >> 16) & 0x1fu;
+
+                    relative_branch =
+                        rt <= 3 || (rt >= 16 && rt <= 19);
+                    call_branch = rt >= 16 && rt <= 19;
+                }
+                if (!relative_branch) {
+                    continue;
+                }
+                score->branches++;
+                if (call_branch) {
+                    score->exact_trials++;
+                }
+
+                const uint64_t source_delta = j - scan_offset;
+                if (source_va > UINT64_MAX - source_delta) {
+                    continue;
+                }
+                source_instruction_va = source_va + source_delta;
+                if (source_instruction_va > UINT64_MAX - 4) {
+                    continue;
+                }
+                displacement =
+                    (int64_t)(int16_t)(instruction & 0xffffu) * 4;
+                if (!elf_text_add_signed_offset(
+                        source_instruction_va + 4, displacement,
+                        &target_va)) {
+                    continue;
+                }
+
+                if (elf_text_va_is_executable(evidence, target_va)) {
+                    score->executable_matches++;
+                }
+                if (elf_text_va_to_file_offset(
+                        evidence, target_va, &target_file_offset)
+                    && target_file_offset >= logical_start
+                    && target_file_offset < logical_end) {
+                    score->matches++;
+                }
+                if (call_branch
+                    && elf_text_has_function_start(evidence, target_va)) {
+                    elf_text_record_exact_target(score, distinct_targets,
+                                                   target_va);
+                }
+            }
+        }
+        else if (evidence->machine == EM_PPC64) {
+            const uint64_t scan_end = scan_offset + scan_bytes;
+            uint64_t j =
+                scan_offset + ((4 - (source_va & 3)) & 3);
+
+            for (; j + 4 <= scan_end; j += 4) {
+                uint32_t instruction_raw;
+                uint32_t instruction;
+                int64_t displacement;
+                uint64_t source_instruction_va;
+                uint64_t target_va;
+                uint64_t target_file_offset;
+                uint32_t opcode;
+                bool call_branch;
+
+                memcpy(&instruction_raw, block + j,
+                       sizeof(instruction_raw));
+                instruction =
+                    to_host_endian_32(instruction_raw,
+                                      evidence->file_is_le);
+                opcode = instruction >> 26;
+                call_branch = (instruction & 0x1u) != 0;
+
+                if ((instruction & 0x2u) != 0) {
+                    continue;
+                }
+                if (opcode == 18) {
+                    displacement =
+                        (int64_t)(instruction & 0x03fffffcu);
+                    if ((displacement & 0x02000000) != 0) {
+                        displacement -= 0x04000000;
+                    }
+                }
+                else if (opcode == 16) {
+                    displacement =
+                        (int64_t)(instruction & 0x0000fffcu);
+                    if ((displacement & 0x00008000) != 0) {
+                        displacement -= 0x00010000;
+                    }
+                }
+                else {
+                    continue;
+                }
+                score->branches++;
+                if (call_branch) {
+                    score->exact_trials++;
+                }
+
+                const uint64_t source_delta = j - scan_offset;
+                if (source_va > UINT64_MAX - source_delta) {
+                    continue;
+                }
+                source_instruction_va = source_va + source_delta;
+                if (!elf_text_add_signed_offset(
+                        source_instruction_va, displacement,
+                        &target_va)) {
+                    continue;
+                }
+
+                if (elf_text_va_is_executable(evidence, target_va)) {
+                    score->executable_matches++;
+                }
+                if (elf_text_va_to_file_offset(
+                        evidence, target_va, &target_file_offset)
+                    && target_file_offset >= logical_start
+                    && target_file_offset < logical_end) {
+                    score->matches++;
+                }
+                if (call_branch
+                    && elf_text_has_function_start(evidence, target_va)) {
+                    elf_text_record_exact_target(score, distinct_targets,
+                                                   target_va);
+                }
+            }
+        }
+        else if (evidence->machine == EM_ARM) {
+            const uint64_t scan_end = scan_offset + scan_bytes;
+            uint64_t j =
+                scan_offset + ((4 - (source_va & 3)) & 3);
+
+            for (; j + 4 <= scan_end; j += 4) {
+                uint32_t instruction_raw;
+                uint32_t instruction;
+                int64_t displacement;
+                uint64_t source_instruction_va;
+                uint64_t target_va;
+                uint64_t target_file_offset;
+                bool call_branch;
+
+                memcpy(&instruction_raw, block + j,
+                       sizeof(instruction_raw));
+                instruction =
+                    to_host_endian_32(instruction_raw,
+                                      evidence->file_is_le);
+
+                // Match position-relative A32 B and BL instructions.
+                if ((instruction & 0x0e000000u) != 0x0a000000u
+                    || (instruction >> 28) == 0x0fu) {
+                    continue;
+                }
+                call_branch = (instruction & 0x01000000u) != 0;
+                score->branches++;
+                if (call_branch) {
+                    score->exact_trials++;
+                }
+
+                displacement =
+                    (int64_t)(instruction & 0x00ffffffu);
+                if ((displacement & 0x00800000) != 0) {
+                    displacement -= 0x01000000;
+                }
+                displacement *= 4;
+
+                const uint64_t source_delta = j - scan_offset;
+                if (source_va > UINT64_MAX - source_delta - 8) {
+                    continue;
+                }
+                source_instruction_va = source_va + source_delta + 8;
+                if (!elf_text_add_signed_offset(
+                        source_instruction_va, displacement,
+                        &target_va)) {
+                    continue;
+                }
+
+                if (elf_text_va_is_executable(evidence, target_va)) {
+                    score->executable_matches++;
+                }
+                if (elf_text_va_to_file_offset(
+                        evidence, target_va, &target_file_offset)
+                    && target_file_offset >= logical_start
+                    && target_file_offset < logical_end) {
+                    score->matches++;
+                }
+                if (call_branch
+                    && elf_text_has_function_start(evidence, target_va)) {
+                    elf_text_record_exact_target(score, distinct_targets,
+                                                   target_va);
                 }
             }
         }
@@ -35854,7 +43859,7 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
     elf_text_wilson_interval(score->executable_matches, score->branches,
                              &score->executable_lower,
                              &score->executable_upper);
-    elf_text_wilson_interval(score->exact_matches, score->branches,
+    elf_text_wilson_interval(score->exact_matches, score->exact_trials,
                              &score->exact_lower,
                              &score->exact_upper);
     elf_text_wilson_interval(score->file_reference_matches,
@@ -35864,16 +43869,19 @@ elf_text_score_branch_fragment(CarveInfo *candidate,
 }
 
 
-// Return whether a file block overlaps executable bytes in a load segment.
+// Return whether a file block overlaps section-derived executable bytes,
+// falling back to an executable load segment when no text layout is available.
 static bool
 elf_text_slot_overlaps_executable(const ElfTextBranchEvidence *evidence,
+                                  const FileState *filestate,
                                   uint64_t slot,
                                   uint32_t blocksize)
 {
     uint64_t file_start;
     uint64_t file_end;
+    bool have_text_layout = false;
 
-    if (!evidence || blocksize == 0
+    if (!evidence || !filestate || blocksize == 0
         || __builtin_mul_overflow(slot, (uint64_t)blocksize,
                                   &file_start)
         || file_start >= evidence->file_size) {
@@ -35882,6 +43890,30 @@ elf_text_slot_overlaps_executable(const ElfTextBranchEvidence *evidence,
     file_end = evidence->file_size - file_start > blocksize
                    ? file_start + blocksize
                    : evidence->file_size;
+
+    // A section table identifies executable bytes more precisely than a
+    // PT_LOAD segment, which may also contain constants and unwind data.
+    for (size_t i = 0; i < filestate->num_components; i++) {
+        const FileComponent *component = &filestate->components[i];
+        uint64_t component_end;
+
+        if (component->type != COMPONENT_SECTION
+            || component->section != SECTION_TEXT
+            || component->size == 0
+            || __builtin_add_overflow(component->fileOffset,
+                                      component->size,
+                                      &component_end)) {
+            continue;
+        }
+        have_text_layout = true;
+        if (file_start < component_end
+            && component->fileOffset < file_end) {
+            return true;
+        }
+    }
+    if (have_text_layout) {
+        return false;
+    }
 
     for (size_t i = 0; i < evidence->num_segments; i++) {
         const SegmentInfo *segment = &evidence->segments[i];
@@ -35900,6 +43932,1500 @@ elf_text_slot_overlaps_executable(const ElfTextBranchEvidence *evidence,
         }
     }
     return false;
+}
+
+
+// Confirm that the unwind constraints agree with code in separate blocks.
+// This evidence is recomputed for each mapping, never carried across trials.
+static bool
+elf_text_code_anchors_corroborate(CarveInfo *candidate,
+                                 const ElfTextBranchEvidence *evidence)
+{
+    const uint32_t blocksize = scalpel_state.blocksize;
+    size_t matches = 0;
+    uint64_t first_slot = UINT64_MAX;
+    bool separate_blocks = false;
+
+    if (!candidate || !evidence || blocksize == 0
+        || evidence->num_code_anchors < ELF_TEXT_MIN_DISTINCT_ANCHORS) {
+        return false;
+    }
+    for (size_t i = 0; i < evidence->num_code_anchors; i++) {
+        const ElfCodeAnchor *anchor = &evidence->code_anchors[i];
+        uint8_t actual[4];
+        if (anchor->length == 0 || anchor->length > sizeof(actual)
+            || anchor->length > blocksize - anchor->file_offset % blocksize
+            || !read_candidate_bytes(candidate, anchor->file_offset,
+                                      anchor->length, actual)
+            || !elf_code_anchor_matches(anchor, actual)) {
+            continue;
+        }
+        const uint64_t slot = anchor->file_offset / blocksize;
+        if (first_slot == UINT64_MAX) {
+            first_slot = slot;
+        }
+        else if (slot != first_slot) {
+            separate_blocks = true;
+        }
+        matches++;
+        if (matches >= ELF_TEXT_MIN_DISTINCT_ANCHORS && separate_blocks) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Count readable constraints in a single logical block of the current mapping.
+static void
+elf_text_code_anchor_counts(CarveInfo *candidate,
+                            const ElfTextBranchEvidence *evidence,
+                            uint64_t slot, int64_t trial_apparent,
+                            uint64_t *trials, uint64_t *matches,
+                            uint64_t *inconclusive)
+{
+    uint64_t start;
+    const uint32_t blocksize = scalpel_state.blocksize;
+    *trials = 0;
+    *matches = 0;
+    if (inconclusive) {
+        *inconclusive = 0;
+    }
+    if (!candidate || !evidence || blocksize == 0
+        || __builtin_mul_overflow(slot, (uint64_t)blocksize, &start)) {
+        return;
+    }
+    size_t lo = 0;
+    size_t hi = evidence->num_code_anchors;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (evidence->code_anchors[mid].file_offset < start) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
+        }
+    }
+    for (size_t i = lo; i < evidence->num_code_anchors; i++) {
+        const ElfCodeAnchor *anchor = &evidence->code_anchors[i];
+        const uint64_t in_block = anchor->file_offset - start;
+        if (in_block >= blocksize) {
+            break;
+        }
+        uint8_t actual[4];
+        if (anchor->length == 0 || anchor->length > sizeof(actual)
+            || anchor->length > blocksize - in_block
+            || !(trial_apparent >= 0
+                     ? get_apparent_block_bytes(scalpel_state.filemirror,
+                                                trial_apparent, in_block,
+                                                anchor->length, actual)
+                     : read_candidate_bytes(candidate, anchor->file_offset,
+                                             anchor->length, actual))) {
+            continue;
+        }
+        const ElfCodeAnchorResult result = elf_code_anchor_evaluate(anchor, actual);
+        if (result == ELF_CODE_ANCHOR_INCONCLUSIVE) {
+            if (inconclusive) {
+                if (anchor->arm_stack_return != 0 && anchor->length == 4) {
+                    uint32_t word;
+                    memcpy(&word, actual, sizeof(word));
+                    word = to_host_endian_32(word, true);
+                    // Branch/system instructions and register-based SP
+                    // adjustments need not express a local stack delta.
+                    if ((word & UINT32_C(0x1c000000)) == UINT32_C(0x14000000)
+                        || (word & UINT32_C(0xffe01fff)) == UINT32_C(0x8b2003ff)) {
+                        continue;
+                    }
+                }
+                (*inconclusive)++;
+            }
+            continue;
+        }
+        (*trials)++;
+        if (result == ELF_CODE_ANCHOR_MATCH) {
+            (*matches)++;
+        }
+    }
+}
+
+// Recognize a small long-mode instruction subset, not arbitrary x86 code.
+// Other prefixes, encodings and control transfers are deliberately unsupported.
+static size_t
+elf_x86_prologue_instruction_length(const uint8_t *data, size_t available)
+{
+    if (!data || available == 0) {
+        return 0;
+    }
+    if (available >= 4 && data[0] == 0xf3 && data[1] == 0x0f
+        && data[2] == 0x1e && data[3] == 0xfa) {
+        return 4;
+    }
+    size_t position = 0;
+    uint8_t rex = 0;
+    if (data[position] >= 0x40 && data[position] <= 0x4f) {
+        rex = data[position++];
+        if (position == available) {
+            return 0;
+        }
+    }
+    const uint8_t opcode = data[position++];
+    size_t immediate = 0;
+    bool modrm = false;
+    if ((opcode >= 0x50 && opcode <= 0x5f) || opcode == 0x90) {
+        return position;
+    }
+    if (opcode >= 0xb0 && opcode <= 0xb7) {
+        immediate = 1;
+    }
+    else if (opcode >= 0xb8 && opcode <= 0xbf) {
+        immediate = (rex & 8u) != 0 ? 8 : 4;
+    }
+    else {
+        switch (opcode) {
+            case 0x6a:
+                immediate = 1;
+                break;
+            case 0x68:
+                immediate = 4;
+                break;
+            case 0x80: case 0x83: case 0xc6:
+                immediate = 1;
+                modrm = true;
+                break;
+            case 0x81: case 0xc7:
+                immediate = 4;
+                modrm = true;
+                break;
+            case 0x01: case 0x03: case 0x21: case 0x23:
+            case 0x29: case 0x2b: case 0x31: case 0x33:
+            case 0x39: case 0x3b: case 0x84: case 0x85:
+            case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8d:
+                modrm = true;
+                break;
+            default:
+                return 0;
+        }
+    }
+    size_t displacement = 0;
+    if (modrm) {
+        if (position == available) {
+            return 0;
+        }
+        const uint8_t byte = data[position++];
+        const unsigned mode = byte >> 6;
+        const unsigned reg = (byte >> 3) & 7u;
+        const unsigned rm = byte & 7u;
+        if ((opcode == 0x8d && mode == 3)
+            || ((opcode == 0xc6 || opcode == 0xc7) && reg != 0)) {
+            return 0;
+        }
+        if (mode != 3 && rm == 4) {
+            if (position == available) {
+                return 0;
+            }
+            const uint8_t sib = data[position++];
+            if (mode == 0 && (sib & 7u) == 5) {
+                displacement = 4;
+            }
+        }
+        if (mode == 1) {
+            displacement = 1;
+        }
+        else if (mode == 2 || (mode == 0 && rm == 5)) {
+            displacement = 4;
+        }
+    }
+    const size_t tail = displacement + immediate;
+    return tail <= available - position ? position + tail : 0;
+}
+
+// Decode only a straight-line prologue from its FDE entry. A CFI row inside
+// a decoded instruction contradicts the proposed mapping. Unknown encodings,
+// truncation and control transfers are inconclusive rather than invalid.
+static bool
+elf_code_boundary_conflicts(const ElfCodeBoundary *boundary,
+                             const uint8_t *actual)
+{
+    if (!boundary || !actual || boundary->boundary == 0
+        || boundary->boundary >= boundary->length || boundary->length > 143) {
+        return false;
+    }
+    size_t position = 0;
+    while (position < boundary->boundary) {
+        const size_t length = elf_x86_prologue_instruction_length(
+            actual + position, boundary->length - position);
+        if (length == 0) {
+            return false;
+        }
+        position += length;
+        if (position > boundary->boundary) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Use boundary disagreement only when independent unwind anchors corroborate
+// this metadata. Restrict every read and decode to one available file block.
+static bool
+elf_text_code_boundaries_disagree(CarveInfo *candidate,
+                                  const ElfTextBranchEvidence *evidence,
+                                  uint64_t slot, int64_t trial_apparent)
+{
+    const uint32_t blocksize = scalpel_state.blocksize;
+    uint64_t start = 0;
+    if (!candidate || !evidence || !evidence->code_anchors_corroborated
+        || blocksize == 0 || __builtin_mul_overflow(slot, (uint64_t)blocksize, &start)) {
+        return false;
+    }
+    size_t lo = 0;
+    size_t hi = evidence->num_code_boundaries;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (evidence->code_boundaries[mid].file_offset < start) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
+        }
+    }
+    for (size_t i = lo; i < evidence->num_code_boundaries; i++) {
+        const ElfCodeBoundary *boundary = &evidence->code_boundaries[i];
+        const uint64_t in_block = boundary->file_offset - start;
+        if (in_block >= blocksize) {
+            break;
+        }
+        uint8_t actual[143];
+        if (boundary->length > sizeof(actual) || boundary->length > blocksize - in_block
+            || !(trial_apparent >= 0
+                    ? get_apparent_block_bytes(scalpel_state.filemirror, trial_apparent,
+                                               in_block, boundary->length, actual)
+                    : read_candidate_bytes(candidate, boundary->file_offset,
+                                            boundary->length, actual))) {
+            continue;
+        }
+        if (elf_code_boundary_conflicts(boundary, actual)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Contradicted anchors justify a search. Unknown instructions can also leave
+// a position unresolved when metadata agrees elsewhere and call/data evidence
+// is weak; that uncertainty is not used to reject alternative fragments.
+static bool
+elf_text_code_anchors_need_search(CarveInfo *candidate,
+                                  const ElfTextBranchEvidence *evidence,
+                                  uint64_t slot, bool weak_branch_evidence)
+{
+    uint64_t trials = 0;
+    uint64_t matches = 0;
+    uint64_t inconclusive = 0;
+    if (!evidence || evidence->num_code_anchors < ELF_TEXT_MIN_DISTINCT_ANCHORS) {
+        return false;
+    }
+    if (elf_text_code_boundaries_disagree(candidate, evidence, slot, -1)) {
+        return true;
+    }
+    elf_text_code_anchor_counts(candidate, evidence, slot, -1,
+                                &trials, &matches, &inconclusive);
+    return matches == 0
+        && (trials >= ELF_TEXT_MIN_DISTINCT_ANCHORS
+            || (evidence->code_anchors_corroborated
+                && (trials > 0
+                    || (weak_branch_evidence && inconclusive > 0))));
+}
+
+// Apply the same code constraints to a proposed contiguous source run before
+// comparing it with other repair hypotheses. No block is removed from the
+// global search space.
+static bool
+elf_text_code_fragment_conflicts(CarveInfo *candidate,
+                                 const ElfTextBranchEvidence *evidence,
+                                 uint64_t logical_start, int64_t apparent_start,
+                                 uint64_t blocks)
+{
+    if (!candidate || !evidence || apparent_start < 0
+        || evidence->num_code_anchors < ELF_TEXT_MIN_DISTINCT_ANCHORS) {
+        return false;
+    }
+    for (uint64_t i = 0; i < blocks; i++) {
+        if (i > UINT64_MAX - logical_start || i > INT64_MAX
+            || apparent_start > INT64_MAX - (int64_t)i) {
+            return true;
+        }
+        if (elf_text_code_boundaries_disagree(candidate, evidence, logical_start + i,
+                                               apparent_start + (int64_t)i)) {
+            return true;
+        }
+        uint64_t trials = 0;
+        uint64_t matches = 0;
+        elf_text_code_anchor_counts(candidate, evidence, logical_start + i,
+                                    apparent_start + (int64_t)i,
+                                    &trials, &matches, NULL);
+        if (matches == 0
+            && (trials >= ELF_TEXT_MIN_DISTINCT_ANCHORS
+                || (trials > 0 && evidence->code_anchors_corroborated))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Matching unwind anchors or independent call/data references bound the part
+// of an executable span that needs reconsideration. Mere code resemblance does
+// not establish a file position.
+static bool
+elf_text_slot_has_position_evidence(CarveInfo *candidate,
+                                    const ElfTextBranchEvidence *evidence,
+                                    uint64_t slot)
+{
+    uint64_t trials = 0;
+    uint64_t matches = 0;
+    elf_text_code_anchor_counts(candidate, evidence, slot, -1,
+                                &trials, &matches, NULL);
+    if (matches > 0) {
+        return true;
+    }
+    const int64_t apparent = blockvector_get_apparent_blocknumber(candidate->b, slot);
+    if (apparent < 0) {
+        return false;
+    }
+    const ElfTextFragment fragment = {.ap_start = (uint64_t)apparent, .len = 1};
+    ElfTextBranchScore score;
+    elf_text_score_branch_fragment(candidate, evidence, slot, &fragment, &score);
+    return elf_text_run_evidence_tier(&score, NULL, NULL, NULL) >= 2;
+}
+
+// Recognize a bounded, RIP-relative switch: unsigned range check, JA, LEA,
+// signed table load, base addition and indirect jump. Register relationships
+// must agree throughout; unfamiliar instruction sequences are inconclusive.
+static bool
+elf_x86_relative_jump_table(const uint8_t *code, size_t size,
+                            uint32_t *entries, uint32_t *lea_end,
+                            int32_t *displacement)
+{
+    size_t p = 0;
+    uint8_t rex = 0;
+    if (!code || !entries || !lea_end || !displacement || size < 20) {
+        return false;
+    }
+    if ((code[p] & 0xf0u) == 0x40u) {
+        rex = code[p++];
+    }
+    const uint8_t cmp = code[p++];
+    if ((cmp != 0x80 && cmp != 0x81 && cmp != 0x83)
+        || (code[p] & 0xf8u) != 0xf8u) {
+        return false;
+    }
+    const uint32_t index = (code[p++] & 7u) | ((rex & 1u) ? 8u : 0u);
+    if (cmp == 0x80 && rex == 0 && index >= 4) {
+        return false;
+    }
+    uint32_t bound;
+    if (cmp == 0x81) {
+        memcpy(&bound, code + p, sizeof(bound));
+        bound = to_host_endian_32(bound, true);
+        p += 4;
+    }
+    else {
+        bound = code[p++];
+        if (cmp == 0x83 && bound >= 128) {
+            return false;
+        }
+    }
+    // Limit this optional analysis, not valid switch sizes or recovery.
+    if (bound < ELF_TEXT_MIN_DISTINCT_ANCHORS - 1 || bound >= 4096) {
+        return false;
+    }
+    int64_t skip;
+    if (code[p] == 0x77) {
+        skip = (int8_t)code[p + 1];
+        p += 2;
+    }
+    else if (code[p] == 0x0f && code[p + 1] == 0x87) {
+        int32_t raw;
+        memcpy(&raw, code + p + 2, sizeof(raw));
+        skip = (int32_t)to_host_endian_32((uint32_t)raw, true);
+        p += 6;
+    }
+    else {
+        return false;
+    }
+    const int64_t default_target = (int64_t)p + skip;
+    if (p > size || size - p < 7 || (code[p] & 0xfbu) != 0x48
+        || code[p + 1] != 0x8d || (code[p + 2] & 0xc7u) != 0x05) {
+        return false;
+    }
+    const uint32_t base = ((code[p + 2] >> 3) & 7u) | ((code[p] & 4u) ? 8u : 0u);
+    if (base == index) {
+        return false;
+    }
+    uint32_t raw_disp;
+    memcpy(&raw_disp, code + p + 3, sizeof(raw_disp));
+    p += 7;
+    *lea_end = (uint32_t)p;
+    *displacement = (int32_t)to_host_endian_32(raw_disp, true);
+    if (cmp == 0x80) {
+        rex = 0;
+        if (p < size && (code[p] & 0xf0u) == 0x40u) {
+            rex = code[p++];
+        }
+        if (p > size || size - p < 3 || code[p] != 0x0f || code[p + 1] != 0xb6
+            || (code[p + 2] & 0xc0u) != 0xc0u || (rex & 8u) != 0
+            || (((code[p + 2] >> 3) & 7u) | ((rex & 4u) ? 8u : 0u)) != index
+            || ((code[p + 2] & 7u) | ((rex & 1u) ? 8u : 0u)) != index) {
+            return false;
+        }
+        p += 3;
+    }
+    if (p > size || size - p < 4 || (code[p] & 0xf8u) != 0x48
+        || code[p + 1] != 0x63 || (code[p + 2] & 0xc7u) != 0x04
+        || (code[p + 3] & 0xc0u) != 0x80u) {
+        return false;
+    }
+    rex = code[p];
+    const uint32_t result = ((code[p + 2] >> 3) & 7u) | ((rex & 4u) ? 8u : 0u);
+    if (result == base || (code[p + 3] & 7u) == 5
+        || (((code[p + 3] >> 3) & 7u) == 4 && (rex & 2u) == 0)
+        || (((code[p + 3] >> 3) & 7u) | ((rex & 2u) ? 8u : 0u)) != index
+        || ((code[p + 3] & 7u) | ((rex & 1u) ? 8u : 0u)) != base) {
+        return false;
+    }
+    p += 4;
+    if (p > size || size - p < 3 || (code[p] & 0xfau) != 0x48
+        || code[p + 1] != 0x01 || (code[p + 2] & 0xc0u) != 0xc0u
+        || (((code[p + 2] >> 3) & 7u) | ((code[p] & 4u) ? 8u : 0u)) != base
+        || ((code[p + 2] & 7u) | ((code[p] & 1u) ? 8u : 0u)) != result) {
+        return false;
+    }
+    p += 3;
+    rex = 0;
+    // CET's NOTRACK prefix does not change the register-indirect target.
+    if (p < size && code[p] == 0x3e) {
+        p++;
+    }
+    if (p < size && (code[p] & 0xf0u) == 0x40u) {
+        rex = code[p++];
+    }
+    if (p > size || size - p < 2 || (rex & 6u) != 0 || code[p] != 0xff
+        || (code[p + 1] & 0xf8u) != 0xe0u
+        || ((code[p + 1] & 7u) | ((rex & 1u) ? 8u : 0u)) != result
+        || (default_target >= 0 && (uint64_t)default_target < p + 2)) {
+        return false;
+    }
+    *entries = bound + 1;
+    return true;
+}
+
+// A switch gives some otherwise opaque read-only data a checkable meaning.
+// Several distinct entries targeting non-executable addresses reopen that
+// data block for search. This does not establish the identity of other bytes.
+static uint64_t
+elf_text_first_jump_table_discontinuity(CarveInfo *candidate,
+                                        const ElfTextBranchEvidence *evidence,
+                                        uint64_t *run_end)
+{
+    const uint64_t blocksize = scalpel_state.blocksize;
+    if (!candidate || !candidate->b || !evidence || evidence->machine != EM_X86_64
+        || !evidence->is_64 || !evidence->file_is_le || !evidence->layout
+        || !evidence->code_anchors_corroborated || blocksize == 0) {
+        return UINT64_MAX;
+    }
+    for (size_t c = 0; c < evidence->layout->num_components; c++) {
+        const FileComponent *component = &evidence->layout->components[c];
+        if (component->type != COMPONENT_SECTION || component->section != SECTION_TEXT
+            || component->fileOffset >= evidence->file_size
+            || component->size > evidence->file_size - component->fileOffset) {
+            continue;
+        }
+        const uint64_t end = component->fileOffset + component->size;
+        uint64_t offset = component->fileOffset;
+        while (offset < end) {
+            const uint64_t slot = offset / blocksize;
+            const uint64_t remaining = blocksize - offset % blocksize;
+            const uint64_t bytes = end - offset < remaining ? end - offset : remaining;
+            uint64_t trials = 0, matches = 0;
+            elf_text_code_anchor_counts(candidate, evidence, slot, -1,
+                                        &trials, &matches, NULL);
+            if (matches == 0) {
+                offset += bytes;
+                continue;
+            }
+            const int64_t apparent = blockvector_get_apparent_blocknumber(candidate->b, slot);
+            uint8_t *block = apparent >= 0
+                ? get_apparent_block_data(scalpel_state.filemirror, apparent) : NULL;
+            if (!block) {
+                offset += bytes;
+                continue;
+            }
+            for (uint64_t j = 0; j < bytes; j++) {
+                const uint64_t local = offset % blocksize + j;
+                const uint8_t lead = block[local];
+                if (lead != 0x80 && lead != 0x81 && lead != 0x83
+                    && (lead & 0xf0u) != 0x40u) {
+                    continue;
+                }
+                uint8_t boundary[48];
+                const uint64_t length = end - offset - j < sizeof(boundary)
+                    ? end - offset - j : sizeof(boundary);
+                const uint8_t *code = block + local;
+                if (length > blocksize - local) {
+                    if (!read_candidate_bytes(candidate, offset + j, length, boundary)) {
+                        continue;
+                    }
+                    code = boundary;
+                }
+                uint32_t entries, lea_end;
+                int32_t displacement;
+                uint64_t lea_va, table_va, table_offset;
+                if (length < 20
+                    || !elf_x86_relative_jump_table(code, length, &entries,
+                                                     &lea_end, &displacement)
+                    || !elf_text_file_range_to_va(evidence, offset + j + lea_end, 1, &lea_va)
+                    || !elf_text_add_signed_offset(lea_va, displacement, &table_va)
+                    || !elf_text_va_to_file_offset(evidence, table_va, &table_offset)
+                    || table_offset >= evidence->file_size
+                    || (uint64_t)entries * 4 > evidence->file_size - table_offset) {
+                    continue;
+                }
+                bool readonly = false;
+                bool mutable_alias = false;
+                for (size_t s = 0; s < evidence->num_segments; s++) {
+                    const SegmentInfo *segment = &evidence->segments[s];
+                    if (segment->seg_type == PT_LOAD && segment->seg_flags == PF_R
+                        && table_va >= segment->seg_vaddr
+                        && table_va - segment->seg_vaddr < segment->seg_file_size
+                        && (uint64_t)entries * 4 <= segment->seg_file_size - (table_va - segment->seg_vaddr)) {
+                        readonly = true;
+                    }
+                    if (segment->seg_type == PT_LOAD
+                        && (segment->seg_flags & (PF_W | PF_X)) != 0
+                        && (__int128)table_va < (__int128)segment->seg_vaddr + segment->seg_mem_size
+                        && (__int128)segment->seg_vaddr < (__int128)table_va + (uint64_t)entries * 4) {
+                        mutable_alias = true;
+                    }
+                }
+                if (!readonly || mutable_alias) {
+                    continue;
+                }
+                uint64_t bad_slot = UINT64_MAX;
+                uint32_t bad_entries = 0;
+                for (uint32_t i = 0; i < entries; i++) {
+                    const uint64_t entry_offset = table_offset + (uint64_t)i * 4;
+                    const uint64_t entry_slot = entry_offset / blocksize;
+                    uint32_t raw;
+                    uint64_t target;
+                    if (entry_slot != bad_slot) {
+                        bad_slot = entry_slot;
+                        bad_entries = 0;
+                    }
+                    if (!read_candidate_bytes(candidate, entry_offset, sizeof(raw), (uint8_t *)&raw)) {
+                        continue;
+                    }
+                    const int32_t delta = (int32_t)to_host_endian_32(raw, true);
+                    if (elf_text_add_signed_offset(table_va, delta, &target)
+                        && elf_text_va_is_executable(evidence, target)) {
+                        continue;
+                    }
+                    bad_entries++;
+                    if (bad_entries >= ELF_TEXT_MIN_DISTINCT_ANCHORS) {
+                        if (run_end) {
+                            *run_end = entry_slot + 1;
+                        }
+                        free(block);
+                        return entry_slot;
+                    }
+                }
+            }
+            free(block);
+            offset += bytes;
+        }
+    }
+    return UINT64_MAX;
+}
+
+// Find a run whose direct calls disagree with the file's own function and
+// linkage tables. This is a search trigger, not proof of invalid bytes: a
+// complete candidate is retained as PROMISING if no unique repair is found.
+static uint64_t
+elf_layout_first_code_discontinuity(CarveInfo *candidate,
+                                   const FileState *layout,
+                                   uint64_t blocks,
+                                   const int64_t *mapping,
+                                   uint64_t *run_end,
+                                   bool consider_uncertain)
+{
+    ElfTextBranchEvidence evidence = {0};
+    CarveInfo hypothesis;
+    BlockVector *hypothesis_vector = NULL;
+    uint64_t first = UINT64_MAX;
+    uint64_t last = UINT64_MAX;
+    bool first_is_unwind = false;
+
+    if (run_end) {
+        *run_end = UINT64_MAX;
+    }
+    if (!candidate || !candidate->b || !layout || blocks == 0) {
+        return UINT64_MAX;
+    }
+    hypothesis = *candidate;
+    if (mapping) {
+        init_blockvector(scalpel_state.filemirror, &hypothesis_vector, blocks, true);
+        if (!hypothesis_vector) {
+            return UINT64_MAX;
+        }
+        hypothesis.b = hypothesis_vector;
+        for (uint64_t i = 0; i < blocks; i++) {
+            blockvector_set_apparent_blocknumber(hypothesis.b, i, mapping[i]);
+        }
+    }
+    if (!elf_text_branch_evidence_init(&hypothesis, layout, &evidence)
+        || evidence.num_function_starts < 4
+        || (evidence.machine != EM_X86_64 && evidence.machine != EM_AARCH64)) {
+        goto done;
+    }
+    evidence.include_linkage_stubs = true;
+    evidence.restrict_to_text_sections = true;
+    evidence.code_anchors_corroborated =
+        elf_text_code_anchors_corroborate(&hypothesis, &evidence);
+    for (uint64_t i = 1; i < blocks; i++) {
+        const int64_t apparent = blockvector_get_apparent_blocknumber(hypothesis.b, i);
+        bool suspect = false;
+        bool unwind_suspect = false;
+        if (apparent >= 0
+            && elf_text_slot_overlaps_executable(
+                   &evidence, layout, i, scalpel_state.blocksize)) {
+            const ElfTextFragment fragment = {.ap_start = (uint64_t)apparent, .len = 1};
+            ElfTextBranchScore score;
+            elf_text_score_branch_fragment(&hypothesis, &evidence, i, &fragment, &score);
+            suspect = score.usable && score.exact_trials > 0
+                && (score.exact_upper < 0.20
+                    || (score.exact_matches == 0 && score.executable_matches == 0));
+            // x86 instruction operands can resemble direct calls. Require
+            // separate disagreement from RIP-relative data references before
+            // reopening a region on that architecture.
+            if (evidence.machine == EM_X86_64) {
+                suspect = suspect && score.file_references >= 4
+                    && score.file_reference_upper < 0.50;
+            }
+            if (!suspect) {
+                unwind_suspect = elf_text_code_anchors_need_search(
+                    &hypothesis, &evidence, i,
+                    consider_uncertain
+                        && elf_text_run_evidence_tier(&score, NULL, NULL, NULL) < 2);
+                suspect = unwind_suspect;
+            }
+            // A non-code block may contain too few call instructions for
+            // target statistics. Independent section evidence can still
+            // reopen it without treating a classifier verdict as invalidity.
+            if (!suspect && score.exact_matches == 0
+                && elf_layout_slot_expects_text(layout, i,
+                                                 scalpel_state.blocksize)
+                && elf_layout_apparent_slot_conflicts(
+                       candidate, layout, i, scalpel_state.blocksize,
+                       apparent)) {
+                suspect = true;
+            }
+        }
+        if (suspect) {
+            if (first == UINT64_MAX) {
+                first = i;
+                first_is_unwind = unwind_suspect;
+            }
+            last = i + 1;
+            if (run_end) {
+                *run_end = i + 1;
+            }
+        }
+        else if (first != UINT64_MAX) {
+            break;
+        }
+    }
+    // A failed prologue need not be the start of the damaged run. Include
+    // neighboring executable blocks until position evidence or a section
+    // boundary bounds the uncertainty. Full validation still decides repair.
+    if (first_is_unwind && evidence.code_anchors_corroborated) {
+        while (first > 1
+               && elf_text_slot_overlaps_executable(
+                      &evidence, layout, first - 1, scalpel_state.blocksize)
+               && !elf_text_slot_has_position_evidence(&hypothesis, &evidence, first - 1)) {
+            first--;
+        }
+        while (last < blocks
+               && elf_text_slot_overlaps_executable(
+                      &evidence, layout, last, scalpel_state.blocksize)
+               && !elf_text_slot_has_position_evidence(&hypothesis, &evidence, last)) {
+            last++;
+        }
+        if (run_end) {
+            *run_end = last;
+        }
+    }
+    // Unreachable switch entries or runtime fixups can be legitimate. This
+    // signal motivates search/status demotion, not a hard validity veto.
+    if (first == UINT64_MAX && consider_uncertain) {
+        first = elf_text_first_jump_table_discontinuity(&hypothesis, &evidence, run_end);
+    }
+done:
+    elf_text_branch_evidence_release(&evidence);
+    if (hypothesis_vector) {
+        free_blockvector(&hypothesis_vector);
+    }
+    return first;
+}
+
+
+// Score every split in one displacement bracket using position-dependent
+// control-flow evidence. Moving a split left changes only one logical block,
+// so the complete score is updated incrementally rather than rescanning the
+// executable region for every hypothesis.
+static bool
+elf_gapsolve_semantic_scores(CarveInfo *candidate,
+                             FileState *filestate,
+                             int64_t header_ap,
+                             const ElfGapSpan *spans,
+                             int nspans,
+                             int moving_span,
+                             int64_t k_lo,
+                             int64_t k_hi,
+                             uint64_t total_blocks,
+                             ElfGapSemanticScore *scores,
+                             size_t score_count)
+{
+    ElfGapSpan local_spans[2 * (ELF_GAPSOLVE_MAX_GAPS + 1)];
+    CarveInfo hypothesis;
+    BlockVector *hypothesis_blockvector = NULL;
+    ElfTextBranchEvidence evidence = {0};
+    ElfTextBranchScore aggregate = {0};
+    bool ok = false;
+
+    if (!candidate || !candidate->b || !filestate || !spans || !scores
+        || header_ap < 0 || nspans <= 0
+        || nspans > (int)(sizeof(local_spans) / sizeof(local_spans[0]))
+        || moving_span < 0 || moving_span >= nspans
+        || k_lo < 0 || k_hi < k_lo || total_blocks == 0
+        || (uint64_t)(k_hi - k_lo) >= SIZE_MAX
+        || score_count != (size_t)(k_hi - k_lo + 1)) {
+        return false;
+    }
+
+    memset(scores, 0, score_count * sizeof(*scores));
+    memcpy(local_spans, spans, (size_t)nspans * sizeof(*local_spans));
+    local_spans[moving_span].split = (uint64_t)k_hi;
+
+    hypothesis = *candidate;
+    clone_blockvector(candidate->b, &hypothesis_blockvector, false);
+    if (!hypothesis_blockvector) {
+        return false;
+    }
+    hypothesis.b = hypothesis_blockvector;
+
+    for (uint64_t slot = 0; slot < total_blocks; slot++) {
+        int64_t apparent =
+            blockvector_get_apparent_blocknumber(candidate->b, slot);
+
+        if (bv_slot_is_unfilled(apparent)) {
+            const __int128 apparent_wide =
+                (__int128)header_ap + (__int128)slot
+                + (__int128)elf_gapsolve_disp_at(local_spans, nspans,
+                                                  slot);
+
+            if (apparent_wide < 0 || apparent_wide > INT64_MAX) {
+                goto done;
+            }
+            apparent = (int64_t)apparent_wide;
+        }
+        blockvector_set_apparent_blocknumber(hypothesis.b, slot, apparent);
+    }
+    normalize_blockvector(hypothesis.b);
+
+    if (!elf_text_branch_evidence_init(&hypothesis, filestate, &evidence)) {
+        goto done;
+    }
+
+    for (uint64_t slot = 0; slot < total_blocks; slot++) {
+        if (!elf_text_slot_overlaps_executable(
+                &evidence, filestate, slot, scalpel_state.blocksize)) {
+            continue;
+        }
+
+        int64_t apparent =
+            blockvector_get_apparent_blocknumber(candidate->b, slot);
+        if (bv_slot_is_unfilled(apparent)) {
+            const __int128 apparent_wide =
+                (__int128)header_ap + (__int128)slot
+                + (__int128)elf_gapsolve_disp_at(local_spans, nspans,
+                                                  slot);
+
+            if (apparent_wide < 0 || apparent_wide > INT64_MAX) {
+                goto done;
+            }
+            apparent = (int64_t)apparent_wide;
+        }
+        if (apparent < 0) {
+            goto done;
+        }
+
+        const ElfTextFragment fragment = {
+            .ap_start = (uint64_t)apparent,
+            .len = 1,
+        };
+        ElfTextBranchScore block_score;
+
+        elf_text_score_branch_fragment(&hypothesis, &evidence, slot,
+                                       &fragment, &block_score);
+        if (!block_score.usable) {
+            goto done;
+        }
+        aggregate.branches += block_score.branches;
+        aggregate.executable_matches += block_score.executable_matches;
+        aggregate.exact_trials += block_score.exact_trials;
+        aggregate.exact_matches += block_score.exact_matches;
+        aggregate.file_references += block_score.file_references;
+        aggregate.file_reference_matches +=
+            block_score.file_reference_matches;
+    }
+
+    for (int64_t split = k_hi; split >= k_lo; split--) {
+        if (split != k_hi) {
+            const uint64_t slot = (uint64_t)split;
+            const int64_t pinned =
+                blockvector_get_apparent_blocknumber(candidate->b, slot);
+
+            if (bv_slot_is_unfilled(pinned)
+                && elf_text_slot_overlaps_executable(
+                       &evidence, filestate, slot,
+                       scalpel_state.blocksize)) {
+                ElfTextBranchScore old_score;
+                ElfTextBranchScore new_score;
+                const __int128 old_apparent_wide =
+                    (__int128)header_ap + (__int128)slot
+                    + (__int128)elf_gapsolve_disp_at(local_spans, nspans,
+                                                      slot);
+
+                local_spans[moving_span].split = slot;
+                const __int128 new_apparent_wide =
+                    (__int128)header_ap + (__int128)slot
+                    + (__int128)elf_gapsolve_disp_at(local_spans, nspans,
+                                                      slot);
+
+                if (old_apparent_wide < 0 || old_apparent_wide > INT64_MAX
+                    || new_apparent_wide < 0
+                    || new_apparent_wide > INT64_MAX) {
+                    goto done;
+                }
+
+                const ElfTextFragment old_fragment = {
+                    .ap_start = (uint64_t)(int64_t)old_apparent_wide,
+                    .len = 1,
+                };
+                const ElfTextFragment new_fragment = {
+                    .ap_start = (uint64_t)(int64_t)new_apparent_wide,
+                    .len = 1,
+                };
+
+                elf_text_score_branch_fragment(&hypothesis, &evidence, slot,
+                                               &old_fragment, &old_score);
+                elf_text_score_branch_fragment(&hypothesis, &evidence, slot,
+                                               &new_fragment, &new_score);
+                if (!old_score.usable || !new_score.usable
+                    || aggregate.branches < old_score.branches
+                    || aggregate.executable_matches
+                           < old_score.executable_matches
+                    || aggregate.exact_trials < old_score.exact_trials
+                    || aggregate.exact_matches < old_score.exact_matches
+                    || aggregate.file_references
+                           < old_score.file_references
+                    || aggregate.file_reference_matches
+                           < old_score.file_reference_matches) {
+                    goto done;
+                }
+
+                aggregate.branches =
+                    aggregate.branches - old_score.branches
+                    + new_score.branches;
+                aggregate.executable_matches =
+                    aggregate.executable_matches
+                    - old_score.executable_matches
+                    + new_score.executable_matches;
+                aggregate.exact_trials =
+                    aggregate.exact_trials - old_score.exact_trials
+                    + new_score.exact_trials;
+                aggregate.exact_matches =
+                    aggregate.exact_matches - old_score.exact_matches
+                    + new_score.exact_matches;
+                aggregate.file_references =
+                    aggregate.file_references - old_score.file_references
+                    + new_score.file_references;
+                aggregate.file_reference_matches =
+                    aggregate.file_reference_matches
+                    - old_score.file_reference_matches
+                    + new_score.file_reference_matches;
+            }
+            else {
+                local_spans[moving_span].split = (uint64_t)split;
+            }
+        }
+
+        ElfGapSemanticScore *result = &scores[(size_t)(split - k_lo)];
+
+        result->branches = aggregate.branches;
+        result->executable_matches = aggregate.executable_matches;
+        result->exact_trials = aggregate.exact_trials;
+        result->exact_matches = aggregate.exact_matches;
+        result->file_references = aggregate.file_references;
+        result->file_reference_matches =
+            aggregate.file_reference_matches;
+        elf_text_wilson_interval(
+            result->executable_matches, result->branches,
+            &result->executable_lower, &result->executable_upper);
+        elf_text_wilson_interval(
+            result->exact_matches, result->exact_trials,
+            &result->exact_lower, &result->exact_upper);
+        elf_text_wilson_interval(
+            result->file_reference_matches, result->file_references,
+            &result->file_reference_lower,
+            &result->file_reference_upper);
+        result->usable = result->branches != 0
+                         || result->exact_trials != 0
+                         || result->file_references != 0;
+    }
+
+    ok = true;
+
+done:
+    elf_text_branch_evidence_release(&evidence);
+    free_blockvector(&hypothesis_blockvector);
+    return ok;
+}
+
+
+/*
+ * Score the executable holes in one structurally valid mapping. Exact
+ * function targets provide position-specific evidence; every executable hole
+ * must independently clear the acceptance thresholds.
+ */
+static bool
+elf_score_monotone_mapping(CarveInfo *candidate,
+                           FileState *filestate,
+                           const int64_t *mapping,
+                           uint64_t blocks,
+                           const uint64_t *holes,
+                           size_t hole_count,
+                           bool *qualified,
+                           double *semantic_lower,
+                           double *semantic_upper,
+                           uint64_t *semantic_matches,
+                           uint64_t *executable_holes)
+{
+    CarveInfo hypothesis;
+    BlockVector *hypothesis_blockvector = NULL;
+    ElfTextBranchEvidence evidence = {0};
+    bool saw_executable = false;
+    bool all_qualified = true;
+    double weakest_lower = 1.0;
+    double weakest_upper = 1.0;
+    uint64_t total_matches = 0;
+    uint64_t executable_mask = 0;
+
+    if (qualified) {
+        *qualified = false;
+    }
+    if (semantic_lower) {
+        *semantic_lower = 0.0;
+    }
+    if (semantic_upper) {
+        *semantic_upper = 0.0;
+    }
+    if (semantic_matches) {
+        *semantic_matches = 0;
+    }
+    if (executable_holes) {
+        *executable_holes = 0;
+    }
+
+    if (!candidate || !candidate->b || !filestate || !mapping
+        || blocks == 0 || !holes || hole_count == 0
+        || hole_count > 64) {
+        return false;
+    }
+
+    hypothesis = *candidate;
+    clone_blockvector(candidate->b, &hypothesis_blockvector, false);
+    if (!hypothesis_blockvector) {
+        return false;
+    }
+    hypothesis.b = hypothesis_blockvector;
+    for (uint64_t slot = 0; slot < blocks; slot++) {
+        blockvector_set_apparent_blocknumber(hypothesis.b, slot,
+                                             mapping[slot]);
+    }
+    normalize_blockvector(hypothesis.b);
+
+    if (!elf_text_branch_evidence_init(
+            &hypothesis, filestate, &evidence)) {
+        goto done;
+    }
+
+    for (size_t hole = 0; hole < hole_count; hole++) {
+        if (!elf_text_slot_overlaps_executable(
+                &evidence, filestate, holes[hole],
+                scalpel_state.blocksize)) {
+            continue;
+        }
+
+        const ElfTextFragment fragment = {
+            .ap_start = (uint64_t)mapping[holes[hole]],
+            .len = 1,
+        };
+        ElfTextBranchScore score;
+
+        saw_executable = true;
+        executable_mask |= UINT64_C(1) << hole;
+        elf_text_score_branch_fragment(
+            &hypothesis, &evidence, holes[hole], &fragment, &score);
+
+        if (!score.usable) {
+            all_qualified = false;
+            weakest_lower = 0.0;
+            continue;
+        }
+
+        const double candidate_upper =
+            score.exact_matches == 0 ? 0.0 : score.exact_upper;
+
+        if (score.exact_lower < weakest_lower) {
+            weakest_lower = score.exact_lower;
+        }
+        if (candidate_upper < weakest_upper) {
+            weakest_upper = candidate_upper;
+        }
+        total_matches += score.exact_matches;
+
+        if (score.exact_matches < 4 || score.exact_lower < 0.20
+            || score.executable_matches < 3
+            || score.executable_lower < 0.20) {
+            all_qualified = false;
+        }
+    }
+
+    if (saw_executable) {
+        if (qualified) {
+            *qualified = all_qualified;
+        }
+        if (semantic_lower) {
+            *semantic_lower = weakest_lower;
+        }
+        if (semantic_upper) {
+            *semantic_upper = weakest_upper;
+        }
+        if (semantic_matches) {
+            *semantic_matches = total_matches;
+        }
+        if (executable_holes) {
+            *executable_holes = executable_mask;
+        }
+    }
+
+done:
+    elf_text_branch_evidence_release(&evidence);
+    free_blockvector(&hypothesis_blockvector);
+    return saw_executable;
+}
+
+
+/*
+ * Complete zero placeholders exposed by a monotone gap solve. The search is
+ * deliberately bounded, validates every complete mapping structurally, and
+ * requires uniquely stronger position-specific evidence before committing an
+ * executable block. Ambiguity leaves the seed unchanged for general recovery.
+ */
+static bool
+elf_try_monotone_zero_gap_completion(ThreadWork *work,
+                                     CarveInfo *candidate,
+                                     FileState *filestate,
+                                     uint64_t file_size,
+                                     const char *cid,
+                                     uuid_string_t uuidp,
+                                     uuid_string_t uuidc,
+                                     bool *returned_to_idle)
+{
+    enum {
+        ELF_MONOTONE_ZERO_MAX_HOLES = ELF_GAPSOLVE_MAX_GAPS,
+        ELF_MONOTONE_ZERO_MAX_CHOICES = 32,
+    };
+
+    FileMirror *fm = scalpel_state.filemirror;
+    const uint32_t blocksize = scalpel_state.blocksize;
+    const uint64_t apparent_blocks = filemirror_apparent_blocks(fm);
+    uint64_t blocks;
+    int64_t *baseline = NULL;
+    int64_t *mapping = NULL;
+    int64_t *used_actual = NULL;
+    uint64_t holes[ELF_MONOTONE_ZERO_MAX_HOLES];
+    int64_t choices[ELF_MONOTONE_ZERO_MAX_HOLES]
+                   [ELF_MONOTONE_ZERO_MAX_CHOICES];
+    double scores[ELF_MONOTONE_ZERO_MAX_HOLES]
+                 [ELF_MONOTONE_ZERO_MAX_CHOICES];
+    size_t choice_counts[ELF_MONOTONE_ZERO_MAX_HOLES] = {0};
+    int64_t invariant_choices[ELF_MONOTONE_ZERO_MAX_HOLES];
+    int64_t best_choices[ELF_MONOTONE_ZERO_MAX_HOLES];
+    size_t hole_count = 0;
+    size_t used_count = 0;
+    size_t choices_per_hole = ELF_MONOTONE_ZERO_MAX_CHOICES;
+    size_t validating_mappings = 0;
+    bool saw_inserted_zero = false;
+    bool have_best = false;
+    double best_lower = 0.0;
+    double best_upper = 0.0;
+    double competitor_upper = 0.0;
+    uint64_t best_matches = 0;
+    uint64_t best_executable_holes = 0;
+    bool completed = false;
+
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+    if (!work || !candidate || !candidate->b || !filestate || !fm
+        || file_size == 0 || blocksize == 0) {
+        return false;
+    }
+
+    blocks = blockvector_get_num_blocks(candidate->b);
+    if (blocks < 3 || CEILDIV(file_size, blocksize) != blocks
+        || blocks > SIZE_MAX / sizeof(*baseline)) {
+        return false;
+    }
+
+    baseline = (int64_t *)malloc((size_t)blocks * sizeof(*baseline));
+    mapping = (int64_t *)malloc((size_t)blocks * sizeof(*mapping));
+    used_actual = (int64_t *)malloc((size_t)blocks * sizeof(*used_actual));
+    if (!baseline || !mapping || !used_actual) {
+        goto done;
+    }
+
+    for (uint64_t slot = 0; slot < blocks; slot++) {
+        baseline[slot] =
+            blockvector_get_apparent_blocknumber(candidate->b, slot);
+    }
+
+    for (uint64_t slot = 0; slot < blocks;) {
+        if (bv_slot_is_placed(baseline[slot])) {
+            slot++;
+            continue;
+        }
+
+        const uint64_t run_lo = slot;
+        while (slot < blocks && bv_slot_is_unfilled(baseline[slot])) {
+            if (hole_count == ELF_MONOTONE_ZERO_MAX_HOLES) {
+                goto done;
+            }
+            holes[hole_count++] = slot;
+            slot++;
+        }
+        const uint64_t run_hi = slot;
+
+        if (run_lo == 0 || run_hi >= blocks
+            || !bv_slot_is_placed(baseline[run_lo - 1])
+            || !bv_slot_is_placed(baseline[run_hi])) {
+            goto done;
+        }
+
+        const int64_t left = baseline[run_lo - 1];
+        const int64_t right = baseline[run_hi];
+        const uint64_t run_length = run_hi - run_lo;
+
+        if (left < 0 || right <= left
+            || (uint64_t)(right - left) != run_length + 1) {
+            goto done;
+        }
+
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+            const uint64_t logical = run_lo + offset;
+            const int64_t apparent = left + (int64_t)offset + 1;
+            const int64_t actual =
+                filemirror_actual_blocknumber(fm, apparent);
+
+            if (actual < 0 || !filemirror_actual_block_is_zero(fm, actual)
+                || elf_layout_known_bytes(filestate, blocksize, logical) == 0) {
+                goto done;
+            }
+            baseline[logical] = apparent;
+        }
+    }
+
+    if (hole_count == 0) {
+        goto done;
+    }
+
+    for (uint64_t slot = 0; slot < blocks; slot++) {
+        const int64_t actual =
+            filemirror_actual_blocknumber(fm, baseline[slot]);
+
+        if (actual < 0) {
+            goto done;
+        }
+        if (slot > 0) {
+            const int64_t previous_actual = used_actual[used_count - 1];
+
+            if (actual <= previous_actual) {
+                goto done;
+            }
+            for (int64_t skipped = previous_actual + 1;
+                 skipped < actual; skipped++) {
+                if (!filemirror_actual_block_is_zero(fm, skipped)) {
+                    goto done;
+                }
+                saw_inserted_zero = true;
+            }
+        }
+        used_actual[used_count++] = actual;
+    }
+    if (!saw_inserted_zero) {
+        goto done;
+    }
+
+    qsort(used_actual, used_count, sizeof(*used_actual), elf_compare_int64);
+
+    while (choices_per_hole > 1) {
+        size_t trials = 1;
+        bool within_budget = true;
+
+        for (size_t hole = 0; hole < hole_count; hole++) {
+            if (trials > ELF_GAPSOLVE_MAX_TRIALS / choices_per_hole) {
+                within_budget = false;
+                break;
+            }
+            trials *= choices_per_hole;
+        }
+        if (within_budget) {
+            break;
+        }
+        choices_per_hole--;
+    }
+
+    for (size_t hole = 0; hole < hole_count; hole++) {
+        for (size_t rank = 0; rank < choices_per_hole; rank++) {
+            choices[hole][rank] = -1;
+            scores[hole][rank] = -DBL_MAX;
+        }
+
+        for (uint64_t apparent = 0;
+             apparent < apparent_blocks; apparent++) {
+            if ((apparent & UINT64_C(0xff)) == 0
+                && elf_relocated_run_time_to_checkpoint(
+                       work, candidate, uuidp, uuidc)) {
+                if (returned_to_idle) {
+                    *returned_to_idle = true;
+                }
+                goto done;
+            }
+
+            const int64_t actual =
+                filemirror_actual_blocknumber(fm, (int64_t)apparent);
+
+            if (actual < 0 || filemirror_actual_block_covered(fm, actual)
+                || filemirror_actual_block_is_zero(fm, actual)
+                || bsearch(&actual, used_actual, used_count,
+                           sizeof(*used_actual), elf_compare_int64)
+                || elf_layout_apparent_slot_has_anchor_conflict(
+                       candidate, filestate, holes[hole], blocksize,
+                       (int64_t)apparent)) {
+                continue;
+            }
+
+            double score = elf_relocated_block_affinity(
+                candidate, filestate, holes[hole], (int64_t)apparent);
+            if (score == -DBL_MAX) {
+                continue;
+            }
+
+            const BlockValidationDecision confidence =
+                filemirror_get_blocktype(fm, actual, candidate->needleidx);
+            const int64_t reservations =
+                scalpel_state.reservations
+                    ? filemirror_actual_block_reserved(fm, actual)
+                    : 0;
+
+            score += 10.0
+                     * (elf_block_selection_adjustment(confidence, 0)
+                        - elf_block_selection_adjustment(confidence,
+                                                         reservations));
+
+            size_t rank;
+            if (choice_counts[hole] < choices_per_hole) {
+                rank = choice_counts[hole]++;
+            }
+            else {
+                rank = choices_per_hole - 1;
+                if (score <= scores[hole][rank]) {
+                    continue;
+                }
+            }
+
+            while (rank > 0 && score > scores[hole][rank - 1]) {
+                scores[hole][rank] = scores[hole][rank - 1];
+                choices[hole][rank] = choices[hole][rank - 1];
+                rank--;
+            }
+            scores[hole][rank] = score;
+            choices[hole][rank] = (int64_t)apparent;
+        }
+
+        if (choice_counts[hole] == 0) {
+            goto done;
+        }
+    }
+
+    for (size_t hole = 0; hole < hole_count; hole++) {
+        invariant_choices[hole] = -1;
+        best_choices[hole] = -1;
+    }
+
+    size_t trial_count = 1;
+    for (size_t hole = 0; hole < hole_count; hole++) {
+        if (trial_count > ELF_GAPSOLVE_MAX_TRIALS / choice_counts[hole]) {
+            goto done;
+        }
+        trial_count *= choice_counts[hole];
+    }
+
+    memcpy(mapping, baseline, (size_t)blocks * sizeof(*mapping));
+    for (size_t trial = 0; trial < trial_count; trial++) {
+        if ((trial & 0xffu) == 0
+            && elf_relocated_run_time_to_checkpoint(
+                   work, candidate, uuidp, uuidc)) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+
+        size_t choice_number = trial;
+        bool duplicate_choice = false;
+
+        for (size_t hole = 0; hole < hole_count; hole++) {
+            const size_t choice = choice_number % choice_counts[hole];
+
+            mapping[holes[hole]] = choices[hole][choice];
+            choice_number /= choice_counts[hole];
+        }
+        for (size_t left = 0; left < hole_count && !duplicate_choice; left++) {
+            const int64_t left_actual = filemirror_actual_blocknumber(
+                fm, mapping[holes[left]]);
+
+            for (size_t right = left + 1; right < hole_count; right++) {
+                if (left_actual == filemirror_actual_blocknumber(
+                                       fm, mapping[holes[right]])) {
+                    duplicate_choice = true;
+                    break;
+                }
+            }
+        }
+        if (duplicate_choice
+            || !elf_validate_relocated_mapping(
+                   candidate, filestate, mapping, blocks, file_size, cid,
+                   false, NULL)) {
+            continue;
+        }
+
+        if (validating_mappings == 0) {
+            for (size_t hole = 0; hole < hole_count; hole++) {
+                invariant_choices[hole] = mapping[holes[hole]];
+            }
+        }
+        else {
+            for (size_t hole = 0; hole < hole_count; hole++) {
+                if (invariant_choices[hole] != mapping[holes[hole]]) {
+                    invariant_choices[hole] = -1;
+                }
+            }
+        }
+        validating_mappings++;
+
+        bool mapping_qualified = false;
+        double semantic_lower = 0.0;
+        double semantic_upper = 0.0;
+        uint64_t semantic_matches = 0;
+        uint64_t executable_holes = 0;
+
+        if (!elf_score_monotone_mapping(
+                candidate, filestate, mapping, blocks,
+                holes, hole_count, &mapping_qualified,
+                &semantic_lower, &semantic_upper,
+                &semantic_matches, &executable_holes)) {
+            continue;
+        }
+
+        const bool better =
+            mapping_qualified
+            && (!have_best
+                || semantic_lower > best_lower + 1.0e-12
+                || (fabs(semantic_lower - best_lower) <= 1.0e-12
+                    && semantic_matches > best_matches));
+
+        if (better) {
+            if (have_best && best_upper > competitor_upper) {
+                competitor_upper = best_upper;
+            }
+            for (size_t hole = 0; hole < hole_count; hole++) {
+                best_choices[hole] = mapping[holes[hole]];
+            }
+            have_best = true;
+            best_lower = semantic_lower;
+            best_upper = semantic_upper;
+            best_matches = semantic_matches;
+            best_executable_holes = executable_holes;
+        }
+        else if (semantic_upper > competitor_upper) {
+            competitor_upper = semantic_upper;
+        }
+    }
+
+    if (have_best && best_lower > competitor_upper) {
+        bool nonexecutable_choices_are_invariant = true;
+
+        for (size_t hole = 0; hole < hole_count; hole++) {
+            if ((best_executable_holes & (UINT64_C(1) << hole)) == 0
+                && invariant_choices[hole] != best_choices[hole]) {
+                nonexecutable_choices_are_invariant = false;
+                break;
+            }
+            mapping[holes[hole]] = best_choices[hole];
+        }
+
+        if (nonexecutable_choices_are_invariant
+            && elf_validate_relocated_mapping(
+                   candidate, filestate, mapping, blocks, file_size, cid,
+                   false, NULL)) {
+            for (uint64_t slot = 0; slot < blocks; slot++) {
+                ELF_DEBUG_SET_APPARENT(candidate, slot, mapping[slot]);
+            }
+            normalize_blockvector(candidate->b);
+            scalpel_log(
+                "[%s] elf monotone semantic completion: repaired %zu "
+                "displaced slots with %" PRIu64
+                " exact function targets (lower=%.3f, competitor "
+                "upper=%.3f).\n",
+                cid, hole_count, best_matches, best_lower,
+                competitor_upper);
+            completed = true;
+        }
+    }
+
+    if (!completed && validating_mappings > 0) {
+        scalpel_log(
+            "[%s] elf monotone zero-gap completion: %zu structurally "
+            "valid alternatives remain ambiguous.\n",
+            cid, validating_mappings);
+    }
+
+done:
+    free(used_actual);
+    free(mapping);
+    free(baseline);
+    return completed;
 }
 
 
@@ -36368,12 +45894,16 @@ elf_find_positioned_frame_runs(ThreadWork *work,
         uint64_t exact_matches = matches[first].exact_matches;
         bool independently_identified = matches[first].unique;
 
+        // Strong descriptors on both sides establish the same physical run
+        // across one block that lacks a usable prologue of its own.
         while (last + 1 < num_matches
                && matches[last + 1].displacement
                       == matches[first].displacement
-               && matches[last].logical_block != UINT64_MAX
+               && matches[last].logical_block <= UINT64_MAX - 2
                && matches[last + 1].logical_block
-                      == matches[last].logical_block + 1) {
+                      > matches[last].logical_block
+               && matches[last + 1].logical_block
+                      <= matches[last].logical_block + 2) {
             last++;
             exact_matches += matches[last].exact_matches;
             independently_identified =
@@ -37001,6 +46531,679 @@ elf_collect_text_fragments(CarveInfo            *candidate,
 }
 
 
+// Position MIPS blocks using procedure descriptors. Descriptor records can
+// identify a displaced .pdr block directly, while their frame sizes identify
+// the corresponding function prologues in displaced executable blocks.
+static ElfPositionedTextRun *
+elf_find_positioned_mips_runs(ThreadWork *work,
+                              CarveInfo *candidate,
+                              FileState *filestate,
+                              uuid_string_t uuidp,
+                              uuid_string_t uuidc,
+                              bool *returned_to_idle,
+                              size_t *out_count)
+{
+    enum { ELF_MIPS_MIN_EXACT_MATCHES = 4 };
+    const uint32_t blocksize = scalpel_state.blocksize;
+    const int64_t apparent_blocks_signed =
+        filemirror_apparent_blocks(scalpel_state.filemirror);
+    ElfTextBranchEvidence evidence = {0};
+    ElfMipsBlockMatch *matches = NULL;
+    size_t num_matches = 0;
+    size_t match_capacity = 0;
+    ElfPositionedTextRun *runs = NULL;
+    size_t num_runs = 0;
+    size_t run_capacity = 0;
+    ElfTextFragment *fragments = NULL;
+    size_t num_fragments = 0;
+    bool *eligible = NULL;
+    bool *seen_apparent = NULL;
+    uint64_t *candidate_apparents = NULL;
+    size_t num_candidate_apparents = 0;
+    size_t candidate_apparent_capacity = 0;
+    uint64_t *prologue_offsets = NULL;
+    uint32_t *prologue_frames = NULL;
+    bool failed = false;
+
+    if (returned_to_idle) {
+        *returned_to_idle = false;
+    }
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!work || !candidate || !candidate->b || !filestate
+        || blocksize < 32 || apparent_blocks_signed <= 0) {
+        return NULL;
+    }
+    const bool evidence_initialized =
+        elf_text_branch_evidence_init(candidate, filestate, &evidence);
+    if (!evidence_initialized
+        || (evidence.machine != EM_MIPS
+            && evidence.machine != EM_MIPS_RS3_LE)
+        || evidence.num_function_starts == 0
+        || evidence.mips_pdr_size < 32) {
+        elf_text_branch_evidence_release(&evidence);
+        return NULL;
+    }
+
+    const uint64_t apparent_blocks =
+        (uint64_t)apparent_blocks_signed;
+    const uint64_t candidate_blocks =
+        blockvector_get_num_blocks(candidate->b);
+    const int64_t header_apparent =
+        blockvector_get_apparent_blocknumber(candidate->b, 0);
+    const int64_t header_actual =
+        header_apparent >= 0
+            ? filemirror_actual_blocknumber(
+                  scalpel_state.filemirror, header_apparent)
+            : -1;
+
+    if (candidate_blocks < 2 || header_actual < 0
+        || evidence.mips_pdr_file_offset > evidence.file_size
+        || evidence.mips_pdr_size
+               > evidence.file_size - evidence.mips_pdr_file_offset) {
+        goto done;
+    }
+
+    const uint64_t pdr_end =
+        evidence.mips_pdr_file_offset + evidence.mips_pdr_size;
+    const uint64_t first_pdr_block =
+        evidence.mips_pdr_file_offset / blocksize;
+    const uint64_t last_pdr_block = (pdr_end - 1) / blocksize;
+
+    for (uint64_t logical_block = first_pdr_block;
+         logical_block <= last_pdr_block
+         && logical_block < candidate_blocks; logical_block++) {
+        const uint64_t block_file_offset = logical_block * blocksize;
+        const uint64_t block_file_end =
+            block_file_offset > UINT64_MAX - blocksize
+                ? UINT64_MAX
+                : block_file_offset + blocksize;
+        const uint64_t overlap_start =
+            block_file_offset > evidence.mips_pdr_file_offset
+                ? block_file_offset
+                : evidence.mips_pdr_file_offset;
+        const uint64_t overlap_end =
+            block_file_end < pdr_end ? block_file_end : pdr_end;
+        uint64_t first_record;
+
+        if (overlap_start >= overlap_end) {
+            continue;
+        }
+        const uint64_t relative_start =
+            overlap_start - evidence.mips_pdr_file_offset;
+        const uint64_t record_index =
+            (relative_start + 31) / 32;
+        if (record_index > UINT64_MAX / 32
+            || evidence.mips_pdr_file_offset
+                   > UINT64_MAX - record_index * 32) {
+            continue;
+        }
+        first_record =
+            evidence.mips_pdr_file_offset + record_index * 32;
+        if (first_record >= overlap_end
+            || overlap_end - first_record < 32) {
+            continue;
+        }
+        const uint64_t exact_trials =
+            (overlap_end - first_record) / 32;
+
+        if (exact_trials < ELF_MIPS_MIN_EXACT_MATCHES) {
+            continue;
+        }
+
+        uint64_t best_matches = 0;
+        uint64_t best_trials = exact_trials;
+        int64_t best_displacement = 0;
+        double best_lower = 0.0;
+        double best_upper = 0.0;
+        double competitor_upper = 0.0;
+        bool have_best = false;
+
+        for (uint64_t apparent = 0;
+             apparent < apparent_blocks; apparent++) {
+            if ((apparent & UINT64_C(0xff)) == 0
+                && elf_relocated_run_time_to_checkpoint(
+                       work, candidate, uuidp, uuidc)) {
+                if (returned_to_idle) {
+                    *returned_to_idle = true;
+                }
+                goto done;
+            }
+            if (!elf_block_is_available_for_candidate(
+                    candidate, apparent, false)) {
+                continue;
+            }
+
+            const int64_t actual =
+                filemirror_actual_blocknumber(
+                    scalpel_state.filemirror, (int64_t)apparent);
+            uint64_t data_length = 0;
+            const uint8_t *data =
+                (const uint8_t *)filemirror_actual_block_data_pointer(
+                    scalpel_state.filemirror, actual, &data_length);
+
+            if (actual < 0 || !data) {
+                continue;
+            }
+
+            bool sample_matches = true;
+            const uint64_t sample_count =
+                exact_trials < 4 ? exact_trials : 4;
+
+            for (uint64_t sample = 0;
+                 sample < sample_count; sample++) {
+                const uint64_t ordinal =
+                    sample_count == 1
+                        ? 0
+                        : sample * (exact_trials - 1)
+                              / (sample_count - 1);
+                const uint64_t record_file_offset =
+                    first_record + ordinal * 32;
+                const uint64_t in_block =
+                    record_file_offset - block_file_offset;
+
+                if (!elf_mips_pdr_record_matches(
+                        data, data_length, in_block,
+                        evidence.file_is_le,
+                        evidence.function_starts,
+                        evidence.num_function_starts)) {
+                    sample_matches = false;
+                    break;
+                }
+            }
+            if (!sample_matches) {
+                continue;
+            }
+
+            uint64_t exact_matches = 0;
+            for (uint64_t record = 0;
+                 record < exact_trials; record++) {
+                const uint64_t record_file_offset =
+                    first_record + record * 32;
+                const uint64_t in_block =
+                    record_file_offset - block_file_offset;
+
+                if (elf_mips_pdr_record_matches(
+                        data, data_length, in_block,
+                        evidence.file_is_le,
+                        evidence.function_starts,
+                        evidence.num_function_starts)) {
+                    exact_matches++;
+                }
+            }
+
+            double exact_lower = 0.0;
+            double exact_upper = 0.0;
+            elf_text_wilson_interval(
+                exact_matches, exact_trials,
+                &exact_lower, &exact_upper);
+            const __int128 displacement_wide =
+                (__int128)actual - (__int128)header_actual
+                - (__int128)logical_block;
+
+            if (displacement_wide < INT64_MIN
+                || displacement_wide > INT64_MAX) {
+                continue;
+            }
+            const int64_t displacement =
+                (int64_t)displacement_wide;
+            const bool better =
+                !have_best || exact_matches > best_matches
+                || (exact_matches == best_matches
+                    && exact_lower > best_lower + 1.0e-12);
+
+            if (better) {
+                if (have_best && best_upper > competitor_upper) {
+                    competitor_upper = best_upper;
+                }
+                have_best = true;
+                best_matches = exact_matches;
+                best_displacement = displacement;
+                best_lower = exact_lower;
+                best_upper = exact_upper;
+            }
+            else if (exact_upper > competitor_upper) {
+                competitor_upper = exact_upper;
+            }
+        }
+
+        if (have_best && best_displacement != 0
+            && best_matches >= ELF_MIPS_MIN_EXACT_MATCHES
+            && best_lower > competitor_upper
+            && !elf_mips_append_block_match(
+                   &matches, &num_matches, &match_capacity,
+                   logical_block, best_displacement,
+                   best_matches, best_trials,
+                   best_lower, best_upper, competitor_upper)) {
+            failed = true;
+            goto done;
+        }
+    }
+
+    if (evidence.mips_debug_line_size > 0
+        && evidence.mips_debug_line_file_offset <= evidence.file_size
+        && evidence.mips_debug_line_size
+               <= evidence.file_size
+                      - evidence.mips_debug_line_file_offset) {
+        const uint64_t debug_end =
+            evidence.mips_debug_line_file_offset
+            + evidence.mips_debug_line_size;
+        const uint64_t first_debug_block =
+            evidence.mips_debug_line_file_offset / blocksize;
+        const uint64_t last_debug_block =
+            (debug_end - 1) / blocksize;
+        const size_t pdr_match_count = num_matches;
+
+        for (size_t pdr_match = 0;
+             pdr_match < pdr_match_count; pdr_match++) {
+            for (int direction = -1; direction <= 1; direction += 2) {
+                if ((direction < 0
+                     && matches[pdr_match].logical_block == 0)
+                    || (direction > 0
+                        && matches[pdr_match].logical_block
+                               == UINT64_MAX)) {
+                    continue;
+                }
+                const uint64_t logical_block =
+                    direction < 0
+                        ? matches[pdr_match].logical_block - 1
+                        : matches[pdr_match].logical_block + 1;
+
+                if (logical_block < first_debug_block
+                    || logical_block > last_debug_block
+                    || logical_block >= candidate_blocks) {
+                    continue;
+                }
+
+                bool already_positioned = false;
+                for (size_t existing = 0;
+                     existing < num_matches; existing++) {
+                    if (matches[existing].logical_block
+                            == logical_block) {
+                        already_positioned = true;
+                        break;
+                    }
+                }
+                if (already_positioned) {
+                    continue;
+                }
+
+                const __int128 actual_wide =
+                    (__int128)header_actual
+                    + (__int128)logical_block
+                    + (__int128)matches[pdr_match].displacement;
+                if (actual_wide < 0 || actual_wide > INT64_MAX) {
+                    continue;
+                }
+                const int64_t actual = (int64_t)actual_wide;
+
+                if (filemirror_actual_block_covered(
+                        scalpel_state.filemirror, actual)) {
+                    continue;
+                }
+                uint64_t data_length = 0;
+                const uint8_t *data =
+                    (const uint8_t *)filemirror_actual_block_data_pointer(
+                        scalpel_state.filemirror, actual, &data_length);
+                uint64_t exact_trials = 0;
+                const uint64_t exact_matches =
+                    elf_mips_debug_line_address_matches(
+                        data, data_length, evidence.is_64,
+                        evidence.file_is_le,
+                        evidence.function_starts,
+                        evidence.num_function_starts,
+                        &exact_trials);
+                double exact_lower = 0.0;
+                double exact_upper = 0.0;
+
+                elf_text_wilson_interval(
+                    exact_matches, exact_trials,
+                    &exact_lower, &exact_upper);
+                if (exact_matches < ELF_MIPS_MIN_EXACT_MATCHES
+                    || exact_matches * 4 < exact_trials * 3
+                    || exact_lower <= 0.5) {
+                    continue;
+                }
+                if (!elf_mips_append_block_match(
+                        &matches, &num_matches, &match_capacity,
+                        logical_block,
+                        matches[pdr_match].displacement,
+                        exact_matches, exact_trials,
+                        exact_lower, exact_upper, 0.0)) {
+                    failed = true;
+                    goto done;
+                }
+            }
+        }
+    }
+
+    if (evidence.num_mips_pdr_records == 0) {
+        goto build_runs;
+    }
+
+    const ElfTunables scoring = default_tunables();
+    fragments = elf_collect_text_fragments(
+        candidate, &scoring, false, true,
+        &eligible, &num_fragments);
+    if (!fragments || num_fragments == 0
+        || apparent_blocks > SIZE_MAX / sizeof(*seen_apparent)) {
+        goto build_runs;
+    }
+    seen_apparent =
+        (bool *)calloc(apparent_blocks, sizeof(*seen_apparent));
+    prologue_offsets =
+        (uint64_t *)malloc(evidence.num_mips_pdr_records
+                           * sizeof(*prologue_offsets));
+    prologue_frames =
+        (uint32_t *)malloc(evidence.num_mips_pdr_records
+                           * sizeof(*prologue_frames));
+    if (!seen_apparent || !prologue_offsets || !prologue_frames) {
+        failed = true;
+        goto done;
+    }
+
+    for (size_t fragment_index = 0;
+         fragment_index < num_fragments; fragment_index++) {
+        const ElfTextFragment *fragment = &fragments[fragment_index];
+
+        for (uint64_t offset = 0; offset < fragment->len; offset++) {
+            if (fragment->ap_start > UINT64_MAX - offset) {
+                break;
+            }
+            const uint64_t apparent = fragment->ap_start + offset;
+
+            if (apparent >= apparent_blocks
+                || seen_apparent[apparent]) {
+                continue;
+            }
+            seen_apparent[apparent] = true;
+
+            if (num_candidate_apparents
+                    == candidate_apparent_capacity) {
+                const size_t new_capacity =
+                    candidate_apparent_capacity == 0
+                        ? 64
+                        : candidate_apparent_capacity * 2;
+
+                if (new_capacity < candidate_apparent_capacity
+                    || new_capacity
+                           > SIZE_MAX / sizeof(*candidate_apparents)) {
+                    failed = true;
+                    goto done;
+                }
+                uint64_t *larger =
+                    (uint64_t *)realloc(
+                        candidate_apparents,
+                        new_capacity * sizeof(*candidate_apparents));
+
+                if (!larger) {
+                    failed = true;
+                    goto done;
+                }
+                candidate_apparents = larger;
+                candidate_apparent_capacity = new_capacity;
+            }
+            candidate_apparents[num_candidate_apparents++] = apparent;
+        }
+    }
+
+    for (uint64_t logical_block = 1;
+         logical_block < candidate_blocks; logical_block++) {
+        size_t num_prologues = 0;
+
+        for (size_t record_index = 0;
+             record_index < evidence.num_mips_pdr_records;
+             record_index++) {
+            const ElfMipsPdrRecord *record =
+                &evidence.mips_pdr_records[record_index];
+            uint64_t file_offset;
+
+            if ((record->function_va & 1u) != 0
+                || record->frame_size == 0
+                || record->frame_size > INT16_MAX
+                || !elf_text_va_to_file_offset(
+                       &evidence, record->function_va,
+                       &file_offset)
+                || file_offset / blocksize != logical_block) {
+                continue;
+            }
+            const uint64_t in_block = file_offset % blocksize;
+
+            if (in_block > blocksize - sizeof(uint32_t)) {
+                continue;
+            }
+            prologue_offsets[num_prologues] = in_block;
+            prologue_frames[num_prologues] = record->frame_size;
+            num_prologues++;
+        }
+
+        if (num_prologues < ELF_MIPS_MIN_EXACT_MATCHES) {
+            continue;
+        }
+
+        uint64_t best_matches = 0;
+        int64_t best_displacement = 0;
+        double best_lower = 0.0;
+        double best_upper = 0.0;
+        double competitor_upper = 0.0;
+        bool have_best = false;
+
+        for (size_t candidate_index = 0;
+             candidate_index < num_candidate_apparents;
+             candidate_index++) {
+            if ((candidate_index & 0xffu) == 0
+                && elf_relocated_run_time_to_checkpoint(
+                       work, candidate, uuidp, uuidc)) {
+                if (returned_to_idle) {
+                    *returned_to_idle = true;
+                }
+                goto done;
+            }
+            const uint64_t apparent =
+                candidate_apparents[candidate_index];
+            const int64_t actual =
+                filemirror_actual_blocknumber(
+                    scalpel_state.filemirror, (int64_t)apparent);
+            uint64_t data_length = 0;
+            const uint8_t *data =
+                (const uint8_t *)filemirror_actual_block_data_pointer(
+                    scalpel_state.filemirror, actual, &data_length);
+
+            if (actual < 0 || !data) {
+                continue;
+            }
+
+            uint64_t exact_matches = 0;
+            for (size_t prologue = 0;
+                 prologue < num_prologues; prologue++) {
+                if (elf_mips_text_prologue_matches(
+                        data, data_length,
+                        prologue_offsets[prologue],
+                        prologue_frames[prologue],
+                        evidence.file_is_le)) {
+                    exact_matches++;
+                }
+            }
+
+            double exact_lower = 0.0;
+            double exact_upper = 0.0;
+            elf_text_wilson_interval(
+                exact_matches, num_prologues,
+                &exact_lower, &exact_upper);
+            const __int128 displacement_wide =
+                (__int128)actual - (__int128)header_actual
+                - (__int128)logical_block;
+
+            if (displacement_wide < INT64_MIN
+                || displacement_wide > INT64_MAX) {
+                continue;
+            }
+            const int64_t displacement =
+                (int64_t)displacement_wide;
+            const bool better =
+                !have_best || exact_matches > best_matches
+                || (exact_matches == best_matches
+                    && exact_lower > best_lower + 1.0e-12);
+
+            if (better) {
+                if (have_best && best_upper > competitor_upper) {
+                    competitor_upper = best_upper;
+                }
+                have_best = true;
+                best_matches = exact_matches;
+                best_displacement = displacement;
+                best_lower = exact_lower;
+                best_upper = exact_upper;
+            }
+            else if (exact_upper > competitor_upper) {
+                competitor_upper = exact_upper;
+            }
+        }
+
+        if (have_best && best_displacement != 0
+            && best_matches >= ELF_MIPS_MIN_EXACT_MATCHES
+            && best_lower > competitor_upper
+            && !elf_mips_append_block_match(
+                   &matches, &num_matches, &match_capacity,
+                   logical_block, best_displacement,
+                   best_matches, num_prologues,
+                   best_lower, best_upper, competitor_upper)) {
+            failed = true;
+            goto done;
+        }
+    }
+
+build_runs:
+    if (num_matches == 0) {
+        goto done;
+    }
+    qsort(matches, num_matches, sizeof(*matches),
+          elf_mips_block_match_compare);
+
+    for (size_t first = 0; first < num_matches;) {
+        size_t last = first;
+        uint64_t exact_matches = matches[first].exact_matches;
+        uint64_t exact_trials = matches[first].exact_trials;
+        double competitor_exact_upper =
+            matches[first].competitor_exact_upper;
+
+        // Strong descriptors on both sides establish the same physical run
+        // across one block that lacks enough descriptors of its own.
+        while (last + 1 < num_matches
+               && matches[last + 1].displacement
+                      == matches[first].displacement
+               && matches[last].logical_block <= UINT64_MAX - 2
+               && matches[last + 1].logical_block
+                      > matches[last].logical_block
+               && matches[last + 1].logical_block
+                      <= matches[last].logical_block + 2) {
+            last++;
+            if (exact_matches
+                    > UINT64_MAX - matches[last].exact_matches
+                || exact_trials
+                       > UINT64_MAX - matches[last].exact_trials) {
+                failed = true;
+                goto done;
+            }
+            exact_matches += matches[last].exact_matches;
+            exact_trials += matches[last].exact_trials;
+            if (matches[last].competitor_exact_upper
+                    > competitor_exact_upper) {
+                competitor_exact_upper =
+                    matches[last].competitor_exact_upper;
+            }
+        }
+
+        if (num_runs == run_capacity) {
+            const size_t new_capacity =
+                run_capacity == 0 ? 8 : run_capacity * 2;
+
+            if (new_capacity < run_capacity
+                || new_capacity > SIZE_MAX / sizeof(*runs)) {
+                failed = true;
+                goto done;
+            }
+            ElfPositionedTextRun *larger =
+                (ElfPositionedTextRun *)realloc(
+                    runs, new_capacity * sizeof(*runs));
+
+            if (!larger) {
+                failed = true;
+                goto done;
+            }
+            runs = larger;
+            run_capacity = new_capacity;
+        }
+
+        double exact_lower = 0.0;
+        double exact_upper = 0.0;
+        elf_text_wilson_interval(
+            exact_matches, exact_trials,
+            &exact_lower, &exact_upper);
+        runs[num_runs++] = (ElfPositionedTextRun){
+            .logical_start = matches[first].logical_block,
+            .length =
+                matches[last].logical_block
+                - matches[first].logical_block + 1,
+            .displacement = matches[first].displacement,
+            .branches = exact_trials,
+            .matches = exact_matches,
+            .exact_matches = exact_matches,
+            .lower = exact_lower,
+            .joint_lower = exact_lower,
+            .exact_lower = exact_lower,
+            .exact_upper = exact_upper,
+            .competitor_exact_upper =
+                competitor_exact_upper,
+            .independent_gain =
+                144.0
+                + 128.0
+                      * (exact_lower - competitor_exact_upper)
+                + log1p((double)exact_matches),
+            .independently_identified = true,
+            .identified_by_function_table = true,
+            .retained = true,
+        };
+
+        scalpel_log(
+            "elf positioned MIPS metadata: file blocks %" PRIu64
+            "..%" PRIu64 " map at signed displacement %" PRId64
+            " (%" PRIu64 "/%" PRIu64
+            " exact descriptor checks; lower=%.3f, competitor upper=%.3f).\n",
+            matches[first].logical_block,
+            matches[last].logical_block,
+            matches[first].displacement,
+            exact_matches, exact_trials,
+            exact_lower, competitor_exact_upper);
+        first = last + 1;
+    }
+
+done:
+    free(prologue_frames);
+    free(prologue_offsets);
+    free(candidate_apparents);
+    free(seen_apparent);
+    free(eligible);
+    free(fragments);
+    free(matches);
+    elf_text_branch_evidence_release(&evidence);
+
+    if (failed || (returned_to_idle && *returned_to_idle)) {
+        free(runs);
+        return NULL;
+    }
+    if (num_runs == 0) {
+        free(runs);
+        return NULL;
+    }
+    if (out_count) {
+        *out_count = num_runs;
+    }
+    return runs;
+}
+
+
 /*
  * Identify relocated executable-text runs using position-dependent direct
  * calls. The current mapping supplies suspect logical intervals, while every
@@ -37008,6 +47211,464 @@ elf_collect_text_fragments(CarveInfo            *candidate,
  * Statistically separated hypotheses are preferred, but every compatible
  * displacement remains eligible for full validation.
  */
+static inline uint64_t
+elf_positioned_proposal_hash(uint64_t logical_start,
+                             uint64_t length,
+                             int64_t displacement)
+{
+    uint64_t hash = logical_start;
+
+    hash ^= length + UINT64_C(0x9e3779b97f4a7c15)
+            + (hash << 6) + (hash >> 2);
+    hash ^= (uint64_t)displacement + UINT64_C(0x9e3779b97f4a7c15)
+            + (hash << 6) + (hash >> 2);
+    hash ^= hash >> 30;
+    hash *= UINT64_C(0xbf58476d1ce4e5b9);
+    hash ^= hash >> 27;
+    hash *= UINT64_C(0x94d049bb133111eb);
+    hash ^= hash >> 31;
+    return hash;
+}
+
+
+static bool
+elf_positioned_proposal_index_reserve(
+    ElfPositionedProposalIndexEntry **entries,
+    size_t *capacity,
+    size_t required_entries)
+{
+    if (!entries || !capacity) {
+        return false;
+    }
+
+    size_t new_capacity = *capacity == 0 ? 16 : *capacity;
+
+    while (required_entries > new_capacity / 2) {
+        if (new_capacity > SIZE_MAX / 2) {
+            return false;
+        }
+        new_capacity *= 2;
+    }
+    if (new_capacity == *capacity) {
+        return true;
+    }
+    if (new_capacity > SIZE_MAX / sizeof(**entries)) {
+        return false;
+    }
+
+    ElfPositionedProposalIndexEntry *larger =
+        (ElfPositionedProposalIndexEntry *)calloc(
+            new_capacity, sizeof(*larger));
+
+    if (!larger) {
+        return false;
+    }
+
+    for (size_t old = 0; old < *capacity; old++) {
+        if (!(*entries)[old].occupied) {
+            continue;
+        }
+
+        size_t slot =
+            (size_t)elf_positioned_proposal_hash(
+                (*entries)[old].logical_start,
+                (*entries)[old].length,
+                (*entries)[old].displacement)
+            & (new_capacity - 1);
+
+        while (larger[slot].occupied) {
+            slot = (slot + 1) & (new_capacity - 1);
+        }
+        larger[slot] = (*entries)[old];
+    }
+
+    free(*entries);
+    *entries = larger;
+    *capacity = new_capacity;
+    return true;
+}
+
+
+static size_t
+elf_positioned_proposal_index_find(
+    const ElfPositionedProposalIndexEntry *entries,
+    size_t capacity,
+    uint64_t logical_start,
+    uint64_t length,
+    int64_t displacement,
+    bool *found)
+{
+    if (found) {
+        *found = false;
+    }
+    if (!entries || capacity == 0
+        || (capacity & (capacity - 1)) != 0) {
+        return SIZE_MAX;
+    }
+
+    size_t slot =
+        (size_t)elf_positioned_proposal_hash(
+            logical_start, length, displacement)
+        & (capacity - 1);
+
+    for (size_t inspected = 0; inspected < capacity; inspected++) {
+        if (!entries[slot].occupied) {
+            return slot;
+        }
+        if (entries[slot].logical_start == logical_start
+            && entries[slot].length == length
+            && entries[slot].displacement == displacement) {
+            if (found) {
+                *found = true;
+            }
+            return slot;
+        }
+        slot = (slot + 1) & (capacity - 1);
+    }
+    return SIZE_MAX;
+}
+
+
+static int
+elf_positioned_logical_order_compare(const void *left, const void *right)
+{
+    const ElfPositionedLogicalOrder *a =
+        (const ElfPositionedLogicalOrder *)left;
+    const ElfPositionedLogicalOrder *b =
+        (const ElfPositionedLogicalOrder *)right;
+
+    if (a->length != b->length) {
+        return a->length < b->length ? -1 : 1;
+    }
+    if (a->logical_start != b->logical_start) {
+        return a->logical_start < b->logical_start ? -1 : 1;
+    }
+    if (a->proposal_index != b->proposal_index) {
+        return a->proposal_index < b->proposal_index ? -1 : 1;
+    }
+    return 0;
+}
+
+
+static int
+elf_positioned_physical_order_compare(const void *left, const void *right)
+{
+    const ElfPositionedPhysicalOrder *a =
+        (const ElfPositionedPhysicalOrder *)left;
+    const ElfPositionedPhysicalOrder *b =
+        (const ElfPositionedPhysicalOrder *)right;
+
+    if (a->length != b->length) {
+        return a->length < b->length ? -1 : 1;
+    }
+    if (a->physical_start != b->physical_start) {
+        return a->physical_start < b->physical_start ? -1 : 1;
+    }
+    if (a->proposal_index != b->proposal_index) {
+        return a->proposal_index < b->proposal_index ? -1 : 1;
+    }
+    return 0;
+}
+
+
+static int
+elf_positioned_retained_order_compare(const void *left, const void *right)
+{
+    const ElfPositionedRetainedOrder *a =
+        (const ElfPositionedRetainedOrder *)left;
+    const ElfPositionedRetainedOrder *b =
+        (const ElfPositionedRetainedOrder *)right;
+
+    if (a->displacement != b->displacement) {
+        return a->displacement < b->displacement ? -1 : 1;
+    }
+    if (a->logical_start != b->logical_start) {
+        return a->logical_start < b->logical_start ? -1 : 1;
+    }
+    if (a->logical_end != b->logical_end) {
+        return a->logical_end < b->logical_end ? -1 : 1;
+    }
+    if (a->proposal_index != b->proposal_index) {
+        return a->proposal_index < b->proposal_index ? -1 : 1;
+    }
+    return 0;
+}
+
+
+static int
+elf_positioned_retained_index_compare(const void *left, const void *right)
+{
+    const ElfPositionedRetainedOrder *a =
+        (const ElfPositionedRetainedOrder *)left;
+    const ElfPositionedRetainedOrder *b =
+        (const ElfPositionedRetainedOrder *)right;
+
+    if (a->proposal_index != b->proposal_index) {
+        return a->proposal_index < b->proposal_index ? -1 : 1;
+    }
+    return 0;
+}
+
+
+static int
+elf_positioned_component_compare(const void *left, const void *right)
+{
+    const ElfPositionedComponent *a =
+        (const ElfPositionedComponent *)left;
+    const ElfPositionedComponent *b =
+        (const ElfPositionedComponent *)right;
+
+    if (a->proposal_index != b->proposal_index) {
+        return a->proposal_index < b->proposal_index ? -1 : 1;
+    }
+    return 0;
+}
+
+
+/*
+ * Exact function targets distinguish both the logical slot and the physical
+ * source block. Grouping equal alternatives computes the same competitor
+ * bounds as an all-pairs scan without quadratic work.
+ */
+static bool
+elf_mark_exact_positioned_proposals(
+    ThreadWork *work,
+    CarveInfo *candidate,
+    uuid_string_t uuidp,
+    uuid_string_t uuidc,
+    ElfPositionedTextRun *proposals,
+    size_t num_proposals,
+    double minimum_lower,
+    bool *returned_to_idle)
+{
+    ElfPositionedLogicalOrder *logical_order = NULL;
+    ElfPositionedPhysicalOrder *physical_order = NULL;
+    double *logical_upper = NULL;
+    double *physical_upper = NULL;
+    bool *have_logical = NULL;
+    bool *have_physical = NULL;
+    size_t num_ordered = 0;
+    bool success = false;
+
+    if (num_proposals == 0) {
+        return true;
+    }
+    if (!proposals
+        || num_proposals > SIZE_MAX / sizeof(*logical_upper)
+        || num_proposals > SIZE_MAX / sizeof(*physical_upper)
+        || num_proposals > SIZE_MAX / sizeof(*have_logical)
+        || num_proposals > SIZE_MAX / sizeof(*have_physical)) {
+        return false;
+    }
+
+    for (size_t p = 0; p < num_proposals; p++) {
+        if (proposals[p].length > 0) {
+            num_ordered++;
+        }
+    }
+    if (num_ordered == 0) {
+        return true;
+    }
+    if (num_ordered > SIZE_MAX / sizeof(*logical_order)
+        || num_ordered > SIZE_MAX / sizeof(*physical_order)) {
+        return false;
+    }
+
+    logical_order =
+        (ElfPositionedLogicalOrder *)malloc(
+            num_ordered * sizeof(*logical_order));
+    physical_order =
+        (ElfPositionedPhysicalOrder *)malloc(
+            num_ordered * sizeof(*physical_order));
+    logical_upper =
+        (double *)calloc(num_proposals, sizeof(*logical_upper));
+    physical_upper =
+        (double *)calloc(num_proposals, sizeof(*physical_upper));
+    have_logical =
+        (bool *)calloc(num_proposals, sizeof(*have_logical));
+    have_physical =
+        (bool *)calloc(num_proposals, sizeof(*have_physical));
+
+    if (!logical_order || !physical_order || !logical_upper
+        || !physical_upper || !have_logical || !have_physical) {
+        goto done;
+    }
+
+    size_t ordered = 0;
+    for (size_t p = 0; p < num_proposals; p++) {
+        if (proposals[p].length == 0) {
+            continue;
+        }
+        const __int128 physical_start =
+            (__int128)proposals[p].logical_start
+            + (__int128)proposals[p].displacement;
+
+        if (physical_start < INT64_MIN || physical_start > INT64_MAX) {
+            goto done;
+        }
+        logical_order[ordered] = (ElfPositionedLogicalOrder){
+            .logical_start = proposals[p].logical_start,
+            .length = proposals[p].length,
+            .reservation_pressure = proposals[p].reservation_pressure,
+            .proposal_index = p,
+        };
+        physical_order[ordered] = (ElfPositionedPhysicalOrder){
+            .physical_start = (int64_t)physical_start,
+            .length = proposals[p].length,
+            .proposal_index = p,
+        };
+        ordered++;
+    }
+
+    qsort(logical_order, num_ordered, sizeof(*logical_order),
+          elf_positioned_logical_order_compare);
+    qsort(physical_order, num_ordered, sizeof(*physical_order),
+          elf_positioned_physical_order_compare);
+
+    for (size_t group = 0; group < num_ordered;) {
+        size_t group_end = group + 1;
+        size_t best = SIZE_MAX;
+        size_t second = SIZE_MAX;
+
+        while (group_end < num_ordered
+               && logical_order[group_end].length
+                      == logical_order[group].length
+               && logical_order[group_end].logical_start
+                      == logical_order[group].logical_start) {
+            group_end++;
+        }
+
+        // A temporary reservation cannot eliminate competing byte evidence.
+        // Compare the entire logical group before identifying any proposal.
+        for (size_t entry = group; entry < group_end; entry++) {
+            const size_t index = logical_order[entry].proposal_index;
+            const double upper = proposals[index].exact_upper;
+
+            if (best == SIZE_MAX
+                || upper > proposals[best].exact_upper) {
+                second = best;
+                best = index;
+            }
+            else if (second == SIZE_MAX
+                     || upper > proposals[second].exact_upper) {
+                second = index;
+            }
+        }
+        for (size_t entry = group; entry < group_end; entry++) {
+            const size_t index = logical_order[entry].proposal_index;
+            const size_t competitor = best != index ? best : second;
+
+            if (competitor != SIZE_MAX) {
+                have_logical[index] = true;
+                logical_upper[index] = proposals[competitor].exact_upper;
+            }
+        }
+        group = group_end;
+
+        if ((group & 0xffu) == 0
+            && elf_relocated_run_time_to_checkpoint(
+                   work, candidate, uuidp, uuidc)) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+    }
+
+    for (size_t group = 0; group < num_ordered;) {
+        size_t group_end = group + 1;
+        size_t best = SIZE_MAX;
+        size_t second = SIZE_MAX;
+
+        while (group_end < num_ordered
+               && physical_order[group_end].length
+                      == physical_order[group].length
+               && physical_order[group_end].physical_start
+                      == physical_order[group].physical_start) {
+            group_end++;
+        }
+        for (size_t entry = group; entry < group_end; entry++) {
+            const size_t index = physical_order[entry].proposal_index;
+            const double upper = proposals[index].exact_upper;
+
+            if (best == SIZE_MAX
+                || upper > proposals[best].exact_upper) {
+                second = best;
+                best = index;
+            }
+            else if (second == SIZE_MAX
+                     || upper > proposals[second].exact_upper) {
+                second = index;
+            }
+        }
+        for (size_t entry = group; entry < group_end; entry++) {
+            const size_t index = physical_order[entry].proposal_index;
+            const size_t competitor = best != index ? best : second;
+
+            if (competitor != SIZE_MAX) {
+                have_physical[index] = true;
+                physical_upper[index] = proposals[competitor].exact_upper;
+            }
+        }
+        group = group_end;
+
+        if ((group & 0xffu) == 0
+            && elf_relocated_run_time_to_checkpoint(
+                   work, candidate, uuidp, uuidc)) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+    }
+
+    for (size_t p = 0; p < num_proposals; p++) {
+        ElfPositionedTextRun *proposal = &proposals[p];
+
+        if (proposal->length == 0
+            || proposal->exact_matches < 4
+            || proposal->exact_lower < minimum_lower) {
+            continue;
+        }
+        if ((have_logical[p]
+             && proposal->exact_lower <= logical_upper[p])
+            || (have_physical[p]
+                && proposal->exact_lower <= physical_upper[p])) {
+            continue;
+        }
+
+        proposal->competitor_exact_upper =
+            logical_upper[p] > physical_upper[p]
+                ? logical_upper[p]
+                : physical_upper[p];
+        const double exact_gain =
+            16.0
+            + 128.0
+                  * (proposal->exact_lower
+                     - proposal->competitor_exact_upper)
+            + 64.0 * proposal->joint_lower
+            + log1p((double)proposal->exact_matches);
+
+        if (exact_gain > proposal->independent_gain) {
+            proposal->independent_gain = exact_gain;
+        }
+        proposal->independently_identified = true;
+        proposal->identified_by_function_table = true;
+        proposal->retained = true;
+    }
+    success = true;
+
+done:
+    free(have_physical);
+    free(have_logical);
+    free(physical_upper);
+    free(logical_upper);
+    free(physical_order);
+    free(logical_order);
+    return success;
+}
+
+
 static inline bool elf_positioned_text_run_stronger(
     const ElfPositionedTextRun *candidate,
     const ElfPositionedTextRun *current)
@@ -37052,6 +47713,57 @@ static inline bool elf_positioned_text_run_stronger(
 }
 
 
+static bool
+elf_append_positioned_runs(ElfPositionedTextRun **destination,
+                           size_t *destination_count,
+                           const ElfPositionedTextRun *additional,
+                           size_t additional_count)
+{
+    if (!destination || !destination_count
+        || (additional_count > 0 && !additional)) {
+        return false;
+    }
+    if (additional_count == 0) {
+        return true;
+    }
+    if (*destination_count > SIZE_MAX - additional_count
+        || *destination_count + additional_count
+               > SIZE_MAX / sizeof(**destination)) {
+        return false;
+    }
+
+    const size_t previous_count = *destination_count;
+    const size_t combined_count = previous_count + additional_count;
+    ElfPositionedTextRun *combined =
+        (ElfPositionedTextRun *)realloc(
+            *destination, combined_count * sizeof(**destination));
+
+    if (!combined) {
+        return false;
+    }
+    *destination = combined;
+    memcpy(combined + previous_count, additional,
+           additional_count * sizeof(*additional));
+
+    for (size_t added = 0; added < additional_count; added++) {
+        size_t insert = previous_count + added;
+
+        while (insert > 0
+               && elf_positioned_text_run_stronger(
+                      &combined[insert], &combined[insert - 1])) {
+            const ElfPositionedTextRun previous = combined[insert - 1];
+
+            combined[insert - 1] = combined[insert];
+            combined[insert] = previous;
+            insert--;
+        }
+    }
+
+    *destination_count = combined_count;
+    return true;
+}
+
+
 static ElfPositionedTextRun *
 elf_find_positioned_text_runs(ThreadWork *work,
                               CarveInfo *candidate,
@@ -37061,7 +47773,9 @@ elf_find_positioned_text_runs(ThreadWork *work,
                               bool *returned_to_idle,
                               size_t *out_count)
 {
-    enum { ELF_TEXT_MIN_BRANCH_MATCHES = 3 };
+    enum {
+        ELF_TEXT_MIN_BRANCH_MATCHES = 3,
+    };
     static const double ELF_TEXT_MIN_BRANCH_LOWER = 0.20;
     const uint32_t blocksize = scalpel_state.blocksize;
     ElfTextBranchEvidence evidence;
@@ -37074,9 +47788,14 @@ elf_find_positioned_text_runs(ThreadWork *work,
     ElfPositionedTextRun *proposals = NULL;
     size_t num_proposals = 0;
     size_t proposal_capacity = 0;
+    ElfPositionedProposalIndexEntry *proposal_index_entries = NULL;
+    size_t proposal_index_capacity = 0;
+    ElfPositionedRetainedOrder *retained_order = NULL;
+    size_t num_retained = 0;
+    ElfPositionedComponent *components = NULL;
+    size_t num_components = 0;
     ElfPositionedTextRun *selected = NULL;
     size_t num_selected = 0;
-    size_t selected_capacity = 0;
     bool failed = false;
 
     if (returned_to_idle) {
@@ -37106,7 +47825,6 @@ elf_find_positioned_text_runs(ThreadWork *work,
     if (!evidence_ready) {
         return NULL;
     }
-
     const ElfTunables scoring = default_tunables();
     fragments =
         elf_collect_text_fragments(candidate, &scoring, false, true,
@@ -37126,7 +47844,7 @@ elf_find_positioned_text_runs(ThreadWork *work,
     while (text_lo < blocks) {
         while (text_lo < blocks
                && !elf_text_slot_overlaps_executable(
-                      &evidence, text_lo, blocksize)) {
+                      &evidence, filestate, text_lo, blocksize)) {
             text_lo++;
         }
         if (text_lo >= blocks) {
@@ -37136,7 +47854,7 @@ elf_find_positioned_text_runs(ThreadWork *work,
         uint64_t text_hi = text_lo;
         while (text_hi + 1 < blocks
                && elf_text_slot_overlaps_executable(
-                      &evidence, text_hi + 1, blocksize)) {
+                      &evidence, filestate, text_hi + 1, blocksize)) {
             text_hi++;
         }
 
@@ -37269,29 +47987,44 @@ elf_find_positioned_text_runs(ThreadWork *work,
 
         for (size_t f = 0; f < num_fragments; f++) {
             const ElfTextFragment *fragment = &fragments[f];
-            const uint64_t trial_length =
+            const uint64_t maximum_trial_length =
                 fragment->len < suspect->len
                     ? fragment->len
                     : suspect->len;
 
-            if (trial_length == 0) {
+            if (maximum_trial_length == 0) {
                 continue;
             }
 
-            const uint64_t logical_offsets =
-                suspect->len - trial_length + 1;
-            const uint64_t physical_offsets =
-                fragment->len - trial_length + 1;
+            const uint64_t trial_lengths[2] = {
+                maximum_trial_length,
+                1,
+            };
+            const size_t num_trial_lengths =
+                maximum_trial_length > 1
+                    && evidence.num_function_starts > 0
+                    ? 2
+                    : 1;
 
-            for (uint64_t logical_offset = 0;
-                 logical_offset < logical_offsets;
-                 logical_offset++) {
-                const uint64_t logical_start =
-                    suspect->lo + logical_offset;
+            for (size_t trial_index = 0;
+                 trial_index < num_trial_lengths; trial_index++) {
+                const uint64_t trial_length =
+                    trial_lengths[trial_index];
 
-                for (uint64_t physical_offset = 0;
-                     physical_offset < physical_offsets;
-                     physical_offset++) {
+                const uint64_t logical_offsets =
+                    suspect->len - trial_length + 1;
+                const uint64_t physical_offsets =
+                    fragment->len - trial_length + 1;
+
+                for (uint64_t logical_offset = 0;
+                     logical_offset < logical_offsets;
+                     logical_offset++) {
+                    const uint64_t logical_start =
+                        suspect->lo + logical_offset;
+
+                    for (uint64_t physical_offset = 0;
+                         physical_offset < physical_offsets;
+                         physical_offset++) {
                     if ((physical_offset & 0xffu) == 0
                         && elf_relocated_run_time_to_checkpoint(
                                work, candidate, uuidp, uuidc)) {
@@ -37310,14 +48043,16 @@ elf_find_positioned_text_runs(ThreadWork *work,
                     elf_text_score_branch_fragment(
                         candidate, &evidence, logical_start,
                         &trial, &score);
-                    if (!score.usable
-                        || score.branches
-                               < ELF_TEXT_MIN_BRANCH_MATCHES) {
+                    if (!score.usable) {
                         continue;
                     }
+                    const bool branch_score_usable =
+                        score.branches >= ELF_TEXT_MIN_BRANCH_MATCHES;
                     const double score_rate =
-                        (double)score.matches
-                        / (double)score.branches;
+                        branch_score_usable
+                            ? (double)score.matches
+                                  / (double)score.branches
+                            : 0.0;
                     const double joint_lower =
                         score.lower * score.executable_lower;
                     const double joint_upper =
@@ -37330,14 +48065,16 @@ elf_find_positioned_text_runs(ThreadWork *work,
                     size_t proposal_index = SIZE_MAX;
 
                     const bool branch_evidence_qualified =
-                        score.matches >= ELF_TEXT_MIN_BRANCH_MATCHES
+                        branch_score_usable
+                        && score.matches >= ELF_TEXT_MIN_BRANCH_MATCHES
                         && score.lower >= ELF_TEXT_MIN_BRANCH_LOWER
                         && score.executable_matches
                                >= ELF_TEXT_MIN_BRANCH_MATCHES
                         && score.executable_lower
                                >= ELF_TEXT_MIN_BRANCH_LOWER;
                     const bool function_table_evidence_qualified =
-                        evidence.num_function_starts > 0
+                        branch_score_usable
+                        && evidence.num_function_starts > 0
                         && score.exact_matches
                                >= ELF_TEXT_MIN_BRANCH_MATCHES
                         && score.exact_lower
@@ -37346,7 +48083,6 @@ elf_find_positioned_text_runs(ThreadWork *work,
                                >= ELF_TEXT_MIN_BRANCH_MATCHES
                         && score.executable_lower
                                >= ELF_TEXT_MIN_BRANCH_LOWER;
-
                     if (branch_evidence_qualified
                         || function_table_evidence_qualified) {
                         const int64_t trial_actual =
@@ -37438,36 +48174,42 @@ elf_find_positioned_text_runs(ThreadWork *work,
                                 .retained = false,
                             };
 
-                            for (size_t p = 0;
-                                 p < num_proposals; p++) {
-                                if ((p & 0xffu) == 0
-                                    && elf_relocated_run_time_to_checkpoint(
-                                           work, candidate, uuidp,
-                                           uuidc)) {
-                                    if (returned_to_idle) {
-                                        *returned_to_idle = true;
-                                    }
-                                    goto done;
-                                }
-                                if (proposals[p].logical_start
-                                        == proposal.logical_start
-                                    && proposals[p].length
-                                           == proposal.length
-                                    && proposals[p].displacement
-                                           == proposal.displacement) {
-                                    proposal_index = p;
-                                    if (proposal.independent_gain
-                                        > proposals[p].independent_gain) {
-                                        const bool retained =
-                                            proposals[p].retained;
-                                        proposals[p] = proposal;
-                                        proposals[p].retained = retained;
-                                    }
-                                    break;
+                            if (!elf_positioned_proposal_index_reserve(
+                                    &proposal_index_entries,
+                                    &proposal_index_capacity,
+                                    num_proposals + 1)) {
+                                failed = true;
+                                goto done;
+                            }
+                            bool proposal_found = false;
+                            const size_t proposal_slot =
+                                elf_positioned_proposal_index_find(
+                                    proposal_index_entries,
+                                    proposal_index_capacity,
+                                    proposal.logical_start,
+                                    proposal.length,
+                                    proposal.displacement,
+                                    &proposal_found);
+
+                            if (proposal_slot == SIZE_MAX) {
+                                failed = true;
+                                goto done;
+                            }
+                            if (proposal_found) {
+                                proposal_index =
+                                    proposal_index_entries[proposal_slot]
+                                        .proposal_index;
+                                if (proposal.independent_gain
+                                    > proposals[proposal_index]
+                                          .independent_gain) {
+                                    const bool retained =
+                                        proposals[proposal_index].retained;
+                                    proposals[proposal_index] = proposal;
+                                    proposals[proposal_index].retained =
+                                        retained;
                                 }
                             }
-
-                            if (proposal_index == SIZE_MAX) {
+                            else {
                                 if (num_proposals
                                     == proposal_capacity) {
                                     const size_t new_capacity =
@@ -37499,6 +48241,16 @@ elf_find_positioned_text_runs(ThreadWork *work,
                                 }
                                 proposal_index = num_proposals;
                                 proposals[num_proposals++] = proposal;
+                                proposal_index_entries[proposal_slot] =
+                                    (ElfPositionedProposalIndexEntry){
+                                        .logical_start =
+                                            proposal.logical_start,
+                                        .length = proposal.length,
+                                        .displacement =
+                                            proposal.displacement,
+                                        .proposal_index = proposal_index,
+                                        .occupied = true,
+                                    };
                             }
 
                             if (score.file_reference_matches > 0) {
@@ -37541,11 +48293,13 @@ elf_find_positioned_text_runs(ThreadWork *work,
                                         score.file_reference_upper;
                                 }
                             }
+
                         }
                     }
 
                     if (proposal_index != SIZE_MAX
-                        && trial_length == suspect->len) {
+                        && trial_length == suspect->len
+                        && branch_score_usable) {
                         const double best_full_rate =
                             have_full_best
                                 ? (double)best_full_score.matches
@@ -37591,38 +48345,42 @@ elf_find_positioned_text_runs(ThreadWork *work,
                         }
                     }
 
-                    const bool better =
-                        !have_best
-                        || joint_lower > best_joint_lower + 1.0e-12
-                        || (fabs(joint_lower - best_joint_lower)
-                                <= 1.0e-12
-                            && score_rate > best_rate + 1.0e-12)
-                        || (fabs(joint_lower - best_joint_lower)
-                                <= 1.0e-12
-                            && fabs(score_rate - best_rate)
-                                   <= 1.0e-12
-                            && score.exact_matches
-                                   > best_score.exact_matches);
+                    if (branch_score_usable) {
+                        const bool better =
+                            !have_best
+                            || joint_lower
+                                   > best_joint_lower + 1.0e-12
+                            || (fabs(joint_lower - best_joint_lower)
+                                    <= 1.0e-12
+                                && score_rate > best_rate + 1.0e-12)
+                            || (fabs(joint_lower - best_joint_lower)
+                                    <= 1.0e-12
+                                && fabs(score_rate - best_rate)
+                                       <= 1.0e-12
+                                && score.exact_matches
+                                       > best_score.exact_matches);
 
-                    if (better) {
-                        if (have_best) {
-                            const double previous_joint_upper =
-                                best_score.upper
-                                * best_score.executable_upper;
+                        if (better) {
+                            if (have_best) {
+                                const double previous_joint_upper =
+                                    best_score.upper
+                                    * best_score.executable_upper;
 
-                            if (previous_joint_upper
-                                > competitor_joint_upper) {
-                                competitor_joint_upper =
-                                    previous_joint_upper;
+                                if (previous_joint_upper
+                                    > competitor_joint_upper) {
+                                    competitor_joint_upper =
+                                        previous_joint_upper;
+                                }
                             }
+                            best_score = score;
+                            best_joint_lower = joint_lower;
+                            best_proposal_index = proposal_index;
+                            have_best = true;
                         }
-                        best_score = score;
-                        best_joint_lower = joint_lower;
-                        best_proposal_index = proposal_index;
-                        have_best = true;
+                        else if (joint_upper > competitor_joint_upper) {
+                            competitor_joint_upper = joint_upper;
+                        }
                     }
-                    else if (joint_upper > competitor_joint_upper) {
-                        competitor_joint_upper = joint_upper;
                     }
                 }
             }
@@ -37717,266 +48475,254 @@ elf_find_positioned_text_runs(ThreadWork *work,
                 competitor_file_reference_upper;
             proposal->retained = true;
         }
+
     }
 
-    /*
-     * A .eh_frame_hdr table names exact function starts for this ELF file.
-     * Use it to resolve both ownership and logical alignment of a physical
-     * text fragment. Comparisons stay within equal-length alternatives so a
-     * short high-variance fragment cannot displace a longer exact match.
-     */
-    for (size_t p = 0; p < num_proposals; p++) {
-        ElfPositionedTextRun *proposal = &proposals[p];
-        const __int128 physical_start =
-            (__int128)proposal->logical_start
-            + (__int128)proposal->displacement;
-        double logical_competitor_upper = 0.0;
-        double physical_competitor_upper = 0.0;
-        bool have_logical_competitor = false;
-        bool have_physical_competitor = false;
-
-        if (proposal->exact_matches < 4
-            || proposal->exact_lower
-                   < ELF_TEXT_MIN_BRANCH_LOWER) {
-            continue;
+    if (!elf_mark_exact_positioned_proposals(
+            work, candidate, uuidp, uuidc,
+            proposals, num_proposals,
+            ELF_TEXT_MIN_BRANCH_LOWER,
+            returned_to_idle)) {
+        if (!returned_to_idle || !*returned_to_idle) {
+            failed = true;
         }
-
-        for (size_t q = 0; q < num_proposals; q++) {
-            if ((q & 0xffu) == 0
-                && elf_relocated_run_time_to_checkpoint(
-                       work, candidate, uuidp, uuidc)) {
-                if (returned_to_idle) {
-                    *returned_to_idle = true;
-                }
-                goto done;
-            }
-            const ElfPositionedTextRun *competitor = &proposals[q];
-            const __int128 competitor_physical_start =
-                (__int128)competitor->logical_start
-                + (__int128)competitor->displacement;
-
-            if (q == p || competitor->length != proposal->length) {
-                continue;
-            }
-
-            if (competitor->logical_start
-                    == proposal->logical_start
-                && competitor->reservation_pressure
-                       <= proposal->reservation_pressure) {
-                have_logical_competitor = true;
-                if (competitor->exact_upper
-                        > logical_competitor_upper) {
-                    logical_competitor_upper =
-                        competitor->exact_upper;
-                }
-            }
-
-            if (competitor_physical_start == physical_start) {
-                have_physical_competitor = true;
-                if (competitor->exact_upper
-                        > physical_competitor_upper) {
-                    physical_competitor_upper =
-                        competitor->exact_upper;
-                }
-            }
-        }
-
-        if ((have_logical_competitor
-             && proposal->exact_lower
-                    <= logical_competitor_upper)
-            || (have_physical_competitor
-                && proposal->exact_lower
-                       <= physical_competitor_upper)) {
-            continue;
-        }
-
-        proposal->competitor_exact_upper =
-            logical_competitor_upper > physical_competitor_upper
-                ? logical_competitor_upper
-                : physical_competitor_upper;
-        const double exact_gain =
-            16.0
-            + 128.0
-                  * (proposal->exact_lower
-                     - proposal->competitor_exact_upper)
-            + 64.0 * proposal->joint_lower
-            + log1p((double)proposal->exact_matches);
-
-        if (exact_gain > proposal->independent_gain) {
-            proposal->independent_gain = exact_gain;
-        }
-        proposal->independently_identified = true;
-        proposal->identified_by_function_table = true;
-        proposal->retained = true;
-    }
-
-    bool *considered =
-        (bool *)calloc(num_proposals, sizeof(*considered));
-    if (num_proposals > 0 && !considered) {
-        failed = true;
         goto done;
     }
 
-    for (;;) {
+    for (size_t p = 0; p < num_proposals; p++) {
+        if ((p & 0xffu) == 0
+            && elf_relocated_run_time_to_checkpoint(
+                   work, candidate, uuidp, uuidc)) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+        if (!proposals[p].retained) {
+            continue;
+        }
+        if (proposals[p].length == 0
+            || proposals[p].logical_start
+                   > UINT64_MAX - (proposals[p].length - 1)) {
+            failed = true;
+            goto done;
+        }
+        num_retained++;
+    }
+
+    if (num_retained > 0) {
+        if (num_retained > SIZE_MAX / sizeof(*retained_order)
+            || num_retained > SIZE_MAX / sizeof(*components)) {
+            failed = true;
+            goto done;
+        }
+        retained_order =
+            (ElfPositionedRetainedOrder *)malloc(
+                num_retained * sizeof(*retained_order));
+        components =
+            (ElfPositionedComponent *)malloc(
+                num_retained * sizeof(*components));
+        if (!retained_order || !components) {
+            failed = true;
+            goto done;
+        }
+    }
+
+    size_t retained_index = 0;
+    for (size_t p = 0; p < num_proposals; p++) {
+        if (!proposals[p].retained) {
+            continue;
+        }
+        retained_order[retained_index++] =
+            (ElfPositionedRetainedOrder){
+                .displacement = proposals[p].displacement,
+                .logical_start = proposals[p].logical_start,
+                .logical_end = proposals[p].logical_start
+                               + proposals[p].length - 1,
+                .proposal_index = p,
+            };
+    }
+
+    if (num_retained > 1) {
+        qsort(retained_order, num_retained, sizeof(*retained_order),
+              elf_positioned_retained_order_compare);
+    }
+
+    for (size_t begin = 0; begin < num_retained;) {
+        const ElfPositionedRetainedOrder *first =
+            &retained_order[begin];
+        uint64_t component_lo = first->logical_start;
+        uint64_t component_hi = first->logical_end;
+        size_t end = begin + 1;
+
+        while (end < num_retained) {
+            const ElfPositionedRetainedOrder *next =
+                &retained_order[end];
+            const bool same_mapping =
+                next->displacement == first->displacement;
+            const bool adjacent =
+                component_hi == UINT64_MAX
+                || next->logical_start <= component_hi + 1;
+
+            if (!same_mapping || !adjacent) {
+                break;
+            }
+            if (next->logical_end > component_hi) {
+                component_hi = next->logical_end;
+            }
+
+            end++;
+        }
+
+        if (end - begin > 1) {
+            qsort(retained_order + begin, end - begin,
+                  sizeof(*retained_order),
+                  elf_positioned_retained_index_compare);
+        }
+        size_t strongest = retained_order[begin].proposal_index;
+
+        for (size_t member = begin + 1; member < end; member++) {
+            const size_t proposal_index =
+                retained_order[member].proposal_index;
+
+            if (elf_positioned_text_run_stronger(
+                    &proposals[proposal_index],
+                    &proposals[strongest])) {
+                strongest = proposal_index;
+            }
+        }
+        component_lo = proposals[strongest].logical_start;
+        component_hi = component_lo + proposals[strongest].length - 1;
+
+        components[num_components] = (ElfPositionedComponent){
+            .run = proposals[strongest],
+            .proposal_index = strongest,
+        };
+        components[num_components].run.positioned_lo =
+            proposals[strongest].logical_start;
+        components[num_components].run.positioned_hi =
+            proposals[strongest].logical_start
+            + proposals[strongest].length - 1;
+        components[num_components].run.positioned_range_valid =
+            proposals[strongest].independently_identified
+            && (proposals[strongest].identified_by_function_table
+                || proposals[strongest].identified_by_file_reference);
+        components[num_components].run.logical_start = component_lo;
+        components[num_components].run.length =
+            component_hi - component_lo + 1;
+        num_components++;
+        begin = end;
+
+        if ((begin & 0xffu) == 0
+            && elf_relocated_run_time_to_checkpoint(
+                   work, candidate, uuidp, uuidc)) {
+            if (returned_to_idle) {
+                *returned_to_idle = true;
+            }
+            goto done;
+        }
+    }
+
+    if (num_components > 1) {
+        qsort(components, num_components, sizeof(*components),
+              elf_positioned_component_compare);
+    }
+
+    if (num_components > 0) {
+        if (num_components > SIZE_MAX / sizeof(*selected)) {
+            failed = true;
+            goto done;
+        }
+        selected =
+            (ElfPositionedTextRun *)malloc(
+                num_components * sizeof(*selected));
+        if (!selected) {
+            failed = true;
+            goto done;
+        }
+    }
+
+    for (size_t output = 0; output < num_components; output++) {
         size_t strongest = SIZE_MAX;
 
-        for (size_t p = 0; p < num_proposals; p++) {
-            if ((p & 0xffu) == 0
-                && elf_relocated_run_time_to_checkpoint(
-                       work, candidate, uuidp, uuidc)) {
-                if (returned_to_idle) {
-                    *returned_to_idle = true;
-                }
-                free(considered);
-                goto done;
-            }
-            if (considered[p] || !proposals[p].retained) {
+        // Preserve the original proposal-order selection semantics. The
+        // strength relation uses tolerant floating-point comparisons and is
+        // therefore not a valid qsort ordering relation.
+        for (size_t component = 0;
+             component < num_components; component++) {
+            if (!components[component].run.retained) {
                 continue;
             }
             if (strongest == SIZE_MAX
                 || elf_positioned_text_run_stronger(
-                       &proposals[p], &proposals[strongest])) {
-                strongest = p;
+                       &components[component].run,
+                       &components[strongest].run)) {
+                strongest = component;
             }
         }
         if (strongest == SIZE_MAX) {
-            break;
+            failed = true;
+            goto done;
         }
+
+        selected[num_selected++] = components[strongest].run;
+        components[strongest].run.retained = false;
         const ElfPositionedTextRun *proposal =
-            &proposals[strongest];
-        uint64_t component_lo = proposal->logical_start;
-        uint64_t component_hi =
-            proposal->logical_start + proposal->length - 1;
-        bool expanded;
+            &selected[num_selected - 1];
+        const uint64_t component_lo = proposal->logical_start;
+        const uint64_t component_hi =
+            component_lo + proposal->length - 1;
 
-        /*
-         * Overlapping observations with the same displacement describe one
-         * physical mapping. Keep its strongest anchor and discard only the
-         * redundant observations. Disjoint runs at the same displacement
-         * remain separate hypotheses.
-         */
-        do {
-            expanded = false;
-            for (size_t p = 0; p < num_proposals; p++) {
-                if ((p & 0xffu) == 0
-                    && elf_relocated_run_time_to_checkpoint(
-                           work, candidate, uuidp, uuidc)) {
-                    if (returned_to_idle) {
-                        *returned_to_idle = true;
-                    }
-                    free(considered);
-                    goto done;
-                }
-                if (considered[p] || !proposals[p].retained
-                    || proposals[p].displacement
-                           != proposal->displacement) {
-                    continue;
-                }
-
-                const uint64_t proposal_lo =
-                    proposals[p].logical_start;
-                const uint64_t proposal_hi =
-                    proposal_lo + proposals[p].length - 1;
-                const bool adjacent_left =
-                    proposal_hi != UINT64_MAX
-                    && proposal_hi + 1 >= component_lo;
-                const bool adjacent_right =
-                    component_hi != UINT64_MAX
-                    && component_hi + 1 >= proposal_lo;
-
-                if (!adjacent_left || !adjacent_right) {
-                    continue;
-                }
-
-                considered[p] = true;
-                if (proposal_lo < component_lo) {
-                    component_lo = proposal_lo;
-                    expanded = true;
-                }
-                if (proposal_hi > component_hi) {
-                    component_hi = proposal_hi;
-                    expanded = true;
-                }
-            }
-        } while (expanded);
-
-        if (num_selected == selected_capacity) {
-            const size_t new_capacity =
-                selected_capacity == 0 ? 4 : selected_capacity * 2;
-
-            if (new_capacity < selected_capacity
-                || new_capacity > SIZE_MAX / sizeof(*selected)) {
-                failed = true;
-                free(considered);
-                goto done;
-            }
-            ElfPositionedTextRun *larger =
-                (ElfPositionedTextRun *)realloc(
-                    selected, new_capacity * sizeof(*selected));
-
-            if (!larger) {
-                failed = true;
-                free(considered);
-                goto done;
-            }
-            selected = larger;
-            selected_capacity = new_capacity;
+        if (!proposal->independently_identified) {
+            continue;
         }
-        selected[num_selected++] = *proposal;
-
-        if (proposal->independently_identified) {
-            if (proposal->identified_by_function_table) {
-                scalpel_log(
-                    "elf positioned text: file blocks %" PRIu64
-                    "..%" PRIu64 " map at signed displacement "
-                    "%" PRId64 " (%" PRIu64
-                    " exact function targets; lower=%.3f, "
-                    "competitor upper=%.3f).\n",
-                    proposal->logical_start,
-                    proposal->logical_start
-                        + proposal->length - 1,
-                    proposal->displacement,
-                    proposal->exact_matches,
-                    proposal->exact_lower,
-                    proposal->competitor_exact_upper);
-            }
-            else if (proposal->identified_by_file_reference) {
-                scalpel_log(
-                    "elf positioned text: file blocks %" PRIu64
-                    "..%" PRIu64 " map at signed displacement "
-                    "%" PRId64 " (%" PRIu64
-                    " file references; lower=%.3f, competitor "
-                    "upper=%.3f).\n",
-                    proposal->logical_start,
-                    proposal->logical_start
-                        + proposal->length - 1,
-                    proposal->displacement,
-                    proposal->file_reference_matches,
-                    proposal->file_reference_lower,
-                    proposal->competitor_file_reference_upper);
-            }
-            else {
-                scalpel_log(
-                    "elf positioned text: file blocks %" PRIu64
-                    "..%" PRIu64 " map at signed displacement "
-                    "%" PRId64 " (%" PRIu64 "/%" PRIu64
-                    " direct calls remain within the logical run; "
-                    "internal lower=%.3f, joint lower=%.3f, "
-                    "competitor joint upper=%.3f).\n",
-                    proposal->logical_start,
-                    proposal->logical_start
-                        + proposal->length - 1,
-                    proposal->displacement, proposal->matches,
-                    proposal->branches, proposal->lower,
-                    proposal->joint_lower,
-                    proposal->competitor_joint_upper);
-            }
+        if (proposal->identified_by_function_table) {
+            scalpel_log(
+                "elf positioned text: file blocks %" PRIu64
+                "..%" PRIu64 " map at signed displacement "
+                "%" PRId64 " (%" PRIu64
+                " exact function targets; lower=%.3f, "
+                "competitor upper=%.3f).\n",
+                component_lo, component_hi,
+                proposal->displacement,
+                proposal->exact_matches,
+                proposal->exact_lower,
+                proposal->competitor_exact_upper);
+        }
+        else if (proposal->identified_by_file_reference) {
+            scalpel_log(
+                "elf positioned text: file blocks %" PRIu64
+                "..%" PRIu64 " map at signed displacement "
+                "%" PRId64 " (%" PRIu64
+                " file references; lower=%.3f, competitor "
+                "upper=%.3f).\n",
+                component_lo, component_hi,
+                proposal->displacement,
+                proposal->file_reference_matches,
+                proposal->file_reference_lower,
+                proposal->competitor_file_reference_upper);
+        }
+        else {
+            scalpel_log(
+                "elf positioned text: file blocks %" PRIu64
+                "..%" PRIu64 " map at signed displacement "
+                "%" PRId64 " (%" PRIu64 "/%" PRIu64
+                " direct calls remain within the logical run; "
+                "internal lower=%.3f, joint lower=%.3f, "
+                "competitor joint upper=%.3f).\n",
+                component_lo, component_hi,
+                proposal->displacement, proposal->matches,
+                proposal->branches, proposal->lower,
+                proposal->joint_lower,
+                proposal->competitor_joint_upper);
         }
     }
-    free(considered);
 
 done:
     elf_text_branch_evidence_release(&evidence);
+    free(components);
+    free(retained_order);
+    free(proposal_index_entries);
     free(proposals);
     free(suspects);
     free(eligible);
@@ -38397,6 +49143,15 @@ elf_reassembly_fill_text_holes_final(CarveInfo             *candidate,
 
 
 
+// Save the caller's continuation before any subsequent helper can checkpoint.
+static void elf_reassembly_set_phase(CarveInfo *candidate, FileState *state,
+                                     ElfReassemblyPhase phase)
+{
+    state->reassembly_phase = phase;
+    carve_put_state(candidate->carvehashkey, state);
+}
+
+
 /**
  * @brief Reassemble a fragmented ELF candidate into a coherent file image.
  *
@@ -38499,9 +49254,12 @@ void elf_reassembly(ThreadWork     *work,
     FileState *filestate = NULL;
 
     uint64_t iters = 0;
+    uint64_t reassembly_file_size = 0;
 
     bool stopped_no_placeable_work = false;
-    bool final_relocated_completed = false;
+    bool candidate_is_64 = false;
+    bool candidate_file_is_le = true;
+    uint16_t candidate_machine = 0;
 
 #ifdef ELF_REASSEMBLY_DEBUG
     lock_fprintf(stdout,
@@ -38521,6 +49279,9 @@ void elf_reassembly(ThreadWork     *work,
 
     candidate = *c;
 
+    (void)get_elf_identity(candidate, &candidate_is_64,
+                           &candidate_file_is_le, &candidate_machine);
+
     cand_id =
         carvehashkey_fp_hex(candidate ? (const char *)candidate->carvehashkey : NULL,
                             cand_id_buf, sizeof(cand_id_buf));
@@ -38536,6 +49297,24 @@ void elf_reassembly(ThreadWork     *work,
             write_candidate(c, false);
         }
         return;
+    }
+
+    // ELF has explicit saved searches and phases; the generic one-shot marker
+    // must not suppress preparation of the next fresh slot.
+    candidate->no_initial_block_extension = false;
+
+    for (size_t i = 0; i < filestate->num_components; i++) {
+        uint64_t component_end;
+
+        if (__builtin_add_overflow(filestate->components[i].fileOffset,
+                                   filestate->components[i].size,
+                                   &component_end)) {
+            reassembly_file_size = 0;
+            break;
+        }
+        if (component_end > reassembly_file_size) {
+            reassembly_file_size = component_end;
+        }
     }
 
     if (filestate->elf_scan_slot != UINT64_MAX
@@ -38588,176 +49367,344 @@ void elf_reassembly(ThreadWork     *work,
         const double tau_place_gallop_loop = sp.tau_place_gallop_loop;
         const SectionDataType INVALID_FOCUS  = (SectionDataType)-1;
 
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_INITIAL_ALIGNMENT) {
+            if (!filestate->initial_gallop_done
+                && !filestate->complete_mapping_verified
+                && elf_bv_is_full(candidate)) {
+                bool alignment_returned_to_idle = false;
 
-        
-        if (!filestate->initial_gallop_done) {
-             filestate->initial_gallop_done = true;
-             carve_put_state(candidate->carvehashkey, filestate);
-            const uint64_t nb = blockvector_get_num_blocks(candidate->b);
-
-            elf_reassembly_prepare_for_extension(work->id,
-                                        candidate,
-                                        0,
-                                        true,   /* is_init */
-                                        false,  /* retry_same_slot */
-                                        0,
-                                        uuidp,
-                                        uuidc);
-
-#ifdef ELF_REASSEMBLY_DEBUG
-            lock_fprintf(stdout,
-                "[ELF-reass][%s] initial gallop scan BEGIN nb=%" PRIu64
-                " tau_gallop=%.6f done=%d\n",
-                cand_id, nb, tau_place_gallop_init,
-                (int)filestate->initial_gallop_done);
-#endif
-
-            for (uint64_t i = 0; i < nb; ++i) {
-                const int64_t ap = blockvector_get_apparent_blocknumber(candidate->b, i);
-                if (!bv_slot_is_placed(ap)) continue;
-
-                if (i + 1 < nb) {
-                    const uint64_t gplaced =
-                        elf_try_gallop_guarded(work->id, candidate, filestate,
-                                            +1, ap + 1, i + 1,
-                                            tau_place_gallop_init, &sp,
-                                            uuidp, uuidc);
-                    if (gplaced > 0) {
-                        normalize_blockvector(candidate->b);
-                    }
-                }
-
-                if (i > 0) {
-                    const uint64_t gplaced =
-                        elf_try_gallop_guarded(work->id, candidate, filestate,
-                                            -1, ap - 1, i - 1,
-                                            tau_place_gallop_init, &sp,
-                                            uuidp, uuidc);
-                    if (gplaced > 0) {
-                        normalize_blockvector(candidate->b);
-                    }
+                (void)elf_try_layout_gap_alignment(
+                    candidate, filestate,
+                    elf_candidate_header_apparent(candidate),
+                    blockvector_get_num_blocks(candidate->b),
+                    reassembly_file_size, scalpel_state.blocksize, cand_id,
+                    work, uuidp, uuidc, &alignment_returned_to_idle);
+                if (alignment_returned_to_idle) {
+                    candidate->no_initial_block_extension = true;
+                    elf_free_carve_state((void **)&filestate);
+                    return;
                 }
             }
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_MONOTONE);
+        }
+
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_MONOTONE) {
+            bool monotone_returned_to_idle = false;
+            (void)elf_try_monotone_zero_gap_completion(
+                work, candidate, filestate, reassembly_file_size, cand_id,
+                uuidp, uuidc, &monotone_returned_to_idle);
+
+            if (monotone_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
+            }
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_SYMBOL_TAIL);
+        }
+
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_SYMBOL_TAIL) {
+            if (!filestate->initial_gallop_done) {
+                bool symbol_tail_returned_to_idle = false;
+                const bool symbol_tail_completed =
+                    elf_try_symbol_tail_completion(
+                        work, candidate, filestate, reassembly_file_size,
+                        cand_id, uuidp, uuidc,
+                        &symbol_tail_returned_to_idle);
+
+                if (symbol_tail_returned_to_idle) {
+                    candidate->no_initial_block_extension = true;
+                    elf_free_carve_state((void **)&filestate);
+                    return;
+                }
+                if (symbol_tail_completed) {
+                    filestate->initial_gallop_done = true;
+                    carve_put_state(candidate->carvehashkey, filestate);
+                }
+            }
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_INITIAL_GALLOP);
+        }
+
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_INITIAL_GALLOP) {
+            if (!filestate->initial_gallop_done) {
+                 filestate->initial_gallop_done = true;
+                 carve_put_state(candidate->carvehashkey, filestate);
+                const uint64_t nb = blockvector_get_num_blocks(candidate->b);
+
+                elf_reassembly_prepare_for_extension(work->id,
+                                            candidate,
+                                            0,
+                                            true,   /* is_init */
+                                            false,  /* retry_same_slot */
+                                            0,
+                                            uuidp,
+                                            uuidc);
 
 #ifdef ELF_REASSEMBLY_DEBUG
-            lock_fprintf(stdout,
-                "[ELF-reass][%s] initial gallop scan END done=%d\n",
-                cand_id, (int)filestate->initial_gallop_done);
+                lock_fprintf(stdout,
+                    "[ELF-reass][%s] initial gallop scan BEGIN nb=%" PRIu64
+                    " tau_gallop=%.6f done=%d\n",
+                    cand_id, nb, tau_place_gallop_init,
+                    (int)filestate->initial_gallop_done);
 #endif
-        }
+
+                for (uint64_t i = 0; i < nb; ++i) {
+                    const int64_t ap = blockvector_get_apparent_blocknumber(candidate->b, i);
+                    if (!bv_slot_is_placed(ap)) continue;
+
+                    if (i + 1 < nb) {
+                        const uint64_t gplaced =
+                            elf_try_gallop_guarded(work->id, candidate, filestate,
+                                                +1, ap + 1, i + 1,
+                                                tau_place_gallop_init, &sp,
+                                                uuidp, uuidc);
+                        if (gplaced > 0) {
+                            normalize_blockvector(candidate->b);
+                        }
+                    }
+
+                    if (i > 0) {
+                        const uint64_t gplaced =
+                            elf_try_gallop_guarded(work->id, candidate, filestate,
+                                                -1, ap - 1, i - 1,
+                                                tau_place_gallop_init, &sp,
+                                                uuidp, uuidc);
+                        if (gplaced > 0) {
+                            normalize_blockvector(candidate->b);
+                        }
+                    }
+                }
+
 #ifdef ELF_REASSEMBLY_DEBUG
-        else {
-            lock_fprintf(stdout,
-                "[ELF-reass][%s] initial gallop scan SKIP done=%d\n",
-                cand_id, (int)filestate->initial_gallop_done);
-        }
+                lock_fprintf(stdout,
+                    "[ELF-reass][%s] initial gallop scan END done=%d\n",
+                    cand_id, (int)filestate->initial_gallop_done);
 #endif
+            }
+#ifdef ELF_REASSEMBLY_DEBUG
+            else {
+                lock_fprintf(stdout,
+                    "[ELF-reass][%s] initial gallop scan SKIP done=%d\n",
+                    cand_id, (int)filestate->initial_gallop_done);
+            }
+#endif
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_INITIAL_ENTROPY);
+        }
 
 #ifdef ELF_REASSEMBLY_DEBUG
         elf_debug_dump_bv_layout(cand_id, candidate, filestate, "pre-early-full");
 #endif
 
-retry_reopened_layout:
-        ;
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_INITIAL_ENTROPY) {
+            bool entropy_returned_to_idle = false;
+            const bool entropy_completed =
+                elf_try_entropy_run_repairs(
+                       work, candidate, filestate, reassembly_file_size, cand_id,
+                       uuidp, uuidc, &entropy_returned_to_idle);
 
-        bool relocated_returned_to_idle = false;
-        const bool relocated_completed =
-            elf_try_relocated_run_completion(
-                work, candidate, filestate, cand_id, uuidp, uuidc,
-                &relocated_returned_to_idle);
-
-        if (relocated_returned_to_idle) {
-            candidate->no_initial_block_extension = true;
-            elf_free_carve_state((void **)&filestate);
-            return;
+            if (entropy_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
+            }
+            filestate->reassembly_entropy_completed = entropy_completed;
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_INITIAL_RELOCATED);
         }
 
-        if (elf_bv_is_full(candidate)) {
-            bool     validates    = false;
-            bool     promising    = false;
-            uint64_t validates_to = 0;
-            uint64_t first_bad_block = UINT64_MAX;
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_INITIAL_RELOCATED) {
+            bool relocated_returned_to_idle = false;
+            const bool relocated_completed =
+                elf_try_relocated_run_completion(
+                    work, candidate, filestate, cand_id, uuidp, uuidc,
+                    &relocated_returned_to_idle);
 
-#ifdef ELF_REASSEMBLY_DEBUG
-            elf_debug_dump_bv_layout(cand_id, candidate, filestate, "early-full");
-#endif
-            normalize_blockvector(candidate->b);
-            inflate_blockvector(candidate->b);
-
-            elf_file_validate((char *)blockvector_get_data_pointer(candidate->b),
-                              (uint64_t)blockvector_get_data_length(candidate->b),
-                              &validates,
-                              &validates_to,
-                              &promising,
-                              candidate->needleidx,
-                              scalpel_state.blocksize,
-                              candidate->carvehashkey);
-            const bool structurally_validates = validates;
-            const uint64_t structural_validates_to = validates_to;
-
-            elf_candidate_validate_layout_internal(
-                candidate, &validates, &validates_to, &promising,
-                &first_bad_block);
-
-#ifdef ELF_REASSEMBLY_DEBUG
-            lock_fprintf(stdout,
-                "[ELF-reass][%s] early-stop FULL validate=%d promising=%d validates_to=%" PRIu64 "\n",
-                cand_id, (int)validates, (int)promising, validates_to);
-#endif
-
-            if (validates) {
-                blockvector_set_data_length(candidate->b, validates_to + 1);
-                resize_blockvector(candidate->b,
-                                   CEILDIV(blockvector_get_data_length(candidate->b),
-                                           scalpel_state.blocksize));
-                candidate->flavor = VALIDATED;
-                goto done_write_candidate;
+            if (relocated_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
             }
+            filestate->reassembly_relocated_completed = relocated_completed;
+            elf_reassembly_set_phase(candidate, filestate,
+                relocated_completed && elf_bv_is_full(candidate)
+                    ? ELF_REASSEMBLY_RELOCATED_ALIGNMENT : ELF_REASSEMBLY_EARLY_VALIDATE);
+        }
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_RELOCATED_ALIGNMENT) {
+            bool post_relocated_alignment_returned_to_idle = false;
 
-            if (relocated_completed && structurally_validates
-                && validates_to == structural_validates_to) {
-                if (structural_validates_to != UINT64_MAX) {
-                    blockvector_set_data_length(
-                        candidate->b, structural_validates_to + 1);
-                    resize_blockvector(
-                        candidate->b,
-                        CEILDIV(blockvector_get_data_length(candidate->b),
-                                scalpel_state.blocksize));
+            (void)elf_try_layout_gap_alignment(
+                candidate, filestate,
+                elf_candidate_header_apparent(candidate),
+                blockvector_get_num_blocks(candidate->b),
+                reassembly_file_size, scalpel_state.blocksize, cand_id,
+                work, uuidp, uuidc,
+                &post_relocated_alignment_returned_to_idle);
+            if (post_relocated_alignment_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
+            }
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_RELOCATED_ENTROPY);
+        }
+
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_RELOCATED_ENTROPY) {
+            bool post_relocated_entropy_returned_to_idle = false;
+            const bool entropy_completed =
+                elf_try_entropy_run_repairs(
+                    work, candidate, filestate, reassembly_file_size,
+                    cand_id, uuidp, uuidc,
+                    &post_relocated_entropy_returned_to_idle)
+                || filestate->reassembly_entropy_completed;
+            if (post_relocated_entropy_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
+            }
+            filestate->reassembly_entropy_completed = entropy_completed;
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_EARLY_VALIDATE);
+        }
+
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_EARLY_VALIDATE) {
+            if (elf_bv_is_full(candidate)) {
+                bool     validates    = false;
+                bool     promising    = false;
+                uint64_t validates_to = 0;
+                uint64_t first_bad_block = UINT64_MAX;
+
+#ifdef ELF_REASSEMBLY_DEBUG
+                elf_debug_dump_bv_layout(cand_id, candidate, filestate, "early-full");
+#endif
+                normalize_blockvector(candidate->b);
+                inflate_blockvector(candidate->b);
+
+                elf_file_validate((char *)blockvector_get_data_pointer(candidate->b),
+                                  (uint64_t)blockvector_get_data_length(candidate->b),
+                                  &validates,
+                                  &validates_to,
+                                  &promising,
+                                  candidate->needleidx,
+                                  scalpel_state.blocksize,
+                                  candidate->carvehashkey);
+                const bool structurally_validates = validates;
+                const uint64_t structural_validates_to = validates_to;
+
+                elf_candidate_validate_layout_internal(
+                    candidate, &validates, &validates_to, &promising,
+                    &first_bad_block,
+                    filestate->complete_mapping_ooo_transitions_positioned);
+
+#ifdef ELF_REASSEMBLY_DEBUG
+                lock_fprintf(stdout,
+                    "[ELF-reass][%s] early-stop FULL validate=%d promising=%d validates_to=%" PRIu64 "\n",
+                    cand_id, (int)validates, (int)promising, validates_to);
+#endif
+
+                if (validates) {
+                    blockvector_set_data_length(candidate->b, validates_to + 1);
+                    resize_blockvector(candidate->b,
+                                       CEILDIV(blockvector_get_data_length(candidate->b),
+                                               scalpel_state.blocksize));
+                    candidate->flavor = VALIDATED;
+                    goto done_write_candidate;
                 }
-                candidate->flavor = PROMISING;
-                goto done_write_candidate;
-            }
 
-            const uint64_t reopen_validates_to =
-                first_bad_block == UINT64_MAX
-                    ? validates_to
-                    : first_bad_block == 0
-                          ? 0
-                          : first_bad_block
-                                * (uint64_t)scalpel_state.blocksize - 1;
-            const uint64_t reopened =
-                elf_reopen_rejected_layout(candidate, filestate,
-                                           reopen_validates_to);
-            if (reopened == 0) {
                 if (structurally_validates
-                    && structural_validates_to != UINT64_MAX) {
-                    blockvector_set_data_length(
-                        candidate->b, structural_validates_to + 1);
-                    resize_blockvector(
-                        candidate->b,
-                        CEILDIV(blockvector_get_data_length(candidate->b),
-                                scalpel_state.blocksize));
-                }
-                candidate->flavor = PROMISING;
-                goto done_write_candidate;
-            }
+                    && first_bad_block != UINT64_MAX
+                    && (validates_to != structural_validates_to
+                        || !candidate_file_is_le)
+                    && !filestate->reassembly_reopened
+                    && first_bad_block
+                           < blockvector_get_num_blocks(candidate->b)
+                    && elf_layout_slot_requires_reassembly(
+                           candidate, filestate, first_bad_block,
+                           scalpel_state.blocksize)) {
+                    const uint64_t reopen_validates_to =
+                        first_bad_block == 0
+                            ? 0
+                            : first_bad_block
+                                  * (uint64_t)scalpel_state.blocksize - 1;
+                    const uint64_t reopened = elf_reopen_rejected_layout(
+                        candidate, filestate, reopen_validates_to);
 
-            scalpel_log("[%s] elf reassembly: reopened %" PRIu64
-                        " blocks after a full layout failed validation.\n",
-                        cand_id, reopened);
+                    if (reopened > 0) {
+                        filestate->reassembly_reopened = true;
+                        elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_PLACE);
+                        scalpel_log(
+                            "[%s] elf reassembly: reopened %" PRIu64
+                            " blocks after physical layout validation.\n",
+                            cand_id, reopened);
+                        goto retry_reopened_layout;
+                    }
+                }
+
+                if ((filestate->reassembly_entropy_completed
+                     || filestate->reassembly_relocated_completed)
+                    && structurally_validates
+                    && validates_to == structural_validates_to) {
+                    if (structural_validates_to != UINT64_MAX) {
+                        blockvector_set_data_length(
+                            candidate->b, structural_validates_to + 1);
+                        resize_blockvector(
+                            candidate->b,
+                            CEILDIV(blockvector_get_data_length(candidate->b),
+                                    scalpel_state.blocksize));
+                    }
+                    // A complete solver mapping can be validated only when its
+                    // physical order supplies no unverified transition.
+                    candidate->flavor =
+                        filestate->complete_mapping_verified
+                        && first_bad_block == UINT64_MAX
+                            ? VALIDATED
+                            : PROMISING;
+                    goto done_write_candidate;
+                }
+
+                if (structurally_validates
+                    && first_bad_block != UINT64_MAX) {
+                    if (validates_to != UINT64_MAX) {
+                        blockvector_set_data_length(candidate->b,
+                                                    validates_to + 1);
+                        resize_blockvector(
+                            candidate->b,
+                            CEILDIV(blockvector_get_data_length(candidate->b),
+                                    scalpel_state.blocksize));
+                    }
+                    candidate->flavor = PROMISING;
+                    goto done_write_candidate;
+                }
+
+                const uint64_t reopen_validates_to =
+                    first_bad_block == UINT64_MAX
+                        ? validates_to
+                        : first_bad_block == 0
+                              ? 0
+                              : first_bad_block
+                                    * (uint64_t)scalpel_state.blocksize - 1;
+                const uint64_t reopened =
+                    elf_reopen_rejected_layout(candidate, filestate,
+                                               reopen_validates_to);
+                if (reopened == 0) {
+                    if (structurally_validates
+                        && structural_validates_to != UINT64_MAX) {
+                        blockvector_set_data_length(
+                            candidate->b, structural_validates_to + 1);
+                        resize_blockvector(
+                            candidate->b,
+                            CEILDIV(blockvector_get_data_length(candidate->b),
+                                    scalpel_state.blocksize));
+                    }
+                    candidate->flavor = PROMISING;
+                    goto done_write_candidate;
+                }
+
+                scalpel_log("[%s] elf reassembly: reopened %" PRIu64
+                            " blocks after a full layout failed validation.\n",
+                            cand_id, reopened);
+                filestate->reassembly_reopened = true;
+            }
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_PLACE);
         }
 
-        {
+retry_reopened_layout:
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_PLACE) {
             static const SectionDataType priority[] = {
                 SECTION_DYNAMIC,
                 SECTION_RELOCATION,
@@ -39276,17 +50223,62 @@ bookkeeping:
                     break;
                 }
             }
+            filestate->reassembly_entropy_completed = false;
+            filestate->reassembly_relocated_completed = false;
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_FINAL_TEXT);
         }
 
-        elf_reassembly_fill_text_holes_final(candidate, filestate, &sp);
-        final_relocated_completed =
-            elf_try_relocated_run_completion(
-                work, candidate, filestate, cand_id, uuidp, uuidc,
-                &relocated_returned_to_idle);
-        if (relocated_returned_to_idle) {
-            candidate->no_initial_block_extension = true;
-            elf_free_carve_state((void **)&filestate);
-            return;
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_FINAL_TEXT) {
+            elf_reassembly_fill_text_holes_final(candidate, filestate, &sp);
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_FINAL_ENTROPY);
+        }
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_FINAL_ENTROPY) {
+            bool entropy_returned_to_idle = false;
+            const bool final_entropy_completed =
+                elf_try_entropy_run_repairs(
+                       work, candidate, filestate, reassembly_file_size, cand_id,
+                       uuidp, uuidc, &entropy_returned_to_idle);
+            if (entropy_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
+            }
+            filestate->reassembly_entropy_completed = final_entropy_completed;
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_FINAL_RELOCATED);
+        }
+
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_FINAL_RELOCATED) {
+            bool relocated_returned_to_idle = false;
+            const bool final_relocated_completed =
+                elf_try_relocated_run_completion(
+                    work, candidate, filestate, cand_id, uuidp, uuidc,
+                    &relocated_returned_to_idle);
+            if (relocated_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
+            }
+            filestate->reassembly_relocated_completed = final_relocated_completed;
+            elf_reassembly_set_phase(candidate, filestate,
+                final_relocated_completed && elf_bv_is_full(candidate)
+                    ? ELF_REASSEMBLY_FINAL_POST_ENTROPY : ELF_REASSEMBLY_FINAL_VALIDATE);
+        }
+        if (filestate->reassembly_phase == ELF_REASSEMBLY_FINAL_POST_ENTROPY) {
+            bool post_relocated_entropy_returned_to_idle = false;
+
+            const bool final_relocated_completed =
+                elf_try_entropy_run_repairs(
+                    work, candidate, filestate, reassembly_file_size,
+                    cand_id, uuidp, uuidc,
+                    &post_relocated_entropy_returned_to_idle)
+                || filestate->reassembly_relocated_completed;
+            if (post_relocated_entropy_returned_to_idle) {
+                candidate->no_initial_block_extension = true;
+                elf_free_carve_state((void **)&filestate);
+                return;
+            }
+            filestate->reassembly_relocated_completed = final_relocated_completed;
+            elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_FINAL_VALIDATE);
         }
     }
 
@@ -39315,7 +50307,8 @@ bookkeeping:
 
         elf_candidate_validate_layout_internal(
             candidate, &validates, &validates_to, &promising,
-            &first_bad_block);
+            &first_bad_block,
+            filestate->complete_mapping_ooo_transitions_positioned);
 
 #ifdef ELF_REASSEMBLY_DEBUG
         lock_fprintf(stdout,
@@ -39334,7 +50327,37 @@ bookkeeping:
             goto done_write_candidate;
         }
 
-        if (final_relocated_completed && structurally_validates
+        if (structurally_validates
+            && first_bad_block != UINT64_MAX
+            && (validates_to != structural_validates_to
+                || !candidate_file_is_le)
+            && !filestate->reassembly_reopened
+            && first_bad_block
+                   < blockvector_get_num_blocks(candidate->b)
+            && elf_layout_slot_requires_reassembly(
+                   candidate, filestate, first_bad_block,
+                   scalpel_state.blocksize)) {
+            const uint64_t reopen_validates_to =
+                first_bad_block == 0
+                    ? 0
+                    : first_bad_block
+                          * (uint64_t)scalpel_state.blocksize - 1;
+            const uint64_t reopened = elf_reopen_rejected_layout(
+                candidate, filestate, reopen_validates_to);
+
+            if (reopened > 0) {
+                filestate->reassembly_reopened = true;
+                elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_PLACE);
+                scalpel_log(
+                    "[%s] elf reassembly: reopened %" PRIu64
+                    " blocks after physical layout validation.\n",
+                    cand_id, reopened);
+                goto retry_reopened_layout;
+            }
+        }
+
+        if ((filestate->reassembly_entropy_completed
+             || filestate->reassembly_relocated_completed) && structurally_validates
             && validates_to == structural_validates_to) {
             if (structural_validates_to != UINT64_MAX) {
                 blockvector_set_data_length(candidate->b,
@@ -39344,11 +50367,31 @@ bookkeeping:
                     CEILDIV(blockvector_get_data_length(candidate->b),
                             scalpel_state.blocksize));
             }
+            // A complete solver mapping can be validated only when its
+            // physical order supplies no unverified transition.
+            candidate->flavor =
+                filestate->complete_mapping_verified
+                && first_bad_block == UINT64_MAX
+                    ? VALIDATED
+                    : PROMISING;
+            goto done_write_candidate;
+        }
+
+        if (structurally_validates
+            && first_bad_block != UINT64_MAX) {
+            if (validates_to != UINT64_MAX) {
+                blockvector_set_data_length(candidate->b,
+                                            validates_to + 1);
+                resize_blockvector(
+                    candidate->b,
+                    CEILDIV(blockvector_get_data_length(candidate->b),
+                            scalpel_state.blocksize));
+            }
             candidate->flavor = PROMISING;
             goto done_write_candidate;
         }
 
-        {
+        if (!filestate->reassembly_reopened) {
             const uint64_t reopen_validates_to =
                 first_bad_block == UINT64_MAX
                     ? validates_to
@@ -39361,6 +50404,8 @@ bookkeeping:
                                            reopen_validates_to);
 
             if (reopened > 0) {
+                filestate->reassembly_reopened = true;
+                elf_reassembly_set_phase(candidate, filestate, ELF_REASSEMBLY_PLACE);
                 scalpel_log("[%s] elf reassembly: reopened %" PRIu64
                             " blocks after final layout validation.\n",
                             cand_id, reopened);

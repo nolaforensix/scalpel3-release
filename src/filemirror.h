@@ -1,35 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//-----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // FileMirror design and implementation Copyright (c) 2021-2026 by Golden G. Richard III. The
 // filemirror handles most high-performance sequential and vector-based I/O as well as blockmap
 // operations for scalpel3.
@@ -110,19 +104,28 @@ typedef enum BlockValidationDecision BlockValidationDecision;
 // IMPORTANT: data associated with blockvectors is synchronized only by inflate_blockvector() or
 // inflate_blockvector_single_block(). Changing apparent or actual block numbers does not update the
 // current byte view. Call one of the inflate functions before expecting
-// blockvector_get_data_pointer() to reflect block number changes.
+// blockvector_get_data_pointer() to reflect block number changes. Full inflation and deflation do
+// not change logical length; the single-block pair temporarily extends it for a trial block.
+// A generic blockvector starts with zero logical byte extent. Its caller must
+// set the intended length explicitly as slots become part of the candidate.
 void init_blockvector(FileMirror *state, BlockVector **b,
                       uint64_t num_blocks, bool disable_reservations);
 void init_essential_blockvector(BlockVector *b, EssentialBlockVector **e);
 void init_empty_essential_blockvector(EssentialBlockVector **e, uint64_t num_blocks);
 bool read_essential_blockvector(EssentialBlockVector **blockvector, FILE *fp);
 bool write_essential_blockvector(EssentialBlockVector *blockvector, FILE *fp);
+// A contiguous blockvector starts with the full byte extent of its slots.
 void init_contiguous_blockvector(FileMirror *state, BlockVector **b,
                                  int64_t start, int64_t stop, bool disable_reservations);
+// The data length is the logical byte extent represented by a blockvector. It
+// is independent of whether the corresponding bytes are currently resident.
 void blockvector_set_data_length(BlockVector *b, uint64_t length);
+void blockvector_set_data_length_to_mapped_extent(BlockVector *b);
 uint64_t blockvector_get_data_length(BlockVector *b);
 uint64_t blockvector_get_non_peekahead_data_length(BlockVector *b);
 uint64_t blockvector_get_num_blocks(BlockVector *b);
+// Setting a negative apparent block number explicitly unmaps and invalidates
+// the slot; the next inflation represents it as a zero-filled block.
 void blockvector_set_apparent_blocknumber(BlockVector *b, uint64_t index, int64_t blocknumber);
 int64_t blockvector_get_apparent_blocknumber(BlockVector *b, uint64_t index);
 int64_t blockvector_get_actual_blocknumber(BlockVector *b, uint64_t index);
@@ -159,6 +162,15 @@ int64_t blockvector_get_choice(BlockVector *b,
                                int64_t apparentblocknumber,
                                int64_t count,
                                uint64_t *blocks_evaluated);
+bool blockvector_choice_is_excluded(BlockVector *b,
+                                    uint64_t index,
+                                    int64_t apparentblocknumber);
+roaring64_bitmap_t *blockvector_clone_choice_exclusions(BlockVector *b,
+                                                        uint64_t index);
+void blockvector_restore_choice_exclusions(
+    BlockVector *b,
+    uint64_t index,
+    const roaring64_bitmap_t *excluded_actual_blocks);
 void blockvector_add_choice(BlockVector *b,
                             uint64_t index,
                             int64_t apparentblocknumber);
@@ -196,6 +208,8 @@ char *filemirror_actual_block_data_pointer(FileMirror *state,
                                            int64_t actualblocknumber,
                                            uint64_t *length);
 int64_t filemirror_actual_block_reserved(FileMirror *state, int64_t actualblocknumber);
+uint64_t filemirror_actual_block_reference_count(FileMirror *state,
+                                                 int64_t actualblocknumber);
 uint64_t filemirror_apparent_filesize(FileMirror *state);
 uint64_t filemirror_apparent_blocks(FileMirror *state);
 uint64_t filemirror_actual_location(FileMirror *state,
@@ -231,6 +245,14 @@ void filemirror_set_blocktype_batch(FileMirror *state,
                                     int64_t actualblocknumber,
                                     const struct BlocktypeAssignment *assignments,
                                     uint32_t count);
+bool filemirror_copy_blocktype_column(FileMirror *state,
+                                      uint32_t filetype,
+                                      unsigned char *column,
+                                      uint64_t count);
+bool filemirror_replace_blocktype_column(FileMirror *state,
+                                         uint32_t filetype,
+                                         const unsigned char *column,
+                                         uint64_t count);
 uint64_t filemirror_default_unclassified_blocktypes(
     FileMirror *state,
     const uint32_t *filetypes,

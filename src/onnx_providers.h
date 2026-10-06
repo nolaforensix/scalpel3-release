@@ -1,3 +1,29 @@
+//
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+//
+// This file is part of Scalpel3.
+//
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
+//
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
+//
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
+//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
+//
+
 // onnx_providers.h: unified ONNX execution provider and GPU device selection.
 //
 // scalpel3 can contain any number of ONNX consumers, but there is one machine, so the
@@ -67,6 +93,10 @@ const char *onnx_cuda_runtime_description(void);
 // resolved CUDA provider. TensorRT is an optimization; false leaves CUDA fully
 // usable and returns a diagnostic in errbuf when one is supplied.
 bool onnx_tensorrt_available(char *errbuf, size_t errbuf_sz);
+
+// stable identity for the loaded TensorRT runtime, suitable for separating
+// compiled-engine caches; empty when TensorRT has not initialized
+const char *onnx_tensorrt_runtime_identity(void);
 
 // report whether the resolved provider is already cpu. This compatibility guard never
 // changes providers; accelerator failures are fatal for both explicit and automatic

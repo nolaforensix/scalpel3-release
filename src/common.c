@@ -1,39 +1,166 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//-----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
-//
-// Please see LICENSE.md and README.md for further information.
-//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
 #include "scalpel.h"
 #include <fnmatch.h>
 #include <openssl/evp.h>
+
+
+static bool is_path_separator(char c);
+
+
+// Save or restore MoDiCo's effective ranking metadata without an inference session.
+// num_specs must already be restored. Leave existing state intact on read failure.
+// Shared by scalpel3 and mergecps so both use the same checkpoint representation.
+//
+bool checkpoint_modico_serialization(ScalpelState *state, FILE *fp,
+                                     StateSerialization mode) {
+
+  uint8_t enabled = state->modico_enabled ? 1 : 0;
+  uint32_t count = state->modico_num_specs;
+  int *mapping = NULL;
+  size_t (*fb)(void *, size_t, size_t, FILE *) = mode == SERIALIZE
+      ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite : fread;
+
+  if (mode != SERIALIZE && mode != DESERIALIZE) {
+    return false;
+  }
+  if (fb(&enabled, sizeof(enabled), 1, fp) != 1
+      || fb(&count, sizeof(count), 1, fp) != 1) {
+    return false;
+  }
+  if (enabled > 1 || count > state->num_specs
+      || (enabled != (count != 0))
+      || (count && SIZE_MAX / count < sizeof(*mapping))) {
+    return false;
+  }
+  if (mode == SERIALIZE) {
+    mapping = state->modico_spec_to_class;
+    if (count && ! mapping) {
+      return false;
+    }
+  }
+  else if (count) {
+    mapping = malloc((size_t)count * sizeof(*mapping));
+    check_memory_allocation(mapping, __LINE__, __FILE__, "MoDiCo checkpoint mapping");
+  }
+
+  for (uint32_t i = 0; i < count; i++) {
+    int32_t class_index = mode == SERIALIZE ? mapping[i] : -1;
+    if (fb(&class_index, sizeof(class_index), 1, fp) != 1
+        || class_index < -1) {
+      if (mode == DESERIALIZE) {
+        free(mapping);
+      }
+      return false;
+    }
+    if (mode == DESERIALIZE) {
+      mapping[i] = class_index;
+    }
+  }
+
+  if (mode == DESERIALIZE) {
+    free(state->modico_spec_to_class);
+    state->modico_spec_to_class = mapping;
+    state->modico_num_specs = count;
+    state->modico_enabled = enabled != 0;
+  }
+  return true;
+}
+
+
+// return true when 'c' separates pathname components on a supported platform.
+//
+static bool is_path_separator(char c) {
+
+  return c == '/' || c == '\\';
+}
+
+
+// return a pointer to the final component of 'path'. Both '/' and '\\' are
+// recognized as pathname separators, and an ASCII drive-letter prefix is
+// skipped when present. The returned pointer refers to storage in 'path'. A
+// NULL or empty path is returned unchanged.
+//
+char *scalpel_path_basename(const char *path) {
+
+  const char *component;
+  const char *end;
+  const char *scan;
+
+  if (! path || ! path[0]) {
+    return (char *)path;
+  }
+
+  component = path;
+  if ((((path[0] >= 'A') && (path[0] <= 'Z'))
+       || ((path[0] >= 'a') && (path[0] <= 'z')))
+      && path[1] == ':') {
+    component += 2;
+  }
+
+  end = path + strlen(path);
+  scan = end;
+  while (scan > component && is_path_separator(scan[-1])) {
+    scan--;
+  }
+
+  if (scan == component) {
+    if (scan == end) {
+      return (char *)end;
+    }
+    return (char *)(end - 1);
+  }
+
+  while (scan > component && ! is_path_separator(scan[-1])) {
+    scan--;
+  }
+
+  return (char *)scan;
+}
+
+
+// return the length of 'name' after excluding redundant trailing pathname
+// separators. A NULL name has length zero.
+//
+size_t scalpel_path_basename_len(const char *name) {
+
+  size_t length;
+
+  if (! name) {
+    return 0;
+  }
+
+  length = strlen(name);
+  while (length > 1 && is_path_separator(name[length - 1])) {
+    length--;
+  }
+
+  return length;
+}
 
 
 // copy a string only when the complete value fits in the destination
@@ -249,10 +376,12 @@ done:
 void checkpoint_test_crash_after(const char *stage) {
 
   const char *requested = getenv("SCALPEL3_TEST_CHECKPOINT_CRASH_AFTER");
+  ssize_t write_result;
 
   if (requested && stage && strcmp(requested, stage) == 0) {
     static const char message[] = "Checkpoint fault injection requested; terminating immediately.\n";
-    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    write_result = write(STDERR_FILENO, message, sizeof(message) - 1);
+    (void)write_result;
     _exit(86);
   }
 }

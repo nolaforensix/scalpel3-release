@@ -43,13 +43,38 @@ AM_COND_IF([FOUND_PKGCONFIG],,[AC_MSG_ERROR([scalpel3 requires 'pkg-config'.])])
 # ---- FUSE (blockmapfs)
 PKG_PROG_PKG_CONFIG
 
-PKG_CHECK_MODULES([FUSE], [fuse3 >= 3.0], [], [
-  AC_MSG_ERROR([FUSE 3 development files are required for blockmapfs.])
-])
+PKG_CHECK_MODULES([FUSE], [fuse3 >= 3.0], [have_fuse3=yes], [have_fuse3=no])
+AM_CONDITIONAL([HAVE_FUSE3], [test "x$have_fuse3" = "xyes"])
 
 AC_SUBST([FUSE_CFLAGS])
 AC_SUBST([FUSE_LIBS])
 
+# MPI compiler (required for hpcscalpel3)
+# AC_ARG_VAR allows MPICC to be set via environment
+AC_ARG_VAR([MPICC], [MPI C compiler (defaults to mpicc if not set)])
+# Only search PATH if MPICC wasn't already provided
+if test -z "$MPICC"; then
+  AC_CHECK_PROG([MPICC], [mpicc], [mpicc], [])
+fi
+AS_IF([test -n "$MPICC"], [have_mpi=yes], [have_mpi=no])
+AM_CONDITIONAL([HAVE_MPI], [test "x$have_mpi" = "xyes"])
+AC_SUBST([MPICC])
+
+# Extract MPI compile flags so gcc can find MPI headers for hpcscalpel3;
+# linking uses @MPICC@ directly via hpcscalpel3_LINK in Makefile.am.
+MPI_CFLAGS=""
+if test "x$have_mpi" = "xyes"; then
+    # OpenMPI
+    MPI_CFLAGS=`$MPICC --showme:compile 2>/dev/null`
+    # MPICH (newer)
+    test -z "$MPI_CFLAGS" && \
+        MPI_CFLAGS=`$MPICC -compile-info 2>/dev/null | sed 's/^[[^ ]]* //'`
+    # MPICH (older) / Intel MPI
+    test -z "$MPI_CFLAGS" && \
+        MPI_CFLAGS=`$MPICC -compile_info 2>/dev/null | sed 's/^[[^ ]]* //'`
+    AC_MSG_NOTICE([MPI compile flags: $MPI_CFLAGS])
+fi
+AC_SUBST([MPI_CFLAGS])
 
 # SDL2 (required for diskviz)
 PKG_CHECK_MODULES([SDL2], [sdl2], [], [AC_MSG_ERROR([diskviz requires SDL2. Install libsdl2-dev.])])
@@ -70,9 +95,24 @@ AC_CHECK_LIB([elf], [elf_begin], [], [AC_MSG_ERROR(scalpel3 requires 'libelf'.)]
 AC_CHECK_LIB([backtrace], [backtrace_create_state], [], [AC_MSG_ERROR(scalpel3 requires 'libbacktrace'.)])
 AC_CHECK_LIB([mpg123], [mpg123_format], [], [AC_MSG_ERROR(scalpel3 requires 'mpg123'.)])
 AC_CHECK_LIB([archive], [archive_read_open_memory], [], [AC_MSG_ERROR(scalpel3 requires 'libarchive'.)])
+AC_CHECK_LIB([sqlite3], [sqlite3_deserialize], [], [AC_MSG_ERROR(scalpel3 requires 'libsqlite3'.)])
+AC_CHECK_LIB([bz2], [BZ2_bzDecompressInit], [], [AC_MSG_ERROR(scalpel3 requires 'libbz2'.)])
+AC_CHECK_LIB([lzma], [lzma_raw_decoder], [], [AC_MSG_ERROR(scalpel3 requires 'liblzma'.)])
+AC_CHECK_LIB([zstd], [ZSTD_createDStream], [], [AC_MSG_ERROR(scalpel3 requires 'libzstd'.)])
 AC_CHECK_LIB([pocketfft_mdct], [pfft_mdctf_init], [], [AC_MSG_ERROR(error compiling pocketfft_mdct.cpp)])
 
 # ---- ONNX Runtime (required for ELF ONNX inference)
+AC_ARG_WITH([cuda-major],
+  [AS_HELP_STRING([--with-cuda-major=12|13|0], [CUDA major required by the selected ONNX Runtime (0: unspecified)])],
+  [case "$withval" in
+     0|12|13) AC_DEFINE_UNQUOTED([SCALPEL3_CUDA_MAJOR], [$withval], [CUDA major required by ONNX Runtime]) ;;
+     *) AC_MSG_ERROR([--with-cuda-major must be 12, 13, or 0]) ;;
+   esac])
+AC_ARG_WITH([scalpel3-cuda-runtime],
+  [AS_HELP_STRING([--with-scalpel3-cuda-runtime=PATH|system], [private CUDA library tree, or the system loader])],
+  [AS_CASE([$withval], [*\"*|*\\*], [AC_MSG_ERROR([CUDA runtime path cannot contain quotes or backslashes])])
+   AC_DEFINE_UNQUOTED([SCALPEL3_CUDA_RUNTIME_DIR], ["$withval"], [Default CUDA library tree])])
+
 AC_LANG_PUSH([C++])
 AC_CHECK_HEADER([onnxruntime_cxx_api.h], [],
   [AC_MSG_ERROR([scalpel3 requires ONNX Runtime headers (onnxruntime_cxx_api.h). Install ORT and ensure CPPFLAGS includes -I/path/to/onnxruntime/include])])
@@ -85,7 +125,7 @@ LIBS="$saved_LIBS"
 
 
 # Checks for header files.
-AC_CHECK_HEADERS([ctype.h sys/stat.h fcntl.h limits.h stddef.h stdlib.h string.h sys/ioctl.h sys/mount.h sys/param.h sys/time.h time.h sys/timeb.h unistd.h sys/file.h errno.h stdarg.h stdint.h math.h stdbool.h pthread.h inttypes.h stdatomic.h locale.h openssl/sha.h sys/socket.h sys/un.h execinfo.h backtrace.h pcre2.h])
+AC_CHECK_HEADERS([ctype.h sys/stat.h fcntl.h limits.h stddef.h stdlib.h string.h sys/ioctl.h sys/mount.h sys/param.h sys/time.h time.h sys/timeb.h unistd.h sys/file.h errno.h stdarg.h stdint.h math.h stdbool.h pthread.h inttypes.h stdatomic.h locale.h openssl/sha.h sys/socket.h sys/un.h execinfo.h backtrace.h pcre2.h sqlite3.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_HEADER_STDBOOL

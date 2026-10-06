@@ -18,6 +18,11 @@ blockmap_filename
 \fBmodblockmap\fR allows the user to cover (mark as used) or uncover (mark as available) single blocks or ranges of blocks within an existing scalpel3 blockmap. It also supports adjusting the active carve window and parsing logs from external tools (e.g., \fBphotorec\fR) to update coverage.
 .PP
 If only the image and blockmap filenames are provided, the current contents of the blockmap are displayed.
+.PP
+Changes are written back to the named blockmap; the image is not modified.
+Options must precede the filenames. Block numbers start at zero and range
+endpoints are inclusive. Quote query arguments, such as \fB'?:0-10'\fR,
+to prevent the shell from treating \(oq?\(cq as a filename pattern.
 
 .SH OPTIONS
 .PP
@@ -28,6 +33,10 @@ Set the start of the active carve window. Must be >= 0.
 .TP
 .BI -k " end_block"
 Set the end of the active carve window. Must be >= 0.
+.PP
+An omitted endpoint retains its existing value. Both endpoints must be
+within the image and the start must not exceed the end. Changing the window
+recalculates duplicate and zero block information for that window.
 
 .SH OPERATIONS
 Operations are specified as positional arguments after the filenames.
@@ -53,6 +62,12 @@ Operations are specified as positional arguments after the filenames.
 \fBphotorec\fR \fIlogfile\fR
 .br
 Parses a PhotoRec log file and covers blocks associated with files recovered by PhotoRec.
+The log must contain the PhotoRec command line with its \fB/d\fR output
+directory and recovery entries with inclusive block ranges. Range numbers
+are used directly, so their block units must match the blockmap.
+
+.SH EXIT STATUS
+Returns zero after a successful query or update and nonzero on error.
 
 .SH SEE ALSO
 .BR scalpel3 (1),

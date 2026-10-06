@@ -1,14 +1,45 @@
+//
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+//
+// This file is part of Scalpel3.
+//
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
+//
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
+//
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
+//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
+//
+
+/**
+ * @author James Ghawaly
+ */
+
 /*
- * modico.h — public C API for the MoDiCo ONNX inference layer.
+ * modico.h - public C API for the MoDiCo ONNX inference layer.
  *
- * This is the surface that will be lifted into Scalpel during Phase 3.
- * The implementation in modico.c owns session lifecycle, single-fragment
- * and batched classification, CoreML cache setup, optional diagnostics, and
- * a top-K helper.
+ * The implementation in modico.c owns ONNX Runtime session lifecycle,
+ * CPU, CUDA, and CoreML provider setup, model selection, single-fragment
+ * and batched classification, timing and diagnostics, termination, and
+ * top-K reporting.
  *
- * Threading model: one mc_session_t per worker thread. ORT's default
- * Run is not concurrent-safe for a single session. Session creation is
- * the expensive part; once you have one, calls are cheap.
+ * An mc_session_t contains mutable scratch buffers, run options, and timing
+ * state and must not be used concurrently. Scalpel3 assigns each concurrent
+ * MoDiCo classification worker its own session and reuses that session because
+ * session creation is expensive.
  */
 #ifndef MODICO_H
 #define MODICO_H
@@ -58,6 +89,16 @@ mc_session_t *mc_create_session_with_accelerator_device(
                                                  int intra_op_threads,
                                                  const char *accelerator,
                                                  int device_id);
+
+/* The workload-aware variant uses the expected per-device block count to
+ * avoid paying a cold TensorRT build cost on short runs. UINT64_MAX preserves
+ * the legacy behavior and always permits TensorRT. */
+mc_session_t *mc_create_session_with_accelerator_device_for_workload(
+                                                 const char *model_path,
+                                                 int intra_op_threads,
+                                                 const char *accelerator,
+                                                 int device_id,
+                                                 uint64_t expected_blocks);
 
 
 /* Which variant of the model an auto-selecting session actually loaded.
@@ -135,6 +176,16 @@ mc_session_t *mc_create_session_auto_with_accelerator_device(
                                      int device_id,
                                      mc_session_info_t *info_out);
 
+/* Automatic model selection plus the workload-aware provider policy above. */
+mc_session_t *mc_create_session_auto_with_accelerator_device_for_workload(
+                                     const char *model_base_path,
+                                     int intra_op_threads,
+                                     mc_session_kind_t prefer,
+                                     const char *accelerator,
+                                     int device_id,
+                                     uint64_t expected_blocks,
+                                     mc_session_info_t *info_out);
+
 void mc_destroy_session(mc_session_t *s);
 
 /* Number of output classes the model produces (read from the graph at
@@ -142,12 +193,18 @@ void mc_destroy_session(mc_session_t *s);
 int mc_get_num_classes(const mc_session_t *s);
 
 const char *mc_execution_provider(const mc_session_t *s);
+/* Actual inference engine. This differs from the execution provider when
+ * TensorRT runs ahead of CUDA as its fallback provider. */
+const char *mc_inference_backend(const mc_session_t *s);
 const char *mc_model_path(const mc_session_t *s);
 int mc_cuda_device_id(const mc_session_t *s);
 int mc_uses_cuda(const mc_session_t *s);
 int mc_uses_coreml(const mc_session_t *s);
+int mc_uses_tensorrt(const mc_session_t *s);
 int mc_uses_native_histograms(const mc_session_t *s);
 int mc_static_batch_size(const mc_session_t *s);
+/* Keep TensorRT on one compiled batch shape by padding the final call. */
+void mc_set_run_batch_size(mc_session_t *s, int batch_size);
 int mc_terminate_current_run(mc_session_t *s);
 int mc_timing_enabled(const mc_session_t *s);
 void mc_get_timing(const mc_session_t *s, mc_timing_t *timing_out);
@@ -156,7 +213,7 @@ void mc_get_timing(const mc_session_t *s, mc_timing_t *timing_out);
  *
  *   bytes        block_size raw bytes (uint8)
  *   block_size   must match the compiled-in input length of the loaded model
- *                (512, 4096, 8192, or 16384)
+ *                (512, 1024, 2048, 4096, 8192, or 16384)
  *   logits_out   caller-owned buffer of length mc_get_num_classes(s)
  *
  * Returns MC_INFERENCE_OK on success. Only MC_INFERENCE_RETRYABLE indicates
@@ -173,7 +230,7 @@ int mc_classify(mc_session_t *s,
  *                (fragment 0 first, then fragment 1, ...)
  *   batch_size   any positive value (the exported ONNX has a dynamic
  *                batch axis)
- *   block_size   must match the model's compiled-in input length
+ *   block_size   must match the loaded model's input length
  *   logits_out   caller-owned buffer of length
  *                batch_size * mc_get_num_classes(s)
  *

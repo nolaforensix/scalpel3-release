@@ -12,9 +12,16 @@ diskviz \- Visualize synthetic disk image layouts
 .PP
 \fBdiskviz\fR reads a \fI.key\fR file produced by \fBfragmentator\fR(1) and renders an interactive GUI visualization of the disk image layout using SDL2.
 .PP
-The visualization displays each disk block as a cell in a grid. Image files (PNG, JPG, GIF) are rendered as tiled image blocks showing the actual image content. Non-visual file types (ZIP, ELF, RAR, MP3, PDF, etc.) are shown as distinctly colored labeled blocks. RANDOM fill blocks are rendered as colorful noise and ZERO fill blocks display repeating "0" characters.
+In block views, each disk block is a cell in a grid. Image files (PNG, JPG,
+GIF) are rendered as tiled image blocks showing the actual image content.
+Other file types are shown as colored labeled blocks. RANDOM fill blocks
+appear as colorful noise and ZERO fill blocks display "0" characters.
 .PP
-The tool opens in the "originals" view, showing all files unfragmented side by side. Pressing SPACEBAR toggles to the "jigsaw" view, which shows the fragmented disk layout as it actually appears on the synthetic disk image.
+The tool has eight views. The first four illustrate files, filesystem block
+mapping, data remaining after filesystem information is lost, and header/footer
+locations for a contiguous layout. The next four illustrate the corresponding
+fragmented layout. It starts at the first view. These are illustrations based
+on the key file, not a display of scalpel3 recovery progress.
 
 .SH OPTIONS
 .PP
@@ -25,20 +32,27 @@ Base directory for resolving file paths referenced in the key file. If not speci
 .SH INTERACTION
 .PP
 .TP
-.B SPACEBAR
-Toggle between the original files view and the jigsaw (fragmented) view.
+.B SPACEBAR / RIGHT ARROW
+Advance to the next view, stopping at view 8.
 .TP
 .B LEFT ARROW
-Switch to the original files view.
+Return to the previous view, stopping at view 1.
 .TP
-.B RIGHT ARROW
-Switch to the jigsaw (fragmented) view.
+.B 1-8
+Jump directly to the corresponding view.
+.TP
+.B + / - / 0
+Zoom in, zoom out, or reset zoom in the block views (3, 4, 7, and 8).
+.TP
+.B Mouse wheel
+Scroll vertically in a block view.
 .TP
 .B Q / ESC
-Quit the application. Works from both the terminal and the graphical window. SPACEBAR and arrow keys also work from either.
+Quit the application. Keyboard controls work from both the terminal and the
+graphical window.
 .TP
 .B Mouse hover
-In jigsaw view, hover over a block to see a tooltip with the file name, block number, and block type.
+In block views, hover over a block to see its file and block information.
 .TP
 .B Window resize
 The grid automatically recomputes to fill the window.

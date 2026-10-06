@@ -2,9 +2,7 @@
 #
 # postprocess_scalpel.sh
 #
-# Runs all Scalpel post-processing steps in order:
-#   1. ZIP rename pass (postprocess_zip.sh)
-#   2. ELF blockvector fill pass (postprocess_elf.py)
+# Runs the Scalpel ELF blockvector post-processing pass.
 #
 # Usage:
 #   ./postprocess_scalpel.sh --image /path/to/image.dd --blockmap /path/to/scalpel.blockmap [options]
@@ -70,20 +68,10 @@ fi
 
 echo "==> Output root: $OUTPUT_ROOT"
 
-# ── Step 1: ZIP post-processing ─────────────────────────────────────────────
-echo ""
-echo "── Step 1: ZIP rename pass ─────────────────────────────────────────────"
-ZIP_SCRIPT="$SCRIPT_DIR/postprocess_zip.sh"
-if [[ ! -f "$ZIP_SCRIPT" ]]; then
-    echo "Warning: postprocess_zip.sh not found at $ZIP_SCRIPT — skipping ZIP pass." >&2
-else
-    bash "$ZIP_SCRIPT"
-    echo "ZIP pass complete."
-fi
+# ── Step 1: Python dependency installation ──────────────────────────────────
 
-# ── Step 2: Python dependency installation ──────────────────────────────────
 echo ""
-echo "── Step 2: Python dependency check ────────────────────────────────────"
+echo "── Step 1: Python dependency check"
 
 # postprocess_elf.py uses only the standard library, but ensure Python 3.8+ is present
 PYTHON=""
@@ -119,9 +107,9 @@ echo "Using Python: $PYTHON ($($PYTHON --version))"
 
 echo "All Python dependencies satisfied."
 
-# ── Step 3: ELF blockvector post-processing ──────────────────────────────────
+# ── Step 2: ELF blockvector post-processing
 echo ""
-echo "── Step 3: ELF blockvector fill pass ───────────────────────────────────"
+echo "── Step 2: ELF blockvector fill pass"
 ELF_SCRIPT="$SCRIPT_DIR/postprocess_elf.py"
 if [[ ! -f "$ELF_SCRIPT" ]]; then
     echo "Error: postprocess_elf.py not found at $ELF_SCRIPT" >&2

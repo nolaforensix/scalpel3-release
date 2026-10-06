@@ -1,3 +1,29 @@
+//
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+//
+// This file is part of Scalpel3.
+//
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
+//
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
+//
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
+//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
+//
+
 // onnx_providers.c: implementation of unified ONNX execution provider selection. See
 // onnx_providers.h for the contract. Capability checking has three layers: the ONNX
 // CUDA libraries are selected before provider discovery, the ONNX Runtime build must
@@ -52,7 +78,12 @@ static size_t g_cudnn_version = 0;
 static bool g_cuda_versions_checked = false;
 static char g_cuda_runtime_description[2048] = {0};
 
+#ifndef SCALPEL3_CUDA_RUNTIME_DIR
 #define SCALPEL3_CUDA_RUNTIME_DIR "/usr/local/lib/scalpel3-cuda"
+#endif
+#ifndef SCALPEL3_CUDA_MAJOR
+#define SCALPEL3_CUDA_MAJOR 0
+#endif
 #define SCALPEL3_TENSORRT_RUNTIME_DIR \
     SCALPEL3_CUDA_RUNTIME_DIR "/tensorrt_libs"
 #define OP_CUDA_RUNTIME_PATH_MAX PATH_MAX
@@ -67,6 +98,26 @@ static const char *const g_cuda_runtime_library_patterns[] = {
     "nvidia/cu13/lib/libnvJitLink.so.13",
     "nvidia/cu13/lib/libnvrtc-builtins.so.13.*",
     "nvidia/cu13/lib/libnvrtc.so.13",
+    "nvidia/cudnn/lib/libcudnn_graph.so.9",
+    "nvidia/cudnn/lib/libcudnn_ops.so.9",
+    "nvidia/cudnn/lib/libcudnn_adv.so.9",
+    "nvidia/cudnn/lib/libcudnn_cnn.so.9",
+    "nvidia/cudnn/lib/libcudnn_engines_precompiled.so.9",
+    "nvidia/cudnn/lib/libcudnn_engines_runtime_compiled.so.9",
+    "nvidia/cudnn/lib/libcudnn_engines_tensor_ir.so.9",
+    "nvidia/cudnn/lib/libcudnn_ext.so.9",
+    "nvidia/cudnn/lib/libcudnn_heuristic.so.9",
+    "nvidia/cudnn/lib/libcudnn.so.9"
+};
+static const char *const g_cuda12_runtime_library_patterns[] = {
+    "nvidia/cuda_runtime/lib/libcudart.so.12",
+    "nvidia/cublas/lib/libcublasLt.so.12",
+    "nvidia/cublas/lib/libcublas.so.12",
+    "nvidia/curand/lib/libcurand.so.10",
+    "nvidia/cufft/lib/libcufft.so.11",
+    "nvidia/nvjitlink/lib/libnvJitLink.so.12",
+    "nvidia/cuda_nvrtc/lib/libnvrtc-builtins.so.12.*",
+    "nvidia/cuda_nvrtc/lib/libnvrtc.so.12",
     "nvidia/cudnn/lib/libcudnn_graph.so.9",
     "nvidia/cudnn/lib/libcudnn_ops.so.9",
     "nvidia/cudnn/lib/libcudnn_adv.so.9",
@@ -102,6 +153,7 @@ static const char *const g_tensorrt_runtime_library_names[] = {
 static bool g_tensorrt_runtime_checked = false;
 static bool g_tensorrt_runtime_available = false;
 static char g_tensorrt_runtime_error[320] = {0};
+static char g_tensorrt_runtime_identity[64] = {0};
 static char g_tensorrt_runtime_root[OP_CUDA_RUNTIME_PATH_MAX] = {0};
 static char g_tensorrt_runtime_libraries[OP_TENSORRT_RUNTIME_LIBRARY_COUNT]
                                         [OP_CUDA_RUNTIME_PATH_MAX];
@@ -117,16 +169,18 @@ static bool op_build_has_provider(const char *ep_name);
 static bool op_nvidia_hardware_present(void);
 static bool op_cuda_physical_present(int physical);
 static bool op_cuda_device_present(int device_id);
+#if defined(__linux__)
 static bool op_cuda_resolve_private_library(const char *pattern, char *path,
                                             size_t path_sz, char *errbuf,
                                             size_t errbuf_sz);
-static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz);
-static bool op_tensorrt_preload_runtime(char *errbuf, size_t errbuf_sz);
 static bool op_cuda_resolve_symbol(void *handle, const char *symbol_name,
                                    const char *expected_path,
                                    void **symbol, char *loaded_path,
                                    size_t loaded_path_sz, char *errbuf,
                                    size_t errbuf_sz);
+#endif
+static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz);
+static bool op_tensorrt_preload_runtime(char *errbuf, size_t errbuf_sz);
 static bool op_cuda_library_versions(char *errbuf, size_t errbuf_sz);
 static bool op_cuda_device_healthy(int device_id, char *errbuf,
                                    size_t errbuf_sz);
@@ -386,11 +440,11 @@ static bool op_cuda_device_present(int device_id) {
   return op_cuda_physical_present(op_cuda_physical(device_id));
 }
 
+#if defined(__linux__)
 // resolve one library pattern inside the private CUDA runtime
 static bool op_cuda_resolve_private_library(const char *pattern, char *path,
                                             size_t path_sz, char *errbuf,
                                             size_t errbuf_sz) {
-#if defined(__linux__)
   char full_pattern[OP_CUDA_RUNTIME_PATH_MAX];
   char resolved[OP_CUDA_RUNTIME_PATH_MAX];
   glob_t matches;
@@ -411,7 +465,7 @@ static bool op_cuda_resolve_private_library(const char *pattern, char *path,
   if (result != 0 || matches.gl_pathc != 1
       || ! realpath(matches.gl_pathv[0], resolved)) {
     snprintf(errbuf, errbuf_sz,
-             "The private CUDA runtime requires exactly one match for %s.",
+             "The private CUDA runtime requires exactly one match for %.250s.",
              full_pattern);
     globfree(&matches);
     return false;
@@ -429,15 +483,8 @@ static bool op_cuda_resolve_private_library(const char *pattern, char *path,
 
   snprintf(path, path_sz, "%s", resolved);
   return true;
-#else
-  (void)pattern;
-  (void)path;
-  (void)path_sz;
-  (void)errbuf;
-  (void)errbuf_sz;
-  return false;
-#endif
 }
+#endif
 
 // preload Scalpel3's private CUDA runtime by absolute path. Keeping these handles open
 // lets ONNX Runtime's CUDA provider resolve the same SONAMEs without changing the system
@@ -448,7 +495,8 @@ static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz) {
   const char *configured = getenv("SCALPEL3_CUDA_RUNTIME_DIR");
   const char *root = configured && *configured
                    ? configured : SCALPEL3_CUDA_RUNTIME_DIR;
-  size_t loaded = 0;
+  const char *const *patterns = g_cuda_runtime_library_patterns;
+  size_t i;
 
   if (g_cuda_runtime_preload_checked) {
     if (g_cuda_runtime_preload_error[0]) {
@@ -458,6 +506,11 @@ static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz) {
     return true;
   }
   g_cuda_runtime_preload_checked = true;
+
+  // The installer can select the system loader without touching a legacy shared tree.
+  if (! *root || ! strcmp(root, "system")) {
+    return true;
+  }
 
   if (access(root, F_OK) != 0) {
     if (configured && *configured) {
@@ -479,9 +532,29 @@ static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz) {
     return false;
   }
 
+  if (SCALPEL3_CUDA_MAJOR == 12) {
+    patterns = g_cuda12_runtime_library_patterns;
+  }
+  else if (SCALPEL3_CUDA_MAJOR == 0) {
+    char cudart12[OP_CUDA_RUNTIME_PATH_MAX];
+    int n = snprintf(cudart12, sizeof(cudart12), "%s/%s", root,
+                     g_cuda12_runtime_library_patterns[0]);
+    if (n > 0 && (size_t)n < sizeof(cudart12) && access(cudart12, R_OK) == 0) {
+      patterns = g_cuda12_runtime_library_patterns;
+    }
+  }
+
   for (size_t i = 0; i < OP_CUDA_RUNTIME_LIBRARY_COUNT; i++) {
+    // These two cuDNN components do not exist in older cuDNN 9 releases.
+    if (i == 14 || i == 15) {
+      char optional[OP_CUDA_RUNTIME_PATH_MAX];
+      int n = snprintf(optional, sizeof(optional), "%s/%s", root, patterns[i]);
+      if (n > 0 && (size_t)n < sizeof(optional) && access(optional, F_OK) != 0) {
+        continue;
+      }
+    }
     if (! op_cuda_resolve_private_library(
-            g_cuda_runtime_library_patterns[i],
+            patterns[i],
             g_cuda_runtime_libraries[i],
             sizeof(g_cuda_runtime_libraries[i]),
             g_cuda_runtime_preload_error,
@@ -496,6 +569,9 @@ static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz) {
     const char *soname = strrchr(g_cuda_runtime_libraries[i], '/');
     void *existing;
 
+    if (! g_cuda_runtime_libraries[i][0]) {
+      continue;
+    }
     soname = soname ? soname + 1 : g_cuda_runtime_libraries[i];
     existing = dlopen(soname, RTLD_NOW | RTLD_NOLOAD);
     if (existing) {
@@ -510,7 +586,10 @@ static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz) {
     }
   }
 
-  for (size_t i = 0; i < OP_CUDA_RUNTIME_LIBRARY_COUNT; i++) {
+  for (i = 0; i < OP_CUDA_RUNTIME_LIBRARY_COUNT; i++) {
+    if (! g_cuda_runtime_libraries[i][0]) {
+      continue;
+    }
     g_cuda_runtime_handles[i] =
         dlopen(g_cuda_runtime_libraries[i], RTLD_NOW | RTLD_GLOBAL);
     if (! g_cuda_runtime_handles[i]) {
@@ -523,14 +602,15 @@ static bool op_cuda_preload_runtime(char *errbuf, size_t errbuf_sz) {
                detail ? ": " : "", detail ? detail : "");
       break;
     }
-    loaded++;
   }
 
-  if (loaded != OP_CUDA_RUNTIME_LIBRARY_COUNT) {
+  if (i != OP_CUDA_RUNTIME_LIBRARY_COUNT) {
     snprintf(errbuf, errbuf_sz, "%s", g_cuda_runtime_preload_error);
-    for (size_t i = 0; i < loaded; i++) {
-      dlclose(g_cuda_runtime_handles[i]);
-      g_cuda_runtime_handles[i] = NULL;
+    for (size_t j = 0; j < OP_CUDA_RUNTIME_LIBRARY_COUNT; j++) {
+      if (g_cuda_runtime_handles[j]) {
+        dlclose(g_cuda_runtime_handles[j]);
+        g_cuda_runtime_handles[j] = NULL;
+      }
     }
     g_cuda_runtime_root[0] = '\0';
     return false;
@@ -552,6 +632,12 @@ static bool op_tensorrt_preload_runtime(char *errbuf, size_t errbuf_sz) {
   const char *configured = getenv("SCALPEL3_TENSORRT_RUNTIME_DIR");
   const char *root = configured && *configured
                    ? configured : SCALPEL3_TENSORRT_RUNTIME_DIR;
+  void *version_symbol = NULL;
+  void *build_symbol = NULL;
+  int32_t (*get_version)(void);
+  int32_t (*get_build)(void);
+  int32_t version;
+  int32_t build;
   size_t loaded = 0;
 
   if (g_tensorrt_runtime_checked) {
@@ -631,6 +717,30 @@ static bool op_tensorrt_preload_runtime(char *errbuf, size_t errbuf_sz) {
     goto unload;
   }
 
+  version_symbol = dlsym(g_tensorrt_runtime_handles[0],
+                         "getInferLibVersion");
+  build_symbol = dlsym(g_tensorrt_runtime_handles[0],
+                       "getInferLibBuildVersion");
+  if (! version_symbol || ! build_symbol) {
+    snprintf(g_tensorrt_runtime_error,
+             sizeof(g_tensorrt_runtime_error),
+             "The TensorRT runtime does not expose its version.");
+    goto unload;
+  }
+  get_version = (int32_t (*)(void))version_symbol;
+  get_build = (int32_t (*)(void))build_symbol;
+  version = get_version();
+  build = get_build();
+  if (version <= 0 || build < 0) {
+    snprintf(g_tensorrt_runtime_error,
+             sizeof(g_tensorrt_runtime_error),
+             "The TensorRT runtime reported an invalid version.");
+    goto unload;
+  }
+  snprintf(g_tensorrt_runtime_identity,
+           sizeof(g_tensorrt_runtime_identity),
+           "tensorrt-%" PRId32 "-build-%" PRId32, version, build);
+
   g_tensorrt_runtime_available = true;
   return true;
 
@@ -642,6 +752,7 @@ unload:
 
 unavailable:
   g_tensorrt_runtime_root[0] = '\0';
+  g_tensorrt_runtime_identity[0] = '\0';
   if (errbuf && errbuf_sz > 0) {
     snprintf(errbuf, errbuf_sz, "%s", g_tensorrt_runtime_error);
   }
@@ -656,13 +767,13 @@ unavailable:
 }
 
 
+#if defined(__linux__)
 // resolve a runtime symbol and verify its defining object when a private path is expected
 static bool op_cuda_resolve_symbol(void *handle, const char *symbol_name,
                                    const char *expected_path,
                                    void **symbol, char *loaded_path,
                                    size_t loaded_path_sz, char *errbuf,
                                    size_t errbuf_sz) {
-#if defined(__linux__)
   Dl_info info;
   char actual[OP_CUDA_RUNTIME_PATH_MAX];
   char expected[OP_CUDA_RUNTIME_PATH_MAX];
@@ -692,18 +803,8 @@ static bool op_cuda_resolve_symbol(void *handle, const char *symbol_name,
     }
   }
   return true;
-#else
-  (void)handle;
-  (void)symbol_name;
-  (void)expected_path;
-  (void)symbol;
-  (void)loaded_path;
-  (void)loaded_path_sz;
-  (void)errbuf;
-  (void)errbuf_sz;
-  return false;
-#endif
 }
+#endif
 
 // query and record the loaded CUDA and cuDNN user-space libraries without creating a
 // CUDA context
@@ -716,7 +817,9 @@ static bool op_cuda_library_versions(char *errbuf, size_t errbuf_sz) {
 #if defined(__linux__)
   void *cudart = g_cuda_runtime_is_private
                ? g_cuda_runtime_handles[OP_CUDA_CUDART_INDEX]
-               : dlopen("libcudart.so.13", RTLD_NOW | RTLD_LOCAL);
+               : dlopen(SCALPEL3_CUDA_MAJOR == 12 ? "libcudart.so.12"
+                                                 : "libcudart.so.13",
+                        RTLD_NOW | RTLD_LOCAL);
   void *cudnn = NULL;
   void *runtime_symbol = NULL;
   void *cudnn_symbol = NULL;
@@ -727,7 +830,7 @@ static bool op_cuda_library_versions(char *errbuf, size_t errbuf_sz) {
   int version = 0;
   bool ok = false;
 
-  if (! cudart && ! g_cuda_runtime_is_private) {
+  if (! cudart && ! g_cuda_runtime_is_private && SCALPEL3_CUDA_MAJOR == 0) {
     cudart = dlopen("libcudart.so.12", RTLD_NOW | RTLD_LOCAL);
   }
   if (! cudart) {
@@ -772,6 +875,12 @@ static bool op_cuda_library_versions(char *errbuf, size_t errbuf_sz) {
     goto done;
   }
   g_cuda_runtime_version = version;
+  if (SCALPEL3_CUDA_MAJOR != 0 && version / 1000 != SCALPEL3_CUDA_MAJOR) {
+    snprintf(errbuf, errbuf_sz,
+             "This ONNX Runtime build requires CUDA %d, but CUDA %d was loaded.",
+             SCALPEL3_CUDA_MAJOR, version / 1000);
+    goto done;
+  }
   g_cudnn_version = get_cudnn_version();
   if (g_cudnn_version == 0) {
     snprintf(errbuf, errbuf_sz,
@@ -1419,6 +1528,14 @@ bool onnx_tensorrt_available(char *errbuf, size_t errbuf_sz) {
     return false;
   }
   return op_tensorrt_preload_runtime(errbuf, errbuf_sz);
+}
+
+const char *onnx_tensorrt_runtime_identity(void) {
+#if defined(__linux__)
+  return g_tensorrt_runtime_identity;
+#else
+  return "";
+#endif
 }
 
 bool onnx_runtime_fallback_to_cpu(const char *reason) {

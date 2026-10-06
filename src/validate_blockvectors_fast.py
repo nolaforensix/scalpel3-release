@@ -27,9 +27,12 @@ Behavior
 - Error if blockvector Length != ground-truth file size.
 - Reports GT files not recovered (no blockvector mapped).
 - With --fail-on-invalid-validated, exits nonzero if a file in VALIDATED does
-  not match any ground-truth SHA256.
+  not match any ground-truth SHA256, a proven ground-truth prefix, or exact
+  embedded content within a ground-truth file.
+- Byte-exact snapshots retained in PROMISING are Category 1 perfect recoveries,
+  just like byte-exact files written to VALIDATED.
 - With --require-all-exact, exits nonzero unless every ground-truth file has a
-  byte-exact recovered snapshot, including snapshots retained in PROMISING.
+  byte-exact recovered snapshot.
 - With --require-exact-at-least N, exits nonzero unless at least N distinct
   ground-truth files have a byte-exact recovered snapshot.
 
@@ -65,7 +68,9 @@ from typing import Dict, List, Optional, Tuple, Set
 def load_exemplar_map(blockmap_path: Path) -> Dict[int, int]:
     """
     Parse a scalpel3 blockmap and return a dict mapping every block number
-    to its exemplar block number.  Non-duplicate blocks map to themselves.
+    to its exemplar block number. Non-duplicate blocks map to themselves and
+    zero blocks map to the negative sentinel used for unmapped zero-filled
+    blockvector slots.
 
     Blockmap layout (from blockmap.h):
         [blocksize:u32] [num_blocks:u64]
@@ -85,6 +90,7 @@ def load_exemplar_map(blockmap_path: Path) -> Dict[int, int]:
     bitmaps_start = 28
     dedup_offset = bitmaps_start + bitmap_bytes          # D bitmap (after C)
     exemplar_offset = dedup_offset + bitmap_bytes        # E bitmap (after D)
+    zero_offset = exemplar_offset + bitmap_bytes         # Z bitmap (after E)
     # On-disk order after bitmaps: T (reservations), then R (refcounts)
     reservations_offset = bitmaps_start + 4 * bitmap_bytes
     refcount_offset = reservations_offset + 8 * num_blocks  # R follows T
@@ -95,6 +101,9 @@ def load_exemplar_map(blockmap_path: Path) -> Dict[int, int]:
 
     exemplar_map: Dict[int, int] = {}
     for j in range(num_blocks):
+        if bit_set(zero_offset, j):
+            exemplar_map[j] = -1
+            continue
         d = bit_set(dedup_offset, j)
         e = bit_set(exemplar_offset, j)
         if d and not e:
@@ -109,7 +118,7 @@ def load_exemplar_map(blockmap_path: Path) -> Dict[int, int]:
 
 
 def blocks_equivalent(a: int, b: int, exemplar_map: Optional[Dict[int, int]]) -> bool:
-    """Return True if blocks a and b are the same or are duplicates of each other."""
+    """Return True for identical, duplicate, or equivalent zero-filled slots."""
     if a == b:
         return True
     if exemplar_map is None:
@@ -117,14 +126,81 @@ def blocks_equivalent(a: int, b: int, exemplar_map: Optional[Dict[int, int]]) ->
     return exemplar_map.get(a, a) == exemplar_map.get(b, b)
 
 
+def find_exact_embedded_offset(candidate_path: Path, ground_truth_path: Path,
+                               start_index: int, block_size: int) -> Optional[int]:
+    """Find candidate bytes that begin within the indicated ground-truth block."""
+    try:
+        candidate_size = candidate_path.stat().st_size
+        ground_truth_size = ground_truth_path.stat().st_size
+        if candidate_size == 0:
+            return None
+
+        search_start = start_index * block_size
+        if search_start >= ground_truth_size:
+            return None
+        search_length = min(block_size, ground_truth_size - search_start)
+
+        with candidate_path.open("rb") as candidate_handle:
+            prefix = candidate_handle.read(min(candidate_size, 64))
+        with ground_truth_path.open("rb") as ground_truth_handle:
+            ground_truth_handle.seek(search_start)
+            search_data = ground_truth_handle.read(search_length)
+
+        relative_offset = search_data.find(prefix)
+        while relative_offset >= 0:
+            candidate_offset = search_start + relative_offset
+            if candidate_offset + candidate_size <= ground_truth_size:
+                exact = True
+                with candidate_path.open("rb") as candidate_handle, \
+                        ground_truth_path.open("rb") as ground_truth_handle:
+                    ground_truth_handle.seek(candidate_offset)
+                    while True:
+                        candidate_data = candidate_handle.read(1024 * 1024)
+                        if not candidate_data:
+                            break
+                        if ground_truth_handle.read(len(candidate_data)) != candidate_data:
+                            exact = False
+                            break
+                if exact:
+                    return candidate_offset
+            relative_offset = search_data.find(prefix, relative_offset + 1)
+    except OSError:
+        return None
+
+    return None
+
+
 # ---------- FRG support ---------- #
+
+def frg_argument(value: str) -> str:
+    """Apply fragmentator's quoting and single-pass environment expansion."""
+    value = value.strip()
+    if value.startswith('"'):
+        end = value.find('"', 1)
+        if end < 0:
+            raise ValueError('Unterminated quoted FRG argument')
+        value = value[1:end]
+
+    def substitute(match: re.Match) -> str:
+        name = match.group(1)
+        if name is None or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', name):
+            raise ValueError(f'Invalid FRG environment reference: {match.group(0)}')
+        if name not in os.environ:
+            raise ValueError(f'FRG environment variable {name!r} is not set')
+        return os.environ[name]
+
+    value = re.sub(r'\$\{([^}]*)\}|\$\{', substitute, value)
+    if len(os.fsencode(value)) > 2048:
+        raise ValueError('Expanded FRG argument exceeds 2048 bytes')
+    return value
+
 
 def load_frg_list(path: Path) -> Tuple[Optional[int], Optional[str], List[str], Dict[str, bool], Dict[str, List[int]]]:
     """
     Parse a .frg file. Returns (blocksize, outputfile, file_list, fragmentation_status, missing_blocks).
       - BLOCKSIZE: first integer after 'BLOCKSIZE:' line if present.
       - OUTPUTFILE: value after 'OUTPUTFILE:' if present.
-      - file_list: list of strings after 'FILE:' lines (whitespace stripped).
+      - file_list: FILE arguments after quoting and environment expansion.
       - fragmentation_status: dict mapping filepath -> is_fragmented (True if GAP/OUTOFORDER/MISSING/FRAGMENTED:TRUE)
       - missing_blocks: dict mapping filepath -> list of MISSING block indices
     Robust against extra whitespace/comments and 'stop' markers.
@@ -144,8 +220,15 @@ def load_frg_list(path: Path) -> Tuple[Optional[int], Optional[str], List[str], 
     current_missing_blocks: List[int] = []
     comment = 0
     
-    for raw in text.splitlines():
-        line = raw.split('#', 1)[0].strip()
+    for line_number, raw in enumerate(text.splitlines(), 1):
+        quoted = False
+        for index, character in enumerate(raw):
+            if character == '"':
+                quoted = not quoted
+            elif character == '#' and not quoted:
+                raw = raw[:index]
+                break
+        line = raw.strip()
         if line.startswith('/*'):
             comment += 1
             continue
@@ -155,21 +238,28 @@ def load_frg_list(path: Path) -> Tuple[Optional[int], Optional[str], List[str], 
         if not line or line.startswith('#') or comment > 0:
             continue
         lo = line.lower()
-        
+
         # Check for STOP first - takes priority over everything
         if lo.startswith('stop'):
             break
+
+        key, separator, argument = line.partition(':')
+        try:
+            argument = frg_argument(argument) if separator else ''
+        except ValueError as error:
+            raise ValueError(f'{path}:{line_number}: {error}') from error
+        lo = key.strip().lower()
         
-        if lo.startswith('blocksize'):
-            m = re.search(r'(\d+)', line)
+        if lo == 'blocksize':
+            m = re.search(r'(\d+)', argument)
             if m:
                 try:
                     bs = int(m.group(1))
                 except Exception:
                     pass
-        elif lo.startswith('outputfile'):
-            of = line.split(':', 1)[1].strip() if ':' in line else None
-        elif lo.startswith('file'):
+        elif lo == 'outputfile':
+            of = argument if separator else None
+        elif lo == 'file':
             # Save previous file's status
             if current_file is not None:
                 fragmentation[current_file] = current_is_fragmented
@@ -177,7 +267,7 @@ def load_frg_list(path: Path) -> Tuple[Optional[int], Optional[str], List[str], 
                     missing_blocks[current_file] = current_missing_blocks.copy()
             
             # Start new file
-            val = line.split(':', 1)[1].strip() if ':' in line else ''
+            val = argument
             if val:
                 current_file = val
                 current_is_fragmented = False  # Reset for new file
@@ -185,19 +275,18 @@ def load_frg_list(path: Path) -> Tuple[Optional[int], Optional[str], List[str], 
                 files.append(val)
         elif current_file is not None:
             # Check for fragmentation indicators
-            if lo.startswith('fragmented:'):
+            if lo == 'fragmented':
                 # Parse FRAGMENTED: TRUE/FALSE
-                if 'true' in lo:
+                if argument.lower() == 'true':
                     current_is_fragmented = True
-            elif lo.startswith('missing'):
+            elif lo == 'missing':
                 # Parse MISSING: block_index, ranges, or comma-separated lists
                 # Format: "MISSING: 1", "MISSING: 10-20", "MISSING: 1, 3, 5, 10-20"
                 current_is_fragmented = True
                 # Extract block indices or ranges
-                parts = line.split(':', 1)
-                if len(parts) > 1:
+                if separator:
                     try:
-                        value = parts[1].strip()
+                        value = argument
                         # Split by comma for lists like "1, 3, 5, 10-20"
                         elements = [elem.strip() for elem in value.split(',')]
                         for elem in elements:
@@ -215,7 +304,7 @@ def load_frg_list(path: Path) -> Tuple[Optional[int], Optional[str], List[str], 
                                 current_missing_blocks.append(block_idx)
                     except ValueError:
                         pass  # Ignore malformed MISSING lines
-            elif lo.startswith('gap') or lo.startswith('outoforder'):
+            elif lo in ('gap', 'outoforder'):
                 # Any GAP or OUTOFORDER means fragmented
                 current_is_fragmented = True
     
@@ -288,6 +377,7 @@ def warn_missing_blockvector_txt(category: str, txt_count: int, non_txt_count: i
 
 # Forgiving: "Length: 12345 bytes" (case-insensitive, flexible spaces)
 LENGTH_RE = re.compile(r"(?i)\bLength\s*:\s*(\d+)\s*bytes\b")
+CAPACITY_RE = re.compile(r"(?i)\bCapacity\s*:\s*(\d+)\s*blocks\b")
 
 
 # ---------- Key loading ---------- #
@@ -370,28 +460,45 @@ def extract_actual_blocks(text: str) -> Tuple[List[int], str]:
       Expected structure:
         - A header line containing "Index" and "Actual" (case-insensitive).
         - Following rows where each line contains at least 3 integers.
-          We take the **second integer** per row as the "Actual" block number.
+          The first integer is the logical index and the second is the actual
+          block number.
         - Parsing stops when a blank/short/non-conforming line is hit.
+
+      Blockvector listings omit unmapped slots. Preserve their logical indices
+      by representing each omitted slot as -1; Scalpel3 materializes those
+      slots as zero-filled blocks.
 
       Returns (sequence, method). If not found, returns ([], "bad-format").
     """
     lines = text.splitlines()
     header_re = re.compile(r"(?i)\bIndex\b.*\bActual\b")
-    seq: List[int] = []
+    capacity_match = CAPACITY_RE.search(text)
+    capacity = int(capacity_match.group(1)) if capacity_match else 0
+    indexed: Dict[int, int] = {}
     for i, line in enumerate(lines):
         if header_re.search(line):
             for row in lines[i + 1:]:
-                ints = [int(x) for x in re.findall(r"\d+", row)]
+                ints = [int(x) for x in re.findall(r"-?\d+", row)]
                 if len(ints) >= 3:
-                    seq.append(ints[1])  # second integer = Actual
+                    index = ints[0]
+                    actual = ints[1]
+                    if index < 0 or actual < -1:
+                        return [], "bad-format"
+                    indexed[index] = actual
                 elif not row.strip():
                     break
                 else:
-                    if seq:
+                    if indexed:
                         break
                     else:
                         continue
-            return (seq, "fixed:Index-Actual") if seq else ([], "bad-format")
+            if not indexed:
+                return [], "bad-format"
+            logical_blocks = max(capacity, max(indexed) + 1)
+            seq = [-1] * logical_blocks
+            for index, actual in indexed.items():
+                seq[index] = actual
+            return seq, "fixed:Index-Actual"
     return ([], "bad-format")
 
 
@@ -417,6 +524,15 @@ def parse_blockvector(bv_path: Path) -> Tuple[Optional[int], Optional[List[int]]
         return None, None
     
     return length, blocks
+
+
+def blocks_within_length(blocks: List[int], length: int,
+                         block_size: int) -> List[int]:
+    """Return only blockvector slots that contribute bytes to Length."""
+    if length <= 0 or block_size <= 0:
+        return []
+    block_count = (length + block_size - 1) // block_size
+    return blocks[:block_count]
 
 
 # ---------- Hashing / Extraction helpers ---------- #
@@ -448,19 +564,23 @@ def sha256_from_image_blocks(image_path: Path, blocks: List[int], block_size: in
         try:
             written = 0
             need = max_bytes
+            zero_block = bytes(block_size)
             for b in blocks:
                 if need is not None and written >= need:
                     break
-                if b < 0:
-                    return False, f"negative block index: {b}"
-                off = b * block_size
-                try:
-                    chunk = os.pread(fd, block_size, off)
-                except AttributeError:
-                    os.lseek(fd, off, os.SEEK_SET)
-                    chunk = os.read(fd, block_size)
-                if len(chunk) != block_size:
-                    return False, f"short read at block {b} (wanted {block_size}, got {len(chunk)})"
+                if b == -1:
+                    chunk = zero_block
+                elif b < -1:
+                    return False, f"invalid negative block index: {b}"
+                else:
+                    off = b * block_size
+                    try:
+                        chunk = os.pread(fd, block_size, off)
+                    except AttributeError:
+                        os.lseek(fd, off, os.SEEK_SET)
+                        chunk = os.read(fd, block_size)
+                    if len(chunk) != block_size:
+                        return False, f"short read at block {b} (wanted {block_size}, got {len(chunk)})"
                 if need is None or need - written >= block_size:
                     h.update(chunk)
                     written += block_size
@@ -476,6 +596,21 @@ def sha256_from_image_blocks(image_path: Path, blocks: List[int], block_size: in
         return False, f"hash-error:{e}"
 
 
+def reconstructed_prefix_matches(image_path: Path, gt_path: Path,
+                                 blocks: List[int], block_size: int,
+                                 candidate_length: int,
+                                 gt_size: int) -> bool:
+    """Return whether the shorter byte extent is an exact source prefix."""
+    compare_length = min(candidate_length, gt_size)
+    if compare_length <= 0:
+        return False
+    ok_gt, gt_sha = sha256_of_file(gt_path, max_bytes=compare_length)
+    ok_img, img_sha = sha256_from_image_blocks(
+        image_path, blocks, block_size, compare_length
+    )
+    return ok_gt and ok_img and gt_sha == img_sha
+
+
 def extract_blocks_to_file(image_path: Path, blocks: List[int], block_size: int, out_path: Path, desired_length: Optional[int] = None) -> Tuple[bool, str]:
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -484,19 +619,23 @@ def extract_blocks_to_file(image_path: Path, blocks: List[int], block_size: int,
             with open(out_path, "wb") as out:
                 bytes_written = 0
                 need = desired_length
+                zero_block = bytes(block_size)
                 for b in blocks:
                     if need is not None and bytes_written >= need:
                         break
-                    if b < 0:
-                        return False, f"negative block index encountered: {b}"
-                    off = b * block_size
-                    try:
-                        chunk = os.pread(fd, block_size, off)
-                    except AttributeError:
-                        os.lseek(fd, off, os.SEEK_SET)
-                        chunk = os.read(fd, block_size)
-                    if len(chunk) != block_size:
-                        return False, f"short read at block {b} (wanted {block_size}, got {len(chunk)})"
+                    if b == -1:
+                        chunk = zero_block
+                    elif b < -1:
+                        return False, f"invalid negative block index: {b}"
+                    else:
+                        off = b * block_size
+                        try:
+                            chunk = os.pread(fd, block_size, off)
+                        except AttributeError:
+                            os.lseek(fd, off, os.SEEK_SET)
+                            chunk = os.read(fd, block_size)
+                        if len(chunk) != block_size:
+                            return False, f"short read at block {b} (wanted {block_size}, got {len(chunk)})"
                     if need is None:
                         out.write(chunk)
                         bytes_written += len(chunk)
@@ -645,6 +784,9 @@ def validate_blockvector_file(
     actual_seq, method = extract_actual_blocks(text)
     if not actual_seq:
         return (rel_name, False, "bad-format: expected a table with 'Index' and 'Actual' header and >=3 integers per row", None, None)
+    actual_seq = blocks_within_length(actual_seq, bv_length, block_size)
+    if not actual_seq:
+        return (rel_name, False, "blockvector Length contains no blocks", None, None)
 
     # (3) Map start block to key path/index and align
     s0 = actual_seq[0]
@@ -765,7 +907,11 @@ def main() -> None:
 
     if args.frg:
         print(f"[info] Loading FRG file: {args.frg}")
-        frg_bs, frg_out, frg_files, fragmentation_status, missing_blocks_map = load_frg_list(args.frg)
+        try:
+            frg_bs, frg_out, frg_files, fragmentation_status, missing_blocks_map = load_frg_list(args.frg)
+        except ValueError as error:
+            print(f"[fatal] Failed to load FRG: {error}", file=sys.stderr)
+            sys.exit(1)
         universe_files = set(frg_files)
         print(f"[info] FRG: {len(frg_files)} files, {len(missing_blocks_map)} with MISSING blocks")
     else:
@@ -794,8 +940,9 @@ def main() -> None:
     cat4_correct: List[Tuple[str, int, Path, int, int]] = []  # (gt, block, path, correct, expected)
     cat5_incorrect: List[Tuple[str, int, Path, int, int, int, int]] = []  # (gt, block, path, first_wrong, correct, expected, carved_count)
     tracked_pairs: Set[Tuple[str, int]] = set()
-    validated_pairs: Set[Tuple[str, int]] = set()
     exact_recovery_files: Set[str] = set()
+    recognized_validated_prefixes: Set[Path] = set()
+    nonroot_validated_origins: Dict[Path, Tuple[str, int]] = {}
     
     # Find all directories recursively
     warned_missing_b = False
@@ -816,10 +963,16 @@ def main() -> None:
     
     for bv_path in validated_files:
         bv_length, actual_blocks = parse_blockvector(bv_path)
-        if not actual_blocks:
+        if bv_length is None or not actual_blocks:
             validated_parse_fail += 1
             if args.verbose:
                 print(f"[debug] VALIDATED parse failed: {bv_path.name}")
+            continue
+        actual_blocks = blocks_within_length(
+            actual_blocks, bv_length, block_size
+        )
+        if not actual_blocks:
+            validated_parse_fail += 1
             continue
         
         # Find GT file
@@ -830,6 +983,8 @@ def main() -> None:
                 print(f"[debug] VALIDATED first block {first_block} not in key: {bv_path.name}")
             continue
         gt_file, start_idx = phys_to_entry[first_block]
+        if gt_file not in universe_files:
+            continue
         
         seq_pairs = path_to_seq.get(gt_file, [])
         if not seq_pairs:
@@ -849,10 +1004,20 @@ def main() -> None:
             if args.verbose:
                 print(f"[debug] VALIDATED no start_block for {gt_file}: {bv_path.name}")
             continue
+
+        # A top-level recovery must begin with logical block zero of its ground
+        # truth file. Content discovered inside another file is classified
+        # separately after its bytes are checked against that source file.
+        if start_idx != 0:
+            blockvector_suffix = ".BLOCKVECTOR.txt"
+            if bv_path.name.endswith(blockvector_suffix):
+                data_name = bv_path.name[:-len(blockvector_suffix)]
+                data_path = bv_path.with_name(data_name)
+                nonroot_validated_origins[data_path] = (gt_file, start_idx)
+            continue
         
         pair_key = (gt_file, start_block)
         tracked_pairs.add(pair_key)
-        validated_pairs.add(pair_key)
         
         # Get GT file size
         gt_path, msg = resolve_gt_path(gt_file, key_dir)
@@ -892,32 +1057,56 @@ def main() -> None:
             first_missing_idx = min(missing_blocks_map[gt_file])
             blocks_expected = sum(1 for idx, phys in seq_pairs if idx < first_missing_idx)
         
-        # Categorize
-        is_terminal_wrong = (first_wrong != -1 and first_wrong == len(actual_blocks) - 1)
-        
-        if all_correct and len(actual_blocks) == len(seq_pairs):
-            # Check length
+        # Byte content is authoritative when duplicate physical blocks or an
+        # unauthenticated trailing extent make block identity or length differ.
+        content_prefix_matches = reconstructed_prefix_matches(
+            image_path, gt_path, actual_blocks, block_size,
+            bv_length, gt_size
+        )
+        if content_prefix_matches:
             if bv_length == gt_size:
-                # Verify SHA256
-                ok_gt, gt_sha = sha256_of_file(gt_path, max_bytes=bv_length)
-                ok_img, img_sha = sha256_from_image_blocks(image_path, actual_blocks, block_size, bv_length)
-                
-                if ok_gt and ok_img and gt_sha == img_sha:
-                    # Category 1: Perfect
-                    cat1_perfect.add(pair_key)
-                    exact_recovery_files.add(gt_file)
-                else:
-                    # SHA256 mismatch - Category 5
-                    cat5_incorrect.append((gt_file, start_block, bv_path, -1, blocks_correct, blocks_expected, len(actual_blocks)))
+                cat1_perfect.add(pair_key)
+                exact_recovery_files.add(gt_file)
+            elif bv_length > gt_size:
+                cat2_length.append(
+                    (gt_file, start_block, bv_path, bv_length, gt_size)
+                )
+                recognized_validated_prefixes.add(bv_path)
+            elif has_missing:
+                cat3_missing.append(
+                    (gt_file, start_block, bv_path,
+                     min(len(actual_blocks), blocks_expected),
+                     blocks_expected)
+                )
+                recognized_validated_prefixes.add(bv_path)
             else:
-                cat2_length.append((gt_file, start_block, bv_path, bv_length, gt_size))
+                cat4_correct.append(
+                    (gt_file, start_block, bv_path,
+                     min(len(actual_blocks), blocks_expected),
+                     blocks_expected)
+                )
+                recognized_validated_prefixes.add(bv_path)
+            continue
+
+        # Categorize block-level evidence when the reconstructed bytes are not
+        # an exact prefix of the source file.
+        is_terminal_wrong = (first_wrong != -1 and first_wrong == len(actual_blocks) - 1)
+
+        if all_correct and len(actual_blocks) == len(seq_pairs):
+            cat5_incorrect.append(
+                (gt_file, start_block, bv_path, -1, blocks_correct,
+                 blocks_expected, len(actual_blocks))
+            )
         elif has_missing and blocks_correct >= blocks_expected:
             # Category 3
             cat3_missing.append((gt_file, start_block, bv_path, blocks_correct, blocks_expected))
+            recognized_validated_prefixes.add(bv_path)
         elif not has_missing and (first_wrong == -1 or is_terminal_wrong):
             # Category 4 - all correct OR terminal block wrong
             actual_correct = blocks_correct if first_wrong == -1 else first_wrong
             cat4_correct.append((gt_file, start_block, bv_path, actual_correct, blocks_expected))
+            if first_wrong == -1:
+                recognized_validated_prefixes.add(bv_path)
         else:
             # Category 5
             cat5_incorrect.append((gt_file, start_block, bv_path, first_wrong, blocks_correct, blocks_expected, len(actual_blocks)))
@@ -956,6 +1145,11 @@ def main() -> None:
     
     for bv_path in promising_files + inprogress_files:
         bv_length, actual_blocks = parse_blockvector(bv_path)
+        if bv_length is None or not actual_blocks:
+            continue
+        actual_blocks = blocks_within_length(
+            actual_blocks, bv_length, block_size
+        )
         if not actual_blocks:
             continue
         
@@ -963,6 +1157,8 @@ def main() -> None:
         if first_block not in phys_to_entry:
             continue
         gt_file, start_idx = phys_to_entry[first_block]
+        if gt_file not in universe_files:
+            continue
         
         seq_pairs = path_to_seq.get(gt_file, [])
         if not seq_pairs:
@@ -975,11 +1171,11 @@ def main() -> None:
                 break
         if start_block is None:
             continue
+
+        if start_idx != 0:
+            continue
         
         pair_key = (gt_file, start_block)
-        
-        if pair_key in validated_pairs:
-            continue
         
         recovery_pool.append((pair_key, bv_path, bv_length, actual_blocks))
         recovery_pairs.add(pair_key)
@@ -1026,21 +1222,42 @@ def main() -> None:
             first_missing_idx = min(missing_blocks_map[gt_file])
             blocks_expected = sum(1 for idx, phys in seq_pairs if idx < first_missing_idx)
 
-        # track byte-exact PROMISING snapshots independently so focused regression
-        # tests can require exact recovery without weakening VALIDATED semantics.
+        # A byte-exact recovery or prefix retains the same classification
+        # regardless of whether it is in VALIDATED or PROMISING.
+        snapshot_prefix_matches = False
         gt_path, _ = resolve_gt_path(gt_file, key_dir)
-        if gt_path and len(actual_blocks) == len(seq_pairs):
+        if gt_path:
             try:
                 gt_size = os.stat(gt_path).st_size
             except OSError:
                 gt_size = -1
-            if bv_length == gt_size:
-                ok_gt, gt_sha = sha256_of_file(gt_path)
-                ok_img, img_sha = sha256_from_image_blocks(
-                    image_path, actual_blocks, block_size, bv_length
+            if gt_size >= 0:
+                snapshot_prefix_matches = reconstructed_prefix_matches(
+                    image_path, gt_path, actual_blocks, block_size,
+                    bv_length, gt_size
                 )
-                if ok_gt and ok_img and gt_sha == img_sha:
+                if snapshot_prefix_matches and bv_length == gt_size:
+                    cat1_perfect.add(pair_key)
                     exact_recovery_files.add(gt_file)
+
+        if snapshot_prefix_matches:
+            if bv_length > gt_size:
+                cat2_length.append(
+                    (gt_file, start_block, bv_path, bv_length, gt_size)
+                )
+            elif bv_length < gt_size and has_missing:
+                cat3_missing.append(
+                    (gt_file, start_block, bv_path,
+                     min(len(actual_blocks), blocks_expected),
+                     blocks_expected)
+                )
+            elif bv_length < gt_size:
+                cat4_correct.append(
+                    (gt_file, start_block, bv_path,
+                     min(len(actual_blocks), blocks_expected),
+                     blocks_expected)
+                )
+            continue
         
         # Categorize
         # For Category 4: terminal block can be wrong ONLY if it's actually the last block
@@ -1257,7 +1474,8 @@ def main() -> None:
         print()
     
     # ========================================================================
-    # INVALID CHECK: files in VALIDATED that don't match ANY GT file by SHA256
+    # INVALID CHECK: files in VALIDATED that neither match a complete ground
+    # truth file nor a blockvector-proven ground truth prefix.
     # ========================================================================
     # Build set of GT SHA256 hashes
     gt_sha256_set: Set[str] = set()
@@ -1270,8 +1488,19 @@ def main() -> None:
                 gt_sha256_set.add(sha)
                 gt_sha256_to_file[sha] = gt_file
 
-    # Find all non-.txt files in VALIDATED directories and SHA256-check them
+    recognized_prefix_files: Set[Path] = set()
+    for blockvector_path in recognized_validated_prefixes:
+        blockvector_suffix = ".BLOCKVECTOR.txt"
+        if blockvector_path.name.endswith(blockvector_suffix):
+            data_name = blockvector_path.name[:-len(blockvector_suffix)]
+            recognized_prefix_files.add(blockvector_path.with_name(data_name))
+
+    # Find all non-.txt files in VALIDATED directories and SHA256-check them.
+    # Prefixes already associated through their blockvectors retain their
+    # normal Category 2, 3, or 4 classification rather than being counted a
+    # second time as invalid.
     invalid_in_validated: List[Tuple[str, int, str]] = []  # (filepath, size, sha256)
+    embedded_in_validated: List[Tuple[str, int, str, str, int]] = []
     validated_data_files: List[Path] = []
     for item in args.scalpel_dir.rglob("VALIDATED"):
         if item.is_dir():
@@ -1280,20 +1509,54 @@ def main() -> None:
                     validated_data_files.append(f)
 
     for data_file in validated_data_files:
+        if data_file in recognized_prefix_files:
+            continue
         file_size = data_file.stat().st_size
         ok, sha = sha256_of_file(data_file)
-        if ok and sha not in gt_sha256_set:
-            invalid_in_validated.append((str(data_file), file_size, sha))
+        if not ok or sha in gt_sha256_set:
+            continue
+
+        origin = nonroot_validated_origins.get(data_file)
+        if origin is not None:
+            gt_file, start_idx = origin
+            gt_path, _ = resolve_gt_path(gt_file, key_dir)
+            if gt_path is not None:
+                embedded_offset = find_exact_embedded_offset(
+                    data_file, Path(gt_path), start_idx, block_size)
+                if embedded_offset is not None:
+                    embedded_in_validated.append(
+                        (str(data_file), file_size, sha, gt_file,
+                         embedded_offset))
+                    continue
+
+        invalid_in_validated.append((str(data_file), file_size, sha))
+
+    if embedded_in_validated:
+        print(
+            f"\nEMBEDDED: {len(embedded_in_validated)} file(s) in VALIDATED "
+            "match exact content within a ground-truth file"
+        )
+        print("-" * 80)
+        for fpath, fsize, fsha, gt_file, offset in sorted(
+                embedded_in_validated, key=lambda entry: entry[1]):
+            print(f"  {Path(fpath).name}")
+            print(f"    size={fsize}  sha256={fsha}")
+            print(f"    source={gt_file}  byte_offset={offset}")
+        print()
 
     if invalid_in_validated:
-        print(f"\nINVALID: {len(invalid_in_validated)} file(s) in VALIDATED that do NOT match any ground truth SHA256")
+        print(f"\nINVALID: {len(invalid_in_validated)} file(s) in VALIDATED that do NOT match ground truth")
         print("-" * 80)
         for fpath, fsize, fsha in sorted(invalid_in_validated, key=lambda x: x[1]):
             print(f"  {Path(fpath).name}")
             print(f"    size={fsize}  sha256={fsha}")
         print()
     else:
-        print(f"\n[OK] All {len(validated_data_files)} file(s) in VALIDATED match a ground truth SHA256.\n")
+        print(
+            f"\n[OK] All {len(validated_data_files)} file(s) in VALIDATED "
+            "match ground truth exactly, as a blockvector-proven prefix, or "
+            "as exact embedded content.\n"
+        )
 
     # ========================================================================
     # SUMMARIES - Per File Type and Overall

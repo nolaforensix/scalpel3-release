@@ -1,35 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//-----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // Complete rewrite of prior hashv2.c by GGRIII. This version uses verstable and xxhash to increase
 // performance.
 //
@@ -91,6 +85,7 @@ struct oa_hash_s {
 };
 
 static inline void kv_set_new(oa_hash *h, oa_kv *e, const void *key, const void *val);
+static bool hash_read_field(oa_serialize_fn deserialize, void **value, FILE *fp, uint64_t size);
 static inline void kv_replace_val(oa_hash *h, oa_kv *e, const void *val);
 static inline void kv_free(oa_hash *h, oa_kv *e);
 static inline struct oa_bucket *get_or_make_bucket(oa_hash *h, size_t s, uint64_t hash);
@@ -333,12 +328,10 @@ bool oa_hash_serialize(oa_hash *h, FILE *fp) {
   // lock all shards for reading; blocks writers
   hash_lock_all_rd(h);
 
-  struct {
-    uint32_t magic;   // 'H''S''H''3'
-    uint16_t ver;     // 1
-    uint32_t shards;  // OA_SHARDS
-    uint64_t total;   // atomic count
-  } hdr = {0x48534833u, 1, OA_SHARDS, atomic_load_explicit(&h->count, memory_order_relaxed)};
+  oa_hash_disk_header hdr = { .magic = OA_HASH_DISK_MAGIC,
+                              .version = OA_HASH_DISK_VERSION,
+                              .shards = OA_SHARDS,
+                              .total = atomic_load_explicit(&h->count, memory_order_relaxed) };
 
   if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
     perror("oa_hash_serialize: header write");
@@ -355,12 +348,58 @@ bool oa_hash_serialize(oa_hash *h, FILE *fp) {
         oa_kv *e = &b->items[i];
         void *kptr = e->ksz ? (void *)e->k_inline : e->kptr;
         void *vptr = e->vsz ? (void *)e->v_inline : e->vptr;
+        oa_hash_disk_entry entry = {0};
+        off_t start = ftello(fp);
+        // Socket/pipe users cannot backpatch. Buffer only one entry for those streams.
+        if (start < 0) {
+          char *bytes = NULL;
+          size_t size = 0;
+          FILE *memory = open_memstream(&bytes, &size);
+          if (! memory) {
+            goto fail;
+          }
+          bool ok = h->key_ops.serialize(&kptr, memory, SERIALIZE);
+          off_t key_end = ftello(memory);
+          ok = ok && key_end > 0 && h->val_ops.serialize(&vptr, memory, SERIALIZE);
+          ok = fclose(memory) == 0 && ok;
+          if (ok && size > (uint64_t)key_end) {
+            entry.key_size = (uint64_t)key_end;
+            entry.value_size = size - (size_t)key_end;
+            ok = fwrite(&entry, sizeof(entry), 1, fp) == 1
+                 && fwrite(bytes, 1, size, fp) == size;
+          }
+          else {
+            ok = false;
+          }
+          free(bytes);
+          if (! ok) {
+            goto fail;
+          }
+          continue;
+        }
+        if (fwrite(&entry, sizeof(entry), 1, fp) != 1) {
+          goto fail;
+        }
+        off_t key_start = ftello(fp);
         if (! h->key_ops.serialize(&kptr, fp, SERIALIZE)) {
           perror("oa_hash_serialize: key");
           goto fail;
         }
+        off_t value_start = ftello(fp);
         if (! h->val_ops.serialize(&vptr, fp, SERIALIZE)) {
           perror("oa_hash_serialize: val");
+          goto fail;
+        }
+        off_t end = ftello(fp);
+        if (key_start < 0 || value_start <= key_start || end <= value_start) {
+          errno = EPROTO;
+          goto fail;
+        }
+        entry.key_size = (uint64_t)(value_start - key_start);
+        entry.value_size = (uint64_t)(end - value_start);
+        if (fseeko(fp, start, SEEK_SET) != 0
+            || fwrite(&entry, sizeof(entry), 1, fp) != 1
+            || fseeko(fp, end, SEEK_SET) != 0) {
           goto fail;
         }
       }
@@ -393,6 +432,43 @@ static bool serialized_count_fits_regular_file(FILE *fp, uint64_t count) {
 }
 
 
+// Verify callback consumption on seekable streams and retain pipe/socket support.
+static bool hash_read_field(oa_serialize_fn deserialize, void **value, FILE *fp, uint64_t size) {
+  off_t start = ftello(fp);
+  if (start >= 0) {
+    if (! deserialize(value, fp, DESERIALIZE)) {
+      return false;
+    }
+    off_t end = ftello(fp);
+    if (end < start || (uint64_t)(end - start) != size) {
+      errno = EPROTO;
+      return false;
+    }
+    return true;
+  }
+  if (! size || size > SIZE_MAX) {
+    errno = EPROTO;
+    return false;
+  }
+  void *bytes = malloc((size_t)size);
+  if (! bytes) {
+    return false;
+  }
+  if (fread(bytes, 1, (size_t)size, fp) != size) {
+    free(bytes);
+    return false;
+  }
+  FILE *memory = fmemopen(bytes, (size_t)size, "rb");
+  bool ok = memory && deserialize(value, memory, DESERIALIZE)
+            && ftello(memory) >= 0 && (uint64_t)ftello(memory) == size;
+  if (memory) {
+    fclose(memory);
+  }
+  free(bytes);
+  return ok;
+}
+
+
 bool oa_hash_deserialize(oa_hash *h, FILE *fp) {
   if (! h || ! fp) {
     errno = EINVAL;
@@ -404,24 +480,21 @@ bool oa_hash_deserialize(oa_hash *h, FILE *fp) {
     return false;
   }
 
-  struct {
-    uint32_t magic;   // 'H''S''H''3' = 0x48534833
-    uint16_t ver;     // 1
-    uint32_t shards;  // OA_SHARDS
-    uint64_t total;   // number of entries serialized
-  } hdr;
+  oa_hash_disk_header hdr;
 
   if (fread(&hdr, sizeof(hdr), 1, fp) != 1) {
     perror("oa_hash_deserialize: header read");
     return false;
   }
 
-  if (hdr.magic != 0x48534833u || hdr.ver != 1 || hdr.shards != (uint32_t)OA_SHARDS) {
+  if (hdr.magic != OA_HASH_DISK_MAGIC || hdr.version != OA_HASH_DISK_VERSION
+      || hdr.shards != (uint32_t)OA_SHARDS || hdr.reserved || hdr.reserved2) {
     errno = EPROTO;
-    fprintf(stderr, "oa_hash_deserialize: header mismatch (magic=%08x ver=%u shards=%u)\n", hdr.magic, hdr.ver, hdr.shards);
+    fprintf(stderr, "oa_hash_deserialize: header mismatch (magic=%08x ver=%u shards=%u)\n", hdr.magic, hdr.version, hdr.shards);
     return false;
   }
-  if (! serialized_count_fits_regular_file(fp, hdr.total)) {
+  if (hdr.total > UINT64_MAX / (sizeof(oa_hash_disk_entry) + 2)
+      || ! serialized_count_fits_regular_file(fp, hdr.total * (sizeof(oa_hash_disk_entry) + 2))) {
     errno = EPROTO;
     fprintf(stderr, "oa_hash_deserialize: entry count exceeds remaining input\n");
     return false;
@@ -440,15 +513,22 @@ bool oa_hash_deserialize(oa_hash *h, FILE *fp) {
 
   for (uint64_t i = 0; i < hdr.total; i++) {
     void *kptr = NULL, *vptr = NULL;
-
-    if (! tmp.key_ops.serialize(&kptr, fp, DESERIALIZE)) {
+    oa_hash_disk_entry entry;
+    if (fread(&entry, sizeof(entry), 1, fp) != 1
+        || ! entry.key_size || ! entry.value_size
+        || entry.key_size > UINT64_MAX - entry.value_size
+        || ! serialized_count_fits_regular_file(fp, entry.key_size + entry.value_size)) {
+      errno = EPROTO;
+      goto fail_tmp;
+    }
+    if (! hash_read_field(tmp.key_ops.serialize, &kptr, fp, entry.key_size)) {
       perror("oa_hash_deserialize: key deserialize");
       if (kptr && tmp.key_ops.free) {
         tmp.key_ops.free(&kptr);
       }
       goto fail_tmp;
     }
-    if (! tmp.val_ops.serialize(&vptr, fp, DESERIALIZE)) {
+    if (! hash_read_field(tmp.val_ops.serialize, &vptr, fp, entry.value_size)) {
       perror("oa_hash_deserialize: val deserialize");
       if (kptr && tmp.key_ops.free) {
         tmp.key_ops.free(&kptr);

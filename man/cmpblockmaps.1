@@ -11,10 +11,18 @@ blockmap_filename_2
 .SH DESCRIPTION
 .PP
 \fBcmpblockmaps\fR compares two scalpel3 blockmap files and outputs the differences. Both blockmaps must represent the same number of blocks and have valid block sizes (>= 512 and multiples of 512).
+.PP
+Use blockmaps for the same image and block size for a meaningful comparison.
+The files are not modified.
 
 .SH OPTIONS
 .PP
 This utility takes exactly two positional arguments: the filenames of the two blockmaps to compare.
+
+.SH EXIT STATUS
+Returns zero when comparison succeeds, even if differences are found.
+Returns nonzero if the files cannot be read or compared. Unlike
+\fBdiff\fR(1), the exit status does not indicate whether the inputs differ.
 
 .SH SEE ALSO
 .BR scalpel3 (1),

@@ -1,35 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-// ----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // scalpel3 fragmented disk image creator, v2. This version substantially increases the number of
 // options available, to facilitate creating more realistic fragmentation scenarios. The original
 // version has incompatible options and configuration, but is available as fragmentator-legacy. This
@@ -232,6 +226,7 @@ static bool is_boolean(char *str, bool *val);
 static char *trim_whitespace(char *str);
 static void strip_line_comment(char *input);
 static int compare_clusters(const void *a, const void *b);
+static void expand_environment_variables(char *argument);
 static bool parse_argument(char *arg_start, char *argument);
 static void parse_line(char *input, ParsedLine *result);
 static void parse_input(char *pathname);
@@ -692,6 +687,75 @@ static LongsSet *process_int_or_intset_or_range(char *args, int64_t maximum) {
 }
 
 
+// Expand ${NAME} in a parsed argument once; substituted bytes remain literal.
+static void expand_environment_variables(char *argument) {
+
+  char expanded[MAX_LINE_LENGTH + 1];
+  char name[MAX_LINE_LENGTH + 1];
+  const char *cursor = argument;
+  size_t length = 0;
+
+  while (*cursor) {
+    const char *value = cursor;
+    size_t value_length = 1;
+
+    if (cursor[0] == '$' && cursor[1] == '{') {
+      const char *name_start = cursor + 2;
+      const char *name_end = strchr(name_start, '}');
+
+      if (! name_end) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr, "\nFatal error: Missing '}' in environment variable reference on line %" PRId64 ".\n",
+                LINENUMBER);
+        fprintf(stderr, "%s", BLACK);
+        exit(-1);
+      }
+
+      size_t name_length = (size_t)(name_end - name_start);
+
+      if (name_length == 0
+          || strspn(name_start, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_") == 0
+          || strspn(name_start, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_0123456789") != name_length) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr, "\nFatal error: Invalid environment variable name '%.*s' on line %" PRId64 ".\n",
+                (int)name_length, name_start, LINENUMBER);
+        fprintf(stderr, "%s", BLACK);
+        exit(-1);
+      }
+
+      memcpy(name, name_start, name_length);
+      name[name_length] = 0;
+      value = getenv(name);
+      if (! value) {
+        fprintf(stderr, "%s", RED);
+        fprintf(stderr, "\nFatal error: Environment variable '%s' is not set on line %" PRId64 ".\n",
+                name, LINENUMBER);
+        fprintf(stderr, "%s", BLACK);
+        exit(-1);
+      }
+      value_length = strnlen(value, MAX_LINE_LENGTH - length + 1);
+      cursor = name_end + 1;
+    }
+    else {
+      cursor++;
+    }
+
+    if (value_length > MAX_LINE_LENGTH - length) {
+      fprintf(stderr, "%s", RED);
+      fprintf(stderr, "\nFatal error: Expanded argument on line %" PRId64 " exceeds %d bytes.\n",
+              LINENUMBER, MAX_LINE_LENGTH);
+      fprintf(stderr, "%s", BLACK);
+      exit(-1);
+    }
+    memcpy(expanded + length, value, value_length);
+    length += value_length;
+  }
+
+  expanded[length] = 0;
+  memcpy(argument, expanded, length + 1);
+}
+
+
 // parse argument for one line of input from config file
 static bool parse_argument(char *arg_start, char *argument) {
 
@@ -719,6 +783,7 @@ static bool parse_argument(char *arg_start, char *argument) {
     argument[i] = 0;
   }
 
+  expand_environment_variables(argument);
   return true;
 }
 
@@ -874,7 +939,7 @@ static void check_File_definition(File file) {
 static void parse_input(char *pathname) {
 
   ParsedLine parsed;
-  char input_line[MAX_LINE_LENGTH + 1];
+  char input_line[MAX_LINE_LENGTH + 2];
   char *input;
   FILE *fp;
   bool file_seen = false;
@@ -902,7 +967,7 @@ static void parse_input(char *pathname) {
   perc1 = 0;
   perc2 = 0;
 
-  while (! stop && fgets(input_line, MAX_LINE_LENGTH, fp)) {
+  while (! stop && fgets(input_line, sizeof(input_line), fp)) {
     perc2 = (int)((double)ftello(fp) / (double)len * (double)100);
     if (DEBUG <= 2 && perc1 != perc2 && isatty(1)) {
       perc1 = perc2;
@@ -912,8 +977,8 @@ static void parse_input(char *pathname) {
 
     LINENUMBER++;
 
-    // check for truncation
-    if (strlen(input_line) == MAX_LINE_LENGTH) {
+    // Allow a trailing newline in addition to MAX_LINE_LENGTH bytes of content.
+    if (strlen(input_line) > MAX_LINE_LENGTH && input_line[MAX_LINE_LENGTH] != '\n') {
       fprintf(stderr, "%s", RED);
       fprintf(stderr,
               "\nFatal error: Line %" PRId64 " exceeds maximum line length.\n"

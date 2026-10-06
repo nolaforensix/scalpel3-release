@@ -1,0 +1,39 @@
+.TH dumpbt "1" "" "The scalpel3 Block Type Dumper" "The scalpel3 Block Type Dumper"
+
+.SH NAME
+dumpbt \- Display a scalpel3 block classification database
+
+.SH SYNOPSIS
+.B dumpbt
+[block_classification_database_pathname]
+
+.SH DESCRIPTION
+.PP
+\fBdumpbt\fR validates and displays the contents of a
+\fIblockclassification.dat\fR file written by \fBscalpel3\fR after block
+validation.  It reports the database dimensions and file type mapping, then
+prints each file type's per-block confidence values.  Consecutive blocks with
+the same confidence are combined into ranges for readability.
+.PP
+Block numbers start at zero and refer to positions in the evidence image,
+not positions in a compacted view. Confidence values range from 0 (invalid)
+through 100 (valid). Consult the associated blockmap for duplicate/exemplar
+relationships and coverage; a confidence value is not a coverage flag.
+
+.SH ARGUMENTS
+.PP
+.TP
+.I [block_classification_database_pathname]
+Optional. The path to the block classification database. If not specified, it
+defaults to "scalpel-output/blockclassification.dat".
+
+.SH EXIT STATUS
+Returns zero for a successfully read database and nonzero for an unreadable,
+unsupported, or malformed database.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR dumphf (1)
+
+.SH AUTHOR
+Golden G. Richard III.

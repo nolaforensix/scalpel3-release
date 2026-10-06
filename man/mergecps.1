@@ -1,0 +1,56 @@
+.TH mergecps "1" "" "The scalpel3 Checkpoint Merger" "The scalpel3 Checkpoint Merger"
+
+.SH NAME
+mergecps \- Merge scalpel3 checkpoint directories
+
+.SH SYNOPSIS
+.B mergecps
+\fIcheckpoint_dir1\fR
+\fIcheckpoint_dir2\fR
+\fIoutput_dir\fR
+
+.SH DESCRIPTION
+.PP
+\fBmergecps\fR combines two scalpel3 checkpoint directories into a single
+output directory after windowed carving, allowing a subsequent
+\fBscalpel3 -R\fR invocation to resume from the merged state. Stop both
+input runs before merging.
+.PP
+Inputs must use the same scalpel3 executable, image and blockmap pathnames,
+block size, file type mapping, and block validation dispositions. The stored
+blockmap pathname must still be readable. Use runs with compatible recovery
+settings; settings not explicitly merged are taken from the first input.
+.PP
+Each input checkpoint directory must contain the persistent
+\fIblockclassification.dat\fR created when block validation completed.
+For each input, \fBmergecps\fR verifies the published checkpoint slot and
+falls back to the newest other valid slot if necessary.  It never combines
+files from different generations of one input checkpoint.
+.PP
+\fBmergecps\fR validates and merges the classification tables and writes a
+new \fIblockclassification.dat\fR with a new two-slot checkpoint in the
+output directory.  The output directory must not already exist.  The complete
+result is first written to a temporary sibling directory and is atomically
+published only after its checkpoint manifest and current-slot marker are
+durable.
+.PP
+Distinct clone candidates and the saved validator state belonging to each
+retained candidate are preserved. If both inputs contain the same candidate
+(the same primary and clone UUIDs), the first input's candidate and its state
+take precedence. Saved block state is combined, with the first input taking
+precedence for a duplicate block-state key.
+.PP
+This command does not merge or copy recovered payloads, audit logs, or the
+external image blockmap. Retain the original output directories and combine
+blockmap coverage separately with \fBmergeblockmap\fR(1) when needed.
+
+.SH EXIT STATUS
+Returns zero on success and nonzero if the checkpoints are incompatible,
+invalid, or cannot be read or written.
+
+.SH SEE ALSO
+.BR scalpel3 (1),
+.BR mergeblockmap (1)
+
+.SH AUTHOR
+Golden G. Richard III.

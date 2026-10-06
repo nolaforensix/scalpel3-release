@@ -26,7 +26,10 @@ configfile
 .PP
 \fBfragmentator\fR generates synthetic disk images for testing data carving tools based on instructions provided in a configuration file (usually ending in .frg). It produces an output image file and a corresponding \fI.key\fR file describing the layout.  Full documentation for \fBfragmentator\fR can be found in template.frg, included in the scalpel3 source distribution.
 .PP
-Global options specified in the \fIconfigfile\fR can be overridden via command-line flags. Care must be taken to ensure consistency (e.g., \fIRANDOMPADBLOCKS\fR and \fIZEROPADBLOCKS\fR are mutually exclusive).
+Global options in \fIconfigfile\fR can be overridden by command-line flags.
+The resulting settings must be consistent; for example, \fIRANDOMPADBLOCKS\fR
+and \fIZEROPADBLOCKS\fR cannot both be nonzero. Options must precede
+\fIconfigfile\fR.
 .PP
 Numeric command-line arguments must contain unsigned base-10 digits only.
 Except for \fBBLOCKSIZE\fR, they may range from 0 through 9223372036854775807.
@@ -43,7 +46,8 @@ Override \fBINITIALZEROBLOCKS\fR (integer >= 0).
 
 .TP
 .B -c
-Ignore all fragmentation directives in \fBFILE:\fR entries and generate a fully contiguous image file.
+Ignore fragmentation directives in \fBFILE:\fR entries so each input file
+is placed contiguously. Padding and filler options still apply.
 
 .TP
 .BI -f " FILE|RANDOM|ZERO"
@@ -64,6 +68,7 @@ Override \fBHEADERBLOCKS\fR (integer >= 0).
 .TP
 .BI -o " outputfile"
 Override \fBOUTPUTFILE\fR path. The filename must not end in ".frg".
+The image and its \fI.key\fR file are overwritten if they already exist.
 
 .TP
 .BI -q " blocksize"
@@ -72,7 +77,10 @@ and divisible by 512.
 
 .TP
 .BI -r " randompadblocks"
-Override \fBRANDOMPADBLOCKS\fR (integer >= 0). Mutually exclusive with \fB-z\fR.
+Override \fBRANDOMPADBLOCKS\fR (integer >= 0). This is the minimum total
+image size in blocks, not the number of blocks to append. Random and zero
+padding cannot both have nonzero values; use \fB-z 0\fR to clear zero
+padding from the configuration.
 
 .TP
 .BI -R " randomblocks"
@@ -89,7 +97,9 @@ Display global configuration. Specifying -v once outputs basic summary informati
 
 .TP
 .BI -z " zeropadblocks"
-Override \fBZEROPADBLOCKS\fR (integer >= 0). Mutually exclusive with \fB-r\fR.
+Override \fBZEROPADBLOCKS\fR (integer >= 0). This is the minimum total
+image size in blocks, not the number of blocks to append. Use \fB-r 0\fR
+to clear random padding from the configuration.
 
 .TP
 .BI -Z " zeroblocks"
@@ -99,8 +109,23 @@ Override \fBZEROBLOCKS\fR (integer >= 0).
 The \(oq#\(cq character begins a comment except when it appears inside a
 double-quoted argument. Pathnames containing \(oq#\(cq should therefore be
 double quoted.
+.PP
+Option values may contain environment variables using \fB${NAME}\fR.
+For example, after setting \fBSCALPEL3_DATA\fR in the shell, a configuration
+can contain:
+.PP
+.nf
+FILE: "${SCALPEL3_DATA}/jpg/example.jpg"
+.fi
+.PP
+Relative input and output paths are resolved from the current working
+directory, not the directory containing the configuration file.
+.PP
 See \fItemplate.frg\fR provided with the source distribution for complete
 configuration-file syntax.
+
+.SH EXIT STATUS
+Returns zero on success, including \fB-h\fR, and nonzero on error.
 
 .SH SEE ALSO
 .BR scalpel3 (1),

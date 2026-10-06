@@ -62,17 +62,40 @@ OUTOFORDER: 4
 # ELF
 
 FILE: TESTS/ls.elf
+GAP: 4
 FILE: TESTS/yelp.elf
 FILE: TESTS/zip.elf
 FILE: TESTS/grep.elf
 
+# EXE
+
+FILE: TESTS/putty-0.84-x86_64.exe
+GAP: 12
+
+# AVI
+
+FILE: TESTS/test-video-cc-by-sa.avi
+GAP: 5
+
 # ZIP
 
 FILE: TESTS/test.zip
+GAP: 5
+
+# SQLite
+
+FILE: TESTS/test.sqlite
+GAP: 5
+OUTOFORDER: 12-13
+
+# CSV
+
+FILE: TESTS/test.csv
 
 # MP3
 
 FILE: TESTS/music1.mp3
+GAP: 10
 FILE: TESTS/music2.mp3
 FILE: TESTS/music3.mp3
 FILE: TESTS/music4.mp3
@@ -82,4 +105,5 @@ FILE: TESTS/music5.mp3
 
 FILE: TESTS/chemical_comp_titin.pdf
 FILE: TESTS/nist.fips.197.pdf
+GAP: 10
 FILE: TESTS/28233-pdf.pdf

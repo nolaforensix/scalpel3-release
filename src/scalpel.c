@@ -1,35 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//------------------------------
-// Additional Integration Terms
-// -----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // scalpel3 is a complete rewrite of the open source scalpel, which was originally developed by
 // Golden G. Richard III in 2005 and then enhanced by both Vico Marziale and Golden G. Richard until
 // ~2013. Earlier versions of scalpel had their roots in Foremost 0.69. The emphasis of scalpel3 is
@@ -1267,6 +1261,7 @@ static void initialize_AI(const char *scalpel3_home) {
   char provider_desc[160];
   int desc_len;
   int modico_intra_threads;
+  uint64_t expected_modico_blocks = UINT64_MAX;
 
   // resolve the ONNX execution provider and GPU device list once for the whole run
   if (! onnx_providers_resolve(onnx_provider_cli[0] ? onnx_provider_cli : NULL,
@@ -1408,8 +1403,28 @@ static void initialize_AI(const char *scalpel3_home) {
   int modico_device = onnx_resolved_num_devices() > 0
                       ? onnx_resolved_device_list()[0] : 0;
 
+  struct stat image_stat;
+  if (stat(scalpel_state.image_pathname, &image_stat) == 0
+      && image_stat.st_size > 0 && scalpel_state.blocksize > 0) {
+    uint64_t total_blocks = ((uint64_t)image_stat.st_size
+                             + scalpel_state.blocksize - 1)
+                          / scalpel_state.blocksize;
+    uint64_t first = scalpel_state.start_block;
+    uint64_t last = scalpel_state.end_block < total_blocks
+                  ? scalpel_state.end_block : total_blocks - 1;
+
+    expected_modico_blocks = first <= last ? last - first + 1 : 0;
+    if (! strcasecmp(onnx_accel, "cuda")
+        && onnx_resolved_num_devices() > 1) {
+      uint64_t devices = (uint64_t)onnx_resolved_num_devices();
+      expected_modico_blocks = (expected_modico_blocks + devices - 1)
+                             / devices;
+    }
+  }
+
   if (! modico_onnx_global_init(modico_base, modico_intra_threads,
-                                onnx_accel, modico_device)) {
+                                onnx_accel, modico_device,
+                                expected_modico_blocks)) {
     char fp32_model[PATH_MAX];
     int fp32_len = snprintf(fp32_model, sizeof(fp32_model), "%s.onnx",
                             modico_base);
@@ -1498,8 +1513,18 @@ static void initialize_AI(const char *scalpel3_home) {
                              modico_onnx_global_provider());
   if (modico_onnx_global_uses_cuda()
       && enabled_len > 0 && (size_t)enabled_len < sizeof(enabled_msg)) {
-    snprintf(enabled_msg + enabled_len, sizeof(enabled_msg) - (size_t)enabled_len,
-             " device=%d", modico_onnx_global_device_id());
+    int appended = snprintf(enabled_msg + enabled_len,
+                            sizeof(enabled_msg) - (size_t)enabled_len,
+                            " device=%d", modico_onnx_global_device_id());
+    if (appended > 0) {
+      enabled_len += appended;
+    }
+  }
+  if (modico_onnx_global_uses_tensorrt()
+      && enabled_len > 0 && (size_t)enabled_len < sizeof(enabled_msg)) {
+    snprintf(enabled_msg + enabled_len,
+             sizeof(enabled_msg) - (size_t)enabled_len,
+             ", inference backend=tensorrt");
   }
   scalpel_log("%s.\n", enabled_msg);
 }
@@ -1630,9 +1655,13 @@ int main(int argc, char *argv[]) {
 
   // this has to happen after init of scalpel_state
   if (! scalpel_state.disable_backtrace) {
-    // initialize backtrace and register signal handler for seg fault
+    // initialize backtrace and register the handler for fatal signals
     bt_state = backtrace_create_state(NULL, 0, bt_error_callback, NULL);
     signal(SIGSEGV, sigsegv_signal_handler);
+    signal(SIGBUS, sigsegv_signal_handler);
+    signal(SIGILL, sigsegv_signal_handler);
+    signal(SIGFPE, sigsegv_signal_handler);
+    signal(SIGABRT, sigsegv_signal_handler);
   }
 
   // stat() image file to make sure it's non-empty
@@ -1645,6 +1674,21 @@ int main(int argc, char *argv[]) {
     lock_fprintf(stdout, "Verbose mode is on.\n");
   }
 
+
+  // Reject an unusable control socket before inference or any recovery threads start.
+  if (! no_IPC) {
+    struct sockaddr_un address;
+    const size_t suffix_length = sizeof("/.scalpel3IPC") - 1;
+    const size_t maximum_length = sizeof(address.sun_path) - 1;
+
+    if (strlen(scalpel_state.output_directory) > maximum_length - suffix_length) {
+      lock_fprintf(stderr,
+                   "IPC socket path exceeds this platform's %zu-byte limit: %s/.scalpel3IPC\n"
+                   "Use a shorter -o pathname (a relative path is allowed), or disable IPC with -C.\n",
+                   maximum_length, scalpel_state.output_directory);
+      handle_error(SCALPEL_ERROR_IPC, "main()", __LINE__, __FILE__);
+    }
+  }
 
   // claim the base output directory before potentially expensive model initialization. No other
   // scalpel3 process may touch its shared databases, checkpoints, or IPC endpoint while we run.

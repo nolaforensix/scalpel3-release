@@ -1,3 +1,33 @@
+//
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+//
+// This file is part of Scalpel3.
+//
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
+//
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
+//
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
+//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
+//
+
+/**
+ * @author James Ghawaly
+ */
+
 /*
  * modico_classmap.c — implementation. See modico_classmap.h.
  */
@@ -14,24 +44,26 @@
 #define MODICO_JSON_CLASS_NAME_MAX 255
 #define MODICO_CLASSMAP_NAME_TOO_LONG -2
 
-/* Non-identity aliases: Scalpel SearchSpec FILETYPE -> MoDiCo class name it
- * should borrow. fzip is Scalpel's fragmented-ZIP path; same byte content as
- * zip, so it draws on MoDiCo's "zip" confidence. Extend as needed. */
-struct alias { const char *spec; const char *modico_name; };
-static const struct alias ALIASES[] = {
-    { "fzip", "zip" },
-};
-static const int N_ALIASES = (int)(sizeof(ALIASES) / sizeof(ALIASES[0]));
+typedef struct ModicoClassAlias {
+  const char *filetype;
+  const char *class_name;
+} ModicoClassAlias;
 
-static const char *alias_lookup(const char *spec_filetype)
-{
-    for (int i = 0; i < N_ALIASES; ++i) {
-        if (strcmp(ALIASES[i].spec, spec_filetype) == 0) {
-            return ALIASES[i].modico_name;
-        }
-    }
-    return spec_filetype;  /* identity */
-}
+static int ci_equal(const char *a, const char *b);
+static const char *modico_class_name_for_filetype(const char *filetype);
+
+// SearchSpec names remain unique even when two carving strategies consume the
+// same MoDiCo class. Keep those intentional differences explicit here.
+//
+static const ModicoClassAlias modico_class_aliases[] = {
+  {"dot", "doc"},
+  {"mpp", "ppt"},
+  {"mpg", "mpeg"},
+  {"ppa", "ppt"},
+  {"xla", "xls"},
+  {"xls-raw", "xls"},
+  {"xlt", "xls"}
+};
 
 /* Case-insensitive string compare (ASCII). */
 static int ci_equal(const char *a, const char *b)
@@ -41,6 +73,21 @@ static int ci_equal(const char *a, const char *b)
         ++a; ++b;
     }
     return *a == '\0' && *b == '\0';
+}
+
+// Return the model class name associated with one SearchSpec file type.
+// File types without an alias map directly by name.
+//
+static const char *modico_class_name_for_filetype(const char *filetype) {
+
+  for (size_t i = 0;
+       i < sizeof(modico_class_aliases) / sizeof(modico_class_aliases[0]);
+       i++) {
+    if (ci_equal(filetype, modico_class_aliases[i].filetype)) {
+      return modico_class_aliases[i].class_name;
+    }
+  }
+  return filetype;
 }
 
 /* Read an entire file into a NUL-terminated heap buffer. Returns NULL on
@@ -203,7 +250,7 @@ int *modico_classmap_build(const char *classmap_path,
     for (int s = 0; s < num_specs; ++s) {
         spec_to_class[s] = -1;
         if (!spec_filetypes[s]) continue;
-        const char *want = alias_lookup(spec_filetypes[s]);
+        const char *want = modico_class_name_for_filetype(spec_filetypes[s]);
         for (int c = 0; c < names.n; ++c) {
             if (ci_equal(names.v[c], want)) {
                 spec_to_class[s] = c;       /* first occurrence wins */

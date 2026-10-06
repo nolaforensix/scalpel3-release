@@ -1,3 +1,33 @@
+//
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+//
+// This file is part of Scalpel3.
+//
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
+//
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
+//
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
+//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
+//
+
+/**
+ * @author James Ghawaly
+ */
+
 /*
  * modico_onnx_global.h — process-global MoDiCo ONNX session for Scalpel3.
  *
@@ -50,7 +80,8 @@ extern "C" {
 bool modico_onnx_global_init(const char *model_base_path,
                              int intra_op_threads,
                              const char *accelerator,
-                             int device_id);
+                             int device_id,
+                             uint64_t expected_blocks);
 
 /* Tear down the global session (safe to call multiple times / when never
  * initialized). */
@@ -69,10 +100,12 @@ bool modico_onnx_global_enabled(void);
 int modico_onnx_global_num_classes(void);
 
 const char *modico_onnx_global_provider(void);
+const char *modico_onnx_global_backend(void);
 const char *modico_onnx_global_model_path(void);
 int modico_onnx_global_device_id(void);
 bool modico_onnx_global_uses_cuda(void);
 bool modico_onnx_global_uses_coreml(void);
+bool modico_onnx_global_uses_tensorrt(void);
 int modico_onnx_global_terminate_current_run(void);
 
 #ifdef __cplusplus

@@ -21,12 +21,12 @@ unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH \
       LIBRARY_PATH LD_LIBRARY_PATH DYLD_LIBRARY_PATH
 
 # ONNX Runtime (C/C++) prebuilt install
-ONNXRUNTIME_VERSION="1.26.0"
-ONNXRUNTIME_INSTALL_PREFIX="/usr/local"
-ONNXRUNTIME_CUDA_MAJOR="13"
-SCALPEL3_CUDA_RUNTIME_VERSION="onnxruntime-${ONNXRUNTIME_VERSION}-cuda-${ONNXRUNTIME_CUDA_MAJOR}-cudnn-9.24"
-SCALPEL3_CUDA_RUNTIME_DIR="/usr/local/lib/scalpel3-cuda"
-SCALPEL3_TENSORRT_RUNTIME_VERSION="tensorrt-cu13-major-10"
+ONNXRUNTIME_VERSION="${ONNXRUNTIME_VERSION:-1.26.0}"
+ONNXRUNTIME_INSTALL_PREFIX="${ONNXRUNTIME_INSTALL_PREFIX:-/usr/local}"
+SCALPEL3_INSTALL_CUDA=auto
+SCALPEL3_ONNX_CONFIGURE_ARGS=()
+ONNX_INCLUDE_FIRST=""
+ONNX_LIB_FIRST=""
 SCALPEL3_INSTALL_TMPDIR="${SCALPEL3_INSTALL_TMPDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/scalpel3-install}"
 echo "Scalpel's ONNX version: $ONNXRUNTIME_VERSION"
 
@@ -95,6 +95,14 @@ onnxruntime_install_matches() {
     marker="${ONNXRUNTIME_INSTALL_PREFIX}/lib/.scalpel3-onnxruntime-version"
     [ -f "$marker" ] && \
         [ "$(cat "$marker")" = "${ONNXRUNTIME_VERSION}:$1" ]
+}
+
+onnxruntime_notices_available() {
+    local docdir
+
+    docdir="${ONNXRUNTIME_INSTALL_PREFIX}/share/doc/onnxruntime"
+    [ -f "$docdir/LICENSE" ] && \
+        [ -f "$docdir/ThirdPartyNotices.txt" ]
 }
 
 onnxruntime_headers_available() {
@@ -175,33 +183,20 @@ verify_fuse3_development_files() {
     return 0
 }
 
-verify_macfuse_runtime() {
-    local bundle="/Library/Filesystems/macfuse.fs"
-    local loader="$bundle/Contents/Resources/load_macfuse"
-
-    if [ ! -x "$loader" ]; then
-        echo "ERROR: The macFUSE runtime is not installed at $bundle."
-        return 1
-    fi
-
-    if ! "$loader" >/dev/null 2>&1; then
-        echo "ERROR: macFUSE is installed but its kernel extension is not active."
-        echo "       Approve macFUSE in System Settings under Privacy & Security."
-        echo "       Restart macOS if requested, then run this script again."
-        return 1
-    fi
-
-    echo "macFUSE runtime verified."
-    return 0
-}
-
 install_onnxruntime_prebuilt() {
-    local arch libdir marker os pkg root tmpdir url ver_dylib ver_so
+    local arch docdir libdir marker notices_only os pkg root tmpdir url
+    local ver_dylib ver_so
 
     os="$(uname)"
+    if [ "$os" = "Linux" ]; then
+        select_linux_onnx
+        return $?
+    fi
     arch="$(uname -m)"
+    docdir="${ONNXRUNTIME_INSTALL_PREFIX}/share/doc/onnxruntime"
     libdir="${ONNXRUNTIME_INSTALL_PREFIX}/lib"
     marker="$libdir/.scalpel3-onnxruntime-version"
+    notices_only=0
 
     case "$os" in
         Darwin)
@@ -214,38 +209,6 @@ install_onnxruntime_prebuilt() {
                     ;;
                 *)
                     echo "Unsupported macOS arch for ONNX Runtime: $arch"
-                    return 1
-                    ;;
-            esac
-            ;;
-        Linux)
-            case "$arch" in
-                x86_64|amd64)
-                    if has_nvidia_hardware && ! has_nvidia_gpu; then
-                        echo "ERROR: NVIDIA GPU hardware is present, but the NVIDIA driver"
-                        echo "       cannot enumerate it. Repair the driver, verify that"
-                        echo "       'nvidia-smi -L' succeeds, and rerun this script."
-                        return 1
-                    fi
-                    if onnxruntime_cuda_prebuilt_available; then
-                        pkg="onnxruntime-linux-x64-gpu_cuda${ONNXRUNTIME_CUDA_MAJOR}-${ONNXRUNTIME_VERSION}.tgz"
-                        echo "NVIDIA GPU detected, using CUDA ${ONNXRUNTIME_CUDA_MAJOR}-enabled ONNX Runtime."
-                    else
-                        pkg="onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
-                        echo "No NVIDIA GPU detected, using CPU ONNX Runtime."
-                    fi
-                    ;;
-                aarch64|arm64)
-                    if has_nvidia_hardware; then
-                        echo "ERROR: ONNX Runtime does not publish a CUDA-enabled Linux ARM64 archive."
-                        echo "       Build ONNX Runtime with CUDA support or explicitly configure"
-                        echo "       Scalpel3 for CPU inference on this platform."
-                        return 1
-                    fi
-                    pkg="onnxruntime-linux-aarch64-${ONNXRUNTIME_VERSION}.tgz"
-                    ;;
-                *)
-                    echo "Unsupported Linux arch for ONNX Runtime: $arch"
                     return 1
                     ;;
             esac
@@ -290,6 +253,9 @@ install_onnxruntime_prebuilt() {
             echo "ONNX Runtime headers present but required APIs are missing. Reinstalling."
         elif has_apple_silicon && ! onnxruntime_coreml_available; then
             echo "ONNX Runtime headers present but CoreML provider missing. Reinstalling macOS arm64 version."
+        elif ! onnxruntime_notices_available; then
+            echo "ONNX Runtime licensing notices are missing. Restoring them."
+            notices_only=1
         else
             echo "ONNX Runtime ${ONNXRUNTIME_VERSION} already installed; skipping install."
             verify_onnxruntime_accelerator_support || return 1
@@ -318,6 +284,27 @@ install_onnxruntime_prebuilt() {
         echo "Failed to locate extracted ONNX Runtime directory."
         rm -rf "$tmpdir"
         return 1
+    fi
+
+    if [ ! -f "$root/LICENSE" ] || [ ! -f "$root/ThirdPartyNotices.txt" ]; then
+        echo "ERROR: The ONNX Runtime archive does not contain its required licensing notices."
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    echo "Installing ONNX Runtime notices -> $docdir/"
+    if ! sudo mkdir -p "$docdir" || \
+       ! sudo cp "$root/LICENSE" "$root/ThirdPartyNotices.txt" "$docdir/"; then
+        echo "ERROR: Failed to install the ONNX Runtime licensing notices."
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if [ "$notices_only" -eq 1 ]; then
+        rm -rf "$tmpdir"
+        verify_onnxruntime_accelerator_support || return 1
+        echo "ONNX Runtime licensing notices restored."
+        return 0
     fi
 
     echo "Installing ONNX Runtime headers -> ${ONNXRUNTIME_INSTALL_PREFIX}/include/"
@@ -380,412 +367,170 @@ install_onnxruntime_prebuilt() {
     echo "ONNX Runtime install complete."
 }
 
-private_cuda_runtime_complete() {
-    local library root
+select_linux_onnx() {
+    local config="$CURDIR/.scalpel3_onnx.conf"
+    local values=()
 
-    root="$1"
-    for library in \
-        nvidia/cu13/lib/libcudart.so.13 \
-        nvidia/cu13/lib/libcublasLt.so.13 \
-        nvidia/cu13/lib/libcublas.so.13 \
-        nvidia/cu13/lib/libcurand.so.10 \
-        nvidia/cu13/lib/libcufft.so.12 \
-        nvidia/cu13/lib/libnvJitLink.so.13 \
-        'nvidia/cu13/lib/libnvrtc-builtins.so.13.*' \
-        nvidia/cu13/lib/libnvrtc.so.13 \
-        nvidia/cudnn/lib/libcudnn_graph.so.9 \
-        nvidia/cudnn/lib/libcudnn_ops.so.9 \
-        nvidia/cudnn/lib/libcudnn_adv.so.9 \
-        nvidia/cudnn/lib/libcudnn_cnn.so.9 \
-        nvidia/cudnn/lib/libcudnn_engines_precompiled.so.9 \
-        nvidia/cudnn/lib/libcudnn_engines_runtime_compiled.so.9 \
-        nvidia/cudnn/lib/libcudnn_engines_tensor_ir.so.9 \
-        nvidia/cudnn/lib/libcudnn_ext.so.9 \
-        nvidia/cudnn/lib/libcudnn_heuristic.so.9 \
-        nvidia/cudnn/lib/libcudnn.so.9
-    do
-        if ! compgen -G "$root/$library" >/dev/null; then
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-verify_private_cuda_runtime() {
-    python3 - "$1" <<'PY'
-import ctypes
-import glob
-import os
+    python3 "$CURDIR/src/onnx_install.py" --mode "$SCALPEL3_INSTALL_CUDA" \
+        --version "$ONNXRUNTIME_VERSION" --output "$config" || return 1
+    mapfile -t values < <(python3 - "$config" <<'PY'
+import json
 import sys
-
-root = os.path.realpath(sys.argv[1])
-patterns = [
-    "nvidia/cu13/lib/libcudart.so.13",
-    "nvidia/cu13/lib/libcublasLt.so.13",
-    "nvidia/cu13/lib/libcublas.so.13",
-    "nvidia/cu13/lib/libcurand.so.10",
-    "nvidia/cu13/lib/libcufft.so.12",
-    "nvidia/cu13/lib/libnvJitLink.so.13",
-    "nvidia/cu13/lib/libnvrtc-builtins.so.13.*",
-    "nvidia/cu13/lib/libnvrtc.so.13",
-    "nvidia/cudnn/lib/libcudnn_graph.so.9",
-    "nvidia/cudnn/lib/libcudnn_ops.so.9",
-    "nvidia/cudnn/lib/libcudnn_adv.so.9",
-    "nvidia/cudnn/lib/libcudnn_cnn.so.9",
-    "nvidia/cudnn/lib/libcudnn_engines_precompiled.so.9",
-    "nvidia/cudnn/lib/libcudnn_engines_runtime_compiled.so.9",
-    "nvidia/cudnn/lib/libcudnn_engines_tensor_ir.so.9",
-    "nvidia/cudnn/lib/libcudnn_ext.so.9",
-    "nvidia/cudnn/lib/libcudnn_heuristic.so.9",
-    "nvidia/cudnn/lib/libcudnn.so.9",
-]
-
-handles = []
-for pattern in patterns:
-    matches = glob.glob(os.path.join(root, pattern))
-    if len(matches) != 1:
-        raise SystemExit(f"runtime pattern {pattern} matched {len(matches)} files")
-    handles.append(ctypes.CDLL(matches[0], mode=ctypes.RTLD_GLOBAL))
-
-runtime_version = ctypes.c_int()
-if handles[0].cudaRuntimeGetVersion(ctypes.byref(runtime_version)) != 0:
-    raise SystemExit("cudaRuntimeGetVersion failed")
-handles[-1].cudnnGetVersion.restype = ctypes.c_size_t
-cudnn_version = handles[-1].cudnnGetVersion()
-if runtime_version.value < 13000:
-    raise SystemExit(f"CUDA runtime {runtime_version.value} is older than CUDA 13")
-if cudnn_version < 92400:
-    raise SystemExit(f"cuDNN runtime {cudnn_version} is older than cuDNN 9.24")
-
-print(
-    f"Private CUDA runtime verified: CUDA {runtime_version.value // 1000}."
-    f"{(runtime_version.value % 1000) // 10}, "
-    f"cuDNN {cudnn_version // 10000}.{(cudnn_version % 10000) // 100}."
-)
+with open(sys.argv[1]) as stream:
+    config = json.load(stream)
+for key in ("prefix", "runtime", "cuda_major", "provider"):
+    print(config[key])
 PY
+    )
+    if [ "${#values[@]}" -ne 4 ]; then
+        echo "ERROR: Could not read the verified ONNX configuration." >&2
+        return 1
+    fi
+    ONNXRUNTIME_INSTALL_PREFIX="${values[0]}"
+    SCALPEL3_ONNX_PROVIDER="${values[3]}"
+    SCALPEL3_ONNX_CONFIGURE_ARGS=(
+        "--with-cuda-major=${values[2]}"
+        "--with-scalpel3-cuda-runtime=${values[1]}"
+    )
+    # Keep this verified header/library pair ahead of unrelated /usr/local copies.
+    ONNX_INCLUDE_FIRST="-I${values[0]}/include "
+    ONNX_LIB_FIRST="-L${values[0]}/lib -Wl,-rpath,${values[0]}/lib "
 }
 
-install_python_pip() {
-    if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -q && sudo apt-get install -y -q python3-pip
-    elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y python3-pip
-    elif command -v yum >/dev/null 2>&1; then
-        sudo yum install -y python3-pip
-    elif command -v zypper >/dev/null 2>&1; then
-        sudo zypper -n install python3-pip
-    elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --needed --noconfirm python-pip
+CURDIR="$PWD"
+
+elf_model_sha256() {
+    local digest
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest="$(sha256sum < "$1")" || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        digest="$(shasum -a 256 < "$1")" || return 1
     else
-        echo "ERROR: Could not install Python pip with a supported package manager."
+        echo "ERROR: ELF model verification requires sha256sum or shasum." >&2
         return 1
     fi
+    printf '%s\n' "${digest%%[[:space:]]*}"
 }
-
-private_tensorrt_runtime_complete() {
-    local library root
-
-    root="$1"
-    for library in \
-        libnvinfer.so.10 \
-        libnvinfer_plugin.so.10 \
-        libnvonnxparser.so.10
-    do
-        if [ ! -f "$root/$library" ]; then
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-verify_private_tensorrt_runtime() {
-    python3 - "$SCALPEL3_CUDA_RUNTIME_DIR" "$1" <<'PY'
-import ctypes
-import glob
-import os
-import sys
-
-cuda_root = os.path.realpath(sys.argv[1])
-tensorrt_root = os.path.realpath(sys.argv[2])
-cuda_patterns = [
-    "nvidia/cu13/lib/libcudart.so.13",
-    "nvidia/cu13/lib/libcublasLt.so.13",
-    "nvidia/cu13/lib/libcublas.so.13",
-    "nvidia/cu13/lib/libcurand.so.10",
-    "nvidia/cu13/lib/libcufft.so.12",
-    "nvidia/cu13/lib/libnvJitLink.so.13",
-    "nvidia/cu13/lib/libnvrtc-builtins.so.13.*",
-    "nvidia/cu13/lib/libnvrtc.so.13",
-    "nvidia/cudnn/lib/libcudnn_graph.so.9",
-    "nvidia/cudnn/lib/libcudnn_ops.so.9",
-    "nvidia/cudnn/lib/libcudnn_adv.so.9",
-    "nvidia/cudnn/lib/libcudnn_cnn.so.9",
-    "nvidia/cudnn/lib/libcudnn_engines_precompiled.so.9",
-    "nvidia/cudnn/lib/libcudnn_engines_runtime_compiled.so.9",
-    "nvidia/cudnn/lib/libcudnn_engines_tensor_ir.so.9",
-    "nvidia/cudnn/lib/libcudnn_ext.so.9",
-    "nvidia/cudnn/lib/libcudnn_heuristic.so.9",
-    "nvidia/cudnn/lib/libcudnn.so.9",
-]
-
-handles = []
-for pattern in cuda_patterns:
-    matches = glob.glob(os.path.join(cuda_root, pattern))
-    if len(matches) != 1:
-        raise SystemExit(f"CUDA runtime pattern {pattern} matched {len(matches)} files")
-    handles.append(ctypes.CDLL(matches[0], mode=ctypes.RTLD_GLOBAL))
-
-for library in ("libnvinfer.so.10", "libnvinfer_plugin.so.10",
-                "libnvonnxparser.so.10"):
-    path = os.path.join(tensorrt_root, library)
-    if not os.path.isfile(path):
-        raise SystemExit(f"TensorRT library is missing: {path}")
-    handles.append(ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL))
-
-print("Private TensorRT 10 runtime verified.")
-PY
-}
-
-install_private_tensorrt_runtime_if_available() {
-    local backup marker runtime staged tmpdir
-
-    runtime="$SCALPEL3_CUDA_RUNTIME_DIR/tensorrt_libs"
-    marker="$runtime/.scalpel3-tensorrt-version"
-    if [ -f "$marker" ] && \
-       [ "$(cat "$marker")" = "$SCALPEL3_TENSORRT_RUNTIME_VERSION" ] && \
-       private_tensorrt_runtime_complete "$runtime" && \
-       verify_private_tensorrt_runtime "$runtime"; then
-        echo "Scalpel3 private TensorRT 10 runtime already installed."
-        return 0
-    fi
-
-    mkdir -p "$SCALPEL3_INSTALL_TMPDIR"
-    tmpdir="$(mktemp -d "$SCALPEL3_INSTALL_TMPDIR/scalpel3-tensorrt.XXXXXX")"
-    echo "Installing optional TensorRT 10 acceleration for ELF validation..."
-    if ! python3 -m pip install \
-            --disable-pip-version-check \
-            --no-cache-dir \
-            --no-deps \
-            --only-binary=:all: \
-            --extra-index-url https://pypi.nvidia.com \
-            --target "$tmpdir/runtime" \
-            'tensorrt-cu13-libs>=10,<11'; then
-        rm -rf "$tmpdir"
-        echo "WARNING: TensorRT could not be installed; Scalpel3 will use CUDA."
-        return 0
-    fi
-
-    runtime="$tmpdir/runtime/tensorrt_libs"
-    find "$runtime" -maxdepth 1 -type f \
-        -name 'libnvinfer_builder_resource_win_*' -delete
-    if ! private_tensorrt_runtime_complete "$runtime" || \
-       ! verify_private_tensorrt_runtime "$runtime"; then
-        rm -rf "$tmpdir"
-        echo "WARNING: TensorRT could not be verified; Scalpel3 will use CUDA."
-        return 0
-    fi
-
-    staged="$SCALPEL3_CUDA_RUNTIME_DIR/tensorrt_libs.new.$$"
-    backup="$SCALPEL3_CUDA_RUNTIME_DIR/tensorrt_libs.old.$$"
-    sudo rm -rf "$staged" "$backup"
-    sudo mkdir -p "$staged"
-    sudo cp -RP "$runtime/." "$staged/"
-    printf '%s\n' "$SCALPEL3_TENSORRT_RUNTIME_VERSION" \
-        | sudo tee "$staged/.scalpel3-tensorrt-version" >/dev/null
-    if ! private_tensorrt_runtime_complete "$staged" || \
-       ! verify_private_tensorrt_runtime "$staged"; then
-        sudo rm -rf "$staged"
-        rm -rf "$tmpdir"
-        echo "WARNING: Staged TensorRT runtime failed verification; using CUDA."
-        return 0
-    fi
-
-    if [ -e "$SCALPEL3_CUDA_RUNTIME_DIR/tensorrt_libs" ]; then
-        if ! sudo mv "$SCALPEL3_CUDA_RUNTIME_DIR/tensorrt_libs" "$backup"; then
-            sudo rm -rf "$staged"
-            rm -rf "$tmpdir"
-            echo "WARNING: Existing TensorRT runtime could not be replaced; using CUDA."
-            return 0
-        fi
-    fi
-    if ! sudo mv "$staged" "$SCALPEL3_CUDA_RUNTIME_DIR/tensorrt_libs"; then
-        if [ -e "$backup" ]; then
-            sudo mv "$backup" "$SCALPEL3_CUDA_RUNTIME_DIR/tensorrt_libs"
-        fi
-        rm -rf "$tmpdir"
-        echo "WARNING: TensorRT activation failed; Scalpel3 will use CUDA."
-        return 0
-    fi
-    sudo rm -rf "$backup"
-    rm -rf "$tmpdir"
-    echo "Scalpel3 private TensorRT runtime installed."
-    return 0
-}
-
-
-install_private_cuda_runtime_if_needed() {
-    local arch backup marker os staged tmpdir
-
-    if ! has_nvidia_gpu; then
-        return 0
-    fi
-
-    os="$(uname)"
-    arch="$(uname -m)"
-    if [ "$os" != "Linux" ] || { [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; }; then
-        echo "Private CUDA runtime installation is supported on Linux x86_64 only."
-        return 0
-    fi
-
-    marker="$SCALPEL3_CUDA_RUNTIME_DIR/.scalpel3-runtime-version"
-    if [ -f "$marker" ] && \
-       [ "$(cat "$marker")" = "$SCALPEL3_CUDA_RUNTIME_VERSION" ] && \
-       private_cuda_runtime_complete "$SCALPEL3_CUDA_RUNTIME_DIR" && \
-       verify_private_cuda_runtime "$SCALPEL3_CUDA_RUNTIME_DIR"; then
-        echo "Scalpel3 private CUDA 13/cuDNN 9.24 runtime already installed."
-        install_private_tensorrt_runtime_if_available
-        return 0
-    fi
-
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "ERROR: Python 3 is required to install Scalpel3's private CUDA runtime."
-        return 1
-    fi
-
-    if ! python3 -m pip --version >/dev/null 2>&1; then
-        if ! install_python_pip; then
-            return 1
-        fi
-    fi
-
-    mkdir -p "$SCALPEL3_INSTALL_TMPDIR"
-    tmpdir="$(mktemp -d "$SCALPEL3_INSTALL_TMPDIR/scalpel3-cuda.XXXXXX")"
-    echo "Installing Scalpel3's private CUDA 13/cuDNN 9.24 runtime..."
-    if ! python3 -m pip install \
-            --disable-pip-version-check \
-            --no-cache-dir \
-            --no-deps \
-            --only-binary=:all: \
-            --target "$tmpdir/runtime" \
-            'nvidia-cuda-runtime>=13,<14' \
-            'nvidia-cublas>=13,<14' \
-            'nvidia-cufft>=12,<13' \
-            'nvidia-curand>=10,<11' \
-            'nvidia-cudnn-cu13>=9.24,<10' \
-            'nvidia-cuda-nvrtc>=13,<14' \
-            'nvidia-nvjitlink>=13,<14'; then
-        rm -rf "$tmpdir"
-        echo "ERROR: Failed to install Scalpel3's private CUDA runtime."
-        return 1
-    fi
-
-    if ! private_cuda_runtime_complete "$tmpdir/runtime"; then
-        rm -rf "$tmpdir"
-        echo "ERROR: The downloaded private CUDA runtime is incomplete."
-        return 1
-    fi
-    if ! verify_private_cuda_runtime "$tmpdir/runtime"; then
-        rm -rf "$tmpdir"
-        echo "ERROR: The downloaded private CUDA runtime could not be loaded."
-        return 1
-    fi
-
-    staged="${SCALPEL3_CUDA_RUNTIME_DIR}.new.$$"
-    backup="${SCALPEL3_CUDA_RUNTIME_DIR}.old.$$"
-    sudo rm -rf "$staged" "$backup"
-    sudo mkdir -p "$staged"
-    sudo cp -RP "$tmpdir/runtime/." "$staged/"
-    printf '%s\n' "$SCALPEL3_CUDA_RUNTIME_VERSION" \
-        | sudo tee "$staged/.scalpel3-runtime-version" \
-          >/dev/null
-
-    if ! private_cuda_runtime_complete "$staged" || \
-       ! verify_private_cuda_runtime "$staged"; then
-        sudo rm -rf "$staged"
-        rm -rf "$tmpdir"
-        echo "ERROR: The staged private CUDA runtime is incomplete or unusable."
-        return 1
-    fi
-
-    if [ -e "$SCALPEL3_CUDA_RUNTIME_DIR" ]; then
-        if ! sudo mv "$SCALPEL3_CUDA_RUNTIME_DIR" "$backup"; then
-            sudo rm -rf "$staged"
-            rm -rf "$tmpdir"
-            return 1
-        fi
-    fi
-    if ! sudo mv "$staged" "$SCALPEL3_CUDA_RUNTIME_DIR"; then
-        if [ -e "$backup" ]; then
-            sudo mv "$backup" "$SCALPEL3_CUDA_RUNTIME_DIR"
-        fi
-        rm -rf "$tmpdir"
-        echo "ERROR: Failed to activate Scalpel3's private CUDA runtime."
-        return 1
-    fi
-    sudo rm -rf "$backup"
-    rm -rf "$tmpdir"
-
-    echo "Scalpel3 private CUDA runtime installed in $SCALPEL3_CUDA_RUNTIME_DIR."
-    install_private_tensorrt_runtime_if_available
-    return 0
-}
-
-
-
-
-CURDIR=`pwd`
 
 reconstruct_elf_onnx_model_if_needed() {
-    local model_dir model chunk_dir part_prefix tmp_model part_count
+    local model_dir model chunk_dir manifest expected_hash expected_name actual_hash
+    local -a parts
 
     model_dir="$CURDIR/src/exe_vision/unix"
     model="$model_dir/elf_unet.onnx"
     chunk_dir="$model_dir/elf_onnx"
-    part_prefix="$chunk_dir/elf_unet.onnx.part_"
-    tmp_model="$model.tmp"
+    manifest="$chunk_dir/elf_unet.onnx.sha256"
+
+    if [ -e "$model" ] && [ ! -f "$model" ]; then
+        echo "ERROR: ELF ONNX model path is not a regular file: $model" >&2
+        return 1
+    fi
+
+    if ! read -r expected_hash expected_name < "$manifest" \
+        || [[ ! "$expected_hash" =~ ^[0-9a-f]{64}$ ]] \
+        || [ "$expected_name" != "elf_unet.onnx" ]; then
+        echo "ERROR: Missing or invalid ELF model checksum: $manifest" >&2
+        return 1
+    fi
 
     if [ -f "$model" ]; then
-        echo "ELF ONNX model already exists: $model"
-        return 0
+        actual_hash="$(elf_model_sha256 "$model")" || return 1
+        if [ "$actual_hash" = "$expected_hash" ]; then
+            echo "ELF ONNX model verified: $model"
+            return 0
+        fi
+        echo "Updating ELF ONNX model to the version supplied with this checkout."
     fi
 
     if [ ! -d "$chunk_dir" ]; then
-        echo "ERROR: ELF ONNX chunk directory not found: $chunk_dir"
+        echo "ERROR: ELF ONNX chunk directory not found: $chunk_dir" >&2
         return 1
     fi
 
-    part_count=$(find "$chunk_dir" -maxdepth 1 -type f -name 'elf_unet.onnx.part_*' | wc -l | tr -d ' ')
-
-    if [ "$part_count" -eq 0 ]; then
-        echo "ERROR: No ELF ONNX model chunks found in: $chunk_dir"
+    parts=("$chunk_dir"/elf_unet.onnx.part_*)
+    if [ "${#parts[@]}" -eq 0 ] || [ ! -f "${parts[0]}" ]; then
+        echo "ERROR: No ELF ONNX model chunks found in: $chunk_dir" >&2
         return 1
     fi
 
-    echo "Reconstructing ELF ONNX model from $part_count chunks..."
+    echo "Reconstructing ELF ONNX model from ${#parts[@]} chunks..."
 
-    rm -f "$tmp_model"
+    # Keep an existing model intact until its replacement is verified.
+    if ! (
+        tmp_model="$(mktemp "$model.tmp.XXXXXX")" || exit 1
+        trap 'rm -f "$tmp_model"' EXIT
+        trap 'exit 1' HUP INT TERM
 
-    find "$chunk_dir" -maxdepth 1 -type f -name 'elf_unet.onnx.part_*' \
-        | LC_ALL=C sort \
-        | while IFS= read -r part; do
-            cat "$part" >> "$tmp_model"
-        done
-
-    if [ ! -s "$tmp_model" ]; then
-        echo "ERROR: Failed to reconstruct ELF ONNX model."
-        rm -f "$tmp_model"
+        if ! cat "${parts[@]}" > "$tmp_model"; then
+            echo "ERROR: Failed to read ELF ONNX model chunks." >&2
+            exit 1
+        fi
+        actual_hash="$(elf_model_sha256 "$tmp_model")" || exit 1
+        if [ "$actual_hash" != "$expected_hash" ]; then
+            echo "ERROR: ELF ONNX model checksum mismatch; existing model left unchanged." >&2
+            echo "Check that all model chunks came from the same checkout." >&2
+            exit 1
+        fi
+        chmod 644 "$tmp_model" && mv -f "$tmp_model" "$model"
+    ); then
         return 1
     fi
 
-    mv "$tmp_model" "$model"
-
-    echo "ELF ONNX model reconstructed:"
-    ls -lh "$model"
-
+    echo "ELF ONNX model reconstructed and verified: $model"
     return 0
 }
+
+if [ "${1:-}" = "--elf-model-only" ]; then
+    if [ "$#" -ne 1 ]; then
+        echo "Usage: $0 --elf-model-only" >&2
+        exit 1
+    fi
+    reconstruct_elf_onnx_model_if_needed
+    exit $?
+fi
+
+
+case "${BASH_SOURCE[0]}" in
+    */*) CURDIR="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd)" ;;
+    *) CURDIR="$PWD" ;;
+esac
+cd "$CURDIR" || exit 1
+SCALPEL3_ONNX_ONLY=0
+SCALPEL3_ONNX_CHECK=0
+for argument in "$@"; do
+    case "$argument" in
+        --cuda=auto|--cuda=cpu|--cuda=12|--cuda=13)
+            SCALPEL3_INSTALL_CUDA="${argument#--cuda=}"
+            ;;
+        --onnx-only) SCALPEL3_ONNX_ONLY=1 ;;
+        --check-onnx) SCALPEL3_ONNX_CHECK=1 ;;
+        --help|-h)
+            echo "Usage: $0 [--cuda=auto|cpu|12|13] [--onnx-only|--check-onnx]"
+            echo "       $0 --elf-model-only"
+            echo "Linux: auto keeps working CUDA 12/13 libraries; otherwise CPU is explicit."
+            echo "--cuda=12 or 13 installs missing libraries in your own data directory."
+            echo "--cuda=cpu configures CPU inference. No NVIDIA drivers are installed or changed."
+            echo "--onnx-only selects ONNX libraries without the full build."
+            echo "--check-onnx checks installed libraries without downloads or configuration changes."
+            exit 0
+            ;;
+        *) echo "Unknown option: $argument (see --help)" >&2; exit 1 ;;
+    esac
+done
+if [ "$#" -gt 0 ] && [ "$(uname)" != "Linux" ]; then
+    echo "CUDA/ONNX selection options apply only to Linux." >&2
+    exit 1
+fi
+if [ "$SCALPEL3_ONNX_CHECK" -eq 1 ]; then
+    python3 "$CURDIR/src/onnx_install.py" --check --mode "$SCALPEL3_INSTALL_CUDA" \
+        --version "$ONNXRUNTIME_VERSION" --output "$CURDIR/.scalpel3_onnx.conf"
+    exit $?
+fi
+if [ "$SCALPEL3_ONNX_ONLY" -eq 1 ]; then
+    select_linux_onnx
+    exit $?
+fi
 
 [[ `uname -m` =~ "64" ]] ||
     {
@@ -796,11 +541,11 @@ reconstruct_elf_onnx_model_if_needed() {
 reconstruct_elf_onnx_model_if_needed || exit 1
 
 if [ "$(uname)" == "Darwin" ]; then
-    echo "*************************************************************************"
-    echo "** blockmapfs on macOS requires approving the macFUSE kernel extension. **"
-    echo "** A first installation may require a restart and rerunning this script. **"
-    echo "*************************************************************************"
-
+    # Keep Libtool's target consistent with this native build. Its unset-target
+    # default is macOS 10.0, which adds the obsolete C++ -bind_at_load flag.
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$(sw_vers -productVersion)}"
+    # Modern macOS already uses a single module; skip Libtool's obsolete probe.
+    export LT_MULTI_MODULE=1
     echo "Checking whether command line tools are installed."
     xcode-select -p &> /dev/null
     if [ $? -ne 0 ]; then
@@ -848,18 +593,19 @@ if [ "$(uname)" == "Darwin" ]; then
 	sudo port install pcre2
 	sudo port install pkgconfig
 	sudo port install hdf5
-	sudo port install macfuse
 	sudo port install libjpeg-turbo
 	sudo port install mpg123
 	sudo port install libarchive
+	sudo port install bzip2
+	sudo port install xz
+	sudo port install zstd
+	sudo port install sqlite3
 	sudo port install libsdl2
 	sudo port install libsdl2_image
 	sudo port install libsdl2_ttf
-	"$CURDIR/install_macfuse_link.sh" || exit 1
 	CPPFLAGS="-g -I /usr/local/include -I /opt/local/include"
 	LDFLAGS="-L/usr/local/lib -L/opt/local/lib"
 	install_onnxruntime_prebuilt || exit 1
-    install_private_cuda_runtime_if_needed || exit 1
     CPPFLAGS+=" -I${ONNXRUNTIME_INSTALL_PREFIX}/include"
     LDFLAGS+=" -L${ONNXRUNTIME_INSTALL_PREFIX}/lib"
     LIBS+=" -lonnxruntime"
@@ -886,26 +632,28 @@ if [ "$(uname)" == "Darwin" ]; then
 	brew install asciidoc
 	brew install docbook
 	brew install hdf5
-	brew install --cask macfuse
 	brew install mpg123
 	brew install libarchive
+	brew install bzip2
+	brew install xz
+	brew install zstd
+	brew install sqlite
 	brew install sdl2
 	brew install sdl2_image
 	brew install sdl2_ttf
 
 	# determine paths based on architecture
 	if [ "$APPLEARCH" == "arm64" ]; then
-	    CPPFLAGS="-g -I /usr/local/include -I /opt/homebrew/opt/libarchive/include -I /opt/homebrew/include"
-	    LDFLAGS="-L/usr/local/lib -L/opt/homebrew/opt/libarchive/lib -L/opt/homebrew/lib"
+	    CPPFLAGS="-g -I /usr/local/include -I /opt/homebrew/opt/libarchive/include -I /opt/homebrew/opt/bzip2/include -I /opt/homebrew/opt/xz/include -I /opt/homebrew/opt/zstd/include -I /opt/homebrew/opt/sqlite/include -I /opt/homebrew/include"
+	    LDFLAGS="-L/usr/local/lib -L/opt/homebrew/opt/libarchive/lib -L/opt/homebrew/opt/bzip2/lib -L/opt/homebrew/opt/xz/lib -L/opt/homebrew/opt/zstd/lib -L/opt/homebrew/opt/sqlite/lib -L/opt/homebrew/lib"
 	else
-	    CPPFLAGS="-g -I/usr/local/include -I/usr/local/opt/libarchive/include"
-	    LDFLAGS="-L/usr/local/lib -L/usr/local/opt/libarchive/lib"
+	    CPPFLAGS="-g -I/usr/local/include -I/usr/local/opt/libarchive/include -I/usr/local/opt/bzip2/include -I/usr/local/opt/xz/include -I/usr/local/opt/zstd/include -I/usr/local/opt/sqlite/include"
+	    LDFLAGS="-L/usr/local/lib -L/usr/local/opt/libarchive/lib -L/usr/local/opt/bzip2/lib -L/usr/local/opt/xz/lib -L/usr/local/opt/zstd/lib -L/usr/local/opt/sqlite/lib"
         LIBS+=" -larchive"
 	fi
 
 	# --- ONNX Runtime (needed for ELF ONNX inference)
     install_onnxruntime_prebuilt || exit 1
-    install_private_cuda_runtime_if_needed || exit 1
 	CPPFLAGS+=" -I${ONNXRUNTIME_INSTALL_PREFIX}/include"
     LDFLAGS+=" -L${ONNXRUNTIME_INSTALL_PREFIX}/lib"
     LIBS+=" -lonnxruntime"
@@ -914,9 +662,6 @@ if [ "$(uname)" == "Darwin" ]; then
 		echo "Neither MacPorts nor Homebrew was detected. Dependencies will have to be installed manually."
 		sleep 5
 	fi
-
-    verify_fuse3_development_files || exit 1
-    verify_macfuse_runtime || exit 1
 
     g++ -std=c++17 -fPIC -c "$CURDIR/src/pocketfft_mdct.cpp" -o "$CURDIR/src/pocketfft_mdct.o"
     sudo g++ -dynamiclib \
@@ -942,101 +687,41 @@ elif [ "$(uname)" == "Linux" ]; then
     # Debian family
     if command -v apt-get >/dev/null 2>&1; then
 
-        sudo apt update -y -q
-        sudo apt install -y -q \
-            software-properties-common \
-            build-essential \
-            curl \
-            git \
-            libssl-dev \
-            zlib1g-dev \
-            libbz2-dev \
-            libreadline-dev \
-            libsqlite3-dev \
-            libffi-dev \
-            libncurses5-dev \
-            libncursesw5-dev \
-            xz-utils \
-            tk-dev \
-            liblzma-dev \
-            lzma \
-            uuid-dev
-
-        sudo apt install autotools-dev -y -q
-        sudo apt install automake -y -q
-        sudo apt install gettext -y -q
-        sudo apt install nasm -y -q
-        sudo apt install libpng-dev -y -q
-        sudo apt install texinfo -y -q
-        sudo apt install libz-dev -y -q
-        sudo apt install libiberty-dev -y -q
-        sudo apt install libndctl-dev -y -q
-        sudo apt install binutils-dev -y -q
-        sudo apt install xmlto -y -q
-        sudo apt install libelf-dev -y -q
-        sudo apt install pkg-config -y -q
-        sudo apt install uuid-dev -y -q
-        sudo apt install libpcre2-dev -y -q
-        sudo apt install fuse3 -y -q
-        sudo apt install libfuse3-dev -y -q
-        sudo apt install libhdf5-dev -y -q
-        sudo apt install libjpeg-turbo8 -y -q
-        sudo apt install libjpeg62-turbo -y -q
-        sudo apt install libmpg123-dev -y -q
-        sudo apt install libarchive-dev -y -q
-        sudo apt install libsdl2-dev -y -q
-        sudo apt install libsdl2-image-dev -y -q
-        sudo apt install libsdl2-ttf-dev -y -q
+        sudo apt-get update -q &&
+        sudo apt-get install -y -q \
+            build-essential python3 python3-pip cmake curl git pkg-config \
+            autoconf automake libtool libtool-bin gettext nasm \
+            libssl-dev zlib1g-dev libbz2-dev libzstd-dev liblzma-dev \
+            libreadline-dev libsqlite3-dev libffi-dev libncurses-dev tk-dev \
+            xz-utils uuid-dev libpng-dev libjpeg-dev libpcre2-dev \
+            libfuse3-dev fuse3 libhdf5-dev libmpg123-dev libarchive-dev \
+            libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev libelf-dev \
+            libiberty-dev libndctl-dev binutils-dev xmlto texinfo || exit 1
 
         install_onnxruntime_prebuilt || exit 1
-        install_private_cuda_runtime_if_needed || exit 1
         CPPFLAGS+=" -I${ONNXRUNTIME_INSTALL_PREFIX}/include"
         LDFLAGS+=" -L${ONNXRUNTIME_INSTALL_PREFIX}/lib"
         LIBS+=" -lonnxruntime"
 
     # Fedora / RedHat family
     elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y curl
-	sudo dnf install -y cmake
-        sudo dnf install -y git
-        sudo dnf install -y gcc
-        sudo dnf install -y which
-        sudo dnf install -y openssl openssl-libs openssl-devel
-        sudo dnf install -y bzip2-devel bzip2-static
-        sudo dnf install -y readline compat-readline5-devel
-        sudo dnf install -y libsqlite3x-devel
-        sudo dnf install -y libffi-devel
-        sudo dnf install -y ncurses-devel ncurses-static
-        sudo dnf install -y xz xz-devel
-        sudo dnf install -y tk-devel
-        sudo dnf install -y lzma-sdk-devel
-        sudo dnf install -y libuuid-devel
-        sudo dnf install -y automake
-        sudo dnf install -y gettext gettext-devel
-        sudo dnf install -y nasm
-        sudo dnf install -y libpng-devel libpng-static
-        sudo dnf install -y texinfo
-        sudo dnf install -y binutils-devel
-        sudo dnf install -y ndctl-devel
-        sudo dnf install -y xmlto
-        sudo dnf install -y elfutils elfutils-libs elfutils-devel elfutils-libelf elfutils-libelf-devel
-        sudo dnf install -y pkgconf pkgconf-pkg-config
-        sudo dnf install -y pcre2-devel
-        sudo dnf install -y fuse3 fuse3-devel
-        sudo dnf install -y hdf5-devel
-        sudo dnf install -y libjpeg-turbo libjpeg-turbo-devel
-        sudo dnf install -y mpg123
-        sudo dnf install -y libarchive libarchive-devel
-        sudo dnf install -y SDL2-devel SDL2_image-devel SDL2_ttf-devel
+        sudo dnf install -y \
+            gcc gcc-c++ make python3 python3-pip cmake curl git which \
+            autoconf automake libtool gettext gettext-devel nasm \
+            openssl-devel zlib-devel bzip2-devel libzstd-devel xz-devel \
+            readline-devel sqlite-devel libffi-devel ncurses-devel tk-devel \
+            libuuid-devel libpng-devel libjpeg-turbo-devel pcre2-devel \
+            fuse3 fuse3-devel hdf5-devel mpg123-devel libarchive-devel \
+            SDL2-devel SDL2_image-devel SDL2_ttf-devel elfutils-libelf-devel \
+            binutils-devel ndctl-devel pkgconf-pkg-config xmlto texinfo || exit 1
 
         install_onnxruntime_prebuilt || exit 1
-        install_private_cuda_runtime_if_needed || exit 1
         CPPFLAGS+=" -I${ONNXRUNTIME_INSTALL_PREFIX}/include"
         LDFLAGS+=" -L${ONNXRUNTIME_INSTALL_PREFIX}/lib"
         LIBS+=" -lonnxruntime"
 
     elif command -v zypper >/dev/null 2>&1; then
-        sudo zypper -n install gcc
+        sudo zypper -n install gcc gcc-c++ python3 python3-pip || exit 1
         sudo zypper -n install make
         sudo zypper -n install curl
 	sudo zypper -n install cmake
@@ -1046,6 +731,7 @@ elif [ "$(uname)" == "Linux" ]; then
         sudo zypper -n install libopenssl-devel
         sudo zypper -n install zlib-devel
         sudo zypper -n install libbz2-devel
+        sudo zypper -n install libzstd-devel
         sudo zypper -n install libreadline5
         sudo zypper -n install readline-devel
         sudo zypper -n install libsqlite3-0
@@ -1086,20 +772,20 @@ elif [ "$(uname)" == "Linux" ]; then
         sudo zypper -n install libSDL2-devel SDL2_image-devel SDL2_ttf-devel
 
         install_onnxruntime_prebuilt || exit 1
-        install_private_cuda_runtime_if_needed || exit 1
     	CPPFLAGS+=" -I${ONNXRUNTIME_INSTALL_PREFIX}/include"
         LDFLAGS+=" -L${ONNXRUNTIME_INSTALL_PREFIX}/lib"
         LIBS+=" -lonnxruntime"
 
     # Arch family
     elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -Sqy gcc --noconfirm
+        sudo pacman -S --needed --noconfirm gcc python python-pip || exit 1
         sudo pacman -Sqy make --noconfirm
         sudo pacman -Sqy curl --noconfirm
 	sudo pacman -Sqy cmake --noconfirm
         sudo pacman -Sqy git --noconfirm
         sudo pacman -Sqy openssl --noconfirm
         sudo pacman -Sqy bzip2 --noconfirm
+        sudo pacman -Sqy zstd --noconfirm
         sudo pacman -Sqy readline --noconfirm
         sudo pacman -Sqy sqlite --noconfirm
         sudo pacman -Sqy libffi --noconfirm
@@ -1133,7 +819,6 @@ elif [ "$(uname)" == "Linux" ]; then
         sudo pacman -Sqy sdl2_ttf --noconfirm
 
         install_onnxruntime_prebuilt || exit 1
-        install_private_cuda_runtime_if_needed || exit 1
     	CPPFLAGS+=" -I${ONNXRUNTIME_INSTALL_PREFIX}/include"
         LDFLAGS+=" -L${ONNXRUNTIME_INSTALL_PREFIX}/lib"
         LIBS+=" -lonnxruntime"
@@ -1195,10 +880,10 @@ fix_platform_make &&
     # unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH \
     #     LIBRARY_PATH LD_LIBRARY_PATH DYLD_LIBRARY_PATH &&
     # Ensure /usr/local gets searched first (libbacktrace + other locally-installed things)
-    CPPFLAGS="-I/usr/local/include $CPPFLAGS" \
-    LDFLAGS="-L/usr/local/lib $LDFLAGS -Wl,-rpath,/usr/local/lib" \
+    CPPFLAGS="${ONNX_INCLUDE_FIRST}-I/usr/local/include $CPPFLAGS" \
+    LDFLAGS="${ONNX_LIB_FIRST}-L/usr/local/lib $LDFLAGS -Wl,-rpath,/usr/local/lib" \
     LIBS="$LIBS" \
-    ./configure &&
+    ./configure "${SCALPEL3_ONNX_CONFIGURE_ARGS[@]}" &&
     cd "$CURDIR" &&
     make clean &&
     make &&
@@ -1210,6 +895,10 @@ fix_platform_make &&
 {   echo
     echo -e '\033[34m';
     echo "scalpel3 is now installed."
+    if [ "${SCALPEL3_ONNX_PROVIDER:-}" = "cpu" ]; then
+        echo "GPU ACCELERATION IS OFF. Run Scalpel3 and TESTS/cmdline.test with -Y cpu."
+        echo "See the ONNX diagnostics above for GPU installation instructions."
+    fi
 
     if [ "$SCALPEL3_HOME" == "" ]; then
         echo 'Before running Scalpel, ensure that SCALPEL3_HOME is set to the location of the root scalpel3'
@@ -1220,6 +909,19 @@ fix_platform_make &&
         echo
         echo 'Then reload your shell (e.g., by running source ~/.bashrc) for the changes to take effect.'
         echo 'This only needs to be done once for a given system.'
+    fi
+
+    if [ "$(uname)" = "Darwin" ]; then
+        echo
+        echo -e '\033[33m'
+        echo "WARNING: blockmapfs requires macFUSE. Download and install it from:"
+        echo
+        echo "           https://macfuse.github.io/"
+        echo
+        echo "         Follow the macFUSE installation and approval instructions. If FUSE 3"
+        echo "         development files were unavailable during this build, blockmapfs was"
+        echo "         skipped; rerun this script after installing macFUSE to build it."
+        echo "         Scalpel3 and the rest of the toolchain do not require macFUSE."
     fi
     echo -e '\033[0m';
     }

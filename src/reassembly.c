@@ -1,35 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//------------------------------
-// Additional Integration Terms
-// -----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // scalpel3 is a complete rewrite of the open source scalpel, which was originally developed by
 // Golden G. Richard III in 2005 and then enhanced by both Vico Marziale and Golden G. Richard until
 // ~2013. Earlier versions of scalpel had their roots in Foremost 0.69. The emphasis of scalpel3 is
@@ -385,6 +379,7 @@ void LR_reassembly(ThreadWork *work, CarveInfo **c, uuid_string_t uuidp, uuid_st
           // inflate_blockvector_single_block() can't be used here, because we may have drastically
           // changed the configuration of the blockvector during backtracking, so use the more
           // expensive inflate_blockvector() instead, which also normalizes the blockvector
+          blockvector_set_data_length_to_mapped_extent(candidate->b);
           inflate_blockvector(candidate->b);
 
           if (scalpel_state.share_reassembly) {
@@ -560,12 +555,17 @@ bool reassembly_time_to_checkpoint(int id, CarveInfo *candidate, uuid_string_t u
 }
 
 
-// handle work sharing between reassembly threads
-void reassembly_share_work(int id, CarveInfo *candidate) {
+// handle work sharing between reassembly threads and return the number of
+// helpers created
+int reassembly_share_work_count(int id, CarveInfo *candidate) {
 
   uuid_string_t uuidp;
   uuid_string_t uuidc;
   void *state;
+
+  if (!scalpel_state.share_reassembly) {
+    return 0;
+  }
 
   // first determine if other reassembly threads are idle *and* the promising queue is empty. If so,
   // clone current candidate and add it to the promising queue to give them something to do.
@@ -576,11 +576,13 @@ void reassembly_share_work(int id, CarveInfo *candidate) {
 
   // fast, no locks exit for common case
   if (nolock_queue_length(&promising_queue) || atomic_load_explicit(&num_idle_reassembly_threads, memory_order_acquire) == 0) {
-    return;
+    return 0;
   }
 
   while ((idle = atomic_load_explicit(&num_idle_reassembly_threads, memory_order_acquire)) > 0
-         && nolock_queue_length(&promising_queue) <= 1 && ++shares <= MAX_REASSEMBLY_SHARES) {
+         && nolock_queue_length(&promising_queue) <= 1
+         && shares < MAX_REASSEMBLY_SHARES) {
+    shares++;
     // clone candidate
     CarveInfo *clone = (CarveInfo *)malloc(sizeof(CarveInfo));
     check_memory_allocation(clone, __LINE__, __FILE__, "clone");
@@ -641,6 +643,15 @@ void reassembly_share_work(int id, CarveInfo *candidate) {
     pthread_cond_broadcast(&reassembly_check_work_available);
     MUTEX_ERROR_CHECK(pthread_mutex_unlock(&reassembly_work_is_available), __LINE__, __FILE__);
   }
+  return shares;
+}
+
+
+// preserve the existing work-sharing API for validators that do not need the
+// number of helpers created
+void reassembly_share_work(int id, CarveInfo *candidate) {
+
+  (void)reassembly_share_work_count(id, candidate);
 }
 
 
@@ -695,6 +706,15 @@ bool reassembly_check_validation(int id, CarveInfo *candidate, uint64_t *validat
                                                                  blockvector_get_data_length(candidate->b), &validates,
                                                                  validates_to, &promising, candidate->needleidx,
                                                                  scalpel_state.blocksize, candidate->carvehashkey);
+
+  // Candidate-level validation must apply to fragmented candidates as well as
+  // contiguous candidates. In particular, container validators can inspect the
+  // completed physical layout or assign a validated container to a semantic
+  // subtype only after reassembly has supplied all of its blocks.
+  if (scalpel_state.search_specs[candidate->needleidx].CANDIDATEVALIDATOR) {
+    scalpel_state.search_specs[candidate->needleidx].CANDIDATEVALIDATOR(
+        candidate, &validates, validates_to, &promising);
+  }
 
 
 #if PRINT_CARVE_STATE > 0
@@ -799,9 +819,9 @@ bool reassembly_check_validation(int id, CarveInfo *candidate, uint64_t *validat
 // Custom reassembly functions MUST address several challenges because of the backend invalidation
 // of covered blocks:
 //
-// (1) Critical portions of the candidate (e.g., the footer, for SEARCHTYPE_BACKWARD file types) may
-//     have been invalidated because blocks in the candidate became covered.  Custom reassembly
-//     functions functions MUST check the candidate to see if it is viable, because blocks
+// (1) Critical portions of the candidate (e.g., a footer used to seed recovery) may have been
+//     invalidated because blocks in the candidate became covered.  Custom reassembly
+//     functions MUST check the candidate to see if it is viable, because blocks
 //     invalidated by coverage events may have removed critical elements of the candidate's
 //     structure!  You must destroy the candidate if recovery is now hopeless.
 //

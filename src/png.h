@@ -1,38 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-// ----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
-//
-// Please see LICENSE.md and README.md for further information.
-//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
-
-//
 // PNG validators for scalpel3 (c) 2021-2026 by Golden G. Richard III.
 //
 // PNG file validation code based primarily on a massive hack of pngcheck
@@ -5291,6 +5282,12 @@ int pngcheck(PNGMemIO *mem) {
                       6     2     2      1    0
                       7     1     2      0    1
                  */
+                if (cur_pass >= 7) {
+                  mem->zlib_stopped = true;
+                  mem->zlib_error = -1;
+                  err = Z_STREAM_END;
+                  break;
+                }
                 ++cur_pass;
                 if (cur_pass & 1) {	/* beginning an odd pass */
                   cur_yoff = cur_xoff;
@@ -9229,6 +9226,32 @@ static inline uint32_t png_gap_locality_score(CarveInfo *candidate,
   return score;
 }
 
+static inline uint32_t png_gap_contiguous_locality_score(
+    CarveInfo *candidate, uint64_t suffix_start_nb, uint32_t first_full,
+    int64_t window_start_ap, uint32_t M) {
+  if (!candidate || !candidate->b || suffix_start_nb == 0
+      || window_start_ap < 0) {
+    return 0;
+  }
+
+  int64_t prefix_actual = blockvector_get_actual_blocknumber(candidate->b,
+      suffix_start_nb - 1);
+  if (prefix_actual < 0) {
+    return 0;
+  }
+
+  uint32_t score = 0;
+  for (uint32_t f = 0; f < M; f++) {
+    int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
+        window_start_ap + (int64_t)f);
+    int64_t expected = prefix_actual + 1 + (int64_t)first_full + (int64_t)f;
+    if (actual == expected) {
+      score++;
+    }
+  }
+  return score;
+}
+
 static inline bool png_gap_match_better(bool validated, uint64_t validates_to,
                                          uint64_t advance_to,
                                          uint32_t locality,
@@ -10764,12 +10787,8 @@ static inline int png_crc_solve_idat(
         bool validated = png_direct_validate(work->id, candidate, &vt,
             local, uuidp, uuidc);
         uint64_t advance_to = local->last_chunk_crc_pos;
-        int64_t window_ap[PNG_GAP_INDEX_MAX_M];
-        for (uint32_t f = 0; f < M; f++) {
-          window_ap[f] = m_start + (int64_t)f;
-        }
-        uint32_t locality = png_gap_locality_score(candidate,
-            suffix_start_nb, first_full, window_ap, M);
+        uint32_t locality = png_gap_contiguous_locality_score(candidate,
+            suffix_start_nb, first_full, m_start, M);
         bool accept = validated || (advance_to >= target)
             || locality == M;
         if (png_trace_this) {
@@ -13381,10 +13400,6 @@ static inline void png_reassembly_init_candidate(CarveInfo *candidate,
             resize_blockvector(candidate->b, keep_blocks);
             blockvector_set_data_length(candidate->b, pos);
             inflate_blockvector(candidate->b);
-            // Restore exact data_length after re-inflate, since
-            // inflate_blockvector_no_IO sets length = numblocks*blocksize
-            // when blocks are consecutive.
-            blockvector_set_data_length(candidate->b, pos);
             // Cap state to trimmed position, but PRESERVE prior verified
             // progress (do NOT zero everything like the previous code did).
             if (local->last_chunk_crc_pos > pos) {

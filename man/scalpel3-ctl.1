@@ -37,6 +37,8 @@ then be scrutinized and used with other options such as \fB-k\fR.
 This command is available only during fragmented recovery; requests during
 other phases are rejected immediately. A successful response is sent only
 after the INPROGRESS update is complete.
+This progress checkpoint is not a restartable recovery checkpoint. Use
+\fB-x\fR to save restartable state and exit when that state is available.
 
 
 .TP

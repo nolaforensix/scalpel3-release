@@ -1,38 +1,27 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2025 by Golden G. Richard III and
-// contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it
-// under the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option) any
-// later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT
-// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
-// details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with
-// this program.  If not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-//------------------------------------------------------------------------
-// Additional Integration Terms
-// ------------------------------------------------------------------------
-// Linking or embedding Scalpel3 (statically or dynamically) into another
-// program such that the resulting executable or library forms a single
-// combined work constitutes creation of a derivative work under the GPL.
-// Any party distributing such a combined work must make the entire source
-// code available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary
-// product or requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact:
-// Golden G. Richard III (golden@cct.lsu.edu).
-//
-// Please see LICENSE.md and README.md for further information.
-//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
 /**
@@ -64,6 +53,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <openssl/evp.h>
 #include <zlib.h>
 
 
@@ -115,6 +105,9 @@
 // cannot size an unbounded stack VLA (char temp[digit_run + 1]).
 #define PDF_MAX_INT_DIGITS 20
 
+// Bound image-wide xref scanning between remote-control/checkpoint polls.
+#define PDF_XREF_SCAN_QUANTUM 256
+
 // Define block selection modes
 #define NEXTOBJECT 1
 #define FINDENDSTREAM 2
@@ -159,6 +152,13 @@ typedef struct XrefTables{
     int count;          // The # of objects in this table
 } XrefTables;
 
+typedef struct PDFEncryptionContext {
+    bool active;
+    bool encrypt_metadata;
+    unsigned char file_key[16];
+    size_t file_key_length;
+} PDFEncryptionContext;
+
 /**
  * Used to store information about xrefs in
  * relation to individual blocks.
@@ -173,13 +173,78 @@ typedef struct XrefParameters{
 typedef struct PDFBlockState{
     int first_obj;
     XrefParameters *xref_block_data;
-    int8_t num_xrefs;
+    int32_t num_xrefs;
 } PDFBlockState;
+
+typedef struct PDFXrefSearchState{
+    bool active;
+    bool exhausted;
+    roaring64_bitmap_t *excluded_actual_blocks;
+    Object *best_entries;
+    int best_entry_count;
+    int64_t *best_blocks;
+    int best_block_count;
+    int32_t best_local;
+    int best_score;
+} PDFXrefSearchState;
+
+typedef struct PDFStreamMetadata {
+    int64_t length;
+    bool has_length;
+    bool flate;
+    bool has_filter;
+    bool jpeg;
+    bool xml;
+    bool incomplete;
+} PDFStreamMetadata;
+
+typedef struct PDFPrefixScan {
+    uint64_t length;
+    uint64_t objects;
+    uint64_t complete_length;
+    uint64_t stream_offset;
+    uint64_t stream_length;
+    bool stream_flate;
+    bool stream_jpeg;
+    bool needs_more;
+    bool interrupted;
+    bool stream_progress;
+} PDFPrefixScan;
+
+// Immutable partial mapping shared by carve-state copies; no file bytes or
+// reservations are retained. Each state owns one reference.
+typedef struct PDFPartialPrefix {
+    atomic_uint references;
+    uint64_t length;
+    uint64_t count;
+    int64_t actual[];
+} PDFPartialPrefix;
+
+// A replacement scan resumes at the next actual block, independently of
+// apparent-block renumbering at checkpoints. No speculative bytes are retained.
+typedef struct PDFStreamRepairCursor {
+    bool active;
+    int32_t prefix_limit;
+    int32_t prefix_length;
+    int32_t run_length;
+    int64_t next_actual;
+} PDFStreamRepairCursor;
+
+typedef struct PDFInteriorSearchState {
+    bool active;
+    size_t table;
+    int32_t entry;
+    PDFStreamRepairCursor repair;
+    uint64_t gap_extra;
+    uint64_t gap_slot;
+} PDFInteriorSearchState;
 
 typedef struct PDFCarveState{
     XrefTables *xref_tables;  // Points to linked list of XrefTables
     size_t num_tables;       // Number of xref tables found
     bool incomplete_obj;
+    bool initialized; // initial candidate xref discovery has completed
+    bool speculative_blocks; // candidate contains a heuristic, non-oracle block assignment
     // Linearization parameters, read once from the candidate's header block.
     // A linearized file places its entry-point xref at the FRONT, so its final
     // startxref does NOT locate the main table; lin_T does. See
@@ -187,7 +252,25 @@ typedef struct PDFCarveState{
     bool    linearized;      // /Linearized dict present as the first object
     int64_t lin_L;           // /L: declared total length of that revision, -1 if absent
     int64_t lin_T;           // /T: offset of that revision's main xref, -1 if absent
+    PDFXrefSearchState xref_search;
+    PDFPartialPrefix *partial_prefix;
+    bool partial_search_active;
+    uint64_t partial_search_length;
+    int64_t partial_search_next;
+    PDFInteriorSearchState interior_search;
 } PDFCarveState;
+
+typedef struct PDFSlotDelta {
+    int64_t delta;
+    uint64_t slot;
+} PDFSlotDelta;
+
+typedef struct PDFRunEvidence {
+    int64_t delta;
+    uint64_t min_slot;
+    uint64_t max_slot;
+    uint64_t count;
+} PDFRunEvidence;
 
 /**
  * Hashing struct for faster validation
@@ -214,11 +297,11 @@ typedef struct ZlibStreamReassembler {
     unsigned char *output;   // accumulated decompressed output
     size_t output_len;
     size_t output_capacity;
-    // Declared /Length and bytes consumed: needed to reach Z_STREAM_END, where
+    // Declared /Length and bytes supplied: needed to reach Z_STREAM_END, where
     // zlib verifies the Adler-32 over the whole output -- DEFLATE's only integrity
     // check, since a wrong block otherwise decodes to plausible garbage.
     size_t stream_length;    // 0 = unknown, no completion gate
-    size_t fed;              // compressed bytes consumed so far
+    size_t fed;              // bytes supplied from the declared stream extent
     int    ended;            // Z_STREAM_END reached
 } ZlibStreamReassembler;
 
@@ -381,17 +464,25 @@ uint64_t search_tables_for_object(XrefTables *test_tables, int num_tables, int o
 
 int64_t scan_blocks_for_object(int obj_num, uint64_t obj_offset);
 
-int check_last_object_length(char *data, uint64_t length, uint64_t *out_offset, XrefTables *test_tables, int num_tables, const char *dict, int dict_len, uint64_t obj_offset);
+int check_last_object_length(char *data, uint64_t length, uint64_t *out_offset, XrefTables *test_tables, int num_tables, const char *dict, int dict_len, uint64_t obj_offset, bool search_image);
 
 int check_last_object_filter(const char *dict, int dict_len);
 
 int calculate_stream_offsets(char *data, uint64_t object_length, uint64_t length, uint64_t offset, int32_t *out_startstream_local_offset, int32_t *out_endstream_local_offset, int *out_blocks_to_extend);
+
+static bool pdf_zlib_extent_complete(const z_stream *stream, size_t supplied, size_t declared);
 
 int zlib_stream_reassembler_init(ZlibStreamReassembler *r, const unsigned char *first_block, size_t block_size, size_t stream_offset, size_t stream_length);
 
 int zlib_stream_reassembler_try_block(ZlibStreamReassembler *r, const unsigned char *block, size_t block_size);
 
 void zlib_stream_reassembler_free(ZlibStreamReassembler *r);
+
+static int pdf_zlib_contiguous_prefix_blocks(const unsigned char *first_block,
+                                            size_t stream_offset,
+                                            size_t stream_length,
+                                            int64_t first_apparent,
+                                            int maximum);
 
 int64_t find_last_object(const char *data, uint64_t length);
 
@@ -431,6 +522,8 @@ static inline void jpeg_feed_sos(JpegStreamReassembler *r, unsigned char c, int 
 
 static inline void jpeg_feed_byte(JpegStreamReassembler *r, unsigned char c);
 
+static bool pdf_jpeg_extent_complete(const JpegStreamReassembler *r);
+
 int jpeg_stream_reassembler_init(JpegStreamReassembler *r, const unsigned char *first_block, size_t block_size, size_t stream_offset, size_t stream_length);
 
 int jpeg_stream_reassembler_try_block(JpegStreamReassembler *r, const unsigned char *block, size_t block_size);
@@ -441,7 +534,7 @@ bool reconstruct_jpeg_stream(ThreadWork *work, CarveInfo *candidate, const char 
 
 Object* scan_blocks_for_xref_at_offset(CarveInfo *candidate, BlockVector *scan_bv, int *entry_count, int64_t **out_xref_blocks, int *out_xref_block_count, int32_t expected_offset);
 
-Object* scan_blocks_for_xref(CarveInfo *candidate, BlockVector **scan_bv, int *entry_count, int64_t **out_xref_blocks, int *out_xref_block_count, int32_t *out_xref_local);
+Object* scan_blocks_for_xref(CarveInfo *candidate, BlockVector **scan_bv, int *entry_count, int64_t **out_xref_blocks, int *out_xref_block_count, int32_t *out_xref_local, int64_t *next_apparent, uint64_t block_budget, bool *more_work);
 
 const char *scan_buf_for_xref(char *data, uint64_t length, uint64_t search_pos, int *xref_type);
 
@@ -450,6 +543,29 @@ static int64_t pdf_lin_param(const char *dict, int dict_len, const char *key, in
 static void pdf_detect_linearization(PDFCarveState *s, const char *data, uint64_t length);
 
 static bool pdf_place_blocks_at_slot(CarveInfo *candidate, const int64_t *actual_blocks, int count, uint64_t first_slot, const char *site);
+
+static bool pdf_repair_interior_zlib_backbone(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, bool exhaustive);
+
+static bool pdf_repair_mapped_zlib_run(CarveInfo *candidate, int64_t stream_at,
+                                      int stream_len, int64_t start_slot,
+                                      int64_t end_slot,
+                                      PDFStreamRepairCursor *cursor);
+
+static bool pdf_repair_gapped_zlib_run(CarveInfo *candidate, int64_t stream_at,
+                                      int stream_len, int64_t start_slot,
+                                      int64_t end_slot,
+                                      PDFInteriorSearchState *search);
+
+static void pdf_store_interior_search(CarveInfo *candidate,
+                                      const PDFInteriorSearchState *search);
+
+static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, bool exhaustive);
+
+static inline uint32_t pdf_icc_lut_value(const unsigned char *profile,
+                                         size_t offset,
+                                         unsigned int bytes_per_value);
+
+static bool pdf_repair_interior_icc_lut(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot);
 
 static int pdf_collect_xref_anchors(const char *data, uint64_t length, int64_t *out, int max_out);
 
@@ -461,7 +577,27 @@ static bool pdf_block_matches_xref_slot(CarveInfo *candidate, int64_t apparent_b
 
 static bool pdf_candidate_has_holes(CarveInfo *candidate);
 
+static bool pdf_fill_physically_bridged_holes(ThreadWork *work,
+                                               CarveInfo *candidate);
+
+static bool pdf_xref_offset_is_unique(CarveInfo *candidate,
+                                      int32_t expected_offset);
+
+static size_t pdf_group_slot_runs(const PDFSlotDelta *observations, size_t count,
+                                  PDFRunEvidence *groups);
+
+static int pdf_compare_slot_delta(const void *a, const void *b);
+
+static bool pdf_try_linearized_physical_runs(ThreadWork *work, CarveInfo *candidate,
+                                            bool logical_groups);
+
+static int pdf_compare_run_evidence(const void *a, const void *b);
+
+static bool pdf_complete_linearized_physical_runs(ThreadWork *work,
+                                                   CarveInfo *candidate);
+
 static bool pdf_complete_trailer(ThreadWork *work, CarveInfo *candidate);
+static bool pdf_xref_block_continuation(const unsigned char *data, size_t length);
 
 #ifdef PDF_TRACE_PLACEMENT
 static void pdf_trace_table_adopt(CarveInfo *candidate, const char *how, Object *ents, int count, int score);
@@ -479,7 +615,97 @@ static bool pdf_flate_body_ok(const unsigned char *buf, size_t len);
 
 static bool pdf_jpeg_body_ok(const unsigned char *buf, size_t len);
 
-static bool pdf_streams_decode_ok(char *data, uint64_t length, XrefTables *tables, int num_tables);
+static bool pdf_xml_body_ok(const unsigned char *buf, size_t len);
+
+static bool pdf_streams_decode_ok(char *data, uint64_t length, XrefTables *tables,
+                                  const XrefObject *xrefs, int num_tables,
+                                  bool *damaged_metadata);
+
+static bool pdf_find_name_value(const unsigned char *data, size_t length,
+                                const char *name, size_t *value_offset);
+
+static bool pdf_token_end(const unsigned char *data, size_t length,
+                           size_t offset, size_t *end);
+
+static bool pdf_parse_signed_integer(const unsigned char *data, size_t length,
+                                     size_t offset, int64_t *value,
+                                     size_t *end_offset);
+
+static bool pdf_parse_string(const unsigned char *data, size_t length,
+                             size_t offset, unsigned char *output,
+                             size_t output_capacity, size_t *output_length);
+
+static bool pdf_parse_indirect_reference(const unsigned char *data,
+                                         size_t length, size_t offset,
+                                         int *object_number);
+
+static bool pdf_incremental_update_prefix(const unsigned char *data,
+                                          size_t length);
+
+static bool pdf_md5(const unsigned char *data, size_t length,
+                    unsigned char digest[16]);
+
+static void pdf_rc4_crypt(const unsigned char *key, size_t key_length,
+                          const unsigned char *input, unsigned char *output,
+                          size_t length);
+
+static bool pdf_xref_dictionary(const unsigned char *data, uint64_t length,
+                                 const XrefObject *xrefs, int num_tables,
+                                 int table, uint64_t *start, uint64_t *end);
+
+static bool pdf_initialize_encryption_context(
+    const unsigned char *data, uint64_t length, XrefTables *tables,
+    const XrefObject *xrefs, int num_tables, PDFEncryptionContext *context);
+
+static bool pdf_decrypt_stream(const PDFEncryptionContext *context,
+                               int object_number, int generation,
+                               const unsigned char *input, size_t length,
+                               unsigned char *output);
+
+static inline bool pdf_lexical_space(unsigned char c);
+
+static inline bool pdf_lexical_delimiter(unsigned char c);
+
+static uint64_t pdf_skip_space_and_comments(const unsigned char *data,
+                                            uint64_t offset,
+                                            uint64_t limit);
+
+static int pdf_indirect_object_header(const unsigned char *data,
+                                       uint64_t offset, uint64_t limit,
+                                       int expected_object,
+                                       uint64_t *body_start, int *generation);
+
+static bool pdf_indirect_object_body_start(const unsigned char *data,
+                                           uint64_t offset,
+                                           uint64_t limit,
+                                           int expected_object,
+                                           uint64_t *body_start,
+                                           int *generation);
+
+static bool pdf_syntax_push(unsigned char **stack, size_t *stack_capacity,
+                            size_t depth, unsigned char delimiter);
+
+static bool pdf_nonstream_object_well_formed(const unsigned char *data,
+                                             uint64_t offset,
+                                             uint64_t limit,
+                                             int expected_object,
+                                             unsigned char **stack,
+                                             size_t *stack_capacity);
+static bool pdf_nonstream_object_end(const unsigned char *data,
+                                    uint64_t offset, uint64_t limit,
+                                    int expected_object, unsigned char **stack,
+                                    size_t *stack_capacity, uint64_t *end,
+                                    PDFStreamMetadata *metadata, bool (*stop)(void));
+
+static uint64_t pdf_embedded_stream_prefix(const unsigned char *data,
+                                           uint64_t available, uint64_t declared,
+                                           uint64_t stream_offset,
+                                           uint32_t blocksize, bool is_jpeg,
+                                           bool (*stop)(void), bool *interrupted);
+
+static bool pdf_nonstream_objects_well_formed(char *data, uint64_t length,
+                                               XrefTables *tables,
+                                               int num_tables);
 
 /*
  * PDF_PLACE() -- the single funnel through which every block placement passes.
@@ -559,6 +785,20 @@ static void pdf_reassembly_extension(ThreadWork *work, CarveInfo **c, Object *ne
 static inline uint32_t pdf_block_validate(char *data, uint64_t length, BlockValidationDecision *decision, uint64_t *validates_to, uint32_t needleidx, uint32_t blocksize, void *blockhashkey);
 
 static inline void pdf_file_validate(char *data, uint64_t length, bool *validates, uint64_t *validates_to, bool *promising, uint32_t needleidx, uint32_t blocksize, void *carvehashkey);
+static uint64_t pdf_partial_skip_space(const unsigned char *data, uint64_t cursor,
+                                       uint64_t limit, bool (*stop)(void));
+static PDFPrefixScan pdf_scan_forward_prefix(const unsigned char *data,
+                                             uint64_t length, uint32_t blocksize,
+                                             bool (*stop)(void));
+static bool pdf_prefix_checkpoint_requested(void);
+static void pdf_partial_prefix_release(PDFPartialPrefix *prefix);
+static void pdf_preserve_partial_prefix(CarveInfo *candidate);
+static bool pdf_partial_endstream_at(int64_t actual, uint64_t offset);
+static bool pdf_partial_jpeg_complete(const unsigned char *data, size_t length);
+static void pdf_extend_partial_prefix(CarveInfo *candidate);
+static void pdf_write_partial_prefix(CarveInfo *candidate);
+static void pdf_candidate_preserve_prefix(CarveInfo *candidate, bool *validates,
+                                           uint64_t *validates_to, bool *promising);
 
 /*******************************************************/
 /* FILE-SCOPE REASSEMBLY STATE                        */
@@ -572,6 +812,10 @@ static inline void pdf_file_validate(char *data, uint64_t length, bool *validate
  */
 static __thread const XrefTables *pdf_inflight_tables = NULL;
 static __thread int pdf_inflight_table_count = 0;
+
+// Physical-run trials need a lexical oracle to distinguish layouts whose xref
+// headers and stream checks are identical but whose non-stream objects differ.
+static __thread bool pdf_require_object_syntax = false;
 
 /*
  * Duplicate-validation guard for the parallel reassembly phase. Several header
@@ -1166,53 +1410,21 @@ static inline void hash_table_free(ObjectHashTable *table) {
  * @param obj_num1      The expected object number.
  * @param length        The length of the buffer.
  *
- * @return              1 if valid, 0 if invalid, -1 on error.
+ * @return              1 for a complete header, 0 for a contradiction, -1 for
+ *                      a missing buffer, -2 for an out-of-range offset, or -3
+ *                      when more bytes are required.
  */
 int validate_at_offset(char *data, int64_t offset, int obj_num1, int64_t length) {
-    // No data Buffer
-    if (!data) return -1;
-
-    // Offset is out of bounds
-    if (offset < 0 || offset >= length) return -2;
-
-    while (offset < length && isspace((unsigned char)data[offset])) {
-        offset++;
+    if (!data) {
+        return -1;
     }
-
-    // Need another block to parse or there is no object number at the offset
-    if (offset >= length || !isdigit((unsigned char)data[offset])) {
-        return -3;
+    if (offset < 0 || offset >= length) {
+        return -2;
     }
-
-    int obj_num2 = 0;
-    int64_t start = offset;
-    while (offset < length && isdigit(data[offset])) {
-        offset++;
-    }
-
-    int64_t obj2_length = offset - start;
-    if (obj2_length <= 0){
-         return -4;
-    }
-    // Cap the copy to a fixed-size buffer so an overlong digit run can't size an
-    // unbounded stack VLA. A value beyond PDF_MAX_INT_DIGITS digits is not a
-    // legitimate object number anyway.
-    int64_t copy_length = obj2_length > PDF_MAX_INT_DIGITS ? PDF_MAX_INT_DIGITS : obj2_length;
-    char temp[PDF_MAX_INT_DIGITS + 1];
-    memcpy(temp, &data[start], copy_length);
-    temp[copy_length] = '\0';
-
-    obj_num2 = atoi(temp);
-
-
-    if(obj_num1 == obj_num2){
-        return 1;
-    }
-
-    // Not a match
-
-    fflush(stdout);
-    return 0;
+    uint64_t body_start = 0;
+    int status = pdf_indirect_object_header((const unsigned char *)data,
+        (uint64_t)offset, (uint64_t)length, obj_num1, &body_start, NULL);
+    return status > 0 ? 1 : (status == 0 ? -3 : 0);
 }
 
 /** @description        Helper function for xref storage
@@ -1352,8 +1564,12 @@ Object* store_xref_stream(const char *decoded_data, size_t decoded_len,
  * @return                  An array of Objects.
  */
 Object* analyze_xref(char* data, int64_t offset, int64_t length, int *entry_count, uint64_t *xref_end_offset){
-    int nested_level = 1;
+    if (!data || !entry_count || !xref_end_offset || offset < 0 || offset >= length) {
+        return NULL;
+    }
+    *entry_count = 0;
     int column_length = 0;
+    size_t predictor_columns = 1;
     size_t *index_array = NULL;
     size_t index_count = 0;
     int w_array[3] = {0, 0, 0};
@@ -1362,6 +1578,19 @@ Object* analyze_xref(char* data, int64_t offset, int64_t length, int *entry_coun
     int num_entries = 0;
     Object *entries = NULL;
     bool predictor_present = false;
+
+    // Xref stream discovery normally finds the /Type /XRef marker inside the
+    // object dictionary. Normalize that marker to the containing object's start;
+    // otherwise detect_xref_type() searches forward and can inspect the next
+    // object instead of the xref stream that was actually found.
+    if (offset >= 0 && offset < length &&
+        ((offset + 10 <= length && !memcmp(&data[offset], "/Type/XRef", 10)) ||
+         (offset + 11 <= length && !memcmp(&data[offset], "/Type /XRef", 11)))) {
+        int64_t object_start = find_xref_stream_start(data, offset);
+        if (object_start >= 0) {
+            offset = object_start;
+        }
+    }
     int xref_type = detect_xref_type(data, offset, length, &offset);
 
     if (xref_type <= 0) {
@@ -1370,55 +1599,163 @@ Object* analyze_xref(char* data, int64_t offset, int64_t length, int *entry_coun
 
     // Parse through stream dictionary for important information needed for decoding
     if (xref_type == 2) {
-        // Use memmem to jump directly to << instead of scanning byte-by-byte
+        // Dictionary syntax, including strings, determines its end. Encryption
+        // dictionaries can themselves contain dictionaries and hexadecimal data.
         char *dict_start = memmem(&data[offset], length - offset, "<<", 2);
         if (!dict_start) {
             return NULL;
         }
-        offset = dict_start - data + 2;
-        int64_t dict_scan_limit = offset + 10000;
-
-        while (nested_level > 0 && offset < dict_scan_limit && offset + 2 <= length) {
-            if (!memcmp(&data[offset], "<<", 2)) nested_level++;
-            if (!memcmp(&data[offset], ">>", 2)) nested_level--;
-
-            if ((offset < length - 2) && !memcmp(&data[offset], "/W", 2)) {
-                if (extract_w_array(data, offset, w_array, length) == 0) {
-                    column_length = w_array[0] + w_array[1] + w_array[2];
-                } else {
-                    w_array[0] = w_array[1] = w_array[2] = 0;
-                }
-            }
-
-            if ((offset < length - 6) && !memcmp(&data[offset], "/Index", 6)) {
-                extract_index_array(data, offset, &index_array, &index_count, length);
-            }
-
-            if ((offset < length - 5) && !memcmp(&data[offset], "/Size", 5)) {
-                num_references = extract_int(data, offset + 5, length,NULL);
-            }
-
-            if ((offset < length - 10) && !memcmp(&data[offset], "/Predictor", 10)) {
-                predictor_present = true;
-            }
-
-            offset++;
+        uint64_t dictionary_end = 0;
+        unsigned char *stack = NULL;
+        size_t stack_capacity = 0;
+        bool complete = pdf_nonstream_object_end((unsigned char *)data,
+            dict_start - data, length, -1, &stack, &stack_capacity,
+            &dictionary_end, NULL, NULL);
+        free(stack);
+        if (!complete) {
+            return NULL;
         }
-
-        // Decoding stream
-        size_t stream_length = 0;
-        size_t decompressed_length = 0;
-        size_t decoded_length = 0;
-
-        char *stream_data = extract_stream_data(data, offset, &stream_length, length, xref_end_offset);
-        if (!stream_data) {
+        const unsigned char *dictionary = (unsigned char *)dict_start;
+        size_t dictionary_length = dictionary_end - (uint64_t)(dict_start - data);
+        size_t value = 0;
+        if (!pdf_find_name_value(dictionary, dictionary_length, "W", &value)
+            || dictionary[value++] != '[') {
+            return NULL;
+        }
+        for (int i = 0; i < 3; i++) {
+            int64_t width = 0;
+            if (!pdf_parse_signed_integer(dictionary, dictionary_length,
+                                            value, &width, &value)
+                || width < 0 || width > 4) {
+                return NULL;
+            }
+            w_array[i] = (int)width;
+            column_length += w_array[i];
+        }
+        value = pdf_skip_space_and_comments(dictionary, value, dictionary_length);
+        if (value >= dictionary_length || dictionary[value] != ']'
+            || column_length == 0) {
+            return NULL;
+        }
+        int64_t count = 0;
+        if (!pdf_find_name_value(dictionary, dictionary_length, "Size", &value)
+            || !pdf_parse_signed_integer(dictionary, dictionary_length, value,
+                                           &count, NULL)
+            || count <= 0 || count > INT_MAX) {
+            return NULL;
+        }
+        num_references = (int)count;
+        if (pdf_find_name_value(dictionary, dictionary_length, "Index", &value)) {
+            if (extract_index_array((char *)dictionary, value, &index_array,
+                                      &index_count, dictionary_length) != 0
+                || index_count == 0 || (index_count & 1) != 0) {
+                free(index_array);
+                return NULL;
+            }
+        }
+        bool flate = false;
+        if (pdf_find_name_value(dictionary, dictionary_length, "Filter", &value)) {
+            if (dictionary[value] == '[') {
+                value = pdf_skip_space_and_comments(dictionary, value + 1,
+                                                     dictionary_length);
+            }
+            size_t filter_end = 0;
+            flate = pdf_token_end(dictionary, dictionary_length, value, &filter_end)
+                && filter_end - value == 12
+                && !memcmp(dictionary + value, "/FlateDecode", 12);
+            if (!flate) {
+                free(index_array);
+                return NULL;
+            }
+        }
+        if (pdf_find_name_value(dictionary, dictionary_length, "DecodeParms", &value)) {
+            if (dictionary[value] == '[') {
+                value = pdf_skip_space_and_comments(dictionary, value + 1,
+                                                     dictionary_length);
+            }
+            size_t predictor = 0;
+            int64_t prediction = 1;
+            if (pdf_find_name_value(dictionary + value, dictionary_length - value,
+                                     "Predictor", &predictor)) {
+                if (!pdf_parse_signed_integer(dictionary + value,
+                        dictionary_length - value, predictor, &prediction, NULL)
+                    || (prediction != 1 && (prediction < 10 || prediction > 15))) {
+                    free(index_array);
+                    return NULL;
+                }
+                predictor_present = prediction >= 10;
+                const unsigned char *parameters = dictionary + value;
+                size_t parameters_length = dictionary_length - value;
+                int64_t columns = 1, colors = 1, bits = 8;
+                if ((pdf_find_name_value(parameters, parameters_length, "Columns", &predictor)
+                     && !pdf_parse_signed_integer(parameters, parameters_length,
+                                                   predictor, &columns, NULL))
+                    || (pdf_find_name_value(parameters, parameters_length, "Colors", &predictor)
+                        && !pdf_parse_signed_integer(parameters, parameters_length,
+                                                      predictor, &colors, NULL))
+                    || (pdf_find_name_value(parameters, parameters_length, "BitsPerComponent", &predictor)
+                        && !pdf_parse_signed_integer(parameters, parameters_length,
+                                                      predictor, &bits, NULL))
+                    || columns <= 0 || (uint64_t)columns > SIZE_MAX
+                    || colors != 1 || bits != 8) {
+                    free(index_array);
+                    return NULL;
+                }
+                predictor_columns = (size_t)columns;
+            }
+        }
+        int64_t declared_length = 0;
+        if (!pdf_find_name_value(dictionary, dictionary_length, "Length", &value)
+            || !pdf_parse_signed_integer(dictionary, dictionary_length, value,
+                                           &declared_length, NULL)
+            || declared_length <= 0) {
             free(index_array);
             return NULL;
         }
-
-        char *decompressed_data = decompress_with_uncompress(stream_data, stream_length, &decompressed_length);
-        free(stream_data);
-
+        uint64_t stream_start = pdf_skip_space_and_comments((unsigned char *)data,
+                                                            dictionary_end, length);
+        if ((uint64_t)length - stream_start < 7
+            || memcmp(data + stream_start, "stream", 6)) {
+            free(index_array);
+            return NULL;
+        }
+        stream_start += 6;
+        if (data[stream_start] == '\r') {
+            stream_start++;
+            if (stream_start < (uint64_t)length && data[stream_start] == '\n') {
+                stream_start++;
+            }
+        } else if (data[stream_start] == '\n') {
+            stream_start++;
+        } else {
+            free(index_array);
+            return NULL;
+        }
+        if ((uint64_t)declared_length > (uint64_t)length - stream_start) {
+            free(index_array);
+            return NULL;
+        }
+        uint64_t stream_end = pdf_skip_space_and_comments((unsigned char *)data,
+            stream_start + (uint64_t)declared_length, length);
+        if ((uint64_t)length - stream_end < 9
+            || memcmp(data + stream_end, "endstream", 9)) {
+            free(index_array);
+            return NULL;
+        }
+        *xref_end_offset = stream_end + 9;
+        size_t decompressed_length = 0;
+        size_t decoded_length = 0;
+        char *decompressed_data = NULL;
+        if (flate) {
+            decompressed_data = decompress_with_uncompress(data + stream_start,
+                (size_t)declared_length, &decompressed_length);
+        } else {
+            decompressed_length = (size_t)declared_length;
+            decompressed_data = malloc(decompressed_length);
+            check_memory_allocation(decompressed_data, __LINE__, __FILE__,
+                                    "PDF xref stream");
+            memcpy(decompressed_data, data + stream_start, decompressed_length);
+        }
         if (!decompressed_data) {
             free(index_array);
             return NULL;
@@ -1426,7 +1763,8 @@ Object* analyze_xref(char* data, int64_t offset, int64_t length, int *entry_coun
 
         char *decoded_data = NULL;
         if (predictor_present) {
-            decoded_data = apply_png_predictor_up(decompressed_data, decompressed_length, column_length, &decoded_length);
+            decoded_data = apply_png_predictor_up(decompressed_data, decompressed_length,
+                                                  predictor_columns, &decoded_length);
             free(decompressed_data);
 
             if (!decoded_data) {
@@ -1445,22 +1783,6 @@ Object* analyze_xref(char* data, int64_t offset, int64_t length, int *entry_coun
     }
 
     if (xref_type == 1) {
-        int64_t temp_offset = offset;
-        nested_level = 1;
-
-        char *dict_start = memmem(&data[temp_offset], length - temp_offset, "<<", 2);
-        if (!dict_start) {
-            return NULL;
-        }
-        temp_offset = dict_start - data + 2;
-        int64_t dict_scan_limit = temp_offset + 10000;
-
-        while (nested_level > 0 && temp_offset < dict_scan_limit) {
-            if ((temp_offset < length - 2) && !memcmp(&data[temp_offset], "<<", 2)) nested_level++;
-            if ((temp_offset < length - 2) && !memcmp(&data[temp_offset], ">>", 2)) nested_level--;
-            temp_offset++;
-        }
-
         entries = store_xref_table(data, offset, &num_entries, length, xref_end_offset);
         *entry_count = num_entries;
     }
@@ -1474,7 +1796,7 @@ Object* analyze_xref(char* data, int64_t offset, int64_t length, int *entry_coun
  *                      within stream and their location in it.
  *
  * @param data          The buffer containing the candidate.
- * @param offset        The offset of the Index array.
+ * @param offset        The offset of the Index array's opening bracket.
  * @param index_array_out   A pointer to store the extracted index array.
  * @param index_count_out   A pointer to store the count of entries in the index array
  * @param length        The length of the buffer.
@@ -1482,55 +1804,48 @@ Object* analyze_xref(char* data, int64_t offset, int64_t length, int *entry_coun
  * @return              0 on success, negative values on failure.
  */
 int extract_index_array(const char *data, int64_t offset, size_t **index_array_out, size_t *index_count_out, int64_t length) {
-    int64_t i = offset;
-
-
-
-    if(strncmp(&data[i], "/Index", 6) != 0) return -1;
-
-    if(i < length - 6){
-        i += 6;
+    if (!data || !index_array_out || !index_count_out || offset < 0
+        || offset >= length) {
+        return -1;
     }
-
-
-    while (i < length && isspace(data[i])) i++;
-
-    if (data[i] != '[') return -2;
-    i++;
-
+    size_t cursor = pdf_skip_space_and_comments((const unsigned char *)data,
+                                                offset, length);
+    if (cursor >= (uint64_t)length || data[cursor++] != '[') {
+        return -2;
+    }
     size_t capacity = 8;
     size_t count = 0;
-    size_t *index_array = (size_t*)malloc(capacity * sizeof(size_t));
-    if (!index_array) return -3;
-
-    while (i < length && data[i] != ']') {
-        while (i < length && isspace(data[i])) i++;
-        if (!isdigit(data[i])) break;
-
-        size_t val = 0;
-        while (i < length && isdigit(data[i])) {
-            val = val * 10 + (data[i] - '0');
-            i++;
+    size_t *index_array = malloc(capacity * sizeof(*index_array));
+    check_memory_allocation(index_array, __LINE__, __FILE__, "PDF xref index");
+    for (;;) {
+        cursor = pdf_skip_space_and_comments((const unsigned char *)data,
+                                              cursor, length);
+        if (cursor < (uint64_t)length && data[cursor] == ']') {
+            break;
         }
-
-        if (count >= capacity) {
-            capacity *= 2;
-            size_t *tmp = (size_t*)realloc(index_array, capacity * sizeof(size_t));
-            if (!tmp) {
+        int64_t value = 0;
+        if (!pdf_parse_signed_integer((const unsigned char *)data, length,
+                                        cursor, &value, &cursor)
+            || value < 0 || value > INT_MAX) {
+            free(index_array);
+            return -3;
+        }
+        if (count == capacity) {
+            if (capacity > SIZE_MAX / (2 * sizeof(*index_array))) {
                 free(index_array);
                 return -4;
             }
-        index_array = tmp;
+            capacity *= 2;
+            size_t *grown = realloc(index_array, capacity * sizeof(*index_array));
+            check_memory_allocation(grown, __LINE__, __FILE__, "PDF xref index");
+            index_array = grown;
         }
-
-        index_array[count++] = val;
-        }
-
-        if (data[i] != ']') {
-            free(index_array);
-            return -5;
-        }
-
+        index_array[count++] = (size_t)value;
+    }
+    if (count == 0 || (count & 1) != 0) {
+        free(index_array);
+        return -5;
+    }
     *index_array_out = index_array;
     *index_count_out = count;
     return 0;
@@ -1586,7 +1901,7 @@ char *decompress_with_uncompress(const char *input, size_t input_length, size_t 
 }
 
 /**
- * @description         Applies PNG UP predictor reversal to decompressed PDF stream data.
+ * @description         Reverses PNG row filters in decompressed PDF stream data.
  *
  * @param input         The buffer containing the decompressed data.
  * @param input_length  The length of the decompressed data.
@@ -1597,8 +1912,10 @@ char *decompress_with_uncompress(const char *input, size_t input_length, size_t 
  */
 char *apply_png_predictor_up(const char *input, size_t input_length, size_t columns, size_t *out_length) {
 
-    if (!input || !out_length || columns == 0 || input_length == 0) {
-        if (out_length) *out_length = 0;
+    if (!input || !out_length || columns == 0 || columns >= input_length) {
+        if (out_length) {
+            *out_length = 0;
+        }
         return NULL;
     }
 
@@ -1606,7 +1923,7 @@ char *apply_png_predictor_up(const char *input, size_t input_length, size_t colu
     size_t row_count = input_length / row_stride;
     size_t remainder = input_length % row_stride;
 
-    if (row_count == 0) {
+    if (row_count == 0 || remainder != 0) {
         *out_length = 0;
         return NULL;
     }
@@ -1625,13 +1942,34 @@ char *apply_png_predictor_up(const char *input, size_t input_length, size_t colu
     for (size_t row = 0; row < row_count; row++) {
         size_t in_offset = row * row_stride;
         unsigned char filter_byte = in[in_offset];
+        if (filter_byte > 4) {
+            free(output);
+            *out_length = 0;
+            return NULL;
+        }
         const unsigned char *in_row = in + in_offset + 1;  // skip filter byte
         unsigned char *out_row = out + (row * columns);
         unsigned char *above_row = (row == 0) ? NULL : out_row - columns;
 
         for (size_t col = 0; col < columns; col++) {
             unsigned char above = above_row ? above_row[col] : 0;
-            out_row[col] = (in_row[col] + above) & 0xFF;
+            unsigned char left = col > 0 ? out_row[col - 1] : 0;
+            unsigned char upper_left = above_row && col > 0 ? above_row[col - 1] : 0;
+            int predictor = 0;
+            if (filter_byte == 1) {
+                predictor = left;
+            } else if (filter_byte == 2) {
+                predictor = above;
+            } else if (filter_byte == 3) {
+                predictor = (left + above) / 2;
+            } else if (filter_byte == 4) {
+                int estimate = left + above - upper_left;
+                int pa = abs(estimate - left);
+                int pb = abs(estimate - above);
+                int pc = abs(estimate - upper_left);
+                predictor = pa <= pb && pa <= pc ? left : (pb <= pc ? above : upper_left);
+            }
+            out_row[col] = (unsigned char)(in_row[col] + predictor);
         }
     }
 
@@ -1651,6 +1989,1143 @@ static int compare_objects(const void *a, const void *b) {
     return (obj_a->obj_offset > obj_b->obj_offset) - (obj_a->obj_offset < obj_b->obj_offset);
 }
 
+static inline bool pdf_lexical_space(unsigned char c) {
+    return c == 0 || c == '\t' || c == '\n' || c == '\f' || c == '\r' ||
+           c == ' ';
+}
+
+static inline bool pdf_lexical_delimiter(unsigned char c) {
+    return c == '(' || c == ')' || c == '<' || c == '>' || c == '[' ||
+           c == ']' || c == '{' || c == '}' || c == '/' || c == '%';
+}
+
+static uint64_t pdf_skip_space_and_comments(const unsigned char *data,
+                                            uint64_t offset,
+                                            uint64_t limit) {
+    for (;;) {
+        while (offset < limit && pdf_lexical_space(data[offset])) {
+            offset++;
+        }
+        if (offset >= limit || data[offset] != '%') {
+            return offset;
+        }
+        while (offset < limit && data[offset] != '\r' && data[offset] != '\n') {
+            offset++;
+        }
+    }
+}
+
+// Parse an indirect object header: 1 is complete, 0 needs more bytes, and -1
+// contradicts the expected header. A number alone does not identify an object.
+static int pdf_indirect_object_header(const unsigned char *data,
+                                           uint64_t offset,
+                                           uint64_t limit,
+                                           int expected_object,
+                                           uint64_t *body_start,
+                                           int *generation) {
+    if (!data || !body_start || expected_object < 0 || offset >= limit) {
+        return -1;
+    }
+
+    offset = pdf_skip_space_and_comments(data, offset, limit);
+    if (offset == limit) {
+        return 0;
+    }
+    uint64_t object_number = 0;
+    uint64_t digit_start = offset;
+    while (offset < limit && isdigit(data[offset])) {
+        unsigned int digit = (unsigned int)(data[offset] - '0');
+        if (object_number > ((uint64_t)INT_MAX - digit) / 10U) {
+            return -1;
+        }
+        object_number = object_number * 10U + digit;
+        offset++;
+    }
+    if (offset == limit) {
+        return object_number <= (uint64_t)expected_object ? 0 : -1;
+    }
+    if (offset == digit_start || object_number != (uint64_t)expected_object) {
+        return -1;
+    }
+
+    uint64_t separator = offset;
+    offset = pdf_skip_space_and_comments(data, offset, limit);
+    if (offset == separator) {
+        return -1;
+    }
+    if (offset == limit) {
+        return 0;
+    }
+
+    uint64_t generation_number = 0;
+    digit_start = offset;
+    while (offset < limit && isdigit(data[offset])) {
+        unsigned int digit = (unsigned int)(data[offset] - '0');
+        if (generation_number > ((uint64_t)INT_MAX - digit) / 10U) {
+            return -1;
+        }
+        generation_number = generation_number * 10U + digit;
+        offset++;
+    }
+    if (offset == digit_start) {
+        return -1;
+    }
+    if (offset == limit) {
+        return 0;
+    }
+
+    separator = offset;
+    offset = pdf_skip_space_and_comments(data, offset, limit);
+    if (offset == separator) {
+        return -1;
+    }
+    if (limit - offset < 3) {
+        return memcmp(data + offset, "obj", (size_t)(limit - offset)) ? -1 : 0;
+    }
+    if (memcmp(data + offset, "obj", 3)) {
+        return -1;
+    }
+    offset += 3;
+    if (offset < limit && !pdf_lexical_space(data[offset]) &&
+        !pdf_lexical_delimiter(data[offset])) {
+        return -1;
+    }
+
+    *body_start = offset;
+    if (generation) {
+        *generation = (int)generation_number;
+    }
+    return 1;
+}
+
+static bool pdf_indirect_object_body_start(const unsigned char *data,
+                                           uint64_t offset, uint64_t limit,
+                                           int expected_object,
+                                           uint64_t *body_start,
+                                           int *generation) {
+    return pdf_indirect_object_header(data, offset, limit, expected_object,
+                                      body_start, generation) == 1;
+}
+
+// Skip one lexical token without interpreting names inside strings as keys.
+static bool pdf_token_end(const unsigned char *data, size_t length,
+                           size_t offset, size_t *end) {
+    if (offset >= length) {
+        return false;
+    }
+    unsigned char first = data[offset++];
+    if (first == '(') {
+        size_t depth = 1;
+        while (offset < length && depth > 0) {
+            unsigned char c = data[offset++];
+            if (c == '\\') {
+                if (offset == length) {
+                    return false;
+                }
+                offset++;
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            }
+        }
+        if (depth != 0) {
+            return false;
+        }
+    } else if (first == '<' && (offset == length || data[offset] != '<')) {
+        while (offset < length && data[offset] != '>') {
+            if (!isxdigit(data[offset]) && !pdf_lexical_space(data[offset])) {
+                return false;
+            }
+            offset++;
+        }
+        if (offset == length) {
+            return false;
+        }
+        offset++;
+    } else if ((first == '<' || first == '>') && offset < length
+               && data[offset] == first) {
+        offset++;
+    } else if (first == '/' || !pdf_lexical_delimiter(first)) {
+        while (offset < length && !pdf_lexical_space(data[offset])
+               && !pdf_lexical_delimiter(data[offset])) {
+            offset++;
+        }
+    }
+    *end = offset;
+    return true;
+}
+
+// Look up an outer dictionary entry, excluding nested keys and name values.
+static bool pdf_find_name_value(const unsigned char *data, size_t length,
+                                const char *name, size_t *value_offset) {
+    if (!data || !name || !value_offset) {
+        return false;
+    }
+    size_t name_length = strlen(name);
+    if (name_length == 0 || name_length > length) {
+        return false;
+    }
+    size_t offset = pdf_skip_space_and_comments(data, 0, length);
+    if (length - offset < 2 || memcmp(data + offset, "<<", 2)) {
+        return false;
+    }
+    offset += 2;
+    while (offset < length) {
+        offset = pdf_skip_space_and_comments(data, offset, length);
+        if (offset >= length || data[offset] != '/') {
+            return false;
+        }
+        size_t end = 0;
+        if (!pdf_token_end(data, length, offset, &end)) {
+            return false;
+        }
+        size_t value = pdf_skip_space_and_comments(data, end, length);
+        if (end - offset == name_length + 1
+            && !memcmp(data + offset + 1, name, name_length)) {
+            *value_offset = value;
+            return value < length;
+        }
+        size_t depth = 0;
+        offset = value;
+        do {
+            offset = pdf_skip_space_and_comments(data, offset, length);
+            if (!pdf_token_end(data, length, offset, &end)) {
+                return false;
+            }
+            bool opening = data[offset] == '['
+                || (end - offset == 2 && !memcmp(data + offset, "<<", 2));
+            bool closing = data[offset] == ']'
+                || (end - offset == 2 && !memcmp(data + offset, ">>", 2));
+            if (opening) {
+                depth++;
+            } else if (closing) {
+                if (depth == 0) {
+                    return false;
+                }
+                depth--;
+            }
+            offset = end;
+        } while (depth > 0);
+        int reference = -1;
+        if (pdf_parse_indirect_reference(data, length, value, &reference)) {
+            for (int token = 0; token < 2; token++) {
+                offset = pdf_skip_space_and_comments(data, offset, length);
+                if (!pdf_token_end(data, length, offset, &offset)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool pdf_parse_signed_integer(const unsigned char *data, size_t length,
+                                     size_t offset, int64_t *value,
+                                     size_t *end_offset) {
+    if (!data || !value || offset >= length) {
+        return false;
+    }
+
+    offset = (size_t)pdf_skip_space_and_comments(
+        data, (uint64_t)offset, (uint64_t)length);
+    bool negative = false;
+    if (offset < length && (data[offset] == '+' || data[offset] == '-')) {
+        negative = data[offset] == '-';
+        offset++;
+    }
+    if (offset >= length || !isdigit(data[offset])) {
+        return false;
+    }
+
+    uint64_t magnitude = 0;
+    uint64_t maximum = negative ? (uint64_t)INT64_MAX + 1U
+                                : (uint64_t)INT64_MAX;
+    while (offset < length && isdigit(data[offset])) {
+        unsigned int digit = (unsigned int)(data[offset] - '0');
+        if (magnitude > (maximum - digit) / 10U) {
+            return false;
+        }
+        magnitude = magnitude * 10U + digit;
+        offset++;
+    }
+
+    if (negative) {
+        *value = magnitude == (uint64_t)INT64_MAX + 1U
+                     ? INT64_MIN
+                     : -(int64_t)magnitude;
+    } else {
+        *value = (int64_t)magnitude;
+    }
+    if (end_offset) {
+        *end_offset = offset;
+    }
+    return true;
+}
+
+static bool pdf_parse_string(const unsigned char *data, size_t length,
+                             size_t offset, unsigned char *output,
+                             size_t output_capacity, size_t *output_length) {
+    if (!data || !output || !output_length || offset >= length) {
+        return false;
+    }
+    offset = (size_t)pdf_skip_space_and_comments(
+        data, (uint64_t)offset, (uint64_t)length);
+    *output_length = 0;
+
+    if (offset < length && data[offset] == '<' &&
+        (offset + 1 >= length || data[offset + 1] != '<')) {
+        int high_nibble = -1;
+        for (offset++; offset < length; offset++) {
+            unsigned char c = data[offset];
+            if (c == '>') {
+                if (high_nibble >= 0) {
+                    if (*output_length >= output_capacity) {
+                        return false;
+                    }
+                    output[(*output_length)++] =
+                        (unsigned char)(high_nibble << 4);
+                }
+                return true;
+            }
+            if (pdf_lexical_space(c)) {
+                continue;
+            }
+            int nibble = -1;
+            if (c >= '0' && c <= '9') {
+                nibble = c - '0';
+            } else if (c >= 'A' && c <= 'F') {
+                nibble = c - 'A' + 10;
+            } else if (c >= 'a' && c <= 'f') {
+                nibble = c - 'a' + 10;
+            } else {
+                return false;
+            }
+            if (high_nibble < 0) {
+                high_nibble = nibble;
+            } else {
+                if (*output_length >= output_capacity) {
+                    return false;
+                }
+                output[(*output_length)++] =
+                    (unsigned char)((high_nibble << 4) | nibble);
+                high_nibble = -1;
+            }
+        }
+        return false;
+    }
+
+    if (offset >= length || data[offset] != '(') {
+        return false;
+    }
+    size_t depth = 1;
+    for (offset++; offset < length; offset++) {
+        unsigned char c = data[offset];
+        if (c == '\\') {
+            offset++;
+            if (offset >= length) {
+                return false;
+            }
+            c = data[offset];
+            if (c == '\r' || c == '\n') {
+                if (c == '\r' && offset + 1 < length &&
+                    data[offset + 1] == '\n') {
+                    offset++;
+                }
+                continue;
+            }
+            switch (c) {
+                case 'n': c = '\n'; break;
+                case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;
+                case 'b': c = '\b'; break;
+                case 'f': c = '\f'; break;
+                case '(':
+                case ')':
+                case '\\':
+                    break;
+                default:
+                    if (c >= '0' && c <= '7') {
+                        unsigned int octal = c - '0';
+                        int digits = 1;
+                        while (digits < 3 && offset + 1 < length &&
+                               data[offset + 1] >= '0' &&
+                               data[offset + 1] <= '7') {
+                            offset++;
+                            octal = octal * 8U +
+                                    (unsigned int)(data[offset] - '0');
+                            digits++;
+                        }
+                        c = (unsigned char)octal;
+                    }
+                    break;
+            }
+        } else if (c == '(') {
+            depth++;
+        } else if (c == ')') {
+            depth--;
+            if (depth == 0) {
+                return true;
+            }
+        }
+
+        if (*output_length >= output_capacity) {
+            return false;
+        }
+        output[(*output_length)++] = c;
+    }
+    return false;
+}
+
+static bool pdf_parse_indirect_reference(const unsigned char *data,
+                                         size_t length, size_t offset,
+                                         int *object_number) {
+    int64_t object = 0;
+    int64_t generation = 0;
+    size_t cursor = 0;
+    if (!object_number ||
+        !pdf_parse_signed_integer(data, length, offset, &object, &cursor) ||
+        object < 0 || object > INT_MAX ||
+        !pdf_parse_signed_integer(data, length, cursor, &generation, &cursor) ||
+        generation < 0 || generation > 65535) {
+        return false;
+    }
+    cursor = (size_t)pdf_skip_space_and_comments(
+        data, (uint64_t)cursor, (uint64_t)length);
+    if (cursor >= length || data[cursor] != 'R' ||
+        (cursor + 1 < length && !pdf_lexical_space(data[cursor + 1]) &&
+         !pdf_lexical_delimiter(data[cursor + 1]))) {
+        return false;
+    }
+    *object_number = (int)object;
+    return true;
+}
+
+static bool pdf_incremental_update_prefix(const unsigned char *data,
+                                          size_t length) {
+    if (!data || length == 0) {
+        return false;
+    }
+    size_t cursor = (size_t)pdf_skip_space_and_comments(
+        data, 0, (uint64_t)length);
+    if (cursor + 4 <= length && !memcmp(data + cursor, "xref", 4) &&
+        (cursor + 4 == length ||
+         pdf_lexical_space(data[cursor + 4]) ||
+         pdf_lexical_delimiter(data[cursor + 4]))) {
+        return true;
+    }
+
+    int64_t object_number = 0;
+    int64_t generation = 0;
+    if (!pdf_parse_signed_integer(data, length, cursor, &object_number,
+                                  &cursor) ||
+        object_number < 0 || object_number > INT_MAX ||
+        !pdf_parse_signed_integer(data, length, cursor, &generation,
+                                  &cursor) ||
+        generation < 0 || generation > 65535) {
+        return false;
+    }
+    cursor = (size_t)pdf_skip_space_and_comments(
+        data, (uint64_t)cursor, (uint64_t)length);
+    return cursor + 3 <= length && !memcmp(data + cursor, "obj", 3) &&
+           (cursor + 3 == length ||
+            pdf_lexical_space(data[cursor + 3]) ||
+            pdf_lexical_delimiter(data[cursor + 3]));
+}
+
+static bool pdf_md5(const unsigned char *data, size_t length,
+                    unsigned char digest[16]) {
+    if (!data || !digest) {
+        return false;
+    }
+    EVP_MD_CTX *context = EVP_MD_CTX_new();
+    if (!context) {
+        return false;
+    }
+    unsigned int digest_length = 0;
+    bool success = EVP_DigestInit_ex(context, EVP_md5(), NULL) == 1 &&
+                   EVP_DigestUpdate(context, data, length) == 1 &&
+                   EVP_DigestFinal_ex(context, digest, &digest_length) == 1 &&
+                   digest_length == 16;
+    EVP_MD_CTX_free(context);
+    return success;
+}
+
+static void pdf_rc4_crypt(const unsigned char *key, size_t key_length,
+                          const unsigned char *input, unsigned char *output,
+                          size_t length) {
+    unsigned char state[256];
+    for (size_t i = 0; i < sizeof(state); i++) {
+        state[i] = (unsigned char)i;
+    }
+
+    unsigned int j = 0;
+    for (unsigned int i = 0; i < 256; i++) {
+        j = (j + state[i] + key[i % key_length]) & 0xffU;
+        unsigned char swap = state[i];
+        state[i] = state[j];
+        state[j] = swap;
+    }
+
+    unsigned int i = 0;
+    j = 0;
+    for (size_t offset = 0; offset < length; offset++) {
+        i = (i + 1U) & 0xffU;
+        j = (j + state[i]) & 0xffU;
+        unsigned char swap = state[i];
+        state[i] = state[j];
+        state[j] = swap;
+        unsigned int index = (state[i] + state[j]) & 0xffU;
+        output[offset] = input[offset] ^ state[index];
+    }
+}
+
+// A classic xref's trailer and an xref stream's dictionary carry document
+// metadata. Keep their lookup inside the dictionary, not the candidate's tail.
+static bool pdf_xref_dictionary(const unsigned char *data, uint64_t length,
+                                 const XrefObject *xrefs, int num_tables,
+                                 int table, uint64_t *start, uint64_t *end) {
+    if (!data || !xrefs || !start || !end || table < 0 || table >= num_tables
+        || xrefs[table].offset < 0 || (uint64_t)xrefs[table].offset >= length
+        || length > SIZE_MAX) {
+        return false;
+    }
+    uint64_t offset = (uint64_t)xrefs[table].offset;
+    uint64_t limit = length;
+    if (table + 1 < num_tables && xrefs[table + 1].offset > xrefs[table].offset
+        && (uint64_t)xrefs[table + 1].offset < limit) {
+        limit = (uint64_t)xrefs[table + 1].offset;
+    }
+    const unsigned char *dictionary = memmem(data + offset, (size_t)(limit - offset),
+                                              "<<", 2);
+    if (!dictionary) {
+        return false;
+    }
+    *start = (uint64_t)(dictionary - data);
+    unsigned char *stack = NULL;
+    size_t capacity = 0;
+    bool found = pdf_nonstream_object_end(data, *start, limit, -1, &stack,
+                                           &capacity, end, NULL, NULL);
+    free(stack);
+    return found;
+}
+
+static bool pdf_initialize_encryption_context(
+    const unsigned char *data, uint64_t length, XrefTables *tables,
+    const XrefObject *xrefs, int num_tables, PDFEncryptionContext *context) {
+    static const unsigned char password_padding[32] = {
+        0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
+        0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+        0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80,
+        0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a
+    };
+    if (!data || length == 0 || length > SIZE_MAX || !tables || !xrefs
+        || num_tables <= 0 || !context) {
+        return false;
+    }
+    memset(context, 0, sizeof(*context));
+    context->encrypt_metadata = true;
+
+    int encrypt_object = -1;
+    const unsigned char *encryption_dictionary = NULL;
+    size_t encryption_dictionary_length = 0;
+    unsigned char document_id[64];
+    size_t document_id_length = 0;
+    for (int table = 0; table < num_tables; table++) {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        if (!tables[table].entries || tables[table].count <= 0
+            || !pdf_xref_dictionary(data, length, xrefs, num_tables, table,
+                                     &start, &end)) {
+            continue;
+        }
+        const unsigned char *dictionary = data + start;
+        size_t dictionary_length = (size_t)(end - start);
+        size_t relative_value = 0;
+        int candidate_object = -1;
+        if (pdf_find_name_value(dictionary, dictionary_length,
+                                 "Encrypt", &relative_value)) {
+            if (pdf_parse_indirect_reference(dictionary, dictionary_length,
+                                              relative_value, &candidate_object)) {
+                encrypt_object = candidate_object;
+                encryption_dictionary = NULL;
+                encryption_dictionary_length = 0;
+            }
+            else if (dictionary_length - relative_value >= 2
+                     && !memcmp(dictionary + relative_value, "<<", 2)) {
+                unsigned char *stack = NULL;
+                size_t capacity = 0;
+                uint64_t dictionary_end = 0;
+                bool found = pdf_nonstream_object_end(
+                    dictionary, relative_value, dictionary_length, -1,
+                    &stack, &capacity, &dictionary_end, NULL, NULL);
+                free(stack);
+                if (found) {
+                    encrypt_object = -1;
+                    encryption_dictionary = dictionary + relative_value;
+                    encryption_dictionary_length = (size_t)(dictionary_end - relative_value);
+                }
+            }
+        }
+        if (!pdf_find_name_value(dictionary, dictionary_length, "ID",
+                                  &relative_value)) {
+            continue;
+        }
+        if (relative_value < dictionary_length && dictionary[relative_value] == '[') {
+            unsigned char candidate_id[64];
+            size_t candidate_length = 0;
+            if (pdf_parse_string(dictionary, dictionary_length, relative_value + 1,
+                                 candidate_id, sizeof(candidate_id),
+                                 &candidate_length) &&
+                candidate_length > 0) {
+                memcpy(document_id, candidate_id, candidate_length);
+                document_id_length = candidate_length;
+            }
+        }
+    }
+    if ((encrypt_object < 0 && !encryption_dictionary) || document_id_length == 0) {
+        return false;
+    }
+
+    if (!encryption_dictionary) {
+        uint64_t encrypt_offset = search_tables_for_object(
+            tables, num_tables, encrypt_object);
+        if (encrypt_offset >= length) {
+            return false;
+        }
+        char *end_object = memmem(data + encrypt_offset,
+                                  (size_t)(length - encrypt_offset),
+                                  "endobj", 6);
+        uint64_t encrypt_limit = end_object
+                                     ? (uint64_t)(end_object - (char *)data) + 6
+                                     : length;
+        uint64_t dictionary_start = 0;
+        if (!pdf_indirect_object_body_start(data, encrypt_offset, encrypt_limit,
+                                            encrypt_object, &dictionary_start,
+                                            NULL)) {
+            return false;
+        }
+        encryption_dictionary = data + dictionary_start;
+        encryption_dictionary_length = (size_t)(encrypt_limit - dictionary_start);
+    }
+    const unsigned char *dictionary = encryption_dictionary;
+    size_t dictionary_length = encryption_dictionary_length;
+
+    size_t value_offset = 0;
+    if (!pdf_find_name_value(dictionary, dictionary_length, "Filter",
+                             &value_offset) ||
+        value_offset + 9 > dictionary_length ||
+        memcmp(dictionary + value_offset, "/Standard", 9) ||
+        (value_offset + 9 < dictionary_length &&
+         !pdf_lexical_space(dictionary[value_offset + 9]) &&
+         !pdf_lexical_delimiter(dictionary[value_offset + 9]))) {
+        return false;
+    }
+
+    int64_t revision = 0;
+    int64_t version = 0;
+    int64_t permissions = 0;
+    int64_t key_bits = 40;
+    if (!pdf_find_name_value(dictionary, dictionary_length, "R",
+                             &value_offset) ||
+        !pdf_parse_signed_integer(dictionary, dictionary_length, value_offset,
+                                  &revision, NULL) ||
+        !pdf_find_name_value(dictionary, dictionary_length, "V",
+                             &value_offset) ||
+        !pdf_parse_signed_integer(dictionary, dictionary_length, value_offset,
+                                  &version, NULL) ||
+        !pdf_find_name_value(dictionary, dictionary_length, "P",
+                             &value_offset) ||
+        !pdf_parse_signed_integer(dictionary, dictionary_length, value_offset,
+                                  &permissions, NULL)) {
+        return false;
+    }
+    if (revision == 2) {
+        if (version != 1 && version != 2) {
+            return false;
+        }
+        key_bits = 40;
+    } else if (revision == 3 && version == 2) {
+        if (pdf_find_name_value(dictionary, dictionary_length, "Length",
+                                &value_offset) &&
+            !pdf_parse_signed_integer(dictionary, dictionary_length,
+                                      value_offset, &key_bits, NULL)) {
+            return false;
+        }
+        if (key_bits < 40 || key_bits > 128 || key_bits % 8 != 0) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    unsigned char owner_entry[64];
+    unsigned char user_entry[64];
+    size_t owner_length = 0;
+    size_t user_length = 0;
+    if (!pdf_find_name_value(dictionary, dictionary_length, "O",
+                             &value_offset) ||
+        !pdf_parse_string(dictionary, dictionary_length, value_offset,
+                          owner_entry, sizeof(owner_entry), &owner_length) ||
+        owner_length != 32 ||
+        !pdf_find_name_value(dictionary, dictionary_length, "U",
+                             &value_offset) ||
+        !pdf_parse_string(dictionary, dictionary_length, value_offset,
+                          user_entry, sizeof(user_entry), &user_length)) {
+        return false;
+    }
+
+    size_t key_length = revision == 2 ? 5 : (size_t)(key_bits / 8);
+    unsigned char key_input[32 + 32 + 4 + sizeof(document_id)];
+    size_t key_input_length = 0;
+    memcpy(key_input + key_input_length, password_padding,
+           sizeof(password_padding));
+    key_input_length += sizeof(password_padding);
+    memcpy(key_input + key_input_length, owner_entry, 32);
+    key_input_length += 32;
+    uint32_t permissions_word = (uint32_t)permissions;
+    for (int byte = 0; byte < 4; byte++) {
+        key_input[key_input_length++] =
+            (unsigned char)((permissions_word >> (byte * 8)) & 0xffU);
+    }
+    memcpy(key_input + key_input_length, document_id, document_id_length);
+    key_input_length += document_id_length;
+
+    unsigned char digest[16];
+    if (!pdf_md5(key_input, key_input_length, digest)) {
+        return false;
+    }
+    if (revision >= 3) {
+        for (int round = 0; round < 50; round++) {
+            if (!pdf_md5(digest, key_length, digest)) {
+                return false;
+            }
+        }
+    }
+
+    unsigned char expected_user[32];
+    if (revision == 2) {
+        if (user_length != 32) {
+            return false;
+        }
+        pdf_rc4_crypt(digest, key_length, password_padding, expected_user,
+                      sizeof(expected_user));
+        if (memcmp(expected_user, user_entry, sizeof(expected_user))) {
+            return false;
+        }
+    } else {
+        if (user_length < 16) {
+            return false;
+        }
+        unsigned char user_seed[32 + sizeof(document_id)];
+        memcpy(user_seed, password_padding, sizeof(password_padding));
+        memcpy(user_seed + sizeof(password_padding), document_id,
+               document_id_length);
+        if (!pdf_md5(user_seed, sizeof(password_padding) + document_id_length,
+                     expected_user)) {
+            return false;
+        }
+        unsigned char encrypted_user[16];
+        pdf_rc4_crypt(digest, key_length, expected_user, encrypted_user,
+                      sizeof(encrypted_user));
+        for (unsigned int round = 1; round <= 19; round++) {
+            unsigned char round_key[16];
+            for (size_t byte = 0; byte < key_length; byte++) {
+                round_key[byte] = digest[byte] ^ (unsigned char)round;
+            }
+            pdf_rc4_crypt(round_key, key_length, encrypted_user,
+                          encrypted_user, sizeof(encrypted_user));
+        }
+        if (memcmp(encrypted_user, user_entry, sizeof(encrypted_user))) {
+            return false;
+        }
+    }
+
+    memcpy(context->file_key, digest, key_length);
+    context->file_key_length = key_length;
+    context->active = true;
+    return true;
+}
+
+static bool pdf_decrypt_stream(const PDFEncryptionContext *context,
+                               int object_number, int generation,
+                               const unsigned char *input, size_t length,
+                               unsigned char *output) {
+    if (!context || !context->active || context->file_key_length == 0 ||
+        context->file_key_length > sizeof(context->file_key) ||
+        object_number < 0 || generation < 0 || generation > 65535 ||
+        (!input && length != 0) || (!output && length != 0)) {
+        return false;
+    }
+
+    unsigned char key_material[21];
+    memcpy(key_material, context->file_key, context->file_key_length);
+    size_t key_material_length = context->file_key_length;
+    key_material[key_material_length++] = (unsigned char)(object_number & 0xff);
+    key_material[key_material_length++] =
+        (unsigned char)((object_number >> 8) & 0xff);
+    key_material[key_material_length++] =
+        (unsigned char)((object_number >> 16) & 0xff);
+    key_material[key_material_length++] = (unsigned char)(generation & 0xff);
+    key_material[key_material_length++] =
+        (unsigned char)((generation >> 8) & 0xff);
+
+    unsigned char digest[16];
+    if (!pdf_md5(key_material, key_material_length, digest)) {
+        return false;
+    }
+    size_t object_key_length = context->file_key_length + 5;
+    if (object_key_length > sizeof(digest)) {
+        object_key_length = sizeof(digest);
+    }
+    pdf_rc4_crypt(digest, object_key_length, input, output, length);
+    return true;
+}
+
+static bool pdf_syntax_push(unsigned char **stack, size_t *stack_capacity,
+                            size_t depth, unsigned char delimiter) {
+    if (depth == *stack_capacity) {
+        size_t new_capacity = *stack_capacity == 0 ? 64 : *stack_capacity * 2;
+        if (new_capacity <= *stack_capacity) {
+            return false;
+        }
+        unsigned char *grown = realloc(*stack, new_capacity);
+        if (!grown) {
+            return false;
+        }
+        *stack = grown;
+        *stack_capacity = new_capacity;
+    }
+    (*stack)[depth] = delimiter;
+    return true;
+}
+
+static bool pdf_nonstream_object_well_formed(const unsigned char *data,
+                                             uint64_t offset,
+                                             uint64_t limit,
+                                             int expected_object,
+                                             unsigned char **stack,
+                                             size_t *stack_capacity) {
+    return pdf_nonstream_object_end(data, offset, limit, expected_object,
+                                    stack, stack_capacity, NULL, NULL, NULL);
+}
+
+static bool pdf_nonstream_object_end(const unsigned char *data,
+                                    uint64_t offset, uint64_t limit,
+                                    int expected_object, unsigned char **stack,
+                                    size_t *stack_capacity, uint64_t *end,
+                                    PDFStreamMetadata *metadata, bool (*stop)(void)) {
+    // A negative object number scans a standalone trailer dictionary.
+    uint64_t cursor = offset;
+    if (expected_object >= 0
+        && !pdf_indirect_object_body_start(data, offset, limit,
+                                            expected_object, &cursor, NULL)) {
+        return false;
+    }
+
+    size_t depth = 0;
+    uint32_t work = 0;
+    bool saw_dictionary = false;
+    while (cursor < limit) {
+        if (stop && (work++ & 1023) == 0 && stop()) {
+            return false;
+        }
+        unsigned char c = data[cursor];
+        if (pdf_lexical_space(c)) {
+            cursor++;
+            continue;
+        }
+        if (c == '%') {
+            if (stop) {
+                while (cursor < limit && data[cursor] != '\r' && data[cursor] != '\n') {
+                    if ((work++ & 1023) == 0 && stop()) {
+                        return false;
+                    }
+                    cursor++;
+                }
+                continue;
+            }
+            cursor = pdf_skip_space_and_comments(data, cursor, limit);
+            continue;
+        }
+        if (c == '(') {
+            uint64_t paren_depth = 1;
+            cursor++;
+            while (cursor < limit && paren_depth > 0) {
+                if (stop && (work++ & 1023) == 0 && stop()) {
+                    return false;
+                }
+                c = data[cursor++];
+                if (c == '\\') {
+                    if (cursor >= limit) {
+                        if (metadata) {
+                            metadata->incomplete = true;
+                        }
+                        return false;
+                    }
+                    if (data[cursor] == '\r') {
+                        cursor++;
+                        if (cursor < limit && data[cursor] == '\n') {
+                            cursor++;
+                        }
+                    } else {
+                        cursor++;
+                    }
+                } else if (c == '(') {
+                    paren_depth++;
+                } else if (c == ')') {
+                    paren_depth--;
+                }
+            }
+            if (paren_depth != 0) {
+                if (metadata) {
+                    metadata->incomplete = true;
+                }
+                return false;
+            }
+            continue;
+        }
+        if (c == '<') {
+            if (cursor + 1 < limit && data[cursor + 1] == '<') {
+                if (!pdf_syntax_push(stack, stack_capacity, depth, '<')) {
+                    return false;
+                }
+                depth++;
+                saw_dictionary = true;
+                cursor += 2;
+                continue;
+            }
+            cursor++;
+            while (cursor < limit && data[cursor] != '>') {
+                if (stop && (work++ & 1023) == 0 && stop()) {
+                    return false;
+                }
+                c = data[cursor++];
+                if (!pdf_lexical_space(c) && !isxdigit(c)) {
+                    return false;
+                }
+            }
+            if (cursor >= limit) {
+                if (metadata) {
+                    metadata->incomplete = true;
+                }
+                return false;
+            }
+            cursor++;
+            continue;
+        }
+        if (c == '>') {
+            if (cursor + 1 >= limit || data[cursor + 1] != '>' || depth == 0 ||
+                (*stack)[depth - 1] != '<') {
+                if (metadata && cursor + 1 == limit && depth > 0
+                    && (*stack)[depth - 1] == '<') {
+                    metadata->incomplete = true;
+                }
+                return false;
+            }
+            depth--;
+            cursor += 2;
+            if (depth == 0 && expected_object < 0) {
+                if (end) {
+                    *end = cursor;
+                }
+                return saw_dictionary;
+            }
+            continue;
+        }
+        if (c == '[') {
+            if (!pdf_syntax_push(stack, stack_capacity, depth, '[')) {
+                return false;
+            }
+            depth++;
+            cursor++;
+            continue;
+        }
+        if (c == ']') {
+            if (depth == 0 || (*stack)[depth - 1] != '[') {
+                return false;
+            }
+            depth--;
+            cursor++;
+            continue;
+        }
+        if (c == ')' || c == '{' || c == '}') {
+            return false;
+        }
+        if (c == '/') {
+            cursor++;
+            uint64_t name_start = cursor;
+            while (cursor < limit && !pdf_lexical_space(data[cursor]) &&
+                   !pdf_lexical_delimiter(data[cursor])) {
+                if (stop && (work++ & 1023) == 0 && stop()) {
+                    return false;
+                }
+                if (data[cursor] < 32) {
+                    return false;
+                }
+                cursor++;
+            }
+            // Stream attributes belong to the outer dictionary, not strings
+            // or nested dictionaries such as DecodeParms.
+            if (metadata && depth == 1 && (*stack)[0] == '<') {
+                uint64_t value = pdf_partial_skip_space(data, cursor, limit, stop);
+                if (cursor - name_start == 6
+                    && !memcmp(data + name_start, "Length", 6)) {
+                    size_t value_end = 0;
+                    metadata->has_length = pdf_parse_signed_integer(
+                        data, limit, value, &metadata->length, &value_end)
+                        && metadata->length >= 0;
+                    if (metadata->has_length) {
+                        uint64_t next = pdf_partial_skip_space(data, value_end, limit, stop);
+                        if (next < limit && isdigit(data[next])) {
+                            metadata->has_length = false;
+                        }
+                    }
+                }
+                else if (cursor - name_start == 6
+                         && !memcmp(data + name_start, "Filter", 6)) {
+                    metadata->has_filter = true;
+                    if (value < limit && data[value] == '[') {
+                        value = pdf_partial_skip_space(data, value + 1, limit, stop);
+                    }
+                    const char filter[] = "/FlateDecode";
+                    size_t filter_length = sizeof(filter) - 1;
+                    metadata->flate = value <= limit && filter_length <= limit - value
+                        && !memcmp(data + value, filter, filter_length)
+                        && (value + filter_length == limit
+                            || pdf_lexical_space(data[value + filter_length])
+                            || pdf_lexical_delimiter(data[value + filter_length]));
+                    const char jpeg_filter[] = "/DCTDecode";
+                    filter_length = sizeof(jpeg_filter) - 1;
+                    metadata->jpeg = value <= limit && filter_length <= limit - value
+                        && !memcmp(data + value, jpeg_filter, filter_length)
+                        && (value + filter_length == limit
+                            || pdf_lexical_space(data[value + filter_length])
+                            || pdf_lexical_delimiter(data[value + filter_length]));
+                }
+                else if (cursor - name_start == 7
+                         && !memcmp(data + name_start, "Subtype", 7)) {
+                    metadata->xml = value <= limit && 4 <= limit - value
+                        && !memcmp(data + value, "/XML", 4)
+                        && (value + 4 == limit || pdf_lexical_space(data[value + 4])
+                            || pdf_lexical_delimiter(data[value + 4]));
+                }
+            }
+            continue;
+        }
+        if (c < 32) {
+            return false;
+        }
+
+        uint64_t token_start = cursor;
+        while (cursor < limit && !pdf_lexical_space(data[cursor]) &&
+               !pdf_lexical_delimiter(data[cursor])) {
+            if (stop && (work++ & 1023) == 0 && stop()) {
+                return false;
+            }
+            if (data[cursor] < 32) {
+                return false;
+            }
+            cursor++;
+        }
+        uint64_t token_length = cursor - token_start;
+        if (depth == 0 && token_length == 6 &&
+            !memcmp(data + token_start, "stream", 6)) {
+            if (saw_dictionary && end) {
+                *end = cursor;
+            }
+            return saw_dictionary;
+        }
+        if (depth == 0 && token_length == 6 &&
+            !memcmp(data + token_start, "endobj", 6)) {
+            if (end) {
+                *end = cursor;
+            }
+            return true;
+        }
+    }
+    if (metadata) {
+        metadata->incomplete = true;
+    }
+    return false;
+}
+
+static bool pdf_nonstream_objects_well_formed(char *data, uint64_t length,
+                                               XrefTables *tables,
+                                               int num_tables) {
+    if (!data || !tables || num_tables <= 0) {
+        return false;
+    }
+
+    size_t object_capacity = 0;
+    for (int table = 0; table < num_tables; table++) {
+        if (tables[table].entries && tables[table].count > 0) {
+            size_t table_count = (size_t)tables[table].count;
+            if (table_count > SIZE_MAX - object_capacity) {
+                return false;
+            }
+            object_capacity += table_count;
+        }
+    }
+    if (object_capacity == 0) {
+        return false;
+    }
+
+    Object *objects = malloc(object_capacity * sizeof(*objects));
+    check_memory_allocation(objects, __LINE__, __FILE__,
+                            "PDF syntax object list");
+    size_t object_count = 0;
+    for (int table = 0; table < num_tables; table++) {
+        if (!tables[table].entries || tables[table].count <= 0) {
+            continue;
+        }
+        for (int entry = 0; entry < tables[table].count; entry++) {
+            Object object = tables[table].entries[entry];
+            if (object.obj_num >= 0 && object.obj_offset < length) {
+                objects[object_count++] = object;
+            }
+        }
+    }
+    if (object_count == 0) {
+        free(objects);
+        return false;
+    }
+    qsort(objects, object_count, sizeof(*objects), compare_objects);
+
+    size_t unique_count = 0;
+    for (size_t i = 0; i < object_count; i++) {
+        if (unique_count > 0 &&
+            objects[i].obj_offset == objects[unique_count - 1].obj_offset) {
+            if (objects[i].obj_num != objects[unique_count - 1].obj_num) {
+                free(objects);
+                return false;
+            }
+            continue;
+        }
+        objects[unique_count++] = objects[i];
+    }
+
+    unsigned char *stack = NULL;
+    size_t stack_capacity = 0;
+    bool well_formed = true;
+    for (size_t i = 0; i < unique_count; i++) {
+        uint64_t limit = i + 1 < unique_count
+                             ? objects[i + 1].obj_offset
+                             : length;
+        if (limit <= objects[i].obj_offset ||
+            !pdf_nonstream_object_well_formed(
+                (const unsigned char *)data, objects[i].obj_offset, limit,
+                objects[i].obj_num, &stack, &stack_capacity)) {
+            well_formed = false;
+            break;
+        }
+    }
+
+    free(stack);
+    free(objects);
+    return well_formed;
+}
+
 /**
  * @description  Sorts a table's object entries in place by ascending obj_offset.
  * @param data   The xref table whose entries are sorted.
@@ -1658,7 +3133,7 @@ static int compare_objects(const void *a, const void *b) {
  */
 void sort_xref_data_by_offset(XrefTables *data) {
     if (!data || !data->entries || data->count == 0) return;
-    
+
     qsort(data->entries, data->count, sizeof(Object), compare_objects);
 }
 
@@ -1736,12 +3211,12 @@ int *list_candidate_objects(char *data, uint64_t length, int *obj_count) {
 
     while ((obj_pos = memmem(obj_pos, end - obj_pos, "obj", 3))) {
         size_t offset = obj_pos - data;
-        
+
         if (obj_pos >= data + 2) {
             char c1 = obj_pos[-1];
             char c2 = obj_pos[-2];
             char c3 = (obj_pos + 3 < end) ? obj_pos[3] : '\n';
-            
+
             int valid_before = (c1 == ' ' || c1 == '\t' || c1 == '\n' || c1 == '\r') &&
                                (c2 >= '0' && c2 <= '9');
             int valid_after = (c3 == ' ' || c3 == '\t' || c3 == '\n' || c3 == '\r' ||
@@ -1823,15 +3298,53 @@ int64_t scan_blocks_for_object(int obj_num, uint64_t obj_offset){
     uint64_t evaluated;
     int64_t block_choice;
     int64_t result = -1;
+    int64_t incomplete = -1;
     init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
-    inflate_blockvector(scan_bv);
     uint64_t local_offset = obj_offset % scalpel_state.blocksize;
 
     while ((block_choice = blockvector_get_choice(scan_bv, slot, start, -1, &evaluated)) != -1) {
         blockvector_remove_choice(scan_bv, slot, block_choice);
         start = block_choice + 1;
-        char *blk = (char*)get_apparent_block_data(scalpel_state.filemirror, block_choice);
-        int check = validate_at_offset(blk, local_offset, obj_num, scalpel_state.blocksize);
+        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            incomplete = -1;
+            break;
+        }
+        unsigned char *blk = (unsigned char *)get_apparent_block_data(
+            scalpel_state.filemirror, block_choice);
+        uint64_t body_start = 0;
+        uint64_t length = scalpel_state.blocksize;
+        int check = pdf_indirect_object_header(blk, local_offset, length,
+                                               obj_num, &body_start, NULL);
+        if (check == 0 && incomplete < 0) {
+            incomplete = block_choice;
+        }
+        int64_t actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror, block_choice);
+        uint64_t image_blocks = CEILDIV(filemirror_filesize(scalpel_state.filemirror),
+                                        scalpel_state.blocksize);
+        // Prefer a complete header, including one crossing adjacent blocks.
+        // If its continuation is displaced, keep the partial match as a fallback.
+        while (check == 0 && actual >= 0 && (uint64_t)actual + 1 < image_blocks &&
+               !atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            actual++;
+            int64_t next = filemirror_apparent_blocknumber(
+                scalpel_state.filemirror, actual);
+            if (next < 0 || length > SIZE_MAX - scalpel_state.blocksize) {
+                break;
+            }
+            unsigned char *tail = (unsigned char *)get_apparent_block_data(
+                scalpel_state.filemirror, next);
+            if (!tail) {
+                break;
+            }
+            blk = realloc(blk, (size_t)(length + scalpel_state.blocksize));
+            check_memory_allocation(blk, __LINE__, __FILE__, "PDF object header");
+            memcpy(blk + length, tail, scalpel_state.blocksize);
+            free(tail);
+            length += scalpel_state.blocksize;
+            check = pdf_indirect_object_header(blk, local_offset, length,
+                                               obj_num, &body_start, NULL);
+        }
         free(blk);
         if (check == 1) {
             result = block_choice;
@@ -1839,7 +3352,7 @@ int64_t scan_blocks_for_object(int obj_num, uint64_t obj_offset){
         }
     }
     free_blockvector(&scan_bv);
-    return result;
+    return result >= 0 ? result : incomplete;
 }
 
 /**
@@ -1854,14 +3367,16 @@ int64_t scan_blocks_for_object(int obj_num, uint64_t obj_offset){
  * @param dict         The object's dictionary bytes.
  * @param dict_len     Length of the dictionary.
  * @param obj_offset   File offset of the object owning the dictionary.
+ * @param search_image Allow reassembly to look outside the assembled candidate.
  * @return       The stream length, or LENGTHNOTFOUND if none could be resolved.
  */
 int check_last_object_length(char *data, uint64_t length, uint64_t *out_offset,
                               XrefTables *test_tables, int num_tables,
-                              const char *dict, int dict_len, uint64_t obj_offset) {
+                              const char *dict, int dict_len, uint64_t obj_offset,
+                              bool search_image) {
     int64_t object_length = 0;
     int obj_num = -1;
-    for(int64_t i = 0; i + 7 <= dict_len; i++){
+    for(int64_t i = 0; i + 7 < dict_len; i++){
         if(!memcmp(&dict[i], "/Length", 7) && !isdigit((unsigned char)dict[i + 7])){
             bool is_indirect = is_indirect_object((char*)dict, (uint64_t)dict_len, i + 7, &obj_num);
             if(!is_indirect){
@@ -1885,7 +3400,7 @@ int check_last_object_length(char *data, uint64_t length, uint64_t *out_offset,
                         object_length = extract_int(data, pos + 4, (int64_t)length, NULL);
                 }
                 // Fallback: image-wide scan for the length object.
-                if(object_length <= 0){
+                if(object_length <= 0 && search_image){
                     object_length = 0;
                     int64_t obj_block = scan_blocks_for_object(obj_num, ref_offset);
                     if(obj_block != -1){
@@ -2022,6 +3537,42 @@ int calculate_stream_offsets(char *data, uint64_t object_length,
 }
 
 /**
+ * @description  Confirms that zlib reached its checksum while accounting for the
+ *               complete declared stream extent. PDF producers occasionally
+ *               include PDF whitespace after the zlib member in /Length; those
+ *               bytes are accepted, but arbitrary unconsumed data is not.
+ * @param stream    The zlib state after Z_STREAM_END.
+ * @param supplied  Bytes supplied from the declared extent.
+ * @param declared  Declared stream length.
+ * @return       true when all declared bytes were consumed or the only
+ *               unconsumed bytes are PDF whitespace.
+ */
+static bool pdf_zlib_extent_complete(const z_stream *stream,
+                                     size_t supplied,
+                                     size_t declared) {
+    if (!stream || supplied != declared || stream->total_in > declared) {
+        return false;
+    }
+
+    size_t trailing = declared - (size_t)stream->total_in;
+    if (trailing == 0) {
+        return true;
+    }
+    if (!stream->next_in || stream->avail_in != trailing) {
+        return false;
+    }
+
+    for (size_t i = 0; i < trailing; i++) {
+        unsigned char c = stream->next_in[i];
+        if (c != 0 && c != '\t' && c != '\n' && c != '\f' &&
+            c != '\r' && c != ' ') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
  * @description  Initialises a zlib stream reassembler and inflates the stream's
  *               first block from stream_offset (capped at /Length), recording an
  *               inflate checkpoint that later blocks are tried against.
@@ -2054,8 +3605,9 @@ int zlib_stream_reassembler_init(ZlibStreamReassembler *r, const unsigned char *
     r->strm.next_in  = (Bytef *)(first_block + stream_offset);
     r->strm.avail_in = avail;
     r->fed = avail;
+    bool stream_ended = false;
 
-        do {
+    do {
         r->strm.next_out  = tmp;
         r->strm.avail_out = sizeof(tmp);
         int ret = inflate(&r->strm, Z_NO_FLUSH);
@@ -2076,7 +3628,21 @@ int zlib_stream_reassembler_init(ZlibStreamReassembler *r, const unsigned char *
         memcpy(r->output + r->output_len, tmp, produced);
         r->output_len += produced;
 
+        if (ret == Z_STREAM_END) {
+            stream_ended = true;
+            break;
+        }
+
     } while (r->strm.avail_out == 0);
+
+    if ((stream_ended && stream_length &&
+         !pdf_zlib_extent_complete(&r->strm, r->fed, stream_length)) ||
+        (!stream_ended && stream_length && r->fed >= stream_length)) {
+        inflateEnd(&r->strm);
+        free(r->output);
+        r->output = NULL;
+        return -1;
+    }
 
     // Snapshot this as our first checkpoint
     if (inflateCopy(&r->checkpoint, &r->strm) != Z_OK) {
@@ -2087,6 +3653,7 @@ int zlib_stream_reassembler_init(ZlibStreamReassembler *r, const unsigned char *
     }
 
     r->total_verified = r->output_len;
+    r->ended = stream_ended;
     return 0;
 }
 
@@ -2161,7 +3728,7 @@ int zlib_stream_reassembler_try_block(ZlibStreamReassembler *r, const unsigned c
 
     } while (r->strm.avail_out == 0);
 
-    r->fed += take - r->strm.avail_in;          // bytes actually consumed
+    r->fed += take;
 
     /*
      * Completion gate. Once the declared /Length has been consumed the stream
@@ -2171,7 +3738,11 @@ int zlib_stream_reassembler_try_block(ZlibStreamReassembler *r, const unsigned c
      * proves the assembled block sequence is wrong, even though every
      * individual block decoded without error.
      */
-    if (r->stream_length && r->fed >= r->stream_length && !stream_ended) {
+    if ((stream_ended && r->stream_length &&
+         !pdf_zlib_extent_complete(&r->strm, r->fed,
+                                   r->stream_length)) ||
+        (!stream_ended && r->stream_length &&
+         r->fed >= r->stream_length)) {
         inflateEnd(&r->strm);
         inflateCopy(&r->strm, &r->checkpoint);
         r->output_len = saved_output_len;
@@ -2198,6 +3769,53 @@ void zlib_stream_reassembler_free(ZlibStreamReassembler *r) {
     inflateEnd(&r->strm);
     inflateEnd(&r->checkpoint);
     free(r->output);
+}
+
+// Count forward blocks that can precede a replacement run in an unfinished
+// Flate stream. Once a prefix fails, changing later blocks cannot repair it.
+// Return -1 on a checkpoint request or -2 if the initial stream is unusable.
+static int pdf_zlib_contiguous_prefix_blocks(const unsigned char *first_block,
+                                            size_t stream_offset,
+                                            size_t stream_length,
+                                            int64_t first_apparent,
+                                            int maximum) {
+    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        return -1;
+    }
+    ZlibStreamReassembler prefix;
+    if (zlib_stream_reassembler_init(&prefix, first_block,
+                                    scalpel_state.blocksize, stream_offset,
+                                    stream_length) == -1) {
+        return -2;
+    }
+    if (prefix.ended) {
+        zlib_stream_reassembler_free(&prefix);
+        return -2;
+    }
+
+    int accepted = 0;
+    int64_t total = (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
+    while (accepted < maximum && first_apparent >= 0 &&
+           first_apparent < total - 1 - accepted) {
+        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            zlib_stream_reassembler_free(&prefix);
+            return -1;
+        }
+        const unsigned char *block = get_apparent_block_data(
+            scalpel_state.filemirror, first_apparent + 1 + accepted);
+        if (!block) {
+            break;
+        }
+        int status = zlib_stream_reassembler_try_block(
+            &prefix, block, scalpel_state.blocksize);
+        free((void *)block);
+        if (status != 1) {
+            break;
+        }
+        accepted++;
+    }
+    zlib_stream_reassembler_free(&prefix);
+    return accepted;
 }
 
 /**
@@ -2307,6 +3925,8 @@ char *extract_dict(ThreadWork *work, CarveInfo *candidate,
                 pdf_reassembly_prepare_for_extension(work->id, candidate, 1, OBJECTEXTNSION);
                 PDF_PLACE(work->id, candidate, blockvector_get_num_blocks(candidate->b) - 1, "DICT_CROSS", (int64_t)(last_apparent + 1), (int64_t)j);
 
+                // Placing the block can relocate the candidate's data buffer.
+                data = blockvector_get_data_pointer(candidate->b);
                 uint64_t part1 = length - dict_start;
                 uint64_t dict_len = part1 + j;
                 char *result = malloc(dict_len + 1);
@@ -2400,7 +4020,6 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
         BlockVector *scan_bv = NULL;
         uint64_t evaluated;
         init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
-        inflate_blockvector(scan_bv);
         int64_t block_choice = blockvector_get_choice(scan_bv, 0, streamstart_block_app + 1, -1, &evaluated);
         free_blockvector(&scan_bv);
         if (block_choice == -1) return false;
@@ -2439,7 +4058,7 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
         }
         zlib_stream_reassembler_free(&r);
         free((void*)stream_block);
-        return true;
+        return stream_check == 1 || stream_check == 2;
     }
 
     if (mode == MULTIBLOCK) {
@@ -2466,12 +4085,17 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
         int64_t findes = pdf_reassembly_get_block_choice(candidate, -1, endstream_local_offset, 0, 0, -1, FINDENDSTREAM,
             (int64_t)blockvector_get_num_blocks(candidate->b) + (int64_t)blocks_to_extend - 1);
         if (findes >= 0 && findes < tot_app && findes != contig_es) es_cands[n_es++] = findes;
+#ifdef PDF_TRACE_STALL
+        lock_fprintf(stdout,
+            "[PDFZMB] candidates streamstart=%" PRIu64
+            " contig=%" PRId64 " found=%" PRId64 " count=%d bte=%d\n",
+            streamstart_block_app, contig_es, findes, n_es,
+            blocks_to_extend);
+#endif
         if (n_es == 0) return false;
 
         const uint64_t nb_before   = blockvector_get_num_blocks(candidate->b);
         const int      n_interior  = blocks_to_extend - 1;   // last slot is the endstream block
-        const int      MAX_SPLITS  = 64;                     // bound the search cost
-
         int64_t *chosen = (int64_t*)malloc(sizeof(int64_t) * (size_t)blocks_to_extend);
         if (!chosen) return false;
 
@@ -2479,8 +4103,7 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
         uint64_t endstream_block_apparent = (uint64_t)es_cands[0];
         for (int ei = 0; ei < n_es && !solved; ei++) {
             endstream_block_apparent = (uint64_t)es_cands[ei];
-            int tried = 0;
-            for (int m = n_interior; m >= 0 && !solved && tried < MAX_SPLITS; m--, tried++) {
+            for (int m = n_interior; m >= 0 && !solved; m--) {
                 ZlibStreamReassembler r;
                 if (zlib_stream_reassembler_init(&r, (const unsigned char*)first_stream_block_data,
                         scalpel_state.blocksize, startstream_local_offset, (size_t)stream_length) == -1)
@@ -2522,6 +4145,203 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                 zlib_stream_reassembler_free(&r);
             }
         }
+#ifdef PDF_TRACE_STALL
+        if (solved) {
+            lock_fprintf(stdout,
+                "[PDFZMB] two-run solved streamstart=%" PRIu64
+                " end=%" PRIu64 " bte=%d\n",
+                streamstart_block_app, endstream_block_apparent,
+                blocks_to_extend);
+        }
+#endif
+
+        /*
+         * A stream spanning both a physical gap and a displaced run needs more
+         * than the two physical runs above. Build that exact hypothesis on a
+         * clone so the active candidate remains untouched; the helper commits
+         * to the clone only after the complete Flate checksum verifies.
+         */
+        for (int ei = 0; ei < n_es && !solved; ei++) {
+            int64_t end_actual = filemirror_actual_blocknumber(
+                scalpel_state.filemirror, es_cands[ei]);
+            if (end_actual < 0) {
+                continue;
+            }
+
+            BlockVector *trial_bv = NULL;
+            clone_blockvector(candidate->b, &trial_bv, false);
+            CarveInfo trial = *candidate;
+            trial.b = trial_bv;
+            int64_t start_slot = (int64_t)nb_before - 1;
+            int64_t end_slot = start_slot + blocks_to_extend;
+            bool placed_end = pdf_place_blocks_at_slot(
+                &trial, &end_actual, 1, (uint64_t)end_slot,
+                "ZLIB_BACKBONE_END");
+#ifdef PDF_TRACE_STALL
+            lock_fprintf(stdout,
+                "[PDFZMB] backbone attempt streamstart=%" PRIu64
+                " end=%" PRId64 " bte=%d placed=%d\n",
+                streamstart_block_app, es_cands[ei], blocks_to_extend,
+                placed_end ? 1 : 0);
+#endif
+            if (placed_end && stream_length <= (uint64_t)INT_MAX &&
+                pdf_repair_interior_zlib_backbone(
+                                  work, &trial,
+                                  start_slot * (int64_t)scalpel_state.blocksize +
+                                      startstream_local_offset,
+                                  (int)stream_length, start_slot, end_slot,
+                                  false)) {
+                solved = true;
+                endstream_block_apparent = (uint64_t)es_cands[ei];
+                for (int i = 0; i < blocks_to_extend; i++) {
+                    chosen[i] = blockvector_get_apparent_blocknumber(
+                        trial.b, (uint64_t)(start_slot + i + 1));
+                    if (chosen[i] < 0) {
+                        solved = false;
+                        break;
+                    }
+                }
+            }
+            free_blockvector(&trial_bv);
+        }
+
+        /*
+         * A displaced run can sit between an otherwise contiguous prefix and
+         * tail. The two-run split above cannot represent that shape. Search the
+         * exact three-run assignments, shortest displaced run first, and still
+         * commit only after zlib verifies the complete stream checksum.
+         */
+        int prefix_limit = n_interior - 1;
+        if (!solved && n_interior > 0) {
+            prefix_limit = pdf_zlib_contiguous_prefix_blocks(
+                (const unsigned char *)first_stream_block_data,
+                startstream_local_offset, (size_t)stream_length,
+                (int64_t)streamstart_block_app, prefix_limit);
+            if (prefix_limit < 0) {
+                free(chosen);
+                return false;
+            }
+        }
+        uint64_t three_run_probes = 0;
+        for (int ei = 0; ei < n_es && !solved; ei++) {
+            endstream_block_apparent = (uint64_t)es_cands[ei];
+            for (int middle_len = 1; middle_len <= n_interior && !solved; middle_len++) {
+                int max_prefix = n_interior - middle_len;
+                if (max_prefix > prefix_limit) {
+                    max_prefix = prefix_limit;
+                }
+                for (int prefix_len = max_prefix;
+                     prefix_len >= 0 && !solved;
+                     prefix_len--) {
+                    int tail_len = n_interior - prefix_len - middle_len;
+                    BlockVector *scan_bv = NULL;
+                    uint64_t evaluated = 0;
+                    int64_t scan_start = 0;
+                    int64_t middle_start = -1;
+
+                    init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
+
+                    while (!solved &&
+                           (middle_start = blockvector_get_choice(
+                                scan_bv, 0, scan_start, -1, &evaluated)) != -1) {
+                        blockvector_remove_choice(scan_bv, 0, middle_start);
+                        scan_start = middle_start + 1;
+
+                        if (middle_start > tot_app - middle_len) {
+                            continue;
+                        }
+
+                        if (((++three_run_probes & 0xffU) == 0U) &&
+                            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                                 memory_order_acquire)) {
+                            free_blockvector(&scan_bv);
+                            free(chosen);
+                            return false;
+                        }
+
+                        int out = 0;
+                        for (int i = 1; i <= prefix_len; i++) {
+                            chosen[out++] = (int64_t)streamstart_block_app + i;
+                        }
+                        for (int i = 0; i < middle_len; i++) {
+                            chosen[out++] = middle_start + i;
+                        }
+                        for (int i = tail_len; i > 0; i--) {
+                            chosen[out++] = (int64_t)endstream_block_apparent - i;
+                        }
+                        chosen[out++] = (int64_t)endstream_block_apparent;
+
+                        bool viable = out == blocks_to_extend;
+                        for (int i = 0; i < out && viable; i++) {
+                            int64_t app = chosen[i];
+                            if (app < 0 || app >= tot_app ||
+                                apparent_block_in_blockvector(candidate->b, app)) {
+                                viable = false;
+                                break;
+                            }
+                            int64_t actual = filemirror_actual_blocknumber(
+                                scalpel_state.filemirror, app);
+                            if (actual < 0 ||
+                                filemirror_actual_block_covered(
+                                    scalpel_state.filemirror, actual) ||
+                                filemirror_actual_block_is_zero(
+                                    scalpel_state.filemirror, actual)) {
+                                viable = false;
+                                break;
+                            }
+                            for (int j = 0; j < i; j++) {
+                                if (chosen[j] == app) {
+                                    viable = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!viable) {
+                            continue;
+                        }
+
+                        ZlibStreamReassembler r;
+                        if (zlib_stream_reassembler_init(
+                                &r, (const unsigned char *)first_stream_block_data,
+                                scalpel_state.blocksize, startstream_local_offset,
+                                (size_t)stream_length) == -1) {
+                            break;
+                        }
+
+                        bool ok = true;
+                        for (int i = 0; i < blocks_to_extend && ok; i++) {
+                            const unsigned char *blk =
+                                (const unsigned char *)get_apparent_block_data(
+                                    scalpel_state.filemirror, chosen[i]);
+                            if (!blk) {
+                                ok = false;
+                                break;
+                            }
+                            int chk = zlib_stream_reassembler_try_block(
+                                &r, blk, scalpel_state.blocksize);
+                            free((void *)blk);
+                            if (i + 1 == blocks_to_extend) {
+                                ok = chk == 2;
+                            } else {
+                                ok = chk == 1;
+                            }
+                        }
+                        solved = ok && r.ended;
+                        zlib_stream_reassembler_free(&r);
+                    }
+                    free_blockvector(&scan_bv);
+                }
+            }
+        }
+#ifdef PDF_TRACE_STALL
+        if (solved) {
+            lock_fprintf(stdout,
+                "[PDFZMB] deferred solver complete streamstart=%" PRIu64
+                " end=%" PRIu64 " bte=%d\n",
+                streamstart_block_app, endstream_block_apparent,
+                blocks_to_extend);
+        }
+#endif
 
         if (!solved) {
 #ifdef PDF_TRACE_STALL
@@ -2598,6 +4418,22 @@ bool reconstruct_raw_stream(ThreadWork *work, CarveInfo *candidate,
     // streamstart+blocks_to_extend.
     uint64_t endstream_app = streamstart_block_app + (uint64_t)blocks_to_extend;
     if ((int64_t)endstream_app >= total) return false;   // runs off the image
+
+    // A known zero or covered block cannot substantiate this unchecksummed
+    // contiguous hypothesis. It may be gap filler (and was in the repeated-run
+    // safety corpus), while the endpoint and xref beyond it can still look valid.
+    // Leave such a stream unresolved unless a stronger format-specific path can
+    // identify its interior blocks.
+    for (int k = 1; k <= blocks_to_extend; k++) {
+        int64_t actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror,
+            (int64_t)streamstart_block_app + k);
+        if (actual < 0 ||
+            filemirror_actual_block_covered(scalpel_state.filemirror, actual) ||
+            filemirror_actual_block_is_zero(scalpel_state.filemirror, actual)) {
+            return false;
+        }
+    }
 
     // (1) Confirm "endstream" sits at its predicted offset in the contiguous
     // end block (handling the case where the keyword straddles the boundary
@@ -2887,7 +4723,6 @@ bool reconstruct_xml_stream(ThreadWork *work, CarveInfo *candidate,
         BlockVector *scan_bv = NULL;
         uint64_t evaluated;
         init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
-        inflate_blockvector(scan_bv);
         int64_t block_choice = blockvector_get_choice(scan_bv, 0, streamstart_block_app + 1, -1, &evaluated);
         free_blockvector(&scan_bv);
 #ifdef PDF_TRACE_ZSTALL
@@ -2927,7 +4762,7 @@ bool reconstruct_xml_stream(ThreadWork *work, CarveInfo *candidate,
         }
         xml_stream_reassembler_free(&r);
         free((void*)stream_block);
-        return true;
+        return stream_check == 2;
     }
 
     if (mode == MULTIBLOCK) {
@@ -3318,6 +5153,31 @@ static inline void jpeg_feed_byte(JpegStreamReassembler *r, unsigned char c) {
 }
 
 /**
+ * @description  Confirms that a JPEG stream reached EOI while accounting for
+ *               its complete declared extent. PDF producers may include PDF
+ *               whitespace after EOI in /Length; arbitrary trailing bytes are
+ *               rejected rather than silently ignored.
+ * @param r  The JPEG reassembler after all declared bytes were supplied.
+ * @return   true when the extent contains a complete JPEG and only optional
+ *           PDF whitespace follows EOI.
+ */
+static bool pdf_jpeg_extent_complete(const JpegStreamReassembler *r) {
+    if (!r || r->fed != r->stream_length || !r->saw_sos || !r->saw_eoi ||
+        r->state != J_DONE || r->pos > r->fed || r->output_len < r->fed) {
+        return false;
+    }
+
+    for (size_t i = r->pos; i < r->fed; i++) {
+        unsigned char c = r->output[i];
+        if (c != 0 && c != '\t' && c != '\n' && c != '\f' &&
+            c != '\r' && c != ' ') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
  * @description  Initialises a JPEG stream reassembler and feeds the stream data in
  *               the first block (capped at /Length) through the marker/scan state
  *               machine, failing if that header portion is already malformed.
@@ -3349,7 +5209,12 @@ int jpeg_stream_reassembler_init(JpegStreamReassembler *r, const unsigned char *
 
     // The first block must start with a valid SOI/marker sequence; if it is
     // already broken this is not a recoverable DCTDecode stream.
-    if (r->malformed) { free(r->output); r->output = NULL; return -1; }
+    if (r->malformed ||
+        (r->fed >= r->stream_length && !pdf_jpeg_extent_complete(r))) {
+        free(r->output);
+        r->output = NULL;
+        return -1;
+    }
     return 0;
 }
 
@@ -3384,7 +5249,9 @@ int jpeg_stream_reassembler_try_block(JpegStreamReassembler *r, const unsigned c
         // Completion: full /Length accounted for. Require a real scan that
         // terminated at EOI. (Restart-interval JPEGs additionally have their
         // RSTn cadence validated above; non-DRI JPEGs are accepted best-effort.)
-        if (r->saw_sos && r->saw_eoi) return 2;   // saw_eoi is set iff state==J_DONE
+        if (pdf_jpeg_extent_complete(r)) {
+            return 2;
+        }
         *r = snap;
         return 0;
     }
@@ -3431,7 +5298,6 @@ bool reconstruct_jpeg_stream(ThreadWork *work, CarveInfo *candidate,
         BlockVector *scan_bv = NULL;
         uint64_t evaluated;
         init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
-        inflate_blockvector(scan_bv);
         int64_t block_choice = blockvector_get_choice(scan_bv, 0, streamstart_block_app + 1, -1, &evaluated);
         free_blockvector(&scan_bv);
 #ifdef PDF_TRACE_ZSTALL
@@ -3471,7 +5337,7 @@ bool reconstruct_jpeg_stream(ThreadWork *work, CarveInfo *candidate,
         }
         jpeg_stream_reassembler_free(&r);
         free((void*)stream_block);
-        return true;
+        return stream_check == 2;
     }
 
     if (mode == MULTIBLOCK) {
@@ -3498,60 +5364,92 @@ bool reconstruct_jpeg_stream(ThreadWork *work, CarveInfo *candidate,
 
         const uint64_t nb_before  = blockvector_get_num_blocks(candidate->b);
         const int      n_interior = blocks_to_extend - 1;
-        const int      MAX_SPLITS = 64;
 
         int64_t *chosen = (int64_t*)malloc(sizeof(int64_t) * (size_t)blocks_to_extend);
-        if (!chosen) return false;
+        if (!chosen) {
+            return false;
+        }
 
         bool solved = false;
+        bool interrupted = false;
         uint64_t endstream_block_apparent = (uint64_t)es_cands[0];
         for (int ei = 0; ei < n_es && !solved; ei++) {
             endstream_block_apparent = (uint64_t)es_cands[ei];
-            int tried = 0;
-            for (int m = n_interior; m >= 0 && !solved && tried < MAX_SPLITS; m--, tried++) {
+            for (int m = n_interior; m >= 0 && !solved; m--) {
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                         memory_order_acquire)) {
+                    interrupted = true;
+                    break;
+                }
                 JpegStreamReassembler r;
                 if (jpeg_stream_reassembler_init(&r, (const unsigned char*)first_stream_block_data,
-                        scalpel_state.blocksize, startstream_local_offset, (size_t)stream_length) == -1)
+                        scalpel_state.blocksize, startstream_local_offset, (size_t)stream_length) == -1) {
                     break;
+                }
 
                 bool ok = true;
                 for (int i = 1; i <= n_interior && ok; i++) {
                     int64_t app = (i <= m) ? (int64_t)streamstart_block_app + i
                                            : (int64_t)endstream_block_apparent - (blocks_to_extend - i);
-                    if (app < 0 || app >= tot_app) { ok = false; break; }
+                    if (app < 0 || app >= tot_app) {
+                        ok = false;
+                        break;
+                    }
                     const unsigned char *blk =
                         (const unsigned char*)get_apparent_block_data(scalpel_state.filemirror, app);
-                    if (!blk) { ok = false; break; }
+                    if (!blk) {
+                        ok = false;
+                        break;
+                    }
                     int chk = jpeg_stream_reassembler_try_block(&r, blk, scalpel_state.blocksize);
                     free((void*)blk);
-                    if (chk != 1 && chk != 2) { ok = false; break; }
+                    if (chk != 1) {
+                        ok = false;
+                        break;
+                    }
                     chosen[i-1] = app;
                 }
 
-                if (ok && !r.saw_eoi) {
+                if (ok) {
                     const unsigned char *blk =
                         (const unsigned char*)get_apparent_block_data(scalpel_state.filemirror, endstream_block_apparent);
-                    if (!blk) ok = false;
-                    else {
+                    if (!blk) {
+                        ok = false;
+                    } else {
                         int chk = jpeg_stream_reassembler_try_block(&r, blk, scalpel_state.blocksize);
                         free((void*)blk);
-                        if (chk != 2) ok = false;             // must COMPLETE (EOI) here
+                        if (chk != 2) {
+                            ok = false;
+                        }
                     }
                 }
                 chosen[blocks_to_extend-1] = (int64_t)endstream_block_apparent;
 
                 // Accept only on completion: EOI reached having consumed /Length.
-                solved = ok && r.saw_eoi;
+                solved = ok && pdf_jpeg_extent_complete(&r);
                 jpeg_stream_reassembler_free(&r);
+            }
+            if (interrupted) {
+                break;
             }
         }
 
-        if (!solved) { free(chosen); return false; }           // commit nothing
+        if (!solved) {
+            free(chosen);
+            return false;
+        }
+
+        for (int i = 0; i < blocks_to_extend; i++) {
+            uint64_t slot = nb_before + (uint64_t)i;
+            if (!pdf_block_matches_xref_slot(candidate, chosen[i], slot)) {
+                free(chosen);
+                return false;
+            }
+        }
 
         pdf_reassembly_prepare_for_extension(work->id, candidate, blocks_to_extend, ENDSTREAMEXTENSION);
         for (int i = 0; i < blocks_to_extend; i++) {
             uint64_t slot = nb_before + (uint64_t)i;
-            if (!pdf_block_matches_xref_slot(candidate, chosen[i], slot)) continue;
             candidate->newblock = filemirror_actual_blocknumber(scalpel_state.filemirror, chosen[i]);
             PDF_PLACE(work->id, candidate, slot,
                       (i == blocks_to_extend-1) ? "JPG_MB_ANCHOR" : "JPG_MB_START",
@@ -3585,7 +5483,6 @@ Object* scan_blocks_for_xref_at_offset(CarveInfo *candidate,
                       int *out_xref_block_count,
                       int32_t expected_offset){
     init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
-    inflate_blockvector(scan_bv);
 
     *out_xref_blocks = NULL;
     *out_xref_block_count = 0;
@@ -3652,7 +5549,7 @@ Object* scan_blocks_for_xref_at_offset(CarveInfo *candidate,
 
             // This xref starts in this block and continues in another
             // try to find the tail in the proceeding blocks
-            if(blk_state->xref_block_data[i].xref_start != -1 && 
+            if(blk_state->xref_block_data[i].xref_start != -1 &&
                blk_state->xref_block_data[i].xref_end == -1 &&
                blk_state->xref_block_data[i].xref_type == 1){
                 if(expected_offset != blk_state->xref_block_data[i].xref_start) continue;
@@ -3703,7 +5600,7 @@ Object* scan_blocks_for_xref_at_offset(CarveInfo *candidate,
             }
             // An xref stream whose dict spans blocks has no in-block end marker;
             // try to find its tail in the next apparent block.
-            if(blk_state->xref_block_data[i].xref_start != -1 && 
+            if(blk_state->xref_block_data[i].xref_start != -1 &&
                blk_state->xref_block_data[i].xref_end == -1 &&
                blk_state->xref_block_data[i].xref_type == 2 &&
                blk_state->xref_block_data[i].conditional_flag != INCOMPLETESTREAMDICT){
@@ -3738,6 +5635,54 @@ cleanup:
 }
 
 /**
+ * @description  Determines whether exactly one xref marker in the available
+ *               image begins at a specified block-local offset. A /Prev value
+ *               supplies an exact logical byte offset, but many unrelated PDF
+ *               xrefs can exist in the same image. Uniqueness at the required
+ *               local offset provides a conservative fallback when the linked
+ *               older table has no objects in common with the current header.
+ *               A checkpoint request stops the scan without asserting
+ *               uniqueness; the caller will return the unchanged candidate.
+ * @param candidate        Candidate whose block states are consulted.
+ * @param expected_offset  Required xref offset within its block.
+ * @return       true only when exactly one xref marker has that offset.
+ */
+static bool pdf_xref_offset_is_unique(CarveInfo *candidate,
+                                      int32_t expected_offset) {
+    if (!candidate || expected_offset < 0 ||
+        expected_offset >= (int32_t)scalpel_state.blocksize) {
+        return false;
+    }
+
+    int matches = 0;
+    int64_t total = filemirror_apparent_blocks(scalpel_state.filemirror);
+    for (int64_t apparent = 0; apparent < total; apparent++) {
+        if ((apparent & (PDF_XREF_SCAN_QUANTUM - 1)) == 0 &&
+            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                 memory_order_acquire)) {
+            return false;
+        }
+
+        PDFBlockState *state =
+            pdf_get_blockstate_from_apparent(candidate, apparent, NULL);
+        if (!state) {
+            continue;
+        }
+        for (int i = 0; i < state->num_xrefs; i++) {
+            if (state->xref_block_data[i].xref_start == expected_offset) {
+                matches++;
+                if (matches > 1) {
+                    pdf_free_block_state((void **)&state);
+                    return false;
+                }
+            }
+        }
+        pdf_free_block_state((void **)&state);
+    }
+    return matches == 1;
+}
+
+/**
  * @description         Searches for xrefs that we probed for during block validation
  *                      best case is to find a table completely contained within a
  *                      single block. Otherwise we will need to search across multiple
@@ -3752,11 +5697,16 @@ Object* scan_blocks_for_xref(CarveInfo *candidate,
                       int *entry_count,
                       int64_t **out_xref_blocks,
                       int *out_xref_block_count,
-                      int32_t *out_xref_local){
+                      int32_t *out_xref_local,
+                      int64_t *next_apparent,
+                      uint64_t block_budget,
+                      bool *more_work){
     if(out_xref_local) *out_xref_local = -1;
+    if (more_work) {
+        *more_work = false;
+    }
     if(*scan_bv == NULL){
         init_blockvector(scalpel_state.filemirror, scan_bv, 1, false);
-        inflate_blockvector(*scan_bv);
     }
     BlockVector *bv = *scan_bv;
 
@@ -3764,16 +5714,29 @@ Object* scan_blocks_for_xref(CarveInfo *candidate,
     *out_xref_block_count = 0;
 
     uint64_t slot = 0;
-    int64_t start = 0;
+    int64_t start = next_apparent && *next_apparent >= 0
+                        ? *next_apparent
+                        : 0;
     int64_t block_choice = -1;
     char *buf = NULL;
     uint64_t evaluated;
     int64_t tmp;
     Object *entries = NULL;
     uint64_t xref_end_offset;
+    uint64_t examined = 0;
     while ((block_choice = blockvector_get_choice(bv, slot, start, -1, &evaluated)) != -1) {
+        if(block_budget > 0 && examined >= block_budget){
+            if (more_work) {
+                *more_work = true;
+            }
+            return NULL;
+        }
+        examined++;
         blockvector_remove_choice(bv, slot, block_choice);
         start = block_choice + 1;
+        if(next_apparent) {
+            *next_apparent = start;
+        }
 
         PDFBlockState *blk_state = pdf_get_blockstate_from_apparent(candidate, block_choice, NULL);
 #ifdef PDF_TRACE_SCANXREF
@@ -3996,10 +5959,15 @@ static int64_t pdf_lin_param(const char *dict, int dict_len,
  * @return       Void.
  */
 static void pdf_detect_linearization(PDFCarveState *s, const char *data, uint64_t length) {
+    if (!s) {
+        return;
+    }
     s->linearized = false;
     s->lin_L = -1;
     s->lin_T = -1;
-    if (!s || !data || length == 0) return;
+    if (!data || length == 0) {
+        return;
+    }
 
     // Only the header block can hold the first object.
     uint64_t scan = (length < (uint64_t)scalpel_state.blocksize)
@@ -4085,22 +6053,6 @@ static bool pdf_place_blocks_at_slot(CarveInfo *candidate,
         candidate->newblock = actual_blocks[b];
         blockvector_set_apparent_blocknumber(candidate->b, slot,
             filemirror_apparent_blocknumber(scalpel_state.filemirror, candidate->newblock));
-        inflate_blockvector_single_block(candidate->b, slot);
-#ifdef PDF_TRACE_PLACEMENT
-        {
-            uuid_string_t uuidp;
-            uuid_unparse_lower(candidate->binuuid, uuidp);
-            lock_fprintf(stdout,
-                "[PDFPLACE] uuid=%.8s slot=%" PRIu64 " apparent=%" PRId64 " actual=%" PRId64
-                " slots=%" PRIu64 " len=%" PRIu64 " site=%-14s line=%d c1=%d c2=%d\n",
-                uuidp, slot,
-                filemirror_apparent_blocknumber(scalpel_state.filemirror, candidate->newblock),
-                candidate->newblock,
-                blockvector_get_num_blocks(candidate->b),
-                blockvector_get_data_length(candidate->b),
-                site, __LINE__, b, count);
-        }
-#endif
     }
 
     uint64_t want = (last_slot + 1) * (uint64_t)scalpel_state.blocksize;
@@ -4108,6 +6060,157 @@ static bool pdf_place_blocks_at_slot(CarveInfo *candidate,
         candidate->best_validates_to = want - 1;
         blockvector_set_data_length(candidate->b, want);
     }
+
+    // Positional placement can leave multiple unmapped slots between the
+    // current frontier and this run. The single-block inflater requires every
+    // other slot to be valid, so normalize and inflate the complete vector to
+    // materialize the run and zero-fill all intervening holes.
+    inflate_blockvector(candidate->b);
+
+#ifdef PDF_TRACE_PLACEMENT
+    for (int b = 0; b < count; b++) {
+        uint64_t slot = first_slot + (uint64_t)b;
+        {
+            uuid_string_t uuidp;
+            uuid_unparse_lower(candidate->binuuid, uuidp);
+            lock_fprintf(stdout,
+                "[PDFPLACE] uuid=%.8s slot=%" PRIu64 " apparent=%" PRId64 " actual=%" PRId64
+                " slots=%" PRIu64 " len=%" PRIu64 " site=%-14s line=%d c1=%d c2=%d\n",
+                uuidp, slot,
+                filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                                actual_blocks[b]),
+                actual_blocks[b],
+                blockvector_get_num_blocks(candidate->b),
+                blockvector_get_data_length(candidate->b),
+                site, __LINE__, b, count);
+        }
+    }
+#endif
+
+    return true;
+}
+
+/**
+ * @description  Replaces an existing run after a format oracle has verified the
+ *               complete assignment. Unlike pdf_place_blocks_at_slot(), this is
+ *               allowed to displace mapped blocks, so callers must defer the call
+ *               until their global integrity check succeeds. The full run is
+ *               checked before any blockvector mutation.
+ * @param candidate      The candidate being repaired.
+ * @param actual_blocks  Verified actual blocks, in logical order.
+ * @param count          Number of blocks to replace.
+ * @param first_slot     First logical slot to replace.
+ * @param site           Trace label.
+ * @return       true if the complete replacement was applied.
+ */
+static bool pdf_replace_blocks_at_slot(CarveInfo *candidate,
+                                       const int64_t *actual_blocks,
+                                       int count,
+                                       uint64_t first_slot,
+                                       const char *site) {
+    (void)site;
+    if (!candidate || !actual_blocks || count <= 0 ||
+        first_slot + (uint64_t)count >
+            blockvector_get_num_blocks(candidate->b)) {
+#ifdef PDF_TRACE_PLACEMENT
+        lock_fprintf(stdout,
+            "[PDFREPLACE-REJECT] site=%s reason=range first=%" PRIu64
+            " count=%d slots=%" PRIu64 "\n",
+            site ? site : "?", first_slot, count,
+            candidate && candidate->b
+                ? blockvector_get_num_blocks(candidate->b) : 0);
+#endif
+        return false;
+    }
+
+    FileMirror *fm = scalpel_state.filemirror;
+    int64_t total_actual =
+        (int64_t)CEILDIV(filemirror_filesize(fm), scalpel_state.blocksize);
+    for (int i = 0; i < count; i++) {
+        int64_t actual = actual_blocks[i];
+        if (actual < 0 || actual >= total_actual ||
+            filemirror_actual_block_covered(fm, actual) ||
+            filemirror_actual_block_is_zero(fm, actual)) {
+#ifdef PDF_TRACE_PLACEMENT
+            lock_fprintf(stdout,
+                "[PDFREPLACE-REJECT] site=%s reason=state index=%d"
+                " actual=%" PRId64 " covered=%d zero=%d\n",
+                site ? site : "?", i, actual,
+                actual >= 0 && actual < total_actual
+                    ? filemirror_actual_block_covered(fm, actual) : -1,
+                actual >= 0 && actual < total_actual
+                    ? filemirror_actual_block_is_zero(fm, actual) : -1);
+#endif
+            return false;
+        }
+        int64_t app = filemirror_apparent_blocknumber(fm, actual);
+        if (app < 0) {
+#ifdef PDF_TRACE_PLACEMENT
+            lock_fprintf(stdout,
+                "[PDFREPLACE-REJECT] site=%s reason=unmapped index=%d"
+                " actual=%" PRId64 "\n",
+                site ? site : "?", i, actual);
+#endif
+            return false;
+        }
+        for (uint64_t slot = 0;
+             slot < blockvector_get_num_blocks(candidate->b);
+             slot++) {
+            if (slot >= first_slot &&
+                slot < first_slot + (uint64_t)count) {
+                continue;
+            }
+            if (blockvector_get_apparent_blocknumber(candidate->b, slot) == app) {
+#ifdef PDF_TRACE_PLACEMENT
+                lock_fprintf(stdout,
+                    "[PDFREPLACE-REJECT] site=%s reason=outside-duplicate"
+                    " index=%d actual=%" PRId64 " slot=%" PRIu64 "\n",
+                    site ? site : "?", i, actual, slot);
+#endif
+                return false;
+            }
+        }
+        for (int prior = 0; prior < i; prior++) {
+            if (actual_blocks[prior] == actual) {
+#ifdef PDF_TRACE_PLACEMENT
+                lock_fprintf(stdout,
+                    "[PDFREPLACE-REJECT] site=%s reason=input-duplicate"
+                    " index=%d prior=%d actual=%" PRId64 "\n",
+                    site ? site : "?", i, prior, actual);
+#endif
+                return false;
+            }
+        }
+    }
+
+    candidate->fastpath = false;
+    for (int i = 0; i < count; i++) {
+        int64_t app = filemirror_apparent_blocknumber(fm, actual_blocks[i]);
+        candidate->newblock = actual_blocks[i];
+        blockvector_set_apparent_blocknumber(
+            candidate->b, first_slot + (uint64_t)i, app);
+    }
+
+    // Apply the complete verified replacement in one synchronized byte view.
+    // This also keeps the helper correct if the candidate already contains
+    // unmapped slots from an earlier positional placement.
+    inflate_blockvector(candidate->b);
+
+#ifdef PDF_TRACE_PLACEMENT
+    for (int i = 0; i < count; i++) {
+        uint64_t slot = first_slot + (uint64_t)i;
+        int64_t app = filemirror_apparent_blocknumber(fm, actual_blocks[i]);
+        {
+            uuid_string_t uuidp;
+            uuid_unparse_lower(candidate->binuuid, uuidp);
+            lock_fprintf(stdout,
+                "[PDFREPLACE] uuid=%.8s slot=%" PRIu64
+                " apparent=%" PRId64 " actual=%" PRId64
+                " site=%-14s index=%d count=%d\n",
+                uuidp, slot, app, actual_blocks[i], site, i, count);
+        }
+    }
+#endif
     return true;
 }
 
@@ -4285,8 +6388,11 @@ static bool pdf_block_matches_xref_slot(CarveInfo *candidate,
     const uint64_t hi  = lo + bsz;
 
     char *blk = NULL;
+    char *joined = NULL;
     bool  ok  = true;
+#ifdef PDF_TRACE_PLACEMENT
     int   objs_seen = 0;
+#endif
 
     // Two sources: the tables already committed to carve state, and the tables
     // the in-progress extension is working from. The second matters -- without
@@ -4306,16 +6412,59 @@ static bool pdf_block_matches_xref_slot(CarveInfo *candidate,
                     blk = (char *)get_apparent_block_data(scalpel_state.filemirror, apparent_block);
                     if (!blk) goto done;               // unreadable: do not veto
                 }
+                int64_t local = (int64_t)(off - lo);
+                int object_check = validate_at_offset(
+                    blk, local, tabs[t].entries[e].obj_num, (int64_t)bsz);
+
+                /*
+                 * Any part of the object header may cross this block boundary.
+                 * Validate that constraint against the
+                 * next logical block when it is already known; otherwise the
+                 * boundary-spanning header is not evidence against this block.
+                 */
+                if (object_check == -3) {
+                    if (!joined) {
+                        uint64_t next_slot = slot + 1;
+                        int64_t next_app =
+                            next_slot < blockvector_get_num_blocks(candidate->b)
+                                ? blockvector_get_apparent_blocknumber(candidate->b,
+                                                                       next_slot)
+                                : -1;
+                        if (next_app >= 0) {
+                            char *next = (char *)get_apparent_block_data(
+                                scalpel_state.filemirror, next_app);
+                            if (next) {
+                                joined = malloc(2 * bsz);
+                                check_memory_allocation(joined, __LINE__, __FILE__,
+                                                        "PDF xref boundary block");
+                                memcpy(joined, blk, bsz);
+                                memcpy(joined + bsz, next, bsz);
+                                free(next);
+                            }
+                        }
+                    }
+                    if (!joined) {
+                        continue;
+                    }
+                    object_check = validate_at_offset(
+                        joined, local, tabs[t].entries[e].obj_num,
+                        (int64_t)(2 * bsz));
+                    if (object_check == -3) {
+                        continue;
+                    }
+                }
+
+#ifdef PDF_TRACE_PLACEMENT
                 objs_seen++;
-                if (validate_at_offset(blk, (int64_t)(off - lo),
-                                       tabs[t].entries[e].obj_num,
-                                       (int64_t)bsz) != 1) {
+#endif
+                if (object_check != 1) {
                     ok = false;                        // object absent where the xref puts it
                 }
             }
         }
     }
 done:
+    free(joined);
     free(blk);
 #ifdef PDF_TRACE_PLACEMENT
     lock_fprintf(stdout,
@@ -4341,6 +6490,51 @@ static bool pdf_candidate_has_holes(CarveInfo *candidate) {
         if (blockvector_get_apparent_blocknumber(candidate->b, i) < 0) return true;
     }
     return false;
+}
+
+/**
+ * @description  Whether a candidate has an unfilled slot within a validator-
+ *               confirmed byte range. Speculative blocks and holes beyond the
+ *               confirmed endpoint are irrelevant because successful validation
+ *               trims them before publication.
+ * @param candidate      Candidate being checked.
+ * @param validates_to   Inclusive last validated byte.
+ * @return       true if a hole intersects the validated range.
+ */
+static bool pdf_candidate_has_holes_through(CarveInfo *candidate,
+                                            uint64_t validates_to) {
+    uint64_t required = validates_to / scalpel_state.blocksize + 1;
+    uint64_t available = blockvector_get_num_blocks(candidate->b);
+    if (required > available) {
+        return true;
+    }
+    for (uint64_t slot = 0; slot < required; slot++) {
+        if (blockvector_get_apparent_blocknumber(candidate->b, slot) < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @description  Returns the byte length of the candidate's contiguous trusted
+ *               prefix. Positioned blocks beyond the first unfilled slot remain
+ *               useful reassembly evidence, but cannot extend a range presented
+ *               to the final file validator.
+ * @param candidate  Candidate whose logical slots are inspected.
+ * @return       Candidate data length, capped at the first unfilled slot.
+ */
+static uint64_t pdf_candidate_trusted_prefix_length(CarveInfo *candidate) {
+    uint64_t length = blockvector_get_data_length(candidate->b);
+    uint64_t slots = blockvector_get_num_blocks(candidate->b);
+
+    for (uint64_t slot = 0; slot < slots; slot++) {
+        if (blockvector_get_apparent_blocknumber(candidate->b, slot) < 0) {
+            uint64_t prefix = slot * (uint64_t)scalpel_state.blocksize;
+            return prefix < length ? prefix : length;
+        }
+    }
+    return length;
 }
 
 #ifdef PDF_TRACE_PLACEMENT
@@ -4603,20 +6797,56 @@ static bool pdf_jpeg_body_ok(const unsigned char *buf, size_t len) {
 }
 
 /**
+ * @description  Verifies an XMP/XML metadata stream with the same structural
+ *               state machine used during fragmented stream reconstruction.
+ *               The caller invokes this only when an ASCII XML signature is
+ *               present, so other legal encodings are left to the ordinary PDF
+ *               checks rather than rejected here.
+ * @param buf  Complete stream body.
+ * @param len  Stream body length.
+ * @return       true when the XML text and nesting are structurally complete.
+ */
+static bool pdf_xml_body_ok(const unsigned char *buf, size_t len) {
+    if (!buf || len == 0 || !xml_has_signature(buf, len)) {
+        return true;
+    }
+
+    XmlStreamReassembler parser;
+    memset(&parser, 0, sizeof(parser));
+    parser.state = X_TEXT;
+    for (size_t i = 0; i < len; i++) {
+        xml_feed_byte(&parser, buf[i]);
+        if (parser.malformed) {
+            return false;
+        }
+    }
+    return parser.state == X_TEXT && parser.tag_depth == 0;
+}
+
+/**
  * @description  Returns false if any validated stream fails a content check -- i.e.
  *               a wrong block lives inside a stream body, which object-offset
- *               validation cannot see. Bounds each stream by the literal "stream"/
- *               "endstream" keywords and dispatches its body to the per-format
- *               verifier, each of which self-gates on its signature so an
+ *               validation cannot see. A declared /Length bounds the body when it
+ *               can be resolved; otherwise the endstream keyword is the fallback.
+ *               Empty-password Standard Security Handler streams using supported
+ *               RC4 revisions are authenticated and decrypted before inspection.
+ *               Every per-format verifier self-gates on its signature so an
  *               unrecognised or chained encoding is skipped, never failed.
  * @param data        The assembled candidate buffer.
  * @param length      Length of the buffer.
  * @param tables      The xref tables locating object headers.
+ * @param xrefs       Locations of the accepted cross-reference sections.
  * @param num_tables  Count of those tables.
  * @return       false if a stream body fails its content check; true otherwise.
  */
 static bool pdf_streams_decode_ok(char *data, uint64_t length,
-                                  XrefTables *tables, int num_tables) {
+                                  XrefTables *tables, const XrefObject *xrefs,
+                                  int num_tables, bool *damaged_metadata) {
+    *damaged_metadata = false;
+    PDFEncryptionContext encryption;
+    bool decrypt_streams = pdf_initialize_encryption_context(
+        (const unsigned char *)data, length, tables, xrefs, num_tables, &encryption);
+
     for (int t = 0; t < num_tables; t++) {
         if (!tables[t].entries) continue;
         for (int j = 0; j < tables[t].count; j++) {
@@ -4630,22 +6860,97 @@ static bool pdf_streams_decode_ok(char *data, uint64_t length,
             uint64_t dict_len = (uint64_t)(sk - (data + off));
             bool is_flate = memmem(data + off, dict_len, "FlateDecode", 11) != NULL;
             bool is_dct   = memmem(data + off, dict_len, "DCTDecode",   9)  != NULL;
-            if (!is_flate && !is_dct) continue;
+            bool is_xml = check_last_object_filter(data + off,
+                                                   (int)dict_len) == XML;
+            if (!is_flate && !is_dct && !is_xml) continue;
+
+            bool is_xref_stream =
+                memmem(data + off, dict_len, "/Type", 5) != NULL &&
+                memmem(data + off, dict_len, "/XRef", 5) != NULL;
+            bool is_metadata_stream =
+                memmem(data + off, dict_len, "/Type", 5) != NULL &&
+                memmem(data + off, dict_len, "/Metadata", 9) != NULL;
 
             uint64_t sdat = (uint64_t)(sk - data) + 6;            // past "stream"
             if (sdat < length && data[sdat] == '\r') sdat++;
             if (sdat < length && data[sdat] == '\n') sdat++;
-            char *ek = (sdat < length)
-                ? (char*)memmem(data + sdat, length - sdat, "endstream", 9) : NULL;
-            uint64_t send = ek ? (uint64_t)(ek - data) : length;
+
+            uint64_t stream_length_offset = 0;
+            int declared_length = check_last_object_length(
+                data, length, &stream_length_offset, tables, num_tables,
+                data + off, (int)dict_len, off, false);
+            uint64_t send = length;
+            if (declared_length > 0 &&
+                (uint64_t)declared_length <= length - sdat) {
+                send = sdat + (uint64_t)declared_length;
+            } else {
+                char *ek = (sdat < length)
+                    ? (char*)memmem(data + sdat, length - sdat,
+                                    "endstream", 9)
+                    : NULL;
+                send = ek ? (uint64_t)(ek - data) : length;
+            }
             if (send <= sdat) continue;
 
             const unsigned char *body = (const unsigned char*)(data + sdat);
             size_t blen = send - sdat;
+            unsigned char *decrypted = NULL;
+            if (decrypt_streams && !is_xref_stream &&
+                (encryption.encrypt_metadata || !is_metadata_stream)) {
+                uint64_t object_body = 0;
+                int generation = 0;
+                if (pdf_indirect_object_body_start(
+                        (const unsigned char *)data, off, obj_end,
+                        tables[t].entries[j].obj_num, &object_body,
+                        &generation)) {
+                    decrypted = malloc(blen);
+                    check_memory_allocation(decrypted, __LINE__, __FILE__,
+                                            "PDF decrypted stream");
+                    if (pdf_decrypt_stream(
+                            &encryption, tables[t].entries[j].obj_num,
+                            generation, body, blen, decrypted)) {
+                        body = decrypted;
+                    } else {
+                        free(decrypted);
+                        decrypted = NULL;
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
             // A filter chain names several filters; try both verifiers and let
             // each self-gate on its signature (the raw body matches at most one).
-            if (is_flate && !pdf_flate_body_ok(body, blen)) return false;
-            if (is_dct   && !pdf_jpeg_body_ok(body, blen))  return false;
+            bool valid = (!is_flate || pdf_flate_body_ok(body, blen)) &&
+                         (!is_dct || pdf_jpeg_body_ok(body, blen));
+            if (is_xml && !pdf_xml_body_ok(body, blen)) {
+                if (is_metadata_stream) {
+                    // A metadata object wholly within one block cannot acquire
+                    // an internal splice during block reassembly. Its XML may
+                    // be malformed in the source while the PDF remains intact.
+                    uint64_t endstream = pdf_skip_space_and_comments(
+                        (const unsigned char *)data, send, length);
+                    bool anchored = declared_length > 0
+                        && endstream <= length && length - endstream >= 9
+                        && !memcmp(data + endstream, "endstream", 9);
+                    uint64_t end = anchored ? pdf_skip_space_and_comments(
+                        (const unsigned char *)data, endstream + 9, length) : length;
+                    anchored = anchored && end <= length && length - end >= 6
+                        && !memcmp(data + end, "endobj", 6)
+                        && scalpel_state.blocksize > 0
+                        && off / scalpel_state.blocksize
+                           == (end + 5) / scalpel_state.blocksize;
+                    if (!anchored) {
+                        *damaged_metadata = true;
+                    }
+                } else {
+                    valid = false;
+                }
+            }
+            free(decrypted);
+            if (!valid) {
+                return false;
+            }
         }
     }
     return true;
@@ -4781,6 +7086,258 @@ static inline PDFBlockState *pdf_get_blockstate_from_apparent(CarveInfo *candida
     return (PDFBlockState *)block_get_state(hashkey);
 }
 
+static inline void pdf_xref_search_state_init(PDFXrefSearchState *state) {
+    if (!state) {
+        return;
+    }
+    memset(state, 0, sizeof(*state));
+    state->best_local = -1;
+}
+
+static inline void pdf_xref_search_state_clear(PDFXrefSearchState *state) {
+    if (!state) {
+        return;
+    }
+    if (state->excluded_actual_blocks) {
+        roaring64_bitmap_free(state->excluded_actual_blocks);
+    }
+    free(state->best_entries);
+    free(state->best_blocks);
+    pdf_xref_search_state_init(state);
+}
+
+static inline void pdf_xref_search_state_copy(PDFXrefSearchState *destination,
+                                               const PDFXrefSearchState *source) {
+    pdf_xref_search_state_init(destination);
+    if (!source) {
+        return;
+    }
+
+    destination->active = source->active;
+    destination->exhausted = source->exhausted;
+    destination->best_entry_count = source->best_entry_count;
+    destination->best_block_count = source->best_block_count;
+    destination->best_local = source->best_local;
+    destination->best_score = source->best_score;
+
+    if (source->excluded_actual_blocks) {
+        destination->excluded_actual_blocks =
+            roaring64_bitmap_copy(source->excluded_actual_blocks);
+        check_memory_allocation(destination->excluded_actual_blocks, __LINE__,
+                                __FILE__, "PDF xref scan exclusions");
+    }
+    if (source->best_entry_count > 0 && source->best_entries) {
+        destination->best_entries = malloc(
+            (size_t)source->best_entry_count * sizeof(*source->best_entries));
+        check_memory_allocation(destination->best_entries, __LINE__, __FILE__,
+                                "PDF xref scan entries");
+        memcpy(destination->best_entries, source->best_entries,
+               (size_t)source->best_entry_count * sizeof(*source->best_entries));
+    }
+    if (source->best_block_count > 0 && source->best_blocks) {
+        destination->best_blocks = malloc(
+            (size_t)source->best_block_count * sizeof(*source->best_blocks));
+        check_memory_allocation(destination->best_blocks, __LINE__, __FILE__,
+                                "PDF xref scan blocks");
+        memcpy(destination->best_blocks, source->best_blocks,
+               (size_t)source->best_block_count * sizeof(*source->best_blocks));
+    }
+}
+
+static inline void pdf_store_xref_search(CarveInfo *candidate,
+                                          BlockVector *scan_blockvector,
+                                          bool exhausted,
+                                          const Object *best_entries,
+                                          int best_entry_count,
+                                          const int64_t *best_blocks,
+                                          int best_block_count,
+                                          int32_t best_local,
+                                          int best_score) {
+    PDFCarveState *state =
+        (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+    if (!state) {
+        state = calloc(1, sizeof(*state));
+        check_memory_allocation(state, __LINE__, __FILE__,
+                                "PDF carve state");
+        state->lin_L = -1;
+        state->lin_T = -1;
+        pdf_xref_search_state_init(&state->xref_search);
+    }
+
+    pdf_xref_search_state_clear(&state->xref_search);
+    state->xref_search.active = true;
+    state->xref_search.exhausted = exhausted;
+    state->xref_search.best_entry_count = best_entry_count;
+    state->xref_search.best_block_count = best_block_count;
+    state->xref_search.best_local = best_local;
+    state->xref_search.best_score = best_score;
+
+    if (scan_blockvector) {
+        state->xref_search.excluded_actual_blocks =
+            blockvector_clone_choice_exclusions(scan_blockvector, 0);
+    }
+    if (best_entry_count > 0 && best_entries) {
+        state->xref_search.best_entries = malloc(
+            (size_t)best_entry_count * sizeof(*best_entries));
+        check_memory_allocation(state->xref_search.best_entries, __LINE__,
+                                __FILE__, "PDF xref scan entries");
+        memcpy(state->xref_search.best_entries, best_entries,
+               (size_t)best_entry_count * sizeof(*best_entries));
+    }
+    if (best_block_count > 0 && best_blocks) {
+        state->xref_search.best_blocks = malloc(
+            (size_t)best_block_count * sizeof(*best_blocks));
+        check_memory_allocation(state->xref_search.best_blocks, __LINE__,
+                                __FILE__, "PDF xref scan blocks");
+        memcpy(state->xref_search.best_blocks, best_blocks,
+               (size_t)best_block_count * sizeof(*best_blocks));
+    }
+
+    carve_put_state(candidate->carvehashkey, state);
+    pdf_free_carve_state((void **)&state);
+}
+
+static inline bool pdf_restore_xref_search(CarveInfo *candidate,
+                                            BlockVector **scan_blockvector,
+                                            bool *exhausted,
+                                            Object **best_entries,
+                                            int *best_entry_count,
+                                            int64_t **best_blocks,
+                                            int *best_block_count,
+                                            int32_t *best_local,
+                                            int *best_score) {
+    PDFCarveState *state =
+        (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+    if (!state || !state->xref_search.active) {
+        pdf_free_carve_state((void **)&state);
+        return false;
+    }
+
+    init_blockvector(scalpel_state.filemirror, scan_blockvector, 1, false);
+    if (state->xref_search.excluded_actual_blocks) {
+        blockvector_restore_choice_exclusions(
+            *scan_blockvector, 0,
+            state->xref_search.excluded_actual_blocks);
+    }
+
+    *exhausted = state->xref_search.exhausted;
+    *best_entries = state->xref_search.best_entries;
+    *best_entry_count = state->xref_search.best_entry_count;
+    *best_blocks = state->xref_search.best_blocks;
+    *best_block_count = state->xref_search.best_block_count;
+    *best_local = state->xref_search.best_local;
+    *best_score = state->xref_search.best_score;
+    state->xref_search.best_entries = NULL;
+    state->xref_search.best_blocks = NULL;
+
+    pdf_free_carve_state((void **)&state);
+    return true;
+}
+
+static inline void pdf_clear_xref_search(CarveInfo *candidate) {
+    PDFCarveState *state =
+        (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+    if (!state) {
+        return;
+    }
+    pdf_xref_search_state_clear(&state->xref_search);
+    carve_put_state(candidate->carvehashkey, state);
+    pdf_free_carve_state((void **)&state);
+}
+
+static inline bool pdf_serialize_xref_search_state(
+    PDFXrefSearchState *state, FILE *fp, StateSerialization mode) {
+    size_t (*fb)(void *ptr, size_t size, size_t nitems, FILE *stream) =
+        mode == SERIALIZE
+            ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite
+            : (size_t (*)(void *, size_t, size_t, FILE *))fread;
+
+    if (mode == DESERIALIZE) {
+        pdf_xref_search_state_init(state);
+    }
+    if (fb(&state->active, sizeof(state->active), 1, fp) != 1
+        || fb(&state->exhausted, sizeof(state->exhausted), 1, fp) != 1) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (!state->active) {
+        return true;
+    }
+
+    size_t bitmap_length = 0;
+    if (mode == SERIALIZE && state->excluded_actual_blocks) {
+        bitmap_length = roaring64_bitmap_portable_size_in_bytes(
+            state->excluded_actual_blocks);
+    }
+    if (fb(&bitmap_length, sizeof(bitmap_length), 1, fp) != 1) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (bitmap_length > 0) {
+        char *serialized_bitmap = malloc(bitmap_length);
+        check_memory_allocation(serialized_bitmap, __LINE__, __FILE__,
+                                "PDF xref scan exclusions");
+        if (mode == SERIALIZE) {
+            roaring64_bitmap_portable_serialize(
+                state->excluded_actual_blocks, serialized_bitmap);
+        }
+        if (fb(serialized_bitmap, 1, bitmap_length, fp) != bitmap_length) {
+            free(serialized_bitmap);
+            handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+        }
+        if (mode == DESERIALIZE) {
+            state->excluded_actual_blocks =
+                roaring64_bitmap_portable_deserialize_safe(serialized_bitmap,
+                                                            bitmap_length);
+            if (!state->excluded_actual_blocks
+                || !roaring64_bitmap_internal_validate(
+                    state->excluded_actual_blocks, NULL)) {
+                free(serialized_bitmap);
+                handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__,
+                             __FILE__);
+            }
+        }
+        free(serialized_bitmap);
+    }
+
+    if (fb(&state->best_entry_count, sizeof(state->best_entry_count), 1, fp)
+            != 1
+        || fb(&state->best_block_count, sizeof(state->best_block_count), 1, fp)
+            != 1
+        || fb(&state->best_local, sizeof(state->best_local), 1, fp) != 1
+        || fb(&state->best_score, sizeof(state->best_score), 1, fp) != 1) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (state->best_entry_count < 0 || state->best_block_count < 0) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+
+    if (mode == DESERIALIZE && state->best_entry_count > 0) {
+        state->best_entries = malloc(
+            (size_t)state->best_entry_count * sizeof(*state->best_entries));
+        check_memory_allocation(state->best_entries, __LINE__, __FILE__,
+                                "PDF xref scan entries");
+    }
+    if (state->best_entry_count > 0
+        && fb(state->best_entries, sizeof(*state->best_entries),
+              (size_t)state->best_entry_count, fp)
+               != (size_t)state->best_entry_count) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+
+    if (mode == DESERIALIZE && state->best_block_count > 0) {
+        state->best_blocks = malloc(
+            (size_t)state->best_block_count * sizeof(*state->best_blocks));
+        check_memory_allocation(state->best_blocks, __LINE__, __FILE__,
+                                "PDF xref scan blocks");
+    }
+    if (state->best_block_count > 0
+        && fb(state->best_blocks, sizeof(*state->best_blocks),
+              (size_t)state->best_block_count, fp)
+               != (size_t)state->best_block_count) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    return true;
+}
+
 /*******************************************************/
 /* CARVE STATE FUNCTION DEFINITIONS                   */
 /*******************************************************/
@@ -4809,13 +7366,27 @@ static inline bool pdf_serialize_carve_state(void **state, FILE *fp,
         (*s)->xref_tables = NULL;  // Initialize to NULL
         (*s)->num_tables = 0;
         (*s)->incomplete_obj = false;
+        (*s)->initialized = false;
+        (*s)->speculative_blocks = false;
         (*s)->linearized = false;
         (*s)->lin_L = -1;
         (*s)->lin_T = -1;
+        (*s)->partial_prefix = NULL;
+        (*s)->partial_search_active = false;
+        (*s)->partial_search_length = 0;
+        (*s)->partial_search_next = 0;
+        memset(&(*s)->interior_search, 0, sizeof((*s)->interior_search));
+        pdf_xref_search_state_init(&(*s)->xref_search);
     }
 
     // Serialize/deserialize number of xref tables
     if (fb(&(*s)->num_tables, sizeof(size_t), 1, fp) != 1) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+
+    if (fb(&(*s)->initialized, sizeof((*s)->initialized), 1, fp) != 1 ||
+        fb(&(*s)->speculative_blocks,
+           sizeof((*s)->speculative_blocks), 1, fp) != 1) {
         handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
 
@@ -4829,6 +7400,70 @@ static inline bool pdf_serialize_carve_state(void **state, FILE *fp,
         handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
     if (fb(&(*s)->lin_T, sizeof(int64_t), 1, fp) != 1) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    pdf_serialize_xref_search_state(&(*s)->xref_search, fp, mode);
+
+    uint64_t interior_version = UINT64_C(0x504446494e543032);
+    PDFInteriorSearchState *interior = &(*s)->interior_search;
+    if (fb(&interior_version, sizeof(interior_version), 1, fp) != 1
+        || (interior_version != UINT64_C(0x504446494e543031)
+            && interior_version != UINT64_C(0x504446494e543032))
+        || fb(&interior->active, sizeof(interior->active), 1, fp) != 1
+        || fb(&interior->table, sizeof(interior->table), 1, fp) != 1
+        || fb(&interior->entry, sizeof(interior->entry), 1, fp) != 1
+        || fb(&interior->repair.active, sizeof(interior->repair.active), 1, fp) != 1
+        || fb(&interior->repair.prefix_limit, sizeof(interior->repair.prefix_limit), 1, fp) != 1
+        || fb(&interior->repair.prefix_length, sizeof(interior->repair.prefix_length), 1, fp) != 1
+        || fb(&interior->repair.run_length, sizeof(interior->repair.run_length), 1, fp) != 1
+        || fb(&interior->repair.next_actual, sizeof(interior->repair.next_actual), 1, fp) != 1
+        || interior->table > (*s)->num_tables || interior->entry < 0
+        || interior->repair.next_actual < 0
+        || (interior->repair.active
+            && (!interior->active || interior->repair.run_length < 1
+                || interior->repair.prefix_limit < 0
+                || interior->repair.prefix_length < 0
+                || interior->repair.prefix_length > interior->repair.prefix_limit))) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (interior_version == UINT64_C(0x504446494e543032)
+        && (fb(&interior->gap_extra, sizeof(interior->gap_extra), 1, fp) != 1
+            || fb(&interior->gap_slot, sizeof(interior->gap_slot), 1, fp) != 1
+            || (interior->gap_extra != 0
+                && (!interior->active || interior->gap_slot == 0)))) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+
+    uint64_t prefix_version = UINT64_C(0x5044465052465832);
+    uint64_t prefix_length = (*s)->partial_prefix ? (*s)->partial_prefix->length : 0;
+    uint64_t prefix_count = (*s)->partial_prefix ? (*s)->partial_prefix->count : 0;
+    if (fb(&prefix_version, sizeof(prefix_version), 1, fp) != 1
+        || prefix_version != UINT64_C(0x5044465052465832)
+        || fb(&prefix_length, sizeof(prefix_length), 1, fp) != 1
+        || fb(&prefix_count, sizeof(prefix_count), 1, fp) != 1
+        || fb(&(*s)->partial_search_active, sizeof((*s)->partial_search_active), 1, fp) != 1
+        || fb(&(*s)->partial_search_length, sizeof((*s)->partial_search_length), 1, fp) != 1
+        || fb(&(*s)->partial_search_next, sizeof((*s)->partial_search_next), 1, fp) != 1
+        || (*s)->partial_search_next < 0
+        || (*s)->partial_search_length > prefix_length
+        || ((*s)->partial_search_active && (*s)->partial_search_length == 0)
+        || prefix_count > (SIZE_MAX - sizeof(PDFPartialPrefix)) / sizeof(int64_t)
+        || (prefix_length == 0) != (prefix_count == 0)
+        || scalpel_state.blocksize == 0
+        || (prefix_length != 0
+            && 1 + (prefix_length - 1) / scalpel_state.blocksize != prefix_count)) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (mode == DESERIALIZE && prefix_count != 0) {
+        PDFPartialPrefix *prefix = malloc(sizeof(*prefix) + prefix_count * sizeof(int64_t));
+        check_memory_allocation(prefix, __LINE__, __FILE__, "PDF partial mapping");
+        atomic_init(&prefix->references, 1);
+        prefix->length = prefix_length;
+        prefix->count = prefix_count;
+        (*s)->partial_prefix = prefix;
+    }
+    if (prefix_count != 0
+        && fb((*s)->partial_prefix->actual, sizeof(int64_t), prefix_count, fp) != prefix_count) {
         handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
 
@@ -4884,10 +7519,21 @@ static inline void *pdf_clone_carve_state(const void *srcstate) {
     /* Copy scalar fields */
     d->num_tables = s->num_tables;
     d->incomplete_obj = s->incomplete_obj;
+    d->initialized = s->initialized;
+    d->speculative_blocks = s->speculative_blocks;
     d->linearized = s->linearized;
     d->lin_L = s->lin_L;
     d->lin_T = s->lin_T;
+    d->partial_prefix = s->partial_prefix;
+    d->partial_search_active = s->partial_search_active;
+    d->partial_search_length = s->partial_search_length;
+    d->partial_search_next = s->partial_search_next;
+    d->interior_search = s->interior_search;
+    if (d->partial_prefix) {
+        atomic_fetch_add_explicit(&d->partial_prefix->references, 1, memory_order_relaxed);
+    }
     d->xref_tables = NULL;
+    pdf_xref_search_state_copy(&d->xref_search, &s->xref_search);
 
     /* Deep-copy the array of XrefTables */
     if (s->xref_tables && s->num_tables > 0) {
@@ -4933,6 +7579,8 @@ static inline void pdf_free_carve_state(void **state) {
     }
 
     s->num_tables = 0;
+    pdf_xref_search_state_clear(&s->xref_search);
+    pdf_partial_prefix_release(s->partial_prefix);
     free(s);
     *state = NULL;
 }
@@ -5005,6 +7653,11 @@ static void pdf_reassembly_init_candidate(int id,
     PDFCarveState *carve_state = (PDFCarveState *)carve_get_state(candidate->carvehashkey);
     if(!carve_state){
         carve_state = (PDFCarveState *)calloc(1, sizeof *carve_state);
+        check_memory_allocation(carve_state, __LINE__, __FILE__,
+                                "PDF carve state");
+        carve_state->lin_L = -1;
+        carve_state->lin_T = -1;
+        pdf_xref_search_state_init(&carve_state->xref_search);
     }
 
     inflate_blockvector(candidate->b);
@@ -5080,6 +7733,7 @@ static void pdf_reassembly_init_candidate(int id,
 
     free(xref_tables);
     carve_state->incomplete_obj = false;
+    carve_state->initialized = true;
     carve_put_state(candidate->carvehashkey, carve_state);
     pdf_free_carve_state((void**)&carve_state);
 }
@@ -5153,7 +7807,6 @@ int64_t pdf_reassembly_get_block_choice(CarveInfo *candidate,
     int64_t block_choice;
     int64_t result = -1;
     init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
-    inflate_blockvector(scan_bv);
 
     if(mode == NEXTOBJECT){
         while ((block_choice = blockvector_get_choice(scan_bv, slot, start, -1, &evaluated)) != -1) {
@@ -5257,35 +7910,1942 @@ static void pdf_reassembly_extension_successful(int id, CarveInfo *candidate, ui
 }
 
 /**
+ * @description  Feeds one compressed extent to a zlib state while discarding
+ *               output. This is an integrity oracle for replacement searches:
+ *               callers retain only whether DEFLATE accepted the bytes and
+ *               whether its terminal Adler-32 was verified.
+ * @param stream  Initialized zlib state.
+ * @param data    Compressed bytes to feed.
+ * @param length  Number of bytes to feed.
+ * @return       2 at Z_STREAM_END, 1 when accepted but incomplete, 0 on invalid
+ *               compressed data, and -1 on an allocation failure.
+ */
+static int pdf_zlib_oracle_feed(z_stream *stream,
+                                const unsigned char *data,
+                                size_t length) {
+    unsigned char output[65536];
+    stream->next_in = (Bytef *)data;
+    stream->avail_in = (uInt)length;
+
+    do {
+        uInt before = stream->avail_in;
+        stream->next_out = output;
+        stream->avail_out = (uInt)sizeof(output);
+        int ret = inflate(stream, Z_NO_FLUSH);
+        if (ret == Z_STREAM_END) {
+            return 2;
+        }
+        if (ret == Z_MEM_ERROR) {
+            return -1;
+        }
+        if (ret != Z_OK && ret != Z_BUF_ERROR) {
+            return 0;
+        }
+        if (ret == Z_BUF_ERROR && stream->avail_in == before &&
+            stream->avail_out == sizeof(output)) {
+            return 0;
+        }
+    } while (stream->avail_in > 0 || stream->avail_out == 0);
+
+    return 1;
+}
+
+static int pdf_try_zlib_backbone_insertion(
+    z_stream *prefix,
+    size_t prefix_fed,
+    const int64_t *backbone,
+    size_t backbone_count,
+    size_t insert,
+    size_t missing,
+    size_t stream_len,
+    int64_t total_actual,
+    const roaring64_bitmap_t *outside_apps,
+    const roaring64_bitmap_t *backbone_apps,
+    int64_t *replacement,
+    uint64_t *probes) {
+    FileMirror *fm = scalpel_state.filemirror;
+    const size_t bsz = scalpel_state.blocksize;
+#ifdef PDF_TRACE_STALL
+    uLong best_total_in = 0;
+    int64_t best_run_start = -1;
+    int best_status = 0;
+#endif
+
+    for (int64_t run_start = 0;
+         run_start <= total_actual - (int64_t)missing;
+         run_start++) {
+        if (((++*probes & 0xffU) == 0U) &&
+            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                 memory_order_acquire)) {
+            return -1;
+        }
+
+        bool viable = true;
+        for (size_t i = 0; i < missing; i++) {
+            int64_t actual = run_start + (int64_t)i;
+            int64_t app = filemirror_apparent_blocknumber(fm, actual);
+            if (app < 0 || filemirror_actual_block_covered(fm, actual) ||
+                filemirror_actual_block_is_zero(fm, actual) ||
+                roaring64_bitmap_contains(outside_apps, (uint64_t)app) ||
+                roaring64_bitmap_contains(backbone_apps, (uint64_t)app)) {
+                viable = false;
+                break;
+            }
+            replacement[i] = actual;
+        }
+        if (!viable) {
+            continue;
+        }
+
+        z_stream trial;
+        memset(&trial, 0, sizeof(trial));
+        if (inflateCopy(&trial, prefix) != Z_OK) {
+            return -1;
+        }
+
+        size_t trial_fed = prefix_fed;
+        int trial_status = 1;
+        bool trial_extent_complete = false;
+        for (size_t i = 0; i < missing && trial_status == 1; i++) {
+            if (trial_fed >= stream_len) {
+                trial_status = 0;
+                break;
+            }
+            size_t take = bsz;
+            if (take > stream_len - trial_fed) {
+                take = stream_len - trial_fed;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, replacement[i]);
+            const unsigned char *block =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                trial_status = 0;
+                break;
+            }
+            trial_status = pdf_zlib_oracle_feed(&trial, block, take);
+            trial_fed += take;
+            if (trial_status == 2) {
+                trial_extent_complete = pdf_zlib_extent_complete(
+                    &trial, trial_fed, stream_len);
+            }
+            free((void *)block);
+            if (trial_status == 2) {
+                trial_status = 0;
+            }
+        }
+
+        for (size_t i = insert;
+             i < backbone_count && trial_status == 1;
+             i++) {
+            if (trial_fed >= stream_len) {
+                trial_status = 0;
+                break;
+            }
+            size_t take = bsz;
+            if (take > stream_len - trial_fed) {
+                take = stream_len - trial_fed;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, backbone[i]);
+            const unsigned char *block =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                trial_status = 0;
+                break;
+            }
+            trial_status = pdf_zlib_oracle_feed(&trial, block, take);
+            trial_fed += take;
+            if (trial_status == 2) {
+                trial_extent_complete = pdf_zlib_extent_complete(
+                    &trial, trial_fed, stream_len);
+            }
+            free((void *)block);
+            if (trial_status == 2 && i + 1 < backbone_count) {
+                trial_status = 0;
+            }
+        }
+
+        bool solved = trial_status == 2 && trial_extent_complete;
+#ifdef PDF_TRACE_STALL
+        if (trial.total_in > best_total_in) {
+            best_total_in = trial.total_in;
+            best_run_start = run_start;
+            best_status = trial_status;
+        }
+#endif
+        inflateEnd(&trial);
+        if (solved) {
+            return 1;
+        }
+    }
+#ifdef PDF_TRACE_STALL
+    lock_fprintf(stdout,
+        "[PDFBACKBONE] insertion=%zu missing=%zu best_run=%" PRId64
+        " best_input=%lu/%zu status=%d\n",
+        insert, missing, best_run_start, (unsigned long)best_total_in,
+        stream_len, best_status);
+#endif
+    return 0;
+}
+
+/**
+ * @description  Repairs a FlateDecode stream assembled across both a physical
+ *               gap and one displaced run. The trusted start and end blocks
+ *               bound a physical backbone; unavailable zero/covered blocks are
+ *               omitted, and the resulting block deficit is searched as one
+ *               contiguous run at every interior logical position. No candidate
+ *               mapping changes until zlib consumes the declared stream length
+ *               and reaches Z_STREAM_END, thereby verifying the final Adler-32.
+ * @param work       Thread context, used for checkpoint responsiveness.
+ * @param candidate  Candidate containing the stream.
+ * @param stream_at  Absolute logical byte offset of compressed stream data.
+ * @param stream_len Declared compressed stream length.
+ * @param start_slot Slot containing the stream start.
+ * @param end_slot   Slot containing the stream end.
+ * @return       true if an exact complete assignment was committed.
+ */
+static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
+                                              CarveInfo *candidate,
+                                              int64_t stream_at,
+                                              int stream_len,
+                                              int64_t start_slot,
+                                              int64_t end_slot,
+                                              bool exhaustive) {
+    (void)work;
+    if (!candidate || stream_len <= 0 || start_slot < 0 ||
+        end_slot <= start_slot ||
+        end_slot >= (int64_t)blockvector_get_num_blocks(candidate->b)) {
+        return false;
+    }
+
+    FileMirror *fm = scalpel_state.filemirror;
+    const size_t bsz = scalpel_state.blocksize;
+    const int64_t total_actual =
+        (int64_t)CEILDIV(filemirror_filesize(fm), bsz);
+    const size_t expected = (size_t)(end_slot - start_slot + 1);
+    int64_t start_app = blockvector_get_apparent_blocknumber(
+        candidate->b, (uint64_t)start_slot);
+    int64_t end_app = blockvector_get_apparent_blocknumber(
+        candidate->b, (uint64_t)end_slot);
+    if (start_app < 0 || end_app < 0) {
+        return false;
+    }
+
+    int64_t start_actual = filemirror_actual_blocknumber(fm, start_app);
+    int64_t end_actual = filemirror_actual_blocknumber(fm, end_app);
+    if (start_actual < 0 || end_actual <= start_actual ||
+        end_actual >= total_actual) {
+        return false;
+    }
+
+    roaring64_bitmap_t *outside_apps = roaring64_bitmap_create();
+    roaring64_bitmap_t *backbone_apps = roaring64_bitmap_create();
+    if (!outside_apps || !backbone_apps) {
+        roaring64_bitmap_free(outside_apps);
+        roaring64_bitmap_free(backbone_apps);
+        return false;
+    }
+
+    uint64_t candidate_blocks = blockvector_get_num_blocks(candidate->b);
+    for (uint64_t slot = 0; slot < candidate_blocks; slot++) {
+        if (slot >= (uint64_t)start_slot && slot <= (uint64_t)end_slot) {
+            continue;
+        }
+        int64_t app = blockvector_get_apparent_blocknumber(candidate->b, slot);
+        if (app >= 0) {
+            roaring64_bitmap_add(outside_apps, (uint64_t)app);
+        }
+    }
+
+    int64_t *backbone = malloc(expected * sizeof(*backbone));
+    int64_t *replacement = malloc(expected * sizeof(*replacement));
+    int64_t *assignment = malloc(expected * sizeof(*assignment));
+    check_memory_allocation(backbone, __LINE__, __FILE__,
+                            "PDF zlib physical backbone");
+    check_memory_allocation(replacement, __LINE__, __FILE__,
+                            "PDF zlib displaced run");
+    check_memory_allocation(assignment, __LINE__, __FILE__,
+                            "PDF zlib exact assignment");
+
+    size_t backbone_count = 0;
+    size_t preferred_insert = 0;
+    bool overflow = false;
+    bool skipping = false;
+    for (int64_t actual = start_actual; actual <= end_actual; actual++) {
+        int64_t app = filemirror_apparent_blocknumber(fm, actual);
+        if (app < 0 || filemirror_actual_block_covered(fm, actual) ||
+            filemirror_actual_block_is_zero(fm, actual) ||
+            roaring64_bitmap_contains(outside_apps, (uint64_t)app)) {
+            if (!skipping && backbone_count > 0) {
+                preferred_insert = backbone_count;
+            }
+            skipping = true;
+            continue;
+        }
+        skipping = false;
+        if (backbone_count == expected) {
+            overflow = true;
+            break;
+        }
+        backbone[backbone_count++] = actual;
+        roaring64_bitmap_add(backbone_apps, (uint64_t)app);
+    }
+
+    bool solved = false;
+    size_t solved_insert = 0;
+    size_t missing = (!overflow && backbone_count < expected)
+                         ? expected - backbone_count
+                         : 0;
+#ifdef PDF_TRACE_STALL
+    lock_fprintf(stdout,
+        "[PDFBACKBONE] start=%" PRId64 " end=%" PRId64
+        " expected=%zu backbone=%zu missing=%zu preferred=%zu overflow=%d\n",
+        start_actual, end_actual, expected, backbone_count, missing,
+        preferred_insert, overflow ? 1 : 0);
+#endif
+    if (overflow || backbone_count < 2 || backbone[0] != start_actual ||
+        backbone[backbone_count - 1] != end_actual) {
+        goto cleanup;
+    }
+
+    size_t first_offset = (size_t)(stream_at - start_slot * (int64_t)bsz);
+    if (first_offset >= bsz) {
+        goto cleanup;
+    }
+
+    z_stream prefix;
+    memset(&prefix, 0, sizeof(prefix));
+    if (inflateInit2(&prefix, 15) != Z_OK) {
+        goto cleanup;
+    }
+
+    size_t prefix_fed = 0;
+    size_t take = bsz - first_offset;
+    if (take > (size_t)stream_len) {
+        take = (size_t)stream_len;
+    }
+    const unsigned char *block =
+        (const unsigned char *)get_apparent_block_data(fm, start_app);
+    int prefix_status = 0;
+    bool prefix_extent_complete = false;
+    if (block) {
+        prefix_status = pdf_zlib_oracle_feed(&prefix, block + first_offset,
+                                             take);
+        prefix_fed = take;
+        if (prefix_status == 2) {
+            prefix_extent_complete = pdf_zlib_extent_complete(
+                &prefix, prefix_fed, (size_t)stream_len);
+        }
+        free((void *)block);
+    }
+
+    if (missing == 0) {
+        size_t fed = prefix_fed;
+        int status = prefix_status;
+        bool extent_complete = prefix_extent_complete;
+        for (size_t i = 1; i < backbone_count && status == 1; i++) {
+            if (((i & 0xffU) == 0U) &&
+                atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                     memory_order_acquire)) {
+                status = -1;
+                break;
+            }
+            if (fed >= (size_t)stream_len) {
+                status = 0;
+                break;
+            }
+            take = bsz;
+            if (take > (size_t)stream_len - fed) {
+                take = (size_t)stream_len - fed;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, backbone[i]);
+            block = (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                status = 0;
+                break;
+            }
+            status = pdf_zlib_oracle_feed(&prefix, block, take);
+            fed += take;
+            if (status == 2) {
+                extent_complete = pdf_zlib_extent_complete(
+                    &prefix, fed, (size_t)stream_len);
+            }
+            free((void *)block);
+            if (status == 2 && i + 1 < backbone_count) {
+                status = 0;
+            }
+        }
+        solved = status == 2 && extent_complete;
+        inflateEnd(&prefix);
+        if (solved) {
+            memcpy(assignment, backbone, expected * sizeof(*assignment));
+            solved = pdf_replace_blocks_at_slot(
+                candidate, assignment, (int)expected,
+                (uint64_t)start_slot, "ZLIB_BACKBONE");
+        }
+#ifdef PDF_TRACE_STALL
+        lock_fprintf(stdout,
+            "[PDFBACKBONE] direct count=%zu committed=%d\n",
+            backbone_count, solved ? 1 : 0);
+#endif
+        goto cleanup;
+    }
+
+    uint64_t probes = 0;
+    if (preferred_insert > 0 && preferred_insert < backbone_count) {
+        z_stream preferred;
+        memset(&preferred, 0, sizeof(preferred));
+        if (inflateInit2(&preferred, 15) != Z_OK) {
+            inflateEnd(&prefix);
+            goto cleanup;
+        }
+
+        size_t preferred_fed = 0;
+        int preferred_status = 1;
+        for (size_t i = 0; i < preferred_insert && preferred_status == 1; i++) {
+            if (preferred_fed >= (size_t)stream_len) {
+                preferred_status = 0;
+                break;
+            }
+            size_t offset = i == 0 ? first_offset : 0;
+            take = bsz - offset;
+            if (take > (size_t)stream_len - preferred_fed) {
+                take = (size_t)stream_len - preferred_fed;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, backbone[i]);
+            block = (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                preferred_status = 0;
+                break;
+            }
+            preferred_status = pdf_zlib_oracle_feed(
+                &preferred, block + offset, take);
+            free((void *)block);
+            preferred_fed += take;
+        }
+        if (preferred_status == 1) {
+            int result = pdf_try_zlib_backbone_insertion(
+                &preferred, preferred_fed, backbone, backbone_count,
+                preferred_insert, missing, (size_t)stream_len, total_actual,
+                outside_apps, backbone_apps, replacement, &probes);
+            if (result < 0) {
+                inflateEnd(&preferred);
+                inflateEnd(&prefix);
+                goto cleanup;
+            }
+            solved = result == 1;
+            if (solved) {
+                solved_insert = preferred_insert;
+            }
+#ifdef PDF_TRACE_STALL
+            lock_fprintf(stdout,
+                "[PDFBACKBONE] preferred=%zu result=%d probes=%" PRIu64
+                "\n",
+                preferred_insert, result, probes);
+#endif
+        }
+        inflateEnd(&preferred);
+    }
+
+    if (!solved && !exhaustive) {
+        inflateEnd(&prefix);
+        goto cleanup;
+    }
+
+    for (size_t insert = 1;
+         prefix_status == 1 && insert < backbone_count && !solved;
+         insert++) {
+        if (insert != preferred_insert) {
+            int result = pdf_try_zlib_backbone_insertion(
+                &prefix, prefix_fed, backbone, backbone_count, insert, missing,
+                (size_t)stream_len, total_actual, outside_apps, backbone_apps,
+                replacement, &probes);
+            if (result < 0) {
+                inflateEnd(&prefix);
+                goto cleanup;
+            }
+            solved = result == 1;
+            if (solved) {
+                solved_insert = insert;
+            }
+        }
+
+        if (!solved) {
+            if (prefix_fed >= (size_t)stream_len) {
+                prefix_status = 0;
+                break;
+            }
+            take = bsz;
+            if (take > (size_t)stream_len - prefix_fed) {
+                take = (size_t)stream_len - prefix_fed;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, backbone[insert]);
+            block = (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                prefix_status = 0;
+                break;
+            }
+            prefix_status = pdf_zlib_oracle_feed(&prefix, block, take);
+            free((void *)block);
+            prefix_fed += take;
+        }
+    }
+    inflateEnd(&prefix);
+
+    if (solved) {
+        size_t out = 0;
+        for (size_t i = 0; i < solved_insert; i++) {
+            assignment[out++] = backbone[i];
+        }
+        for (size_t i = 0; i < missing; i++) {
+            assignment[out++] = replacement[i];
+        }
+        for (size_t i = solved_insert; i < backbone_count; i++) {
+            assignment[out++] = backbone[i];
+        }
+        solved = out == expected && pdf_replace_blocks_at_slot(
+            candidate, assignment, (int)expected, (uint64_t)start_slot,
+            "ZLIB_BACKBONE");
+#ifdef PDF_TRACE_STALL
+        lock_fprintf(stdout,
+            "[PDFBACKBONE] solved insert=%zu missing=%zu committed=%d\n",
+            solved_insert, missing, solved ? 1 : 0);
+#endif
+    }
+
+cleanup:
+    free(assignment);
+    free(replacement);
+    free(backbone);
+    roaring64_bitmap_free(backbone_apps);
+    roaring64_bitmap_free(outside_apps);
+    return solved;
+}
+
+static int pdf_try_jpeg_backbone_insertion(
+    const JpegStreamReassembler *prefix,
+    const int64_t *backbone,
+    size_t backbone_count,
+    size_t insert,
+    size_t missing,
+    int64_t total_actual,
+    const roaring64_bitmap_t *outside_apps,
+    const roaring64_bitmap_t *backbone_apps,
+    int64_t *replacement,
+    uint64_t *probes) {
+    FileMirror *fm = scalpel_state.filemirror;
+    const size_t bsz = scalpel_state.blocksize;
+
+    for (int64_t run_start = 0;
+         run_start <= total_actual - (int64_t)missing;
+         run_start++) {
+        if (((++*probes & 0xffU) == 0U) &&
+            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                 memory_order_acquire)) {
+            return -1;
+        }
+
+        bool viable = true;
+        for (size_t i = 0; i < missing; i++) {
+            int64_t actual = run_start + (int64_t)i;
+            int64_t app = filemirror_apparent_blocknumber(fm, actual);
+            if (app < 0 || filemirror_actual_block_covered(fm, actual) ||
+                filemirror_actual_block_is_zero(fm, actual) ||
+                roaring64_bitmap_contains(outside_apps, (uint64_t)app) ||
+                roaring64_bitmap_contains(backbone_apps, (uint64_t)app)) {
+                viable = false;
+                break;
+            }
+            replacement[i] = actual;
+        }
+        if (!viable) {
+            continue;
+        }
+
+        /*
+         * The parser state is scalar and its output buffer is preallocated.
+         * A by-value copy therefore gives this trial an independent parser
+         * position; trial bytes overwrite only scratch output that no parser
+         * decision reads.
+         */
+        JpegStreamReassembler trial = *prefix;
+        int status = 1;
+        for (size_t i = 0; i < missing && status == 1; i++) {
+            int64_t app = filemirror_apparent_blocknumber(fm, replacement[i]);
+            const unsigned char *block =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                status = 0;
+                break;
+            }
+            status = jpeg_stream_reassembler_try_block(&trial, block, bsz);
+            free((void *)block);
+            if (status != 1) {
+                status = 0;
+            }
+        }
+
+        for (size_t i = insert;
+             i < backbone_count && status == 1;
+             i++) {
+            int64_t app = filemirror_apparent_blocknumber(fm, backbone[i]);
+            const unsigned char *block =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                status = 0;
+                break;
+            }
+            status = jpeg_stream_reassembler_try_block(&trial, block, bsz);
+            free((void *)block);
+            if (i + 1 < backbone_count && status != 1) {
+                status = 0;
+            }
+        }
+
+        if (status == 2 && pdf_jpeg_extent_complete(&trial)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @description  Repairs a DCTDecode stream whose xref-positioned start and end
+ *               blocks bracket interior holes. Available blocks between those
+ *               anchors form a physical backbone. If blocks were displaced,
+ *               every insertion position for the missing contiguous run is
+ *               tested. The candidate changes only after the complete declared
+ *               extent satisfies JPEG marker, table, scan, restart, EOI, and
+ *               trailing-whitespace checks.
+ * @param work       Thread context, used for checkpoint responsiveness.
+ * @param candidate  Candidate containing the stream.
+ * @param stream_at  Absolute logical byte offset of JPEG stream data.
+ * @param stream_len Declared stream length.
+ * @param start_slot Slot containing the stream start.
+ * @param end_slot   Slot containing the stream end.
+ * @param exhaustive Search every insertion position when the physical-gap
+ *                   position does not solve the stream.
+ * @return       true if a complete structurally verified assignment was committed.
+ */
+static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work,
+                                              CarveInfo *candidate,
+                                              int64_t stream_at,
+                                              int stream_len,
+                                              int64_t start_slot,
+                                              int64_t end_slot,
+                                              bool exhaustive) {
+    (void)work;
+    if (!candidate || stream_len <= 0 || start_slot < 0 ||
+        end_slot <= start_slot ||
+        end_slot >= (int64_t)blockvector_get_num_blocks(candidate->b)) {
+        return false;
+    }
+
+    FileMirror *fm = scalpel_state.filemirror;
+    const size_t bsz = scalpel_state.blocksize;
+    const int64_t total_actual =
+        (int64_t)CEILDIV(filemirror_filesize(fm), bsz);
+    const size_t expected = (size_t)(end_slot - start_slot + 1);
+    if (expected > (size_t)INT_MAX) {
+        return false;
+    }
+
+    int64_t start_app = blockvector_get_apparent_blocknumber(
+        candidate->b, (uint64_t)start_slot);
+    int64_t end_app = blockvector_get_apparent_blocknumber(
+        candidate->b, (uint64_t)end_slot);
+    if (start_app < 0 || end_app < 0) {
+        return false;
+    }
+
+    int64_t start_actual = filemirror_actual_blocknumber(fm, start_app);
+    int64_t end_actual = filemirror_actual_blocknumber(fm, end_app);
+    if (start_actual < 0 || end_actual <= start_actual ||
+        end_actual >= total_actual) {
+        return false;
+    }
+
+    roaring64_bitmap_t *outside_apps = roaring64_bitmap_create();
+    roaring64_bitmap_t *backbone_apps = roaring64_bitmap_create();
+    if (!outside_apps || !backbone_apps) {
+        roaring64_bitmap_free(outside_apps);
+        roaring64_bitmap_free(backbone_apps);
+        return false;
+    }
+
+    uint64_t candidate_blocks = blockvector_get_num_blocks(candidate->b);
+    for (uint64_t slot = 0; slot < candidate_blocks; slot++) {
+        if (slot >= (uint64_t)start_slot && slot <= (uint64_t)end_slot) {
+            continue;
+        }
+        int64_t app = blockvector_get_apparent_blocknumber(candidate->b, slot);
+        if (app >= 0) {
+            roaring64_bitmap_add(outside_apps, (uint64_t)app);
+        }
+    }
+
+    int64_t *backbone = malloc(expected * sizeof(*backbone));
+    int64_t *replacement = malloc(expected * sizeof(*replacement));
+    int64_t *assignment = malloc(expected * sizeof(*assignment));
+    check_memory_allocation(backbone, __LINE__, __FILE__,
+                            "PDF JPEG physical backbone");
+    check_memory_allocation(replacement, __LINE__, __FILE__,
+                            "PDF JPEG displaced run");
+    check_memory_allocation(assignment, __LINE__, __FILE__,
+                            "PDF JPEG exact assignment");
+
+    size_t backbone_count = 0;
+    size_t preferred_insert = 0;
+    bool overflow = false;
+    bool skipping = false;
+    for (int64_t actual = start_actual; actual <= end_actual; actual++) {
+        int64_t app = filemirror_apparent_blocknumber(fm, actual);
+        if (app < 0 || filemirror_actual_block_covered(fm, actual) ||
+            filemirror_actual_block_is_zero(fm, actual) ||
+            roaring64_bitmap_contains(outside_apps, (uint64_t)app)) {
+            if (!skipping && backbone_count > 0) {
+                preferred_insert = backbone_count;
+            }
+            skipping = true;
+            continue;
+        }
+        skipping = false;
+        if (backbone_count == expected) {
+            overflow = true;
+            break;
+        }
+        backbone[backbone_count++] = actual;
+        roaring64_bitmap_add(backbone_apps, (uint64_t)app);
+    }
+
+    bool solved = false;
+    size_t solved_insert = 0;
+    size_t missing = (!overflow && backbone_count < expected)
+                         ? expected - backbone_count
+                         : 0;
+    if (overflow || backbone_count < 2 || backbone[0] != start_actual ||
+        backbone[backbone_count - 1] != end_actual) {
+        goto cleanup;
+    }
+
+    size_t first_offset = (size_t)(stream_at - start_slot * (int64_t)bsz);
+    if (first_offset >= bsz) {
+        goto cleanup;
+    }
+
+    const unsigned char *first_block =
+        (const unsigned char *)get_apparent_block_data(fm, start_app);
+    if (!first_block) {
+        goto cleanup;
+    }
+    JpegStreamReassembler prefix;
+    int init_status = jpeg_stream_reassembler_init(
+        &prefix, first_block, bsz, first_offset, (size_t)stream_len);
+    free((void *)first_block);
+    if (init_status == -1) {
+        goto cleanup;
+    }
+
+    if (missing == 0) {
+        int status = 1;
+        for (size_t i = 1; i < backbone_count && status == 1; i++) {
+            if (((i & 0xffU) == 0U) &&
+                atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                     memory_order_acquire)) {
+                status = -1;
+                break;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, backbone[i]);
+            const unsigned char *block =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                status = 0;
+                break;
+            }
+            status = jpeg_stream_reassembler_try_block(&prefix, block, bsz);
+            free((void *)block);
+            if (i + 1 < backbone_count && status != 1) {
+                status = 0;
+            }
+        }
+        solved = status == 2 && pdf_jpeg_extent_complete(&prefix);
+        jpeg_stream_reassembler_free(&prefix);
+        if (solved) {
+            memcpy(assignment, backbone, expected * sizeof(*assignment));
+            solved = pdf_replace_blocks_at_slot(
+                candidate, assignment, (int)expected,
+                (uint64_t)start_slot, "JPEG_BACKBONE");
+        }
+        goto cleanup;
+    }
+
+    uint64_t probes = 0;
+    if (preferred_insert > 0 && preferred_insert < backbone_count) {
+        JpegStreamReassembler preferred = prefix;
+        int status = 1;
+        for (size_t i = 1; i < preferred_insert && status == 1; i++) {
+            int64_t app = filemirror_apparent_blocknumber(fm, backbone[i]);
+            const unsigned char *block =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!block) {
+                status = 0;
+                break;
+            }
+            status = jpeg_stream_reassembler_try_block(&preferred, block, bsz);
+            free((void *)block);
+            if (status != 1) {
+                status = 0;
+            }
+        }
+        if (status == 1) {
+            int result = pdf_try_jpeg_backbone_insertion(
+                &preferred, backbone, backbone_count, preferred_insert, missing,
+                total_actual, outside_apps, backbone_apps, replacement, &probes);
+            if (result < 0) {
+                jpeg_stream_reassembler_free(&prefix);
+                goto cleanup;
+            }
+            solved = result == 1;
+            if (solved) {
+                solved_insert = preferred_insert;
+            }
+        }
+    }
+
+    if (!solved && exhaustive) {
+        int prefix_status = 1;
+        for (size_t insert = 1;
+             insert < backbone_count && prefix_status == 1 && !solved;
+             insert++) {
+            if (insert != preferred_insert) {
+                int result = pdf_try_jpeg_backbone_insertion(
+                    &prefix, backbone, backbone_count, insert, missing,
+                    total_actual, outside_apps, backbone_apps, replacement,
+                    &probes);
+                if (result < 0) {
+                    break;
+                }
+                solved = result == 1;
+                if (solved) {
+                    solved_insert = insert;
+                }
+            }
+
+            if (!solved) {
+                int64_t app = filemirror_apparent_blocknumber(
+                    fm, backbone[insert]);
+                const unsigned char *block =
+                    (const unsigned char *)get_apparent_block_data(fm, app);
+                if (!block) {
+                    prefix_status = 0;
+                    break;
+                }
+                prefix_status = jpeg_stream_reassembler_try_block(
+                    &prefix, block, bsz);
+                free((void *)block);
+                if (prefix_status != 1) {
+                    prefix_status = 0;
+                }
+            }
+        }
+    }
+    jpeg_stream_reassembler_free(&prefix);
+
+    if (solved) {
+        size_t out = 0;
+        for (size_t i = 0; i < solved_insert; i++) {
+            assignment[out++] = backbone[i];
+        }
+        for (size_t i = 0; i < missing; i++) {
+            assignment[out++] = replacement[i];
+        }
+        for (size_t i = solved_insert; i < backbone_count; i++) {
+            assignment[out++] = backbone[i];
+        }
+        solved = out == expected && pdf_replace_blocks_at_slot(
+            candidate, assignment, (int)expected, (uint64_t)start_slot,
+            "JPEG_BACKBONE");
+    }
+
+cleanup:
+    free(assignment);
+    free(replacement);
+    free(backbone);
+    roaring64_bitmap_free(backbone_apps);
+    roaring64_bitmap_free(outside_apps);
+    return solved;
+}
+
+/**
+ * @description  Repairs one mapped all-zero run inside a FlateDecode stream.
+ *               A vacated displaced run can appear mapped rather than holed when
+ *               fragmentator or an acquisition image fills its old location with
+ *               zeroes. The valid compressed prefix is inflated once, each
+ *               available physical run of the same length is tried from a cloned
+ *               zlib state, and replacement occurs only when the complete stream
+ *               reaches Z_STREAM_END and verifies its Adler-32.
+ * @param work       Thread context, used for checkpoint responsiveness.
+ * @param candidate  Candidate containing the stream.
+ * @param stream_at  Absolute logical byte offset of compressed stream data.
+ * @param stream_len Declared compressed stream length.
+ * @param start_slot Slot containing the stream start.
+ * @param end_slot   Slot containing the stream end.
+ * @return       true if a verified displaced run was restored.
+ */
+static bool pdf_repair_interior_zlib_zero_run(ThreadWork *work,
+                                              CarveInfo *candidate,
+                                              int64_t stream_at,
+                                              int stream_len,
+                                              int64_t start_slot,
+                                              int64_t end_slot) {
+    (void)work;
+    FileMirror *fm = scalpel_state.filemirror;
+    const size_t bsz = scalpel_state.blocksize;
+    const int64_t total_actual =
+        (int64_t)CEILDIV(filemirror_filesize(fm), bsz);
+
+    int64_t zero_first = -1;
+    int64_t zero_last = -1;
+    bool second_run = false;
+    for (int64_t slot = start_slot; slot <= end_slot; slot++) {
+        int64_t app = blockvector_get_apparent_blocknumber(candidate->b,
+                                                           (uint64_t)slot);
+        if (app < 0) {
+            return false;
+        }
+        int64_t actual = filemirror_actual_blocknumber(fm, app);
+        if (!filemirror_actual_block_is_zero(fm, actual)) {
+            continue;
+        }
+        if (zero_first < 0) {
+            zero_first = slot;
+            zero_last = slot;
+        } else if (slot == zero_last + 1) {
+            zero_last = slot;
+        } else {
+            second_run = true;
+            break;
+        }
+    }
+    if (zero_first < 0 || second_run || zero_first == start_slot) {
+        return false;
+    }
+
+    int run_length = (int)(zero_last - zero_first + 1);
+    z_stream prefix;
+    memset(&prefix, 0, sizeof(prefix));
+    if (inflateInit2(&prefix, 15) != Z_OK) {
+        return false;
+    }
+
+    size_t fed = 0;
+    size_t first_offset = (size_t)(stream_at - start_slot * (int64_t)bsz);
+    size_t take = bsz - first_offset;
+    if (take > (size_t)stream_len) {
+        take = (size_t)stream_len;
+    }
+    const unsigned char *candidate_data =
+        (const unsigned char *)blockvector_get_data_pointer(candidate->b);
+    int status = pdf_zlib_oracle_feed(
+        &prefix, candidate_data + start_slot * (int64_t)bsz +
+                     (int64_t)first_offset,
+        take);
+    fed += take;
+
+    for (int64_t slot = start_slot + 1;
+         status == 1 && slot < zero_first;
+         slot++) {
+        if (fed >= (size_t)stream_len) {
+            status = 0;
+            break;
+        }
+        take = bsz;
+        if (take > (size_t)stream_len - fed) {
+            take = (size_t)stream_len - fed;
+        }
+        int64_t app = blockvector_get_apparent_blocknumber(candidate->b,
+                                                           (uint64_t)slot);
+        const unsigned char *blk =
+            (const unsigned char *)get_apparent_block_data(fm, app);
+        if (!blk) {
+            status = 0;
+            break;
+        }
+        status = pdf_zlib_oracle_feed(&prefix, blk, take);
+        free((void *)blk);
+        fed += take;
+    }
+    if (status != 1 || fed >= (size_t)stream_len) {
+        inflateEnd(&prefix);
+        return false;
+    }
+
+    int64_t *replacement = malloc((size_t)run_length * sizeof(*replacement));
+    check_memory_allocation(replacement, __LINE__, __FILE__,
+                            "PDF zlib displaced run");
+    bool solved = false;
+    uint64_t probes = 0;
+
+    for (int64_t run_start = 0;
+         run_start <= total_actual - run_length && !solved;
+         run_start++) {
+        if (((++probes & 0xffU) == 0U) &&
+            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                 memory_order_acquire)) {
+            break;
+        }
+
+        bool viable = true;
+        for (int i = 0; i < run_length; i++) {
+            int64_t actual = run_start + i;
+            int64_t app = filemirror_apparent_blocknumber(fm, actual);
+            if (app < 0 || filemirror_actual_block_covered(fm, actual) ||
+                filemirror_actual_block_is_zero(fm, actual) ||
+                apparent_block_in_blockvector(candidate->b, app)) {
+                viable = false;
+                break;
+            }
+            replacement[i] = actual;
+        }
+        if (!viable) {
+            continue;
+        }
+
+        z_stream trial;
+        memset(&trial, 0, sizeof(trial));
+        if (inflateCopy(&trial, &prefix) != Z_OK) {
+            break;
+        }
+
+        size_t trial_fed = fed;
+        int trial_status = 1;
+        bool trial_extent_complete = false;
+        for (int i = 0; i < run_length && trial_status == 1; i++) {
+            if (trial_fed >= (size_t)stream_len) {
+                trial_status = 0;
+                break;
+            }
+            take = bsz;
+            if (take > (size_t)stream_len - trial_fed) {
+                take = (size_t)stream_len - trial_fed;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, replacement[i]);
+            const unsigned char *blk =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!blk) {
+                trial_status = 0;
+                break;
+            }
+            trial_status = pdf_zlib_oracle_feed(&trial, blk, take);
+            trial_fed += take;
+            if (trial_status == 2) {
+                trial_extent_complete = pdf_zlib_extent_complete(
+                    &trial, trial_fed, (size_t)stream_len);
+            }
+            free((void *)blk);
+            if (trial_status == 2 && zero_first + i != end_slot) {
+                trial_status = 0;
+            }
+        }
+
+        for (int64_t slot = zero_last + 1;
+             trial_status == 1 && slot <= end_slot;
+             slot++) {
+            if (trial_fed >= (size_t)stream_len) {
+                trial_status = 0;
+                break;
+            }
+            take = bsz;
+            if (take > (size_t)stream_len - trial_fed) {
+                take = (size_t)stream_len - trial_fed;
+            }
+            int64_t app = blockvector_get_apparent_blocknumber(
+                candidate->b, (uint64_t)slot);
+            const unsigned char *blk =
+                (const unsigned char *)get_apparent_block_data(fm, app);
+            if (!blk) {
+                trial_status = 0;
+                break;
+            }
+            trial_status = pdf_zlib_oracle_feed(&trial, blk, take);
+            trial_fed += take;
+            if (trial_status == 2) {
+                trial_extent_complete = pdf_zlib_extent_complete(
+                    &trial, trial_fed, (size_t)stream_len);
+            }
+            free((void *)blk);
+            if (trial_status == 2 && slot != end_slot) {
+                trial_status = 0;
+            }
+        }
+
+        solved = trial_status == 2 && trial_extent_complete;
+        inflateEnd(&trial);
+    }
+
+    inflateEnd(&prefix);
+    bool replaced = solved && pdf_replace_blocks_at_slot(
+        candidate, replacement, run_length, (uint64_t)zero_first,
+        "ZLIB_ZERO_RUN");
+    free(replacement);
+    return replaced;
+}
+
+// Repair a mapped Flate stream by substituting a physical run at each interior
+// position. The first and last blocks remain fixed. The prefix is inflated once
+// per position, and a trial is committed only after the full stream checksum and
+// declared extent agree. The cursor always names the next untested actual run.
+static bool pdf_repair_mapped_zlib_run(CarveInfo *candidate,
+                                       int64_t stream_at,
+                                       int stream_len,
+                                       int64_t start_slot,
+                                       int64_t end_slot,
+                                       PDFStreamRepairCursor *cursor) {
+    const size_t bsz = scalpel_state.blocksize;
+    FileMirror *fm = scalpel_state.filemirror;
+    if (!candidate || !cursor || bsz == 0 || stream_at < 0 || stream_len <= 0
+        || start_slot < 0 || end_slot <= start_slot || end_slot - start_slot <= 1
+        || end_slot >= (int64_t)blockvector_get_num_blocks(candidate->b)
+        || (uint64_t)stream_at / bsz != (uint64_t)start_slot
+        || (uint64_t)stream_at + (uint64_t)stream_len
+            > blockvector_get_data_length(candidate->b)
+        || ((uint64_t)stream_at + (uint64_t)stream_len - 1) / bsz
+            != (uint64_t)end_slot
+        || end_slot - start_slot > INT_MAX) {
+        return false;
+    }
+    const int32_t interior = (int32_t)(end_slot - start_slot - 1);
+    const int64_t total_actual = (int64_t)CEILDIV(filemirror_filesize(fm), bsz);
+    const unsigned char *data =
+        (const unsigned char *)blockvector_get_data_pointer(candidate->b);
+    const size_t offset = (size_t)((uint64_t)stream_at % bsz);
+    const size_t first_length = bsz - offset;
+    for (int64_t slot = start_slot; slot <= end_slot; slot++) {
+        if (blockvector_get_apparent_blocknumber(candidate->b, (uint64_t)slot) < 0) {
+            return false;
+        }
+    }
+
+    if (!cursor->active) {
+        z_stream probe = {0};
+        if (inflateInit(&probe) != Z_OK) {
+            return false;
+        }
+        int32_t status = pdf_zlib_oracle_feed(&probe, data + stream_at, first_length);
+        size_t supplied = first_length;
+        int32_t failed_slot = 0;
+        for (int32_t i = 1; status == 1 && i <= interior + 1; i++) {
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                inflateEnd(&probe);
+                return false;
+            }
+            size_t take = (size_t)stream_len - supplied;
+            if (take > bsz) {
+                take = bsz;
+            }
+            status = pdf_zlib_oracle_feed(&probe,
+                data + ((uint64_t)start_slot + (uint64_t)i) * bsz, take);
+            supplied += take;
+            if (status != 1) {
+                failed_slot = i;
+            }
+        }
+        bool complete = status == 2
+            && pdf_zlib_extent_complete(&probe, supplied, (size_t)stream_len);
+        inflateEnd(&probe);
+        if (status == 1 && supplied == (size_t)stream_len) {
+            failed_slot = interior + 1;
+        }
+        if (complete || failed_slot == 0 || status < 0) {
+            return false;
+        }
+        cursor->active = true;
+        cursor->prefix_limit = failed_slot - 1;
+        if (cursor->prefix_limit >= interior) {
+            cursor->prefix_limit = interior - 1;
+        }
+        cursor->run_length = 1;
+        cursor->prefix_length = cursor->prefix_limit;
+        cursor->next_actual = 0;
+    }
+    if (cursor->run_length < 1 || cursor->run_length > interior
+        || cursor->prefix_limit < 0 || cursor->prefix_limit >= interior
+        || cursor->prefix_length < 0 || cursor->prefix_length > cursor->prefix_limit
+        || cursor->prefix_length > interior - cursor->run_length
+        || cursor->next_actual < 0) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+
+    int64_t *replacement = malloc((size_t)interior * sizeof(*replacement));
+    check_memory_allocation(replacement, __LINE__, __FILE__, "PDF Flate replacement");
+    bool solved = false;
+    while (cursor->run_length <= interior && !solved) {
+        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            break;
+        }
+        int64_t first = start_slot + cursor->prefix_length + 1;
+        int64_t last = first + cursor->run_length - 1;
+        if (first <= start_slot || last >= end_slot) {
+            handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+        }
+        z_stream prefix = {0};
+        if (inflateInit(&prefix) != Z_OK) {
+            break;
+        }
+        int32_t status = pdf_zlib_oracle_feed(&prefix, data + stream_at, first_length);
+        size_t supplied = first_length;
+        for (int32_t i = 1; status == 1 && i <= cursor->prefix_length; i++) {
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                inflateEnd(&prefix);
+                free(replacement);
+                return false;
+            }
+            status = pdf_zlib_oracle_feed(&prefix,
+                data + ((uint64_t)start_slot + (uint64_t)i) * bsz, bsz);
+            supplied += bsz;
+        }
+
+        roaring64_bitmap_t *outside = roaring64_bitmap_create();
+        check_memory_allocation(outside, __LINE__, __FILE__, "PDF fixed stream blocks");
+        for (uint64_t slot = 0; slot < blockvector_get_num_blocks(candidate->b); slot++) {
+            if (slot >= (uint64_t)first && slot <= (uint64_t)last) {
+                continue;
+            }
+            int64_t app = blockvector_get_apparent_blocknumber(candidate->b, slot);
+            if (app >= 0) {
+                roaring64_bitmap_add(outside, (uint64_t)app);
+            }
+        }
+
+        while (status == 1 && cursor->next_actual <= total_actual - cursor->run_length) {
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                break;
+            }
+            bool viable = true;
+            for (int32_t i = 0; i < cursor->run_length; i++) {
+                int64_t actual = cursor->next_actual + i;
+                int64_t app = filemirror_apparent_blocknumber(fm, actual);
+                if (app < 0 || filemirror_actual_block_covered(fm, actual)
+                    || filemirror_actual_block_is_zero(fm, actual)
+                    || roaring64_bitmap_contains(outside, (uint64_t)app)) {
+                    viable = false;
+                    break;
+                }
+                replacement[i] = actual;
+            }
+            if (viable) {
+                z_stream trial = {0};
+                if (inflateCopy(&trial, &prefix) != Z_OK) {
+                    roaring64_bitmap_free(outside);
+                    inflateEnd(&prefix);
+                    free(replacement);
+                    return false;
+                }
+                int32_t trial_status = 1;
+                size_t trial_fed = supplied;
+                for (int32_t i = 0; i < cursor->run_length && trial_status == 1; i++) {
+                    uint64_t available = 0;
+                    const unsigned char *block = (const unsigned char *)
+                        filemirror_actual_block_data_pointer(fm, replacement[i], &available);
+                    if (!block || available < bsz) {
+                        trial_status = 0;
+                        break;
+                    }
+                    trial_status = pdf_zlib_oracle_feed(&trial, block, bsz);
+                    trial_fed += bsz;
+                    if (trial_status == 2) {
+                        trial_status = 0;
+                    }
+                    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                        break;
+                    }
+                }
+                bool complete = false;
+                for (int64_t slot = last + 1; trial_status == 1 && slot <= end_slot; slot++) {
+                    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                        break;
+                    }
+                    size_t take = (size_t)stream_len - trial_fed;
+                    if (take > bsz) {
+                        take = bsz;
+                    }
+                    trial_status = pdf_zlib_oracle_feed(&trial, data + (uint64_t)slot * bsz, take);
+                    trial_fed += take;
+                    complete = slot == end_slot && trial_status == 2
+                        && pdf_zlib_extent_complete(&trial, trial_fed, (size_t)stream_len);
+                }
+                inflateEnd(&trial);
+                if (complete && pdf_replace_blocks_at_slot(candidate, replacement,
+                        cursor->run_length, (uint64_t)first, "ZLIB_MAPPED_RUN")) {
+                    solved = true;
+                    break;
+                }
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                    break;
+                }
+            }
+            cursor->next_actual++;
+        }
+        roaring64_bitmap_free(outside);
+        inflateEnd(&prefix);
+        if (solved || atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            break;
+        }
+        cursor->next_actual = 0;
+        if (cursor->prefix_length > 0) {
+            cursor->prefix_length--;
+        } else {
+            cursor->run_length++;
+            cursor->prefix_length = interior - cursor->run_length;
+            if (cursor->prefix_length > cursor->prefix_limit) {
+                cursor->prefix_length = cursor->prefix_limit;
+            }
+        }
+    }
+    if (solved || cursor->run_length > interior) {
+        memset(cursor, 0, sizeof(*cursor));
+    }
+    free(replacement);
+    return solved;
+}
+
+// A stream terminator displaced by whole blocks supplies possible gap lengths.
+// Remove each such gap on a clone, then test an interior replacement run. The
+// original mapping changes only after the stream checksum and full PDF agree.
+// gap_extra/gap_slot and the actual-block cursor retain the next trial at a
+// checkpoint; temporary mappings never become candidate state.
+static bool pdf_repair_gapped_zlib_run(CarveInfo *candidate, int64_t stream_at,
+                                      int stream_len, int64_t start_slot,
+                                      int64_t end_slot,
+                                      PDFInteriorSearchState *search) {
+    if (!candidate || !search || stream_at < 0 || stream_len <= 0
+        || start_slot < 0 || end_slot <= start_slot
+        || scalpel_state.blocksize == 0) {
+        return false;
+    }
+    const uint64_t bsz = scalpel_state.blocksize;
+    const uint64_t length = blockvector_get_data_length(candidate->b);
+    const uint64_t count = blockvector_get_num_blocks(candidate->b);
+    const uint64_t send = (uint64_t)stream_at + (uint64_t)stream_len;
+    if (send > length || (uint64_t)end_slot >= count
+        || send / bsz < (uint64_t)end_slot) {
+        return false;
+    }
+    const char *data = blockvector_get_data_pointer(candidate->b);
+    if (search->gap_extra == 0) {
+        // A stream that already passes its checksum needs no gap search, even
+        // if later objects happen to end at the same offset within a block.
+        z_stream probe = {0};
+        if (inflateInit(&probe) != Z_OK) {
+            return false;
+        }
+        size_t supplied = 0;
+        int status = 1;
+        while (status == 1 && supplied < (size_t)stream_len) {
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                inflateEnd(&probe);
+                return false;
+            }
+            size_t take = (size_t)stream_len - supplied;
+            if (take > bsz) {
+                take = bsz;
+            }
+            status = pdf_zlib_oracle_feed(&probe,
+                (const unsigned char *)data + stream_at + supplied, take);
+            supplied += take;
+        }
+        bool complete = status == 2
+            && pdf_zlib_extent_complete(&probe, supplied, (size_t)stream_len);
+        inflateEnd(&probe);
+        if (complete || status < 0) {
+            return false;
+        }
+        search->gap_extra = 1;
+        search->gap_slot = (uint64_t)start_slot + 1;
+        memset(&search->repair, 0, sizeof(search->repair));
+    }
+    if (search->gap_slot <= (uint64_t)start_slot
+        || search->gap_slot > (uint64_t)end_slot) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    for (; search->gap_extra <= (length - send) / bsz;
+         search->gap_extra++, search->gap_slot = (uint64_t)start_slot + 1) {
+        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            return false;
+        }
+        uint64_t marker = send + search->gap_extra * bsz;
+        if (marker < length && data[marker] == '\r') {
+            marker++;
+        }
+        if (marker < length && data[marker] == '\n') {
+            marker++;
+        }
+        if (length - marker < 9 || memcmp(data + marker, "endstream", 9)) {
+            continue;
+        }
+        for (; search->gap_slot <= (uint64_t)end_slot; search->gap_slot++) {
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                return false;
+            }
+            BlockVector *trial_bv = NULL;
+            clone_blockvector(candidate->b, &trial_bv, false);
+            const uint64_t trial_count = count - search->gap_extra;
+            for (uint64_t slot = search->gap_slot; slot < trial_count; slot++) {
+                blockvector_set_apparent_blocknumber(trial_bv, slot,
+                    blockvector_get_apparent_blocknumber(candidate->b,
+                        slot + search->gap_extra));
+            }
+            resize_blockvector(trial_bv, trial_count);
+            blockvector_set_data_length(trial_bv, length - search->gap_extra * bsz);
+            inflate_blockvector(trial_bv);
+            CarveInfo trial = *candidate;
+            trial.b = trial_bv;
+
+            bool complete = false;
+            z_stream stream = {0};
+            if (inflateInit(&stream) == Z_OK) {
+                int status = pdf_zlib_oracle_feed(&stream,
+                    (const unsigned char *)blockvector_get_data_pointer(trial_bv)
+                        + stream_at, (size_t)stream_len);
+                complete = status == 2 && pdf_zlib_extent_complete(&stream,
+                    (size_t)stream_len, (size_t)stream_len);
+                inflateEnd(&stream);
+            }
+            if (!complete) {
+                complete = pdf_repair_mapped_zlib_run(&trial, stream_at,
+                    stream_len, start_slot, end_slot, &search->repair);
+            }
+            if (complete && !atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                                   memory_order_acquire)) {
+                bool validates = false;
+                bool promising = false;
+                uint64_t validates_to = 0;
+                pdf_file_validate(blockvector_get_data_pointer(trial_bv),
+                    blockvector_get_data_length(trial_bv), &validates,
+                    &validates_to, &promising, candidate->needleidx,
+                    (uint32_t)bsz, NULL);
+                if (validates && validates_to >= send
+                    && !pdf_candidate_has_holes_through(&trial, validates_to)) {
+                    blockvector_set_data_length(trial_bv, validates_to + 1);
+                    free_blockvector(&candidate->b);
+                    candidate->b = trial_bv;
+                    candidate->fastpath = false;
+                    candidate->best_validates_to = validates_to;
+                    search->gap_extra = 0;
+                    search->gap_slot = 0;
+                    memset(&search->repair, 0, sizeof(search->repair));
+                    return true;
+                }
+            }
+            free_blockvector(&trial_bv);
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                return false;
+            }
+            memset(&search->repair, 0, sizeof(search->repair));
+        }
+    }
+    search->gap_extra = 0;
+    search->gap_slot = 0;
+    memset(&search->repair, 0, sizeof(search->repair));
+    return false;
+}
+
+// Save only the interior scan state; other repair helpers can independently
+// update the candidate's xref evidence or speculative-mapping flag.
+static void pdf_store_interior_search(CarveInfo *candidate,
+                                      const PDFInteriorSearchState *search) {
+    PDFCarveState *state = (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+    if (state) {
+        state->interior_search = *search;
+        carve_put_state(candidate->carvehashkey, state);
+        pdf_free_carve_state((void **)&state);
+    }
+}
+
+static inline uint32_t pdf_icc_lut_value(const unsigned char *profile,
+                                         size_t offset,
+                                         unsigned int bytes_per_value) {
+    if (bytes_per_value == 1) {
+        return profile[offset];
+    }
+    return ((uint32_t)profile[offset] << 8) | profile[offset + 1];
+}
+
+/**
+ * @description  Repairs one displaced run inside an uncompressed ICC lookup
+ *               table. ICC mft1/mft2 tables are sampled on a regular
+ *               multidimensional grid, so adjacent entries normally vary
+ *               smoothly. Every viable physical run is ranked by total
+ *               variation on the grid edges affected by the hole. A run is
+ *               accepted only when it is structurally plausible and clearly
+ *               separated from the runner-up. ICC v2 has no checksum for this
+ *               table, so the candidate is persistently marked speculative and
+ *               remains PROMISING even if the completed PDF validates.
+ * @param work       Thread context, used for checkpoint responsiveness.
+ * @param candidate  Candidate containing the ICC stream.
+ * @param stream_at  Absolute logical byte offset of the profile.
+ * @param stream_len Declared profile stream length.
+ * @param start_slot Slot containing the beginning of the profile.
+ * @param end_slot   Slot containing the end of the profile.
+ * @return       true if a uniquely ranked run was committed.
+ */
+static bool pdf_repair_interior_icc_lut(ThreadWork *work,
+                                        CarveInfo *candidate,
+                                        int64_t stream_at,
+                                        int stream_len,
+                                        int64_t start_slot,
+                                        int64_t end_slot) {
+    (void)work;
+    if (!candidate || stream_at < 0 || stream_len < 132 || start_slot < 0 ||
+        end_slot <= start_slot ||
+        end_slot >= (int64_t)blockvector_get_num_blocks(candidate->b)) {
+        return false;
+    }
+
+    FileMirror *fm = scalpel_state.filemirror;
+    const uint64_t bsz = scalpel_state.blocksize;
+    const uint64_t candidate_length =
+        blockvector_get_data_length(candidate->b);
+    if ((uint64_t)stream_at > candidate_length ||
+        (uint64_t)stream_len > candidate_length - (uint64_t)stream_at) {
+        return false;
+    }
+
+    int64_t hole_first = -1;
+    int64_t hole_last = -1;
+    bool hole_closed = false;
+    for (int64_t slot = start_slot; slot <= end_slot; slot++) {
+        bool hole = blockvector_get_apparent_blocknumber(
+                        candidate->b, (uint64_t)slot) < 0;
+        if (hole) {
+            if (hole_closed) {
+                return false;
+            }
+            if (hole_first < 0) {
+                hole_first = slot;
+            }
+            hole_last = slot;
+        } else if (hole_first >= 0) {
+            hole_closed = true;
+        }
+    }
+    if (hole_first <= start_slot || hole_last >= end_slot) {
+        return false;
+    }
+
+    uint64_t stream_start = (uint64_t)stream_at;
+    uint64_t stream_end = stream_start + (uint64_t)stream_len;
+    uint64_t hole_byte_start = (uint64_t)hole_first * bsz;
+    uint64_t hole_byte_end = ((uint64_t)hole_last + 1) * bsz;
+    if (hole_byte_start < stream_start || hole_byte_end > stream_end) {
+        return false;
+    }
+    size_t hole_profile_start = (size_t)(hole_byte_start - stream_start);
+    size_t hole_profile_end = (size_t)(hole_byte_end - stream_start);
+
+    inflate_blockvector(candidate->b);
+    const unsigned char *candidate_data =
+        (const unsigned char *)blockvector_get_data_pointer(candidate->b);
+    if (!candidate_data) {
+        return false;
+    }
+
+    unsigned char *profile = malloc((size_t)stream_len);
+    check_memory_allocation(profile, __LINE__, __FILE__, "PDF ICC profile");
+    memcpy(profile, candidate_data + stream_start, (size_t)stream_len);
+
+    size_t profile_size = read_be(profile, 4, (size_t)stream_len);
+    if (profile_size < 132 || profile_size > (size_t)stream_len ||
+        memcmp(profile + 36, "acsp", 4)) {
+        free(profile);
+        return false;
+    }
+
+    uint32_t tag_count = read_be(profile + 128, 4, profile_size - 128);
+    if (tag_count == 0 || tag_count > (profile_size - 132) / 12) {
+        free(profile);
+        return false;
+    }
+
+    size_t clut_offset = 0;
+    size_t clut_end = 0;
+    uint64_t node_count = 0;
+    unsigned int input_channels = 0;
+    unsigned int output_channels = 0;
+    unsigned int grid_points = 0;
+    unsigned int bytes_per_value = 0;
+    bool layout_found = false;
+
+    for (uint32_t tag = 0; tag < tag_count; tag++) {
+        size_t entry = 132 + (size_t)tag * 12;
+        size_t tag_offset = read_be(profile + entry + 4, 4,
+                                    profile_size - entry - 4);
+        size_t tag_size = read_be(profile + entry + 8, 4,
+                                  profile_size - entry - 8);
+        if (tag_offset > profile_size || tag_size > profile_size - tag_offset ||
+            tag_size < 48) {
+            continue;
+        }
+
+        const unsigned char *lut = profile + tag_offset;
+        bool mft1 = !memcmp(lut, "mft1", 4);
+        bool mft2 = !memcmp(lut, "mft2", 4);
+        if (!mft1 && !mft2) {
+            continue;
+        }
+
+        unsigned int in_ch = lut[8];
+        unsigned int out_ch = lut[9];
+        unsigned int grid = lut[10];
+        unsigned int value_bytes = mft2 ? 2U : 1U;
+        size_t header_size = mft2 ? 52U : 48U;
+        if (in_ch == 0 || in_ch > 15 || out_ch == 0 || out_ch > 15 ||
+            grid < 2 || header_size > tag_size) {
+            continue;
+        }
+
+        unsigned int input_entries = 256;
+        unsigned int output_entries = 256;
+        if (mft2) {
+            input_entries = read_be(lut + 48, 2, tag_size - 48);
+            output_entries = read_be(lut + 50, 2, tag_size - 50);
+            if (input_entries < 2 || output_entries < 2) {
+                continue;
+            }
+        }
+
+        uint64_t nodes = 1;
+        bool overflow = false;
+        for (unsigned int channel = 0; channel < in_ch; channel++) {
+            if (nodes > UINT64_MAX / grid) {
+                overflow = true;
+                break;
+            }
+            nodes *= grid;
+        }
+        if (overflow || nodes > SIZE_MAX / out_ch ||
+            nodes * out_ch > SIZE_MAX / value_bytes) {
+            continue;
+        }
+
+        uint64_t input_table_bytes =
+            (uint64_t)in_ch * input_entries * value_bytes;
+        uint64_t clut_bytes = nodes * out_ch * value_bytes;
+        uint64_t output_table_bytes =
+            (uint64_t)out_ch * output_entries * value_bytes;
+        uint64_t local_clut = (uint64_t)header_size + input_table_bytes;
+        uint64_t local_end = local_clut + clut_bytes;
+        if (local_clut > tag_size || local_end > tag_size ||
+            output_table_bytes > tag_size - local_end) {
+            continue;
+        }
+
+        size_t absolute_clut = tag_offset + (size_t)local_clut;
+        size_t absolute_end = tag_offset + (size_t)local_end;
+        if (hole_profile_start < absolute_clut ||
+            hole_profile_end > absolute_end) {
+            continue;
+        }
+
+        if (layout_found &&
+            (clut_offset != absolute_clut || clut_end != absolute_end ||
+             node_count != nodes || input_channels != in_ch ||
+             output_channels != out_ch || grid_points != grid ||
+             bytes_per_value != value_bytes)) {
+            free(profile);
+            return false;
+        }
+
+        layout_found = true;
+        clut_offset = absolute_clut;
+        clut_end = absolute_end;
+        node_count = nodes;
+        input_channels = in_ch;
+        output_channels = out_ch;
+        grid_points = grid;
+        bytes_per_value = value_bytes;
+    }
+
+    if (!layout_found) {
+        free(profile);
+        return false;
+    }
+
+    uint64_t known_score = 0;
+    uint64_t known_edges = 0;
+    uint64_t affected_edges = 0;
+    uint64_t stride = 1;
+    for (unsigned int dimension = 0;
+         dimension < input_channels;
+         dimension++) {
+        for (uint64_t node = 0; node < node_count; node++) {
+            if (((node / stride) % grid_points) + 1 >= grid_points) {
+                continue;
+            }
+            uint64_t neighbor = node + stride;
+            for (unsigned int channel = 0;
+                 channel < output_channels;
+                 channel++) {
+                size_t left = clut_offset +
+                    (size_t)(node * output_channels + channel) *
+                    bytes_per_value;
+                size_t right = clut_offset +
+                    (size_t)(neighbor * output_channels + channel) *
+                    bytes_per_value;
+                bool left_affected =
+                    left < hole_profile_end &&
+                    left + bytes_per_value > hole_profile_start;
+                bool right_affected =
+                    right < hole_profile_end &&
+                    right + bytes_per_value > hole_profile_start;
+                if (left_affected || right_affected) {
+                    affected_edges++;
+                    continue;
+                }
+
+                uint32_t a = pdf_icc_lut_value(profile, left,
+                                               bytes_per_value);
+                uint32_t b = pdf_icc_lut_value(profile, right,
+                                               bytes_per_value);
+                known_score += a > b ? a - b : b - a;
+                known_edges++;
+            }
+        }
+        stride *= grid_points;
+    }
+
+    if (known_edges < 16 || affected_edges < 16) {
+        free(profile);
+        return false;
+    }
+
+    roaring64_bitmap_t *outside_apps = roaring64_bitmap_create();
+    if (!outside_apps) {
+        free(profile);
+        return false;
+    }
+    uint64_t candidate_blocks = blockvector_get_num_blocks(candidate->b);
+    for (uint64_t slot = 0; slot < candidate_blocks; slot++) {
+        if (slot >= (uint64_t)hole_first && slot <= (uint64_t)hole_last) {
+            continue;
+        }
+        int64_t app = blockvector_get_apparent_blocknumber(candidate->b, slot);
+        if (app >= 0) {
+            roaring64_bitmap_add(outside_apps, (uint64_t)app);
+        }
+    }
+
+    int run_length = (int)(hole_last - hole_first + 1);
+    int64_t total_actual =
+        (int64_t)CEILDIV(filemirror_filesize(fm), bsz);
+    int64_t *replacement = malloc((size_t)run_length * sizeof(*replacement));
+    int64_t *best_replacement =
+        malloc((size_t)run_length * sizeof(*best_replacement));
+    check_memory_allocation(replacement, __LINE__, __FILE__,
+                            "PDF ICC trial run");
+    check_memory_allocation(best_replacement, __LINE__, __FILE__,
+                            "PDF ICC best run");
+
+    uint64_t best_score = UINT64_MAX;
+    uint64_t second_score = UINT64_MAX;
+    uint64_t viable_runs = 0;
+    uint64_t probes = 0;
+    bool interrupted = false;
+
+    for (int64_t run_start = 0;
+         run_start <= total_actual - run_length;
+         run_start++) {
+        if (((++probes & 0xffU) == 0U) &&
+            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                 memory_order_acquire)) {
+            interrupted = true;
+            break;
+        }
+
+        bool viable = true;
+        for (int i = 0; i < run_length; i++) {
+            int64_t actual = run_start + i;
+            int64_t app = filemirror_apparent_blocknumber(fm, actual);
+            if (app < 0 || filemirror_actual_block_covered(fm, actual) ||
+                filemirror_actual_block_is_zero(fm, actual) ||
+                roaring64_bitmap_contains(outside_apps, (uint64_t)app)) {
+                viable = false;
+                break;
+            }
+            replacement[i] = actual;
+        }
+        if (!viable) {
+            continue;
+        }
+
+        for (int i = 0; i < run_length; i++) {
+            uint64_t block_length = 0;
+            const unsigned char *block =
+                (const unsigned char *)filemirror_actual_block_data_pointer(
+                    fm, replacement[i], &block_length);
+            uint64_t logical_start = ((uint64_t)hole_first + (uint64_t)i) * bsz;
+            uint64_t copy_start = logical_start > stream_start
+                                      ? logical_start : stream_start;
+            uint64_t logical_end = logical_start + bsz;
+            uint64_t copy_end = logical_end < stream_end
+                                    ? logical_end : stream_end;
+            size_t source_offset = (size_t)(copy_start - logical_start);
+            size_t copy_length = (size_t)(copy_end - copy_start);
+            if (!block || source_offset > block_length ||
+                copy_length > block_length - source_offset) {
+                viable = false;
+                break;
+            }
+            memcpy(profile + (copy_start - stream_start),
+                   block + source_offset, copy_length);
+        }
+        if (!viable) {
+            continue;
+        }
+        viable_runs++;
+
+        uint64_t score = 0;
+        bool pruned = false;
+        stride = 1;
+        for (unsigned int dimension = 0;
+             dimension < input_channels && !pruned;
+             dimension++) {
+            for (uint64_t node = 0; node < node_count && !pruned; node++) {
+                if (((node / stride) % grid_points) + 1 >= grid_points) {
+                    continue;
+                }
+                uint64_t neighbor = node + stride;
+                for (unsigned int channel = 0;
+                     channel < output_channels;
+                     channel++) {
+                    size_t left = clut_offset +
+                        (size_t)(node * output_channels + channel) *
+                        bytes_per_value;
+                    size_t right = clut_offset +
+                        (size_t)(neighbor * output_channels + channel) *
+                        bytes_per_value;
+                    bool affected =
+                        (left < hole_profile_end &&
+                         left + bytes_per_value > hole_profile_start) ||
+                        (right < hole_profile_end &&
+                         right + bytes_per_value > hole_profile_start);
+                    if (!affected) {
+                        continue;
+                    }
+
+                    uint32_t a = pdf_icc_lut_value(profile, left,
+                                                   bytes_per_value);
+                    uint32_t b = pdf_icc_lut_value(profile, right,
+                                                   bytes_per_value);
+                    score += a > b ? a - b : b - a;
+                    if (second_score != UINT64_MAX &&
+                        score >= second_score) {
+                        pruned = true;
+                        break;
+                    }
+                }
+            }
+            stride *= grid_points;
+        }
+        if (pruned) {
+            continue;
+        }
+
+        if (score < best_score) {
+            second_score = best_score;
+            best_score = score;
+            memcpy(best_replacement, replacement,
+                   (size_t)run_length * sizeof(*best_replacement));
+        } else if (score < second_score) {
+            second_score = score;
+        }
+    }
+
+    bool accepted = !interrupted && viable_runs >= 2 &&
+                    best_score != UINT64_MAX &&
+                    second_score != UINT64_MAX;
+    if (accepted) {
+        long double known_mean =
+            (long double)known_score / (long double)known_edges;
+        long double best_mean =
+            (long double)best_score / (long double)affected_edges;
+        long double second_mean =
+            (long double)second_score / (long double)affected_edges;
+        accepted = (known_mean == 0.0L ? best_mean == 0.0L
+                                      : best_mean <= known_mean * 4.0L) &&
+                   second_mean >= best_mean * 1.25L &&
+                   (best_mean != 0.0L || second_mean > 0.0L);
+    }
+
+    bool replaced = accepted && pdf_replace_blocks_at_slot(
+        candidate, best_replacement, run_length, (uint64_t)hole_first,
+        "ICC_LUT_RUN");
+    if (replaced) {
+        PDFCarveState *state =
+            (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+        if (state) {
+            state->speculative_blocks = true;
+            carve_put_state(candidate->carvehashkey, state);
+            pdf_free_carve_state((void **)&state);
+        }
+    }
+
+    free(best_replacement);
+    free(replacement);
+    roaring64_bitmap_free(outside_apps);
+    free(profile);
+    return replaced;
+}
+
+/**
  * @description  Fills interior stream-body holes left after xref adoption. Positional
  *               xref placement lands object-HEADER blocks at their true slots but
  *               never reconstructs the streams BETWEEN them, so a linearized/gapped
  *               file can finish with correct headers and holed stream interiors. For
- *               each FlateDecode stream whose interior is holed, this verifies the
- *               disk-contiguous hypothesis by inflating the contiguous run to
- *               Z_STREAM_END (Adler-32) and, ONLY on success, places the interior
- *               blocks -- so a wrong guess can never be committed. Limited to zlib
- *               streams because their checksum makes the fill verifiable.
+ *               each FlateDecode or DCTDecode stream whose interior is holed,
+ *               this verifies a complete assignment with the format-specific
+ *               stream oracle before placing any blocks. Uncompressed ICC LUTs
+ *               may also be reconstructed from their grid structure, but are
+ *               retained as PROMISING because that evidence is not a checksum.
  * @param work       The thread work context (unused).
  * @param candidate  The candidate whose interior stream holes are filled.
  * @return       true if any hole was filled.
  */
 static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidate){
-    (void)work;
     FileMirror *fm = scalpel_state.filemirror;
     const int64_t bsz = (int64_t)scalpel_state.blocksize;
+    const int64_t total_actual =
+        (int64_t)CEILDIV(filemirror_filesize(fm), scalpel_state.blocksize);
     bool any = false;
 
     PDFCarveState *cs = (PDFCarveState*)carve_get_state(candidate->carvehashkey);
     if(!cs) return false;
+    PDFInteriorSearchState *search = &cs->interior_search;
+    if (!search->active) {
+        memset(search, 0, sizeof(*search));
+        search->active = true;
+    }
+    roaring64_bitmap_t *processed_streams = roaring64_bitmap_create();
+    if (!processed_streams) {
+        pdf_free_carve_state((void **)&cs);
+        return false;
+    }
 
     char *data = blockvector_get_data_pointer(candidate->b);
     int64_t length = (int64_t)blockvector_get_data_length(candidate->b);
 
-    for(int t = 0; t < (int)cs->num_tables; t++){
+    for(int t = (int)search->table; t < (int)cs->num_tables; t++, search->entry = 0){
+        search->table = (size_t)t;
         XrefTables *tab = &cs->xref_tables[t];
         if(!tab->entries) continue;
-        for(int e = 0; e < tab->count; e++){
+        for(int e = search->entry; e < tab->count; e++){
+            search->entry = e;
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                goto interrupted;
+            }
+            // A prior repair may have re-inflated and relocated the blockvector
+            // even when its structural oracle ultimately rejected the repair.
+            data = blockvector_get_data_pointer(candidate->b);
+            length = (int64_t)blockvector_get_data_length(candidate->b);
             int64_t obj_off = (int64_t)tab->entries[e].obj_offset;
             if(obj_off < 0 || obj_off + 16 >= length) continue;
             if(blockvector_get_apparent_blocknumber(candidate->b, obj_off / bsz) < 0) continue; // header block a hole
@@ -5297,26 +9857,97 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
             if(!sk) continue;
             if(sk - data >= 3 && !memcmp(sk - 3, "end", 3)) continue;          // "endstream", not a dict
             int dict_len = (int)(sk - (data + obj_off));
-            if(check_last_object_filter(data + obj_off, dict_len) != ZLIB) continue;
+            int filter = check_last_object_filter(data + obj_off, dict_len);
+            if (filter != ZLIB && filter != JPEG && filter != NOFILTER) {
+                continue;
+            }
 
             uint64_t out_off = 0;
             int slen = check_last_object_length(data, (uint64_t)length, &out_off,
-                          cs->xref_tables, (int)cs->num_tables, data + obj_off, dict_len, (uint64_t)obj_off);
+                          cs->xref_tables, (int)cs->num_tables, data + obj_off,
+                          dict_len, (uint64_t)obj_off, true);
             if(slen == LENGTHNOTFOUND || slen <= 0) continue;
 
             int64_t sdat = (sk - data) + 6;
             if(sdat < length && data[sdat] == '\r') sdat++;
             if(sdat < length && data[sdat] == '\n') sdat++;
+            if (roaring64_bitmap_contains(processed_streams,
+                                          (uint64_t)sdat)) {
+                continue;
+            }
+            roaring64_bitmap_add(processed_streams, (uint64_t)sdat);
             int64_t send = sdat + slen;
             int64_t sslot = sdat / bsz, eslot = (send - 1) / bsz;
             int span = (int)(eslot - sslot);                                   // blocks after the start block
             if(span <= 0 || span > 4096) continue;                            // single-block or implausibly large
             if(eslot >= (int64_t)blockvector_get_num_blocks(candidate->b)) continue;
+            if (blockvector_get_apparent_blocknumber(candidate->b, (uint64_t)sslot) < 0) {
+                continue;
+            }
 
             bool has_hole = false;
-            for(int64_t s = sslot + 1; s <= eslot && !has_hole; s++)
-                if(blockvector_get_apparent_blocknumber(candidate->b, s) < 0) has_hole = true;
-            if(!has_hole) continue;
+            for (int64_t s = sslot + 1; s <= eslot && !has_hole; s++) {
+                if (blockvector_get_apparent_blocknumber(candidate->b, s) < 0) {
+                    has_hole = true;
+                }
+            }
+
+            if (filter == NOFILTER) {
+                if (has_hole && pdf_repair_interior_icc_lut(
+                        work, candidate, sdat, slen, sslot, eslot)) {
+                    any = true;
+                    data = blockvector_get_data_pointer(candidate->b);
+                    length = (int64_t)blockvector_get_data_length(candidate->b);
+                }
+                continue;
+            }
+
+            if (filter == JPEG) {
+                if (pdf_repair_interior_jpeg_backbone(
+                        work, candidate, sdat, slen, sslot, eslot, true)) {
+                    any = true;
+                    data = blockvector_get_data_pointer(candidate->b);
+                    length = (int64_t)blockvector_get_data_length(candidate->b);
+                }
+                continue;
+            }
+
+            if(!has_hole){
+                bool repaired = false;
+                if (search->gap_extra == 0 && !search->repair.active) {
+                    repaired = pdf_repair_interior_zlib_zero_run(
+                        work, candidate, sdat, slen, sslot, eslot);
+                }
+                if (!repaired && search->gap_extra == 0 &&
+                    !atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                    repaired = pdf_repair_mapped_zlib_run(
+                        candidate, sdat, slen, sslot, eslot, &search->repair);
+                }
+                if (!repaired &&
+                    !atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                    repaired = pdf_repair_gapped_zlib_run(
+                        candidate, sdat, slen, sslot, eslot, search);
+                }
+                if(repaired){
+                    any = true;
+                    data = blockvector_get_data_pointer(candidate->b);
+                    length = (int64_t)blockvector_get_data_length(candidate->b);
+                }
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                    goto interrupted;
+                }
+                memset(&search->repair, 0, sizeof(search->repair));
+                continue;
+            }
+
+            bool backbone_repaired = pdf_repair_interior_zlib_backbone(
+                work, candidate, sdat, slen, sslot, eslot, true);
+            data = blockvector_get_data_pointer(candidate->b);
+            length = (int64_t)blockvector_get_data_length(candidate->b);
+            if (backbone_repaired) {
+                any = true;
+                continue;
+            }
 
             // Inflate the stream from its start block, using each slot's ALREADY-
             // PLACED block where one exists and the disk-contiguous hypothesis
@@ -5343,88 +9974,1057 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
                 kdone = k;
             }
             zlib_stream_reassembler_free(&r);
-            if(!(ok && complete)) continue;                                    // unverified: leave the holes
+
+            /*
+             * If a physical gap splits the stream, the start-contiguous run
+             * above is wrong after the split. Derive the stream's last actual
+             * block from the nearest already placed block to its right, then
+             * try every exact two-run split. Nothing is placed until the whole
+             * declared stream reaches Z_STREAM_END and verifies its Adler-32.
+             */
+            int64_t *split_actual = NULL;
+            if (!(ok && complete)) {
+                int64_t end_actual = -1;
+                int64_t end_app = blockvector_get_apparent_blocknumber(
+                    candidate->b, (uint64_t)eslot);
+                if (end_app >= 0) {
+                    end_actual = filemirror_actual_blocknumber(fm, end_app);
+                } else {
+                    uint64_t candidate_blocks =
+                        blockvector_get_num_blocks(candidate->b);
+                    for (uint64_t right_slot = (uint64_t)eslot + 1;
+                         right_slot < candidate_blocks;
+                         right_slot++) {
+                        int64_t right_app = blockvector_get_apparent_blocknumber(
+                            candidate->b, right_slot);
+                        if (right_app < 0) {
+                            continue;
+                        }
+                        int64_t right_actual =
+                            filemirror_actual_blocknumber(fm, right_app);
+                        uint64_t distance = right_slot - (uint64_t)eslot;
+                        if ((uint64_t)right_actual >= distance) {
+                            end_actual = right_actual - (int64_t)distance;
+                        }
+                        break;
+                    }
+                }
+
+                if (end_actual >= 0 && end_actual < total_actual) {
+                    split_actual = malloc((size_t)span * sizeof(*split_actual));
+                    check_memory_allocation(split_actual, __LINE__, __FILE__,
+                                            "PDF interior zlib split");
+
+                    uint64_t probes = 0;
+                    bool interrupted = false;
+                    for (int split = span; split >= 0 && !complete; split--) {
+                        if (((++probes & 0x0fU) == 0U) &&
+                            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                                 memory_order_acquire)) {
+                            interrupted = true;
+                            break;
+                        }
+
+                        ZlibStreamReassembler sr;
+                        if (zlib_stream_reassembler_init(
+                                &sr,
+                                (const unsigned char *)(data + sslot * bsz),
+                                (size_t)bsz,
+                                (size_t)(sdat - sslot * bsz),
+                                (size_t)slen) == -1) {
+                            break;
+                        }
+
+                        bool split_ok = true;
+                        for (int k = 1; k <= span && split_ok; k++) {
+                            int64_t slot_app =
+                                blockvector_get_apparent_blocknumber(
+                                    candidate->b, (uint64_t)(sslot + k));
+                            int64_t actual;
+                            if (slot_app >= 0) {
+                                actual = filemirror_actual_blocknumber(fm,
+                                                                      slot_app);
+                            } else if (k <= split) {
+                                actual = D0 + k;
+                            } else {
+                                actual = end_actual - (span - k);
+                            }
+
+                            if (actual < 0 || actual >= total_actual) {
+                                split_ok = false;
+                                break;
+                            }
+
+                            int64_t app =
+                                filemirror_apparent_blocknumber(fm, actual);
+                            if (app < 0) {
+                                split_ok = false;
+                                break;
+                            }
+
+                            if (slot_app < 0) {
+                                if (filemirror_actual_block_covered(fm, actual) ||
+                                    filemirror_actual_block_is_zero(fm, actual) ||
+                                    apparent_block_in_blockvector(candidate->b,
+                                                                 app)) {
+                                    split_ok = false;
+                                    break;
+                                }
+                                for (int prior = 0; prior < k - 1; prior++) {
+                                    if (split_actual[prior] == actual) {
+                                        split_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (!split_ok) {
+                                    break;
+                                }
+                            }
+                            split_actual[k - 1] = actual;
+
+                            const unsigned char *blk =
+                                (const unsigned char *)get_apparent_block_data(
+                                    fm, app);
+                            if (!blk) {
+                                split_ok = false;
+                                break;
+                            }
+                            int chk = zlib_stream_reassembler_try_block(
+                                &sr, blk, (size_t)bsz);
+                            free((void *)blk);
+                            split_ok = (k == span) ? (chk == 2) : (chk == 1);
+                        }
+
+                        complete = split_ok && sr.ended;
+                        if (complete) {
+                            kdone = span;
+                        }
+                        zlib_stream_reassembler_free(&sr);
+                    }
+
+                    if (interrupted) {
+                        free(split_actual);
+                        goto interrupted;
+                    }
+                }
+            }
+
+            if (!(ok && complete) && !split_actual) {
+                continue;
+            }
+            if (!complete) {
+                free(split_actual);
+                continue;
+            }
 
             for(int k = 1; k <= kdone; k++){
                 if(blockvector_get_apparent_blocknumber(candidate->b, sslot + k) >= 0) continue; // already placed
-                int64_t hb = D0 + k;
+                int64_t hb = split_actual ? split_actual[k - 1] : D0 + k;
                 if(pdf_place_blocks_at_slot(candidate, &hb, 1, (uint64_t)(sslot + k), "ZLIB_HOLE_FILL")){
                     any = true;
                     data = blockvector_get_data_pointer(candidate->b);
                     length = (int64_t)blockvector_get_data_length(candidate->b);
                 }
             }
+            free(split_actual);
+            if(pdf_repair_interior_zlib_zero_run(work, candidate, sdat, slen,
+                                                 sslot, eslot)){
+                any = true;
+                data = blockvector_get_data_pointer(candidate->b);
+                length = (int64_t)blockvector_get_data_length(candidate->b);
+            }
         }
     }
+    memset(search, 0, sizeof(*search));
+interrupted:
+    pdf_store_interior_search(candidate, search);
+    roaring64_bitmap_free(processed_streams);
     pdf_free_carve_state((void**)&cs);
     return any;
 }
 
 /**
- * @description  Completes a candidate that assembled every object but is missing
- *               only its final trailer block(s). A PDF's last block holds the
- *               trailer keywords -- "startxref" and the terminal "%%EOF" -- but no
- *               indirect object, so the object-driven placement never pulls it in,
- *               nor does xref adoption (it is a separate block from the xref). A
- *               file that is byte-correct except for this tail cannot validate for
- *               want of its end. When a 0-hole candidate does not already end in
- *               "%%EOF", this walks the disk-contiguous continuation (last placed
- *               block + 1, then + 2) and appends ONLY blocks carrying the trailer
- *               signature, stopping at the one that ends the file. Safety rests on
- *               the trailer signature plus the final pdf_file_validate, which
- *               authenticates startxref -> xref -> root against the assembled body:
- *               a foreign or wrong tail cannot make a wrong body validate, so no
- *               byte-inexact candidate is promoted.
- * @param work       The thread work context (unused).
- * @param candidate  The candidate to complete.
- * @return       true if a trailer block was appended.
+ * @description  Completes a candidate whose remaining holes are bracketed by
+ *               correctly placed blocks that preserve both logical and physical
+ *               distance. All inferred blocks are staged in a cloned blockvector;
+ *               the original candidate is changed only if the completed clone
+ *               passes full PDF validation, including any adjacent trailer
+ *               continuation. This handles ordinary contiguous
+ *               regions between xref-anchored objects without allowing a failed
+ *               contiguity hypothesis to poison later recovery.
+ * @param work       Reassembly worker passed to trailer completion.
+ * @param candidate  The candidate whose bracketed holes are considered.
+ * @return       true if every remaining hole was verified and filled.
  */
-static bool pdf_complete_trailer(ThreadWork *work, CarveInfo *candidate){
+static bool pdf_fill_physically_bridged_holes(ThreadWork *work,
+                                               CarveInfo *candidate) {
+    if (!candidate || !pdf_candidate_has_holes(candidate)) {
+        return false;
+    }
+
+    FileMirror *fm = scalpel_state.filemirror;
+    uint64_t nblocks = blockvector_get_num_blocks(candidate->b);
+    int64_t total_actual =
+        (int64_t)CEILDIV(filemirror_filesize(fm), scalpel_state.blocksize);
+    uint64_t *slots = malloc(nblocks * sizeof(*slots));
+    int64_t *actuals = malloc(nblocks * sizeof(*actuals));
+    check_memory_allocation(slots, __LINE__, __FILE__,
+                            "PDF bridged-hole slots");
+    check_memory_allocation(actuals, __LINE__, __FILE__,
+                            "PDF bridged-hole blocks");
+
+    size_t count = 0;
+    bool all_bridged = true;
+    uint64_t slot = 0;
+    while (slot < nblocks) {
+        if (blockvector_get_apparent_blocknumber(candidate->b, slot) >= 0) {
+            slot++;
+            continue;
+        }
+
+        uint64_t first_hole = slot;
+        while (slot < nblocks &&
+               blockvector_get_apparent_blocknumber(candidate->b, slot) < 0) {
+            slot++;
+        }
+        uint64_t after_hole = slot;
+        if (first_hole == 0 || after_hole >= nblocks) {
+            all_bridged = false;
+            break;
+        }
+
+        int64_t left_app = blockvector_get_apparent_blocknumber(
+            candidate->b, first_hole - 1);
+        int64_t right_app = blockvector_get_apparent_blocknumber(
+            candidate->b, after_hole);
+        int64_t left_actual = filemirror_actual_blocknumber(fm, left_app);
+        int64_t right_actual = filemirror_actual_blocknumber(fm, right_app);
+        uint64_t logical_distance = after_hole - (first_hole - 1);
+        if (right_actual <= left_actual ||
+            (uint64_t)(right_actual - left_actual) != logical_distance) {
+            all_bridged = false;
+            break;
+        }
+
+        for (uint64_t fill_slot = first_hole;
+             fill_slot < after_hole;
+             fill_slot++) {
+            int64_t actual = left_actual +
+                (int64_t)(fill_slot - (first_hole - 1));
+            if (actual < 0 || actual >= total_actual ||
+                filemirror_actual_block_covered(fm, actual) ||
+                filemirror_actual_block_is_zero(fm, actual)) {
+                all_bridged = false;
+                break;
+            }
+            int64_t app = filemirror_apparent_blocknumber(fm, actual);
+            if (app < 0 ||
+                apparent_block_in_blockvector(candidate->b, app)) {
+                all_bridged = false;
+                break;
+            }
+            for (size_t prior = 0; prior < count; prior++) {
+                if (actuals[prior] == actual) {
+                    all_bridged = false;
+                    break;
+                }
+            }
+            if (!all_bridged) {
+                break;
+            }
+            slots[count] = fill_slot;
+            actuals[count] = actual;
+            count++;
+        }
+        if (!all_bridged) {
+            break;
+        }
+    }
+
+    bool verified = false;
+    if (all_bridged && count > 0) {
+        BlockVector *trial_bv = NULL;
+        clone_blockvector(candidate->b, &trial_bv, false);
+        CarveInfo trial = *candidate;
+        trial.b = trial_bv;
+
+        bool placed = true;
+        for (size_t i = 0; i < count && placed; i++) {
+            placed = pdf_place_blocks_at_slot(&trial, &actuals[i], 1,
+                                              slots[i], "BRIDGE_TRIAL");
+        }
+
+        if (placed && !pdf_candidate_has_holes(&trial)) {
+            pdf_complete_trailer(work, &trial);
+            bool validates = false;
+            bool promising = true;
+            uint64_t validates_to = scalpel_state.blocksize - 1;
+            uint64_t trial_length = blockvector_get_data_length(trial.b);
+            bool previous_syntax_requirement = pdf_require_object_syntax;
+            pdf_require_object_syntax = true;
+            pdf_file_validate(blockvector_get_data_pointer(trial.b),
+                              trial_length,
+                              &validates, &validates_to, &promising,
+                              trial.needleidx, scalpel_state.blocksize,
+                              trial.carvehashkey);
+            pdf_require_object_syntax = previous_syntax_requirement;
+            // An earlier revision cannot establish the newly filled tail.
+            verified = validates && validates_to < trial_length &&
+                validates_to / scalpel_state.blocksize ==
+                    blockvector_get_num_blocks(trial.b) - 1;
+            if (verified) {
+                uint64_t trial_blocks = blockvector_get_num_blocks(trial.b);
+                resize_blockvector(candidate->b, trial_blocks);
+                for (size_t i = 0; i < count; i++) {
+                    blockvector_set_apparent_blocknumber(
+                        candidate->b, slots[i],
+                        blockvector_get_apparent_blocknumber(trial.b, slots[i]));
+                }
+                for (uint64_t tail = nblocks; tail < trial_blocks; tail++) {
+                    blockvector_set_apparent_blocknumber(
+                        candidate->b, tail,
+                        blockvector_get_apparent_blocknumber(trial.b, tail));
+                }
+                // Keep later incremental revisions visible to final validation.
+                blockvector_set_data_length(candidate->b, trial_length);
+                inflate_blockvector(candidate->b);
+                candidate->best_validates_to = validates_to;
+                candidate->fastpath = false;
+            }
+        }
+        free_blockvector(&trial_bv);
+    }
+
+    free(actuals);
+    free(slots);
+    return verified;
+}
+
+static int pdf_compare_slot_delta(const void *a, const void *b) {
+    const PDFSlotDelta *left = (const PDFSlotDelta *)a;
+    const PDFSlotDelta *right = (const PDFSlotDelta *)b;
+    if (left->delta < right->delta) {
+        return -1;
+    }
+    if (left->delta > right->delta) {
+        return 1;
+    }
+    if (left->slot < right->slot) {
+        return -1;
+    }
+    if (left->slot > right->slot) {
+        return 1;
+    }
+    return 0;
+}
+
+// Group adjacent observations with equal displacement. In logical-slot order,
+// the same displacement on both sides of a displaced run forms distinct groups.
+// The output array has room for count entries; missing slots are not observations.
+static size_t pdf_group_slot_runs(const PDFSlotDelta *observations, size_t count,
+                                  PDFRunEvidence *groups) {
+    size_t group_count = 0;
+    for (size_t first = 0; first < count;) {
+        size_t end = first + 1;
+        while (end < count && observations[end].delta == observations[first].delta) {
+            end++;
+        }
+        groups[group_count].delta = observations[first].delta;
+        groups[group_count].min_slot = observations[first].slot;
+        groups[group_count].max_slot = observations[end - 1].slot;
+        groups[group_count].count = end - first;
+        group_count++;
+        first = end;
+    }
+    return group_count;
+}
+
+static int pdf_compare_run_evidence(const void *a, const void *b) {
+    const PDFRunEvidence *left = (const PDFRunEvidence *)a;
+    const PDFRunEvidence *right = (const PDFRunEvidence *)b;
+    if (left->min_slot < right->min_slot) {
+        return -1;
+    }
+    if (left->min_slot > right->min_slot) {
+        return 1;
+    }
+    if (left->count > right->count) {
+        return -1;
+    }
+    if (left->count < right->count) {
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * @description  Completes a linearized PDF assembled from multiple physically
+ *               contiguous runs. Xref-positioned objects provide mappings of
+ *               logical slots to actual blocks; mappings from one physical run
+ *               share the same actual-minus-logical displacement. The /L value
+ *               supplies the baseline revision length. This routine retains runs
+ *               with at least three agreeing mappings, enumerates only the
+ *               unresolved boundaries between those runs, and tests every layout
+ *               on a private blockvector. If a later incremental revision follows
+ *               physically, its discovered EOF is also tested and the farthest
+ *               fully validated revision is retained. The original candidate is
+ *               changed only after the selected PDF validates through its end.
+ * @param work       Reassembly worker, used for checkpoint responsiveness.
+ * @param candidate  Candidate to repair.
+ * @param logical_groups  Keep observations in logical order rather than grouping
+ *                        all observations with the same displacement together.
+ * @return       true if a complete verified layout was committed.
+ */
+static bool pdf_try_linearized_physical_runs(ThreadWork *work,
+                                            CarveInfo *candidate,
+                                            bool logical_groups) {
     (void)work;
+    if (!candidate || !candidate->b) {
+        return false;
+    }
+
+    PDFCarveState *state =
+        (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+    if (!state || !state->linearized || state->lin_L <= 0) {
+        pdf_free_carve_state((void **)&state);
+        return false;
+    }
+
+    const uint64_t blocksize = (uint64_t)scalpel_state.blocksize;
+    const uint64_t exact_length = (uint64_t)state->lin_L;
+    const uint64_t total_slots = CEILDIV(exact_length, blocksize);
+    const int64_t image_blocks =
+        (int64_t)CEILDIV(filemirror_filesize(scalpel_state.filemirror),
+                         scalpel_state.blocksize);
+    pdf_free_carve_state((void **)&state);
+
+    if (total_slots < 2 || total_slots > (uint64_t)image_blocks) {
+        return false;
+    }
+
+    uint64_t current_slots = blockvector_get_num_blocks(candidate->b);
+    PDFSlotDelta *observations =
+        malloc(current_slots * sizeof(*observations));
+    check_memory_allocation(observations, __LINE__, __FILE__,
+                            "PDF physical-run observations");
+
+    size_t observation_count = 0;
+    for (uint64_t slot = 0; slot < current_slots && slot < total_slots; slot++) {
+        int64_t actual =
+            blockvector_get_actual_blocknumber(candidate->b, slot);
+        if (actual < 0) {
+            continue;
+        }
+        observations[observation_count].delta = actual - (int64_t)slot;
+        observations[observation_count].slot = slot;
+        observation_count++;
+    }
+    if (observation_count < 6) {
+        free(observations);
+        return false;
+    }
+
+    if (!logical_groups) {
+        qsort(observations, observation_count, sizeof(*observations), pdf_compare_slot_delta);
+    }
+
+    PDFRunEvidence *groups =
+        malloc(observation_count * sizeof(*groups));
+    PDFRunEvidence *eligible =
+        malloc(observation_count * sizeof(*eligible));
+    PDFRunEvidence *chain =
+        malloc(observation_count * sizeof(*chain));
+    check_memory_allocation(groups, __LINE__, __FILE__,
+                            "PDF physical-run groups");
+    check_memory_allocation(eligible, __LINE__, __FILE__,
+                            "PDF eligible physical runs");
+    check_memory_allocation(chain, __LINE__, __FILE__,
+                            "PDF physical-run chain");
+
+    size_t group_count = pdf_group_slot_runs(observations, observation_count, groups);
+
+    int64_t first_actual =
+        blockvector_get_actual_blocknumber(candidate->b, 0);
+    int64_t first_delta = first_actual;
+    size_t eligible_count = 0;
+    for (size_t i = 0; i < group_count; i++) {
+        bool is_header_run = groups[i].delta == first_delta &&
+                             groups[i].min_slot == 0;
+        if ((is_header_run || groups[i].count >= 3) &&
+            groups[i].max_slot < total_slots) {
+            eligible[eligible_count++] = groups[i];
+        }
+    }
+    qsort(eligible, eligible_count, sizeof(*eligible),
+          pdf_compare_run_evidence);
+
+    size_t chain_count = 0;
+    for (size_t i = 0; i < eligible_count; i++) {
+        if (chain_count == 0) {
+            if (eligible[i].delta == first_delta &&
+                eligible[i].min_slot == 0) {
+                chain[chain_count++] = eligible[i];
+            }
+            continue;
+        }
+        if (eligible[i].delta != chain[chain_count - 1].delta &&
+            eligible[i].min_slot > chain[chain_count - 1].max_slot) {
+            chain[chain_count++] = eligible[i];
+        }
+    }
+
+    free(groups);
+    free(eligible);
+    free(observations);
+    if (chain_count < 2) {
+        free(chain);
+        return false;
+    }
+
+    size_t boundary_count = chain_count - 1;
+    uint64_t *boundary_lo =
+        malloc(boundary_count * sizeof(*boundary_lo));
+    uint64_t *boundary_hi =
+        malloc(boundary_count * sizeof(*boundary_hi));
+    uint64_t *boundaries =
+        malloc(boundary_count * sizeof(*boundaries));
+    int64_t *actuals = malloc(total_slots * sizeof(*actuals));
+    int64_t *solution_actuals =
+        malloc(total_slots * sizeof(*solution_actuals));
+    check_memory_allocation(boundary_lo, __LINE__, __FILE__,
+                            "PDF physical-run boundary minima");
+    check_memory_allocation(boundary_hi, __LINE__, __FILE__,
+                            "PDF physical-run boundary maxima");
+    check_memory_allocation(boundaries, __LINE__, __FILE__,
+                            "PDF physical-run boundaries");
+    check_memory_allocation(actuals, __LINE__, __FILE__,
+                            "PDF physical-run trial blocks");
+    check_memory_allocation(solution_actuals, __LINE__, __FILE__,
+                            "PDF physical-run verified blocks");
+
+    bool ranges_valid = true;
+    for (size_t i = 0; i < boundary_count; i++) {
+        boundary_lo[i] = chain[i].max_slot + 1;
+        boundary_hi[i] = chain[i + 1].min_slot;
+        boundaries[i] = boundary_lo[i];
+        if (boundary_lo[i] > boundary_hi[i]) {
+            ranges_valid = false;
+        }
+    }
+
+    bool done = !ranges_valid;
+    bool interrupted = false;
+    uint64_t valid_layouts = 0;
+    uint64_t trials = 0;
+    while (!done && valid_layouts < 2) {
+        if ((trials & 31U) == 0 &&
+            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                 memory_order_acquire)) {
+            interrupted = true;
+            break;
+        }
+        trials++;
+
+        bool layout_ok = true;
+        uint64_t segment_start = 0;
+        for (size_t run = 0; run < chain_count && layout_ok; run++) {
+            uint64_t segment_end = run < boundary_count
+                                       ? boundaries[run] - 1
+                                       : total_slots - 1;
+            int64_t actual_start =
+                (int64_t)segment_start + chain[run].delta;
+            int64_t actual_end =
+                (int64_t)segment_end + chain[run].delta;
+            if (actual_start < 0 || actual_end < actual_start ||
+                actual_end >= image_blocks) {
+                layout_ok = false;
+                break;
+            }
+            for (size_t prior = 0; prior < run; prior++) {
+                uint64_t prior_start = prior == 0 ? 0 : boundaries[prior - 1];
+                uint64_t prior_end = boundaries[prior] - 1;
+                int64_t prior_actual_start =
+                    (int64_t)prior_start + chain[prior].delta;
+                int64_t prior_actual_end =
+                    (int64_t)prior_end + chain[prior].delta;
+                if (!(actual_end < prior_actual_start ||
+                      actual_start > prior_actual_end)) {
+                    layout_ok = false;
+                    break;
+                }
+            }
+            for (uint64_t slot = segment_start;
+                 slot <= segment_end && layout_ok;
+                 slot++) {
+                int64_t actual = (int64_t)slot + chain[run].delta;
+                int64_t apparent = filemirror_apparent_blocknumber(
+                    scalpel_state.filemirror, actual);
+                bool already_present = apparent >= 0 &&
+                    apparent_block_in_blockvector(candidate->b, apparent);
+                if (apparent < 0 ||
+                    filemirror_actual_block_is_zero(scalpel_state.filemirror,
+                                                    actual) ||
+                    (filemirror_actual_block_covered(scalpel_state.filemirror,
+                                                     actual) &&
+                     !already_present)) {
+                    layout_ok = false;
+                    break;
+                }
+                actuals[slot] = actual;
+            }
+            segment_start = segment_end + 1;
+        }
+
+        if (layout_ok) {
+            BlockVector *trial_bv = NULL;
+            clone_blockvector(candidate->b, &trial_bv, false);
+            resize_blockvector(trial_bv, total_slots);
+            for (uint64_t slot = 0; slot < total_slots; slot++) {
+                blockvector_set_apparent_blocknumber(
+                    trial_bv, slot,
+                    filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                                    actuals[slot]));
+            }
+            blockvector_set_data_length(trial_bv, exact_length);
+            inflate_blockvector(trial_bv);
+
+            CarveInfo trial = *candidate;
+            trial.b = trial_bv;
+            bool validates = false;
+            bool promising = true;
+            uint64_t validates_to = blocksize - 1;
+            bool previous_syntax_requirement = pdf_require_object_syntax;
+            pdf_require_object_syntax = true;
+            pdf_file_validate(blockvector_get_data_pointer(trial_bv),
+                              exact_length, &validates, &validates_to,
+                              &promising, trial.needleidx,
+                              scalpel_state.blocksize, trial.carvehashkey);
+            pdf_require_object_syntax = previous_syntax_requirement;
+            bool trial_validates =
+                validates && validates_to + 1 == exact_length &&
+                !pdf_candidate_has_holes(&trial);
+            if (trial_validates) {
+                if (valid_layouts == 0) {
+                    memcpy(solution_actuals, actuals,
+                           total_slots * sizeof(*solution_actuals));
+                }
+                valid_layouts++;
+            }
+            free_blockvector(&trial_bv);
+        }
+
+        bool advanced = false;
+        for (size_t i = boundary_count; i-- > 0;) {
+            if (boundaries[i] < boundary_hi[i]) {
+                boundaries[i]++;
+                for (size_t reset = i + 1;
+                     reset < boundary_count; reset++) {
+                    boundaries[reset] = boundary_lo[reset];
+                }
+                advanced = true;
+                break;
+            }
+        }
+        done = !advanced;
+    }
+
+    bool verified = !interrupted && done && valid_layouts == 1;
+    uint64_t solution_length = exact_length;
+    uint64_t solution_slots = total_slots;
+    bool incremental_update_evidence = false;
+
+    /*
+     * A linearized PDF can acquire incremental updates without changing the
+     * first revision's /L value. When the verified baseline run continues
+     * physically to another discovered %%EOF, test that complete revision too.
+     * Multiple successful EOFs are nested revisions of the same physical run,
+     * so retaining the farthest one preserves the complete current document.
+     */
+    if (verified && candidate->needleidx >= 0 &&
+        (uint32_t)candidate->needleidx < scalpel_state.num_specs) {
+        SearchSpecOffsets *offsets =
+            &scalpel_state.search_specs[candidate->needleidx].offsets;
+        int64_t baseline_last_actual = solution_actuals[total_slots - 1];
+        uint64_t baseline_tail =
+            exact_length - (total_slots - 1) * blocksize;
+        uint64_t image_size =
+            filemirror_filesize(scalpel_state.filemirror);
+
+        if (baseline_last_actual >= 0 &&
+            (uint64_t)baseline_last_actual <=
+                (UINT64_MAX - baseline_tail) / blocksize) {
+            uint64_t baseline_physical_end =
+                (uint64_t)baseline_last_actual * blocksize + baseline_tail;
+
+            unsigned char update_prefix[128];
+            size_t update_prefix_length = 0;
+            uint64_t read_position = baseline_physical_end;
+            while (update_prefix_length < sizeof(update_prefix) &&
+                   read_position < image_size) {
+                int64_t read_block_number =
+                    (int64_t)(read_position / blocksize);
+                uint64_t read_block_length = 0;
+                char *read_block = filemirror_actual_block_data_pointer(
+                    scalpel_state.filemirror, read_block_number,
+                    &read_block_length);
+                uint64_t read_local = read_position % blocksize;
+                if (!read_block || read_local >= read_block_length) {
+                    break;
+                }
+                size_t available = (size_t)(read_block_length - read_local);
+                size_t needed = sizeof(update_prefix) - update_prefix_length;
+                size_t take = available < needed ? available : needed;
+                memcpy(update_prefix + update_prefix_length,
+                       read_block + read_local, take);
+                update_prefix_length += take;
+                read_position += take;
+            }
+            incremental_update_evidence = pdf_incremental_update_prefix(
+                update_prefix, update_prefix_length);
+
+            for (uint64_t footer_index = 0;
+                 footer_index < offsets->numfooters; footer_index++) {
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                         memory_order_acquire)) {
+                    interrupted = true;
+                    verified = false;
+                    break;
+                }
+
+                uint64_t footer_start = offsets->footers[footer_index];
+                size_t footer_length = offsets->footerlens
+                                           ? offsets->footerlens[footer_index]
+                                           : 5;
+                if (footer_length == 0 ||
+                    footer_start > UINT64_MAX - footer_length) {
+                    continue;
+                }
+                uint64_t physical_end = footer_start + footer_length;
+                if (physical_end <= baseline_physical_end ||
+                    physical_end > image_size) {
+                    continue;
+                }
+
+                uint64_t tail_block_length = 0;
+                int64_t tail_block_number =
+                    (int64_t)(physical_end / blocksize);
+                char *tail_block = filemirror_actual_block_data_pointer(
+                    scalpel_state.filemirror, tail_block_number,
+                    &tail_block_length);
+                uint64_t tail_local = physical_end % blocksize;
+                if (tail_block && tail_local < tail_block_length) {
+                    if (tail_block[tail_local] == '\r') {
+                        physical_end++;
+                        tail_local++;
+                        if (tail_local >= tail_block_length &&
+                            physical_end < image_size) {
+                            tail_block_number++;
+                            tail_block = filemirror_actual_block_data_pointer(
+                                scalpel_state.filemirror, tail_block_number,
+                                &tail_block_length);
+                            tail_local = 0;
+                        }
+                        if (tail_block && tail_local < tail_block_length &&
+                            tail_block[tail_local] == '\n') {
+                            physical_end++;
+                        }
+                    } else if (tail_block[tail_local] == '\n') {
+                        physical_end++;
+                    }
+                }
+
+                uint64_t physical_extension =
+                    physical_end - baseline_physical_end;
+                if (exact_length > UINT64_MAX - physical_extension) {
+                    continue;
+                }
+                uint64_t trial_length = exact_length + physical_extension;
+                if (trial_length <= solution_length ||
+                    trial_length > (uint64_t)scalpel_state
+                                       .search_specs[candidate->needleidx]
+                                       .MAXIMUMSIZE) {
+                    continue;
+                }
+                uint64_t trial_slots = CEILDIV(trial_length, blocksize);
+                if (trial_slots < total_slots ||
+                    trial_slots > (uint64_t)image_blocks) {
+                    continue;
+                }
+
+                bool extension_available = true;
+                for (uint64_t slot = total_slots;
+                     slot < trial_slots && extension_available; slot++) {
+                    int64_t actual = baseline_last_actual +
+                                     (int64_t)(slot - total_slots) + 1;
+                    if (actual < 0 || actual >= image_blocks) {
+                        extension_available = false;
+                        break;
+                    }
+                    int64_t apparent = filemirror_apparent_blocknumber(
+                        scalpel_state.filemirror, actual);
+                    bool already_present = apparent >= 0 &&
+                        apparent_block_in_blockvector(candidate->b, apparent);
+                    if (apparent < 0 ||
+                        filemirror_actual_block_is_zero(
+                            scalpel_state.filemirror, actual) ||
+                        (filemirror_actual_block_covered(
+                             scalpel_state.filemirror, actual) &&
+                         !already_present)) {
+                        extension_available = false;
+                        break;
+                    }
+                    for (uint64_t prior = 0; prior < total_slots; prior++) {
+                        if (solution_actuals[prior] == actual) {
+                            extension_available = false;
+                            break;
+                        }
+                    }
+                }
+                if (!extension_available) {
+                    continue;
+                }
+
+                BlockVector *trial_bv = NULL;
+                clone_blockvector(candidate->b, &trial_bv, false);
+                resize_blockvector(trial_bv, trial_slots);
+                for (uint64_t slot = 0; slot < total_slots; slot++) {
+                    blockvector_set_apparent_blocknumber(
+                        trial_bv, slot,
+                        filemirror_apparent_blocknumber(
+                            scalpel_state.filemirror,
+                            solution_actuals[slot]));
+                }
+                for (uint64_t slot = total_slots; slot < trial_slots; slot++) {
+                    int64_t actual = baseline_last_actual +
+                                     (int64_t)(slot - total_slots) + 1;
+                    blockvector_set_apparent_blocknumber(
+                        trial_bv, slot,
+                        filemirror_apparent_blocknumber(
+                            scalpel_state.filemirror, actual));
+                }
+                blockvector_set_data_length(trial_bv, trial_length);
+                inflate_blockvector(trial_bv);
+
+                CarveInfo trial = *candidate;
+                trial.b = trial_bv;
+                bool validates = false;
+                bool promising = true;
+                uint64_t validates_to = blocksize - 1;
+                bool previous_syntax_requirement =
+                    pdf_require_object_syntax;
+                pdf_require_object_syntax = true;
+                pdf_file_validate(blockvector_get_data_pointer(trial_bv),
+                                  trial_length, &validates, &validates_to,
+                                  &promising, trial.needleidx,
+                                  scalpel_state.blocksize,
+                                  trial.carvehashkey);
+                pdf_require_object_syntax = previous_syntax_requirement;
+                bool trial_validates =
+                    validates && validates_to + 1 == trial_length &&
+                    !pdf_candidate_has_holes(&trial);
+                if (trial_validates) {
+                    solution_length = trial_length;
+                    solution_slots = trial_slots;
+                }
+                free_blockvector(&trial_bv);
+            }
+        }
+    }
+
+    if (verified && solution_length == exact_length &&
+        incremental_update_evidence) {
+        verified = false;
+    }
+
+    if (verified) {
+        resize_blockvector(candidate->b, solution_slots);
+        for (uint64_t slot = 0; slot < total_slots; slot++) {
+            blockvector_set_apparent_blocknumber(
+                candidate->b, slot,
+                filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                                solution_actuals[slot]));
+        }
+        int64_t baseline_last_actual = solution_actuals[total_slots - 1];
+        for (uint64_t slot = total_slots; slot < solution_slots; slot++) {
+            int64_t actual = baseline_last_actual +
+                             (int64_t)(slot - total_slots) + 1;
+            blockvector_set_apparent_blocknumber(
+                candidate->b, slot,
+                filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                                actual));
+        }
+        blockvector_set_data_length(candidate->b, solution_length);
+        inflate_blockvector(candidate->b);
+        candidate->best_validates_to = solution_length - 1;
+        candidate->fastpath = false;
+
+        PDFCarveState *committed =
+            (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+        if (committed) {
+            committed->speculative_blocks = false;
+            carve_put_state(candidate->carvehashkey, committed);
+            pdf_free_carve_state((void **)&committed);
+        }
+    }
+
+    free(solution_actuals);
+    free(actuals);
+    free(boundaries);
+    free(boundary_hi);
+    free(boundary_lo);
+    free(chain);
+    return verified;
+}
+
+// Displacement consensus tolerates isolated incorrect mappings. Logical groups
+// retain separated runs when the same displacement recurs after another run.
+// Both interpretations use the same complete-file and unique-layout checks.
+static bool pdf_complete_linearized_physical_runs(ThreadWork *work,
+                                                   CarveInfo *candidate) {
+    if (pdf_try_linearized_physical_runs(work, candidate, false)) {
+        return true;
+    }
+    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        return false;
+    }
+    return pdf_try_linearized_physical_runs(work, candidate, true);
+}
+
+// Recognize classic xref rows between arbitrary carving block boundaries.
+static bool pdf_xref_block_continuation(const unsigned char *data, size_t length) {
+    if (!data || length == 0) {
+        return false;
+    }
+    size_t cursor = 0;
+    size_t rows = 0;
+    // A block can begin within an entry; check the following complete rows.
+    while (cursor < length && data[cursor] != '\r' && data[cursor] != '\n') {
+        cursor++;
+    }
+    while (cursor < length) {
+        if (data[cursor] == '\r') {
+            cursor++;
+        }
+        if (cursor < length && data[cursor] == '\n') {
+            cursor++;
+        }
+        size_t start = cursor;
+        while (cursor < length && data[cursor] != '\r' && data[cursor] != '\n') {
+            cursor++;
+        }
+        if (cursor == length) {
+            break;
+        }
+        size_t width = cursor - start;
+        if ((width != 18 && width != 19) || data[start + 10] != ' '
+            || data[start + 16] != ' '
+            || (data[start + 17] != 'n' && data[start + 17] != 'f')
+            || (width == 19 && data[start + 18] != ' ')) {
+            return false;
+        }
+        for (size_t offset = 0; offset < 16; offset++) {
+            if (offset != 10 && (data[start + offset] < '0' || data[start + offset] > '9')) {
+                return false;
+            }
+        }
+        rows++;
+    }
+    return rows != 0;
+}
+
+// Append adjacent cross-reference rows and trailer blocks to a hole-free body.
+// Full validation still checks the resulting xref and object relationships.
+static bool pdf_complete_trailer(ThreadWork *work, CarveInfo *candidate) {
+    (void)work;
+    if (!candidate || !candidate->b || scalpel_state.blocksize == 0) {
+        return false;
+    }
     FileMirror *fm = scalpel_state.filemirror;
     const int64_t bsz = (int64_t)scalpel_state.blocksize;
 
     // The body must be complete: a hole reads as zeroes the validator could take
     // for content, and appending a tail past it would be premature.
-    if(pdf_candidate_has_holes(candidate)) return false;
+    if (pdf_candidate_has_holes(candidate)) {
+        return false;
+    }
     uint64_t nblocks = blockvector_get_num_blocks(candidate->b);
-    if(nblocks == 0) return false;
+    if (nblocks == 0) {
+        return false;
+    }
 
     int64_t last_app = blockvector_get_apparent_blocknumber(candidate->b, nblocks - 1);
-    if(last_app < 0) return false;
+    if (last_app < 0) {
+        return false;
+    }
 
-    // Already terminated: the last block carries "%%EOF". This covers every
-    // complete candidate -- including the recovered files -- so they are untouched.
+    // A terminal marker in the last block leaves nothing to append here.
     {
         unsigned char *lb = (unsigned char*)get_apparent_block_data(fm, last_app);
-        if(!lb) return false;
+        if (!lb) {
+            return false;
+        }
         bool terminated = memmem(lb, (size_t)bsz, "%%EOF", 5) != NULL;
         free(lb);
-        if(terminated) return false;
+        if (terminated) {
+            return false;
+        }
     }
 
     int64_t last_actual = filemirror_actual_blocknumber(fm, last_app);
-    if(last_actual < 0) return false;
+    if (last_actual < 0) {
+        return false;
+    }
 
-    const int MAX_TRAILER = 2;   // a trailer spans at most a block or two past the body
+    const uint64_t image_blocks = CEILDIV(filemirror_filesize(fm), scalpel_state.blocksize);
     bool appended = false;
-    for(int k = 1; k <= MAX_TRAILER; k++){
-        int64_t d_actual = last_actual + k;
+    for (uint64_t next = (uint64_t)last_actual + 1; next < image_blocks; next++) {
+        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+            break;
+        }
+        int64_t d_actual = (int64_t)next;
         int64_t d_app = filemirror_apparent_blocknumber(fm, d_actual);
-        if(d_app < 0) break;
+        if (d_app < 0) {
+            break;
+        }
         unsigned char *blk = (unsigned char*)get_apparent_block_data(fm, d_app);
-        if(!blk) break;
+        if (!blk) {
+            break;
+        }
         bool has_sx  = memmem(blk, (size_t)bsz, "startxref", 9) != NULL;
         bool has_eof = memmem(blk, (size_t)bsz, "%%EOF", 5) != NULL;
+        bool xref_rows = pdf_xref_block_continuation(blk, (size_t)bsz);
         free(blk);
-        if(!has_sx && !has_eof) break;   // not a trailer continuation -- stop
+        if (!has_sx && !has_eof && !xref_rows) {
+            break;
+        }
 
         uint64_t slot = blockvector_get_num_blocks(candidate->b);
-        if(!pdf_place_blocks_at_slot(candidate, &d_actual, 1, slot, "TRAILER_FILL")) break;
+        if (!pdf_place_blocks_at_slot(candidate, &d_actual, 1, slot, "TRAILER_FILL")) {
+            break;
+        }
         appended = true;
-        if(has_eof) break;               // reached the terminal block
+        if (has_eof) {
+            break;
+        }
     }
     return appended;
+}
+
+static bool pdf_reassembly_poll(ThreadWork *work,
+                                CarveInfo **candidate,
+                                uuid_string_t uuidp,
+                                uuid_string_t uuidc) {
+    if (!work || !candidate || !*candidate) {
+        return true;
+    }
+    if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+        return true;
+    }
+    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)
+        && reassembly_time_to_checkpoint(work->id, *candidate, uuidp, uuidc)) {
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -5445,23 +11045,55 @@ void pdf_reassembly(ThreadWork *work,
 		            uuid_string_t uuidc){
 
     CarveInfo *candidate = *c;
+    bool resume_xref_scan = false;
+    bool state_initialized = false;
+    bool resume_interior_scan = false;
+    bool resume_partial_search = false;
 #ifdef PDF_TRACE_REASM
     uint64_t dbg_start_blocks = blockvector_get_num_blocks(candidate->b);
     int dbg_s2_scans = 0, dbg_s2_best = -1, dbg_s2_found = 0;
 #endif
 
-    /* === Strategy 1: extend using xref tables already in the candidate === */
-    pdf_reassembly_init_candidate(work->id, candidate, uuidp, uuidc);
     {
-        PDFCarveState *carve_state = (PDFCarveState*)carve_get_state(candidate->carvehashkey);
-        if(carve_state) {
-            for(size_t i = 0; i < carve_state->num_tables; i++)
-                sort_xref_data_by_offset(&carve_state->xref_tables[i]);
-            carve_put_state(candidate->carvehashkey, carve_state);
-            pdf_free_carve_state((void**)&carve_state);
-            pdf_reassembly_extension(work, c, NULL, 0, NULL, 0, -1, false);
-            candidate = *c;
+        PDFCarveState *state =
+            (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+        resume_xref_scan = state && state->xref_search.active;
+        state_initialized = state && state->initialized;
+        resume_interior_scan = state && state->interior_search.active;
+        resume_partial_search = state && state->partial_search_active;
+        pdf_free_carve_state((void **)&state);
+    }
+
+    if (resume_partial_search) {
+        goto finish_partial;
+    }
+    if (resume_interior_scan) {
+        goto finish_interiors;
+    }
+
+    /* === Strategy 1: extend using xref tables already in the candidate === */
+    if (!resume_xref_scan) {
+        if (!state_initialized) {
+            pdf_reassembly_init_candidate(work->id, candidate, uuidp, uuidc);
         }
+        {
+            PDFCarveState *carve_state =
+                (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+            if (carve_state) {
+                for (size_t i = 0; i < carve_state->num_tables; i++) {
+                    sort_xref_data_by_offset(&carve_state->xref_tables[i]);
+                }
+                carve_put_state(candidate->carvehashkey, carve_state);
+                pdf_free_carve_state((void **)&carve_state);
+                pdf_reassembly_extension(work, c, NULL, 0, NULL, 0, -1,
+                                         false);
+                candidate = *c;
+            }
+        }
+        if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+            return;
+        }
+        candidate = *c;
     }
 
     /* === Strategies 2 & 3: loop until neither extends the candidate === */
@@ -5501,35 +11133,151 @@ void pdf_reassembly(ThreadWork *work,
             int32_t  best_local = -1;
             int      best_score = 0;
 
-            for(;;){
-                free(entries); entries = NULL;
-                free(xref_blocks); xref_blocks = NULL; xref_block_count = 0;
-                entries = scan_blocks_for_xref(candidate, &scan_bv, &entry_count, &xref_blocks, &xref_block_count, &xref_local);
-                if(!entries || entry_count <= 0){ free(entries); entries = NULL; break; }
+            bool scan_exhausted = false;
+            int64_t scan_cursor = 0;
+            pdf_restore_xref_search(candidate, &scan_bv, &scan_exhausted,
+                                    &best_entries, &best_entry_count,
+                                    &best_blocks, &best_block_count,
+                                    &best_local, &best_score);
 
-                int score = pdf_xref_confirms_header(candidate, entries, entry_count);
+            while (!scan_exhausted) {
+                free(entries);
+                entries = NULL;
+                free(xref_blocks);
+                xref_blocks = NULL;
+                xref_block_count = 0;
+                entry_count = 0;
+                bool more_work = false;
+                entries = scan_blocks_for_xref(
+                    candidate, &scan_bv, &entry_count, &xref_blocks,
+                    &xref_block_count, &xref_local, &scan_cursor,
+                    PDF_XREF_SCAN_QUANTUM, &more_work);
+                if (!entries || entry_count <= 0) {
+                    free(entries);
+                    entries = NULL;
+                    if (!more_work) {
+                        scan_exhausted = true;
+                    }
+                }
+
+                int score = entries
+                                ? pdf_xref_confirms_header(candidate, entries,
+                                                           entry_count)
+                                : 0;
+                bool xref_already_present = entries && xref_block_count > 0;
+                for (int b = 0; b < xref_block_count && xref_already_present; b++) {
+                    int64_t xref_app = filemirror_apparent_blocknumber(
+                        scalpel_state.filemirror, xref_blocks[b]);
+                    bool block_present = false;
+                    for (uint64_t k = 0;
+                         k < blockvector_get_num_blocks(candidate->b) && !block_present;
+                         k++) {
+                        block_present =
+                            blockvector_get_apparent_blocknumber(candidate->b, k) == xref_app;
+                    }
+                    xref_already_present = block_present;
+                }
+                // Xrefs already in the candidate were parsed during candidate
+                // initialization or /Prev adoption. Rescoring them can starve a
+                // later incremental xref whose smaller table is still needed.
+                if (xref_already_present) {
+                    score = 0;
+                }
 #ifdef PDF_TRACE_REASM
-                dbg_s2_scans++; dbg_s2_found = 1;
-                if(score > dbg_s2_best) dbg_s2_best = score;
+                if (entries) {
+                    dbg_s2_scans++;
+                    dbg_s2_found = 1;
+                    if (score > dbg_s2_best) {
+                        dbg_s2_best = score;
+                    }
+                }
 #endif
-                if(score > best_score){
-                    free(best_entries); free(best_blocks);
-                    best_entries = entries;      entries = NULL;      // ownership moves
-                    best_blocks  = xref_blocks;  xref_blocks = NULL;
+                bool prefer_xref = entries && score > best_score;
+                if (entries && best_entries && score == best_score &&
+                    score >= MIN_CONFIRMATIONS) {
+                    int64_t candidate_slot = pdf_resolve_xref_slot(
+                        candidate, xref_blocks, xref_block_count, xref_local);
+                    int64_t current_slot = pdf_resolve_xref_slot(
+                        candidate, best_blocks, best_block_count, best_local);
+                    // A terminal xref and a linearized front hint can contain the
+                    // same entries. Prefer the one whose own trailer identifies
+                    // its exact file position; content score remains the primary
+                    // discriminator and the normal confirmation threshold still
+                    // applies.
+                    prefer_xref = candidate_slot >= 0 && current_slot < 0;
+                }
+                if (prefer_xref) {
+                    free(best_entries);
+                    free(best_blocks);
+                    best_entries = entries;
+                    entries = NULL;
+                    best_blocks = xref_blocks;
+                    xref_blocks = NULL;
                     best_entry_count = entry_count;
-                    best_block_count = xref_block_count; xref_block_count = 0;
-                    best_local  = xref_local;
-                    best_score  = score;
+                    best_block_count = xref_block_count;
+                    xref_block_count = 0;
+                    best_local = xref_local;
+                    best_score = score;
                 }
 #ifdef PDF_FIRST_MATCH_XREF
                 // Diagnostic mode: stop at the first xref over the bar, reproducing
                 // the pre-argmax behaviour so the two can be diffed.
-                if(best_score >= MIN_CONFIRMATIONS) break;
+                if (best_score >= MIN_CONFIRMATIONS) {
+                    scan_exhausted = true;
+                }
 #endif
+
+                if (reassembly_check_kill_queue(work, c, uuidp, uuidc)) {
+                    free(entries);
+                    entries = NULL;
+                    free(xref_blocks);
+                    xref_blocks = NULL;
+                    free(best_entries);
+                    best_entries = NULL;
+                    free(best_blocks);
+                    best_blocks = NULL;
+                    if (scan_bv) {
+                        free_blockvector(&scan_bv);
+                    }
+                    return;
+                }
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                         memory_order_acquire)) {
+                    pdf_store_xref_search(
+                        candidate, scan_bv, scan_exhausted, best_entries,
+                        best_entry_count, best_blocks, best_block_count,
+                        best_local, best_score);
+                    free(entries);
+                    free(xref_blocks);
+                    free(best_entries);
+                    free(best_blocks);
+                    if (scan_bv) {
+                        free_blockvector(&scan_bv);
+                    }
+                    if (reassembly_time_to_checkpoint(work->id, candidate,
+                                                      uuidp, uuidc)) {
+                        return;
+                    }
+                    pdf_restore_xref_search(
+                        candidate, &scan_bv, &scan_exhausted,
+                        &best_entries, &best_entry_count, &best_blocks,
+                        &best_block_count, &best_local, &best_score);
+                    scan_cursor = 0;
+                }
             }
-            free(entries); entries = NULL;
-            free(xref_blocks); xref_blocks = NULL;
-            if(scan_bv) free_blockvector(&scan_bv);
+            free(entries);
+            entries = NULL;
+            free(xref_blocks);
+            xref_blocks = NULL;
+
+            // Keep the completed argmax result restartable until its extension
+            // has been committed to the candidate and carve state.
+            pdf_store_xref_search(candidate, scan_bv, true, best_entries,
+                                  best_entry_count, best_blocks,
+                                  best_block_count, best_local, best_score);
+            if (scan_bv) {
+                free_blockvector(&scan_bv);
+            }
 
             bool possible_match = (best_score >= MIN_CONFIRMATIONS);
             entries          = best_entries;
@@ -5538,17 +11286,29 @@ void pdf_reassembly(ThreadWork *work,
             xref_block_count = best_block_count;
             xref_local       = best_local;
 
-            if(possible_match){
+            if (possible_match) {
                 // The scan found WHICH blocks hold the xref; recover WHERE they
                 // belong before handing them over. -1 means unresolved, and the
                 // extension falls back to appending at the frontier.
                 int64_t xref_slot = pdf_resolve_xref_slot(candidate, xref_blocks,
                                                           xref_block_count, xref_local);
-                pdf_reassembly_extension(work, c, entries, entry_count, xref_blocks, xref_block_count, xref_slot, true);
+                pdf_reassembly_extension(work, c, entries, entry_count,
+                                         xref_blocks, xref_block_count,
+                                         xref_slot, true);
             }
-            else
+            else {
                 free(entries);
+            }
             free(xref_blocks);
+            candidate = *c;
+            // An interrupted extension still needs the selected xref on resume.
+            if (!atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                pdf_clear_xref_search(candidate);
+                resume_xref_scan = false;
+            }
+            if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+                return;
+            }
             candidate = *c;
         }
 
@@ -5558,9 +11318,16 @@ void pdf_reassembly(ThreadWork *work,
             uint64_t search_pos = 0;
             const char *first_xref = scan_buf_for_xref(blockvector_get_data_pointer(candidate->b),
                 blockvector_get_data_length(candidate->b), search_pos, &xref_type);
-            int64_t xref_offset = first_xref - blockvector_get_data_pointer(candidate->b);
-            int64_t prev_entry = find_prev_entry(blockvector_get_data_pointer(candidate->b),
-                blockvector_get_data_length(candidate->b), xref_offset, xref_type);
+            int64_t xref_offset = first_xref
+                                      ? first_xref
+                                            - blockvector_get_data_pointer(candidate->b)
+                                      : -1;
+            int64_t prev_entry = xref_offset >= 0
+                                     ? find_prev_entry(
+                                           blockvector_get_data_pointer(candidate->b),
+                                           blockvector_get_data_length(candidate->b),
+                                           xref_offset, xref_type)
+                                     : -1;
             if(prev_entry > 0){
                 int64_t tmp;
                 int prev_check = detect_xref_type(blockvector_get_data_pointer(candidate->b),
@@ -5586,8 +11353,14 @@ void pdf_reassembly(ThreadWork *work,
                         // Attribute the /Prev table before adopting it: /Prev is read
                         // from the candidate's current bytes, so a foreign xref block
                         // would otherwise point its /Prev into that other file.
-                        int prev_score = pdf_xref_confirms_header(candidate, prev_entries, prev_entry_count);
-                        if(!xref_already_present && prev_score >= 2){
+                        int prev_score = pdf_xref_confirms_header(
+                            candidate, prev_entries, prev_entry_count);
+                        bool exact_link_unique = prev_score < 2 &&
+                            pdf_xref_offset_is_unique(
+                                candidate,
+                                (int32_t)xref_local_block_offset);
+                        if (!xref_already_present &&
+                            (prev_score >= 2 || exact_link_unique)) {
 #ifdef PDF_TRACE_PLACEMENT
                             pdf_trace_table_adopt(candidate, "PREV", prev_entries, prev_entry_count, prev_score);
 #endif
@@ -5618,6 +11391,11 @@ void pdf_reassembly(ThreadWork *work,
             candidate = *c;
         }
 
+        if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+            return;
+        }
+        candidate = *c;
+
         if(blockvector_get_num_blocks(candidate->b) > blocks_before)
             extended = true;
 
@@ -5625,14 +11403,30 @@ void pdf_reassembly(ThreadWork *work,
 
     candidate = *c;
 
+finish_interiors:
+    candidate = *c;
     // Xref adoption places object-HEADER blocks but not the stream interiors
     // between them; fill any verifiable interior holes before validating.
     pdf_fill_interior_stream_holes(work, candidate);
+    if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+        return;
+    }
+    candidate = *c;
+    pdf_fill_physically_bridged_holes(work, candidate);
+    pdf_complete_linearized_physical_runs(work, candidate);
+    if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+        return;
+    }
+    candidate = *c;
 
     // A fully-assembled body can still lack its final trailer block (startxref +
     // %%EOF), which holds no object and so is never placed; append it so the file
     // can terminate and validate.
     pdf_complete_trailer(work, candidate);
+    if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+        return;
+    }
+    candidate = *c;
 
     // Extension is done. Run the file validator on the assembled result: if it
     // validates as a complete PDF, trim the blockvector to the validated length
@@ -5650,16 +11444,33 @@ void pdf_reassembly(ThreadWork *work,
     bool validates = false;
     bool promising = true;
     uint64_t validates_to = scalpel_state.blocksize - 1;
+    uint64_t validation_length = pdf_candidate_trusted_prefix_length(candidate);
     pdf_file_validate(blockvector_get_data_pointer(candidate->b),
-                      blockvector_get_data_length(candidate->b),
+                      validation_length,
                       &validates, &validates_to, &promising,
                       candidate->needleidx, scalpel_state.blocksize,
                       candidate->carvehashkey);
 
+    PDFCarveState *final_state =
+        (PDFCarveState *)carve_get_state(candidate->carvehashkey);
+    bool speculative_blocks =
+        final_state && final_state->speculative_blocks;
+    pdf_free_carve_state((void **)&final_state);
+    if (validates && speculative_blocks) {
+        blockvector_set_data_length(candidate->b, validates_to + 1);
+        resize_blockvector(
+            candidate->b,
+            CEILDIV(blockvector_get_data_length(candidate->b),
+                    scalpel_state.blocksize));
+        validates = false;
+        promising = true;
+    }
+
     // Positional placement can leave unfilled slots between the frontier and an
-    // anchored block. Those read back as zeroes, which the validator above can
-    // mistake for real content, so a candidate with holes is never VALIDATED.
-    if (validates && pdf_candidate_has_holes(candidate)) {
+    // anchored block. A hole inside the validated byte range reads as zeroes and
+    // cannot be trusted; holes after validates_to are discarded by the trim below.
+    if (validates &&
+        pdf_candidate_has_holes_through(candidate, validates_to)) {
         validates = false;
         promising = true;
     }
@@ -5674,14 +11485,32 @@ void pdf_reassembly(ThreadWork *work,
         // each emit a VALIDATED copy. A later duplicate is demoted to PROMISING.
         if (pdf_claim_body_blocks_or_duplicate(candidate)) {
             candidate->flavor = PROMISING;
-            write_candidate(&candidate, true);
+            if (scalpel_state.write_promising) {
+                write_candidate(c, false);
+            }
+            else {
+                destroy_candidate(c);
+            }
         } else {
             candidate->flavor = VALIDATED;
-            write_candidate(&candidate, false);
+            write_candidate(c, false);
         }
     } else {
+        pdf_preserve_partial_prefix(candidate);
+finish_partial:
+        pdf_extend_partial_prefix(candidate);
+        if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+            return;
+        }
+        candidate = *c;
+        pdf_write_partial_prefix(candidate);
         candidate->flavor = PROMISING;
-        write_candidate(&candidate, true);
+        if (scalpel_state.write_promising) {
+            write_candidate(c, false);
+        }
+        else {
+            destroy_candidate(c);
+        }
     }
     return;
 }
@@ -5810,6 +11639,11 @@ static void pdf_reassembly_extension(ThreadWork *work,
     for(int i = 0; i < num_tables + 1; i++){
         current_table = i;
         for(int j = 0; j < test_tables[i].count; j++){
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                goto extension_done;
+            }
+            // Reassembly can relocate the blockvector data buffer between objects.
+            data = blockvector_get_data_pointer(candidate->b);
             check = validate_at_offset(data, test_tables[i].entries[j].obj_offset,
                 test_tables[i].entries[j].obj_num, blockvector_get_data_length(candidate->b));
             current_object = test_tables[i].entries[j].obj_num;
@@ -5841,7 +11675,7 @@ static void pdf_reassembly_extension(ThreadWork *work,
                 char *first_stream_block_data = (char*)get_apparent_block_data(scalpel_state.filemirror, streamstart_block_app);
                 int stream_length = stream_dict
                     ? check_last_object_length(data, length, &offset, test_tables, num_tables + 1,
-                                               stream_dict, dict_len, (uint64_t)obj_off)
+                                               stream_dict, dict_len, (uint64_t)obj_off, true)
                     : LENGTHNOTFOUND;
                 int filter = stream_dict
                     ? check_last_object_filter(stream_dict, dict_len)
@@ -5866,48 +11700,47 @@ static void pdf_reassembly_extension(ThreadWork *work,
                 }
                 if(filter == ZLIB){
                     if(stream_condition == INNEXTBLOCK){
-                        if(!reconstruct_zlib_stream(work, candidate, first_stream_block_data,
-                                startstream_local_offset, endstream_local_offset, 0,
-                                (uint64_t)stream_length, INNEXTBLOCK)){
+                        bool reconstructed = reconstruct_zlib_stream(work, candidate,
+                                first_stream_block_data, startstream_local_offset,
+                                endstream_local_offset, 0, (uint64_t)stream_length,
+                                INNEXTBLOCK);
 #ifdef PDF_TRACE_STALL
+                        if(!reconstructed){
                             { uuid_string_t uu; uuid_unparse_lower(candidate->binuuid, uu);
                               lock_fprintf(stdout,"[PDFSTALL] uuid=%.8s obj_off=%" PRId64 " ZLIB INNEXTBLOCK failed bte=%d\n", uu, obj_off, blocks_to_extend); }
-#endif
-                            free(first_stream_block_data);
-                            pdf_inflight_tables = NULL; pdf_inflight_table_count = 0; return;
                         }
+#else
+                        (void)reconstructed;
+#endif
                     }
                     if(stream_condition == MULTIBLOCK){
-                        if(!reconstruct_zlib_stream(work, candidate, first_stream_block_data,
+                        bool reconstructed = reconstruct_zlib_stream(work, candidate, first_stream_block_data,
                                 startstream_local_offset, endstream_local_offset, blocks_to_extend,
-                                (uint64_t)stream_length, MULTIBLOCK)){
+                                (uint64_t)stream_length, MULTIBLOCK);
+                        if(!reconstructed){
 #ifdef PDF_TRACE_STALL
                             { uuid_string_t uu; uuid_unparse_lower(candidate->binuuid, uu);
                               lock_fprintf(stdout,"[PDFSTALL] uuid=%.8s obj_off=%" PRId64 " ZLIB MULTIBLOCK failed bte=%d\n", uu, obj_off, blocks_to_extend); }
 #endif
-                            free(first_stream_block_data);
-                            pdf_inflight_tables = NULL; pdf_inflight_table_count = 0; return;
                         }
-                        data = blockvector_get_data_pointer(candidate->b);
+                        if(reconstructed){
+                            data = blockvector_get_data_pointer(candidate->b);
+                        }
                     }
                 }
                 else if(filter == XML){
                     if(stream_condition == INNEXTBLOCK){
-                        if(!reconstruct_xml_stream(work, candidate, first_stream_block_data,
+                        (void)reconstruct_xml_stream(work, candidate, first_stream_block_data,
                                 startstream_local_offset, endstream_local_offset, 0,
-                                (uint64_t)stream_length, INNEXTBLOCK)){
-                            free(first_stream_block_data);
-                            pdf_inflight_tables = NULL; pdf_inflight_table_count = 0; return;
-                        }
+                                (uint64_t)stream_length, INNEXTBLOCK);
                     }
                     if(stream_condition == MULTIBLOCK){
-                        if(!reconstruct_xml_stream(work, candidate, first_stream_block_data,
+                        bool reconstructed = reconstruct_xml_stream(work, candidate, first_stream_block_data,
                                 startstream_local_offset, endstream_local_offset, blocks_to_extend,
-                                (uint64_t)stream_length, MULTIBLOCK)){
-                            free(first_stream_block_data);
-                            pdf_inflight_tables = NULL; pdf_inflight_table_count = 0; return;
+                                (uint64_t)stream_length, MULTIBLOCK);
+                        if(reconstructed){
+                            data = blockvector_get_data_pointer(candidate->b);
                         }
-                        data = blockvector_get_data_pointer(candidate->b);
                     }
                 }
                 else if(filter == NOFILTER){
@@ -5915,34 +11748,35 @@ static void pdf_reassembly_extension(ThreadWork *work,
                     // known exactly. Without this branch the stream is skipped
                     // entirely and its interior blocks stay holes forever.
                     if(stream_condition == MULTIBLOCK){
-                        if(!reconstruct_raw_stream(work, candidate,
-                                endstream_local_offset, blocks_to_extend, MULTIBLOCK)){
-                            free(first_stream_block_data);
-                            return;
+                        bool reconstructed = reconstruct_raw_stream(work, candidate,
+                                endstream_local_offset, blocks_to_extend, MULTIBLOCK);
+                        if(reconstructed){
+                            data = blockvector_get_data_pointer(candidate->b);
                         }
-                        data = blockvector_get_data_pointer(candidate->b);
                     }
                 }
                 else if(filter == JPEG){
                     if(stream_condition == INNEXTBLOCK){
-                        if(!reconstruct_jpeg_stream(work, candidate, first_stream_block_data,
+                        (void)reconstruct_jpeg_stream(work, candidate, first_stream_block_data,
                                 startstream_local_offset, endstream_local_offset, 0,
-                                (uint64_t)stream_length, INNEXTBLOCK)){
-                            free(first_stream_block_data);
-                            pdf_inflight_tables = NULL; pdf_inflight_table_count = 0; return;
-                        }
+                                (uint64_t)stream_length, INNEXTBLOCK);
                     }
                     if(stream_condition == MULTIBLOCK){
-                        if(!reconstruct_jpeg_stream(work, candidate, first_stream_block_data,
+                        bool reconstructed = reconstruct_jpeg_stream(work, candidate, first_stream_block_data,
                                 startstream_local_offset, endstream_local_offset, blocks_to_extend,
-                                (uint64_t)stream_length, MULTIBLOCK)){
-                            free(first_stream_block_data);
-                            pdf_inflight_tables = NULL; pdf_inflight_table_count = 0; return;
+                                (uint64_t)stream_length, MULTIBLOCK);
+                        if(reconstructed){
+                            data = blockvector_get_data_pointer(candidate->b);
                         }
-                        data = blockvector_get_data_pointer(candidate->b);
                     }
                 }
                 free(first_stream_block_data);
+            }
+
+            // A stream search interrupted for a checkpoint is not exhausted.
+            // Keep its frontier rather than jumping to a later object anchor.
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                goto extension_done;
             }
 
             /*
@@ -6022,6 +11856,7 @@ static void pdf_reassembly_extension(ThreadWork *work,
             }
 
             if(check != 1){
+                data = blockvector_get_data_pointer(candidate->b);
                 for(int k = 0; k < num_tables + 1; k++){
                     if(k == current_table) continue;
                     if(!xref_hashes[k]) continue;
@@ -6036,6 +11871,9 @@ static void pdf_reassembly_extension(ThreadWork *work,
         }
     }
 
+    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        goto extension_done;
+    }
     if(xref_validated){
         if(save_new_table){
 #ifdef PDF_TRACE_PLACEMENT
@@ -6090,7 +11928,7 @@ static void pdf_reassembly_extension(ThreadWork *work,
         }
     }
 
-    test_tables[num_tables].entries = NULL;
+extension_done:
     if(test_tables){
         for(int i = 0; i <= num_tables; i++){
             free(test_tables[i].entries);
@@ -6136,101 +11974,85 @@ static inline uint32_t pdf_block_validate(char *data,
     uint64_t *validates_to,
     uint32_t needleidx,
     uint32_t blocksize,
-    void *blockhashkey){
+    void *blockhashkey) {
 
+    *decision = BLOCK_CONFIDENCE_INVALID;
+    *validates_to = 0;
+    if (!data || length == 0 || length > blocksize) {
+        return needleidx;
+    }
     *decision = BLOCK_CONFIDENCE_VALID;
     *validates_to = length - 1;
-    PDFBlockState *s = (PDFBlockState *)malloc(sizeof(PDFBlockState));
-    if(!s) return needleidx;
+    PDFBlockState *s = calloc(1, sizeof(*s));
+    check_memory_allocation(s, __LINE__, __FILE__, "PDF block state");
     s->first_obj = -1;
-    s->num_xrefs = 0;
-    s->xref_block_data = NULL;
-    char* obj_pos = NULL;
-
-    // Check for first object in block
-    if ((obj_pos = memmem(data, length, " obj", 4))){ // Extract the obj # and insert into block's data
-        size_t offset = obj_pos - data;
-        s->first_obj = extract_obj_num(data, offset, length);
+    char *obj_pos = memmem(data, length, " obj", 4);
+    if (obj_pos) {
+        s->first_obj = extract_obj_num(data, (size_t)(obj_pos - data), length);
     }
 
-    // Bound the scan by the block's valid data length, not the full block-buffer
-    // size. On the final partial block length < blocksize, and iterating to
-    // blocksize would scan the block's padding (in-buffer, so not a memory
-    // over-read, but it can surface spurious xref/trailer markers).
-    for(uint32_t i = 0; i < length; i++){
-        if(i + 5 < blocksize && !memcmp(&data[i], "xref", 4)){
-            bool prev_ok = (i == 0) || isspace(data[i - 1]);
-            bool next_ok = (i + 5 >= length) || isspace(data[i + 4]);
-            if (!prev_ok || !next_ok) {
-                continue;
-            }
-            s->num_xrefs++;
-            XrefParameters *temp_xbd = (XrefParameters*)realloc(s->xref_block_data, s->num_xrefs * sizeof(XrefParameters));
-            if(temp_xbd == NULL){
-                free(s->xref_block_data);
-                return needleidx;
-            }
-            s->xref_block_data = temp_xbd;
-            memset(&s->xref_block_data[s->num_xrefs - 1], 0, sizeof(XrefParameters));
-            s->xref_block_data[s->num_xrefs - 1].xref_start = i;
-            s->xref_block_data[s->num_xrefs - 1].xref_end = -1;
-            s->xref_block_data[s->num_xrefs - 1].xref_type = 1;
-            for(uint32_t j = i; j < blocksize; j++){
-                if(j + 7 < blocksize && !memcmp(&data[j], "trailer", 7)){
-                    s->xref_block_data[s->num_xrefs - 1].xref_end = j;
-                    i = j + 1;
-                    break;
+    size_t capacity = 0;
+    bool no_trailer = false;
+    bool no_endstream = false;
+    // Marker and endpoint searches only inspect the bytes supplied by the caller.
+    for (uint64_t i = 0; i < length; i++) {
+        uint64_t remaining = length - i;
+        XrefParameters entry = {.xref_start = -1, .xref_end = -1};
+        if (remaining >= 4 && !memcmp(data + i, "xref", 4)
+            && (i == 0 || isspace((unsigned char)data[i - 1]))
+            && (remaining == 4 || isspace((unsigned char)data[i + 4]))) {
+            entry.xref_start = (int64_t)i;
+            entry.xref_type = 1;
+            if (!no_trailer) {
+                char *end = memmem(data + i, remaining, "trailer", 7);
+                if (end) {
+                    entry.xref_end = (int64_t)(end - data);
+                    i = (uint64_t)entry.xref_end + 1;
+                }
+                else {
+                    no_trailer = true;
                 }
             }
         }
-
-        if(i + 7 < blocksize && !memcmp(&data[i], "trailer", 7)){
-            s->num_xrefs++;
-            XrefParameters *temp_xbd = (XrefParameters*)realloc(s->xref_block_data, s->num_xrefs * sizeof(XrefParameters));
-            if(temp_xbd == NULL){
-                free(s->xref_block_data);
-                return needleidx;
-            }
-            s->xref_block_data = temp_xbd;
-            memset(&s->xref_block_data[s->num_xrefs - 1], 0, sizeof(XrefParameters));
-            s->xref_block_data[s->num_xrefs - 1].xref_start = -1;
-            s->xref_block_data[s->num_xrefs - 1].xref_end = i;
-            s->xref_block_data[s->num_xrefs - 1].xref_type = 1;
+        else if (remaining >= 7 && !memcmp(data + i, "trailer", 7)) {
+            entry.xref_end = (int64_t)i;
+            entry.xref_type = 1;
         }
-
-        if(i + 10 < blocksize && !memcmp(&data[i], "/Type/XRef", 10)){
-            xref_stream_end_search:
-            s->num_xrefs++;
-            XrefParameters *temp_xbd = (XrefParameters*)realloc(s->xref_block_data, s->num_xrefs * sizeof(XrefParameters));
-            if(temp_xbd == NULL){
-                free(s->xref_block_data);
-                return needleidx;
+        else if ((remaining >= 10 && !memcmp(data + i, "/Type/XRef", 10))
+                 || (remaining >= 11 && !memcmp(data + i, "/Type /XRef", 11))) {
+            entry.xref_start = find_xref_stream_start(data, (int64_t)i);
+            entry.xref_type = 2;
+            if (entry.xref_start == (int64_t)i) {
+                entry.conditional_flag = INCOMPLETESTREAMDICT;
             }
-            s->xref_block_data = temp_xbd;
-            memset(&s->xref_block_data[s->num_xrefs - 1], 0, sizeof(XrefParameters));
-            s->xref_block_data[s->num_xrefs - 1].xref_start = find_xref_stream_start(data, i);
-            s->xref_block_data[s->num_xrefs - 1].xref_type = 2;
-            s->xref_block_data[s->num_xrefs - 1].conditional_flag = 0;
-            if(s->xref_block_data[s->num_xrefs - 1].xref_start == (int64_t)i){
-                s->xref_block_data[s->num_xrefs - 1].conditional_flag = INCOMPLETESTREAMDICT;
-            }
-            s->xref_block_data[s->num_xrefs - 1].xref_end = -1;
-            for(uint32_t j = i; j < blocksize; j++){
-                if(j + 9 < blocksize && !(memcmp(&data[j], "endstream", 9))){
-                    s->xref_block_data[s->num_xrefs - 1].xref_end = j;
-                    i = j + 1;
-                    break;
+            if (!no_endstream) {
+                char *end = memmem(data + i, remaining, "endstream", 9);
+                if (end) {
+                    entry.xref_end = (int64_t)(end - data);
+                    i = (uint64_t)entry.xref_end + 1;
+                }
+                else {
+                    no_endstream = true;
                 }
             }
         }
-
-        else if(i + 11 < blocksize && !memcmp(&data[i], "/Type /XRef", 11)){
-            goto xref_stream_end_search;
+        else {
+            continue;
         }
 
-        // if(i + 9 < blocksize && !(memcmp(&data[i], "endstream", 9))){
-        //     s->xref_block_data->xref_end = i;
-        // }
+        if ((size_t)s->num_xrefs == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 8;
+            if (next_capacity < capacity
+                || next_capacity > SIZE_MAX / sizeof(*s->xref_block_data)) {
+                handle_error(SCALPEL_GENERAL_ABORT, NULL, __LINE__, __FILE__);
+            }
+            XrefParameters *entries = realloc(
+                s->xref_block_data, next_capacity * sizeof(*entries));
+            check_memory_allocation(entries, __LINE__, __FILE__, "PDF xref markers");
+            s->xref_block_data = entries;
+            capacity = next_capacity;
+        }
+        s->xref_block_data[s->num_xrefs++] = entry;
     }
     block_put_state(blockhashkey, s);
     return needleidx;
@@ -6260,14 +12082,21 @@ static inline void pdf_file_validate(char *data,
     uint32_t needleidx,
     uint32_t blocksize,
     void *carvehashkey){
+    if (!data || length < 9 || blocksize == 0) {
+        *validates = false;
+        *promising = false;
+        *validates_to = 0;
+        return;
+    }
     *promising = true;
     *validates = false;
     *validates_to = blocksize - 1;
 #ifdef NOFRAG
     XrefObject *xref_list = NULL;
     int xref_count = 0;
+    int validated_xref_count = 0;
     int8_t check = 0;
-    uint64_t validation_cutoff = blocksize - 1;
+    uint64_t validation_cutoff = 0;
     int64_t *supp_stms = (int64_t*)malloc(sizeof(int64_t));
     int supp_count = 0;
     XrefTables* xref_tables = malloc(sizeof(XrefTables));
@@ -6276,6 +12105,7 @@ static inline void pdf_file_validate(char *data,
     int8_t validated = 0;
     uint8_t fail_count = 0;
     uint64_t xref_end_offset = 0;
+    bool damaged_metadata = false;
 #ifdef PDF_TRACE_VALIDATE
     int dbg_pass = 0, dbg_fail = 0, dbg_outer = 0;
 #endif
@@ -6466,6 +12296,7 @@ static inline void pdf_file_validate(char *data,
         leave_loop:
         if(check == 1){
             kg_validation_cutoff = validation_cutoff;
+            validated_xref_count = xref_count;
 #ifdef PDF_TRACE_VALIDATE
             if(!validated)
                 lock_fprintf(stdout, "[PDFVAL] len=%" PRIu64 " VALIDATED-SET after table %d/%d "
@@ -6491,10 +12322,23 @@ static inline void pdf_file_validate(char *data,
     // Object offsets only prove header blocks are placed; a wrong block inside a
     // stream body is invisible to them. Reject if a validated FlateDecode stream
     // fails to decompress -- must run before the tables are freed below.
-    if(validated == 1 && !pdf_streams_decode_ok(data, length, xref_tables, xref_count)){
+    if(validated == 1 && !pdf_streams_decode_ok(data, length, xref_tables,
+                                              xref_list, validated_xref_count,
+                                              &damaged_metadata)){
         validated = 0;
 #ifdef PDF_TRACE_VALIDATE
         lock_fprintf(stdout, "[PDFVAL] len=%" PRIu64 " REJECTED by stream decode check\n", length);
+#endif
+    }
+    if (validated == 1 && pdf_require_object_syntax &&
+        !pdf_nonstream_objects_well_formed(data, length, xref_tables,
+                                           validated_xref_count)) {
+        validated = 0;
+#ifdef PDF_TRACE_VALIDATE
+        lock_fprintf(stdout,
+                     "[PDFVAL] len=%" PRIu64
+                     " REJECTED by indirect-object syntax check\n",
+                     length);
 #endif
     }
     free(xref_list);
@@ -6529,8 +12373,8 @@ static inline void pdf_file_validate(char *data,
                 !memcmp(&data[validation_cutoff + 1], "\x0D\x0A", 2)){
                     validation_cutoff += 2;
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
-                    *promising = false;
-                    *validates = true;
+                    *promising = damaged_metadata;
+                    *validates = !damaged_metadata;
                     *validates_to = validation_cutoff;
                     return;
                 }
@@ -6539,15 +12383,15 @@ static inline void pdf_file_validate(char *data,
                 data[validation_cutoff + 1] == 0x0A)){
                     validation_cutoff++;
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
-                    *promising = false;
-                    *validates = true;
+                    *promising = damaged_metadata;
+                    *validates = !damaged_metadata;
                     *validates_to = validation_cutoff;
                     return;
                 }
                 else{
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
-                    *promising = false;
-                    *validates = true;
+                    *promising = damaged_metadata;
+                    *validates = !damaged_metadata;
                     *validates_to = validation_cutoff;
                     return;
                 }
@@ -6585,8 +12429,8 @@ static inline void pdf_file_validate(char *data,
                 !memcmp(&data[validation_cutoff + 1], "\x0D\x0A", 2)){
                     validation_cutoff += 2;
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
-                    *promising = false;
-                    *validates = true;
+                    *promising = damaged_metadata;
+                    *validates = !damaged_metadata;
                     *validates_to = validation_cutoff;
                     return;
                 }
@@ -6595,15 +12439,15 @@ static inline void pdf_file_validate(char *data,
                 data[validation_cutoff + 1] == 0x0A)){
                     validation_cutoff++;
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
-                    *promising = false;
-                    *validates = true;
+                    *promising = damaged_metadata;
+                    *validates = !damaged_metadata;
                     *validates_to = validation_cutoff;
                     return;
                 }
                 else{
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
-                    *promising = false;
-                    *validates = true;
+                    *promising = damaged_metadata;
+                    *validates = !damaged_metadata;
                     *validates_to = validation_cutoff;
                     return;
                 }
@@ -6617,6 +12461,716 @@ static inline void pdf_file_validate(char *data,
         *validates_to = kg_validation_cutoff;
     return;
 #endif
+}
+
+// Skip PDF whitespace and comments with interruption checks for partial scans.
+static uint64_t pdf_partial_skip_space(const unsigned char *data, uint64_t cursor,
+                                       uint64_t limit, bool (*stop)(void)) {
+    if (!stop) {
+        return pdf_skip_space_and_comments(data, cursor, limit);
+    }
+    uint32_t work = 0;
+    bool comment = false;
+    while (cursor < limit) {
+        if ((work++ & 1023) == 0 && stop()) {
+            return limit;
+        }
+        unsigned char c = data[cursor];
+        if (comment) {
+            comment = c != '\r' && c != '\n';
+        }
+        else if (c == '%') {
+            comment = true;
+        }
+        else if (!pdf_lexical_space(c)) {
+            break;
+        }
+        cursor++;
+    }
+    return cursor;
+}
+
+// Reuse the stream parsers without accumulating output. A malformed block
+// leaves the preceding checked blocks available as a partial, not validated,
+// result. A short final input can end within a token or marker.
+static uint64_t pdf_embedded_stream_prefix(const unsigned char *data,
+                                           uint64_t available, uint64_t declared,
+                                           uint64_t stream_offset,
+                                           uint32_t blocksize, bool is_jpeg,
+                                           bool (*stop)(void), bool *interrupted) {
+    if (!data || !available || blocksize == 0 || available > SIZE_MAX
+        || declared > SIZE_MAX) {
+        return 0;
+    }
+    if (!is_jpeg
+        && !xml_has_signature(data, available < blocksize ? available : blocksize)) {
+        return 0;
+    }
+    JpegStreamReassembler jpeg = {0};
+    XmlStreamReassembler xml = {0};
+    jpeg.state = J_START;
+    jpeg.stream_length = declared;
+    xml.state = X_TEXT;
+    uint64_t good = 0;
+    for (uint64_t cursor = 0; cursor < available; cursor++) {
+        if (stop && (cursor & 1023) == 0 && stop()) {
+            *interrupted = true;
+            break;
+        }
+        if (is_jpeg) {
+            if (jpeg.state == J_DONE && !pdf_lexical_space(data[cursor])) {
+                break;
+            }
+            jpeg_feed_byte(&jpeg, data[cursor]);
+            if (jpeg.malformed) {
+                break;
+            }
+        }
+        else {
+            xml_feed_byte(&xml, data[cursor]);
+            if (xml.malformed) {
+                break;
+            }
+        }
+        if ((!is_jpeg || jpeg.saw_sos)
+            && ((stream_offset + cursor + 1) % blocksize == 0
+                || cursor + 1 == available)) {
+            good = cursor + 1;
+        }
+    }
+    return good;
+}
+
+// Scan a partial body independently of its cross-reference table. This is
+// progress evidence only; it is not a complete-file validation decision.
+static PDFPrefixScan pdf_scan_forward_prefix(const unsigned char *data,
+                                             uint64_t length,
+                                             uint32_t blocksize,
+                                             bool (*stop)(void)) {
+    PDFPrefixScan result = { 0 };
+    if (!data || length < 8 || length > SIZE_MAX || blocksize == 0
+        || memcmp(data, "%PDF-", 5)
+        || (data[5] != '1' && data[5] != '2')
+        || data[6] != '.' || !isdigit(data[7])) {
+        return result;
+    }
+    uint64_t cursor = 8;
+    result.length = cursor;
+    unsigned char *stack = NULL;
+    size_t capacity = 0;
+    while (cursor < length) {
+        if (stop && stop()) {
+            result.interrupted = true;
+            break;
+        }
+        cursor = pdf_partial_skip_space(data, cursor, length, stop);
+        result.stream_length = 0;
+        if (length - cursor >= 4 && !memcmp(data + cursor, "xref", 4)) {
+            cursor += 4;
+            for (;;) {
+                cursor = pdf_partial_skip_space(data, cursor, length, stop);
+                if (length - cursor >= 7 && !memcmp(data + cursor, "trailer", 7)) {
+                    cursor = pdf_partial_skip_space(data, cursor + 7, length, stop);
+                    uint64_t end = 0;
+                    if (length - cursor < 2 || memcmp(data + cursor, "<<", 2)
+                        || !pdf_nonstream_object_end(data, cursor, length, -1,
+                                                      &stack, &capacity, &end,
+                                                      NULL, stop)) {
+                        goto finished;
+                    }
+                    cursor = end;
+                    result.length = cursor;
+                    break;
+                }
+                int64_t first = 0;
+                int64_t count = 0;
+                size_t end = 0;
+                if (!pdf_parse_signed_integer(data, length, cursor, &first, &end)
+                    || first < 0 || first > INT_MAX || end >= length
+                    || !pdf_lexical_space(data[end])
+                    || !pdf_parse_signed_integer(data, length,
+                          pdf_partial_skip_space(data, end, length, stop), &count, &end)
+                    || count < 0 || count > INT_MAX - first || end >= length
+                    || !pdf_lexical_space(data[end])) {
+                    goto finished;
+                }
+                cursor = end;
+                for (int64_t index = 0; index < count; index++) {
+                    if (stop && stop()) {
+                        result.interrupted = true;
+                        goto finished;
+                    }
+                    int64_t offset = 0;
+                    int64_t generation = 0;
+                    if (!pdf_parse_signed_integer(data, length,
+                          pdf_partial_skip_space(data, cursor, length, stop), &offset, &end)
+                        || offset < 0 || end >= length || !pdf_lexical_space(data[end])
+                        || !pdf_parse_signed_integer(data, length,
+                              pdf_partial_skip_space(data, end, length, stop), &generation, &end)
+                        || generation < 0 || generation > 65535 || end >= length
+                        || !pdf_lexical_space(data[end])) {
+                        goto finished;
+                    }
+                    cursor = pdf_partial_skip_space(data, end, length, stop);
+                    if (cursor >= length || (data[cursor] != 'n' && data[cursor] != 'f')
+                        || cursor + 1 >= length || !pdf_lexical_space(data[cursor + 1])) {
+                        goto finished;
+                    }
+                    cursor++;
+                    result.length = cursor;
+                }
+            }
+            continue;
+        }
+        if (length - cursor >= 9 && !memcmp(data + cursor, "startxref", 9)) {
+            int64_t offset = 0;
+            size_t end = 0;
+            if (!pdf_parse_signed_integer(data, length,
+                  pdf_partial_skip_space(data, cursor + 9, length, stop), &offset, &end)
+                || offset < 0) {
+                break;
+            }
+            cursor = end;
+            while (cursor < length && pdf_lexical_space(data[cursor])) {
+                if (stop && (cursor & 1023) == 0 && stop()) {
+                    result.interrupted = true;
+                    goto finished;
+                }
+                cursor++;
+            }
+            if (length - cursor < 5 || memcmp(data + cursor, "%%EOF", 5)) {
+                break;
+            }
+            cursor += 5;
+            result.length = cursor;
+            continue;
+        }
+        int64_t object_number = -1;
+        if (!pdf_parse_signed_integer(data, (size_t)length, (size_t)cursor,
+                                       &object_number, NULL)
+            || object_number < 0 || object_number > INT_MAX) {
+            break;
+        }
+        uint64_t body = 0;
+        uint64_t end = 0;
+        PDFStreamMetadata metadata = { 0 };
+        int header = pdf_indirect_object_header(data, cursor, length,
+                                                 (int)object_number, &body, NULL);
+        if (header < 0) {
+            break;
+        }
+        // A header cut off by the input boundary is still useful partial
+        // progress. A contradictory header must not extend the prefix.
+        if (header == 0) {
+            result.length = length;
+            result.needs_more = true;
+            break;
+        }
+        result.length = body;
+        if (!pdf_nonstream_object_end(data, cursor, length,
+                                       (int)object_number, &stack,
+                                       &capacity, &end, &metadata, stop)) {
+            result.needs_more = metadata.incomplete;
+            break;
+        }
+        if (!memcmp(data + end - 6, "endobj", 6)) {
+            result.length = end;
+            result.complete_length = end;
+            result.objects++;
+            cursor = end;
+            continue;
+        }
+        uint64_t stream = end;
+        if (stream < length && data[stream] == '\r') {
+            stream++;
+            if (stream < length && data[stream] == '\n') {
+                stream++;
+            }
+        }
+        else if (stream < length && data[stream] == '\n') {
+            stream++;
+        }
+        else {
+            break;
+        }
+        uint64_t stream_length = metadata.has_length ? (uint64_t)metadata.length : length - stream;
+        result.stream_offset = stream;
+        result.stream_length = metadata.has_length ? stream_length : 0;
+        result.stream_flate = metadata.flate;
+        result.stream_jpeg = metadata.jpeg;
+        uint64_t available = stream_length < length - stream
+                                 ? stream_length : length - stream;
+        bool ended = false;
+        result.length = stream;
+        if (metadata.flate) {
+            z_stream inflater = { 0 };
+            if (inflateInit(&inflater) != Z_OK) {
+                break;
+            }
+            unsigned char output[32768];
+            uint64_t supplied = 0;
+            uint64_t good = 0;
+            int status = Z_OK;
+            while (supplied < available || inflater.avail_in != 0) {
+                if (stop && stop()) {
+                    result.interrupted = true;
+                    break;
+                }
+                if (inflater.avail_in == 0) {
+                    uint64_t count = blocksize - (stream + supplied) % blocksize;
+                    if (count > available - supplied) {
+                        count = available - supplied;
+                    }
+                    inflater.next_in = (Bytef *)(data + stream + supplied);
+                    inflater.avail_in = (uInt)count;
+                    supplied += count;
+                }
+                uInt before = inflater.avail_in;
+                inflater.next_out = output;
+                inflater.avail_out = sizeof(output);
+                status = inflate(&inflater, Z_NO_FLUSH);
+                if (status != Z_OK && status != Z_STREAM_END) {
+                    break;
+                }
+                if (inflater.avail_in == 0 || status == Z_STREAM_END) {
+                    good = supplied - inflater.avail_in;
+                }
+                if (status == Z_STREAM_END) {
+                    ended = true;
+                    break;
+                }
+                if (before == inflater.avail_in && inflater.avail_out == sizeof(output)) {
+                    break;
+                }
+            }
+            inflateEnd(&inflater);
+            result.length = stream + good;
+            result.stream_progress |= good != 0;
+            if (!ended || result.interrupted) {
+                result.needs_more = !result.interrupted && good == available;
+                break;
+            }
+            stream_length = good;
+        }
+        else if (metadata.jpeg || (metadata.xml && !metadata.has_filter)) {
+            uint64_t good = pdf_embedded_stream_prefix(data + stream, available,
+                metadata.has_length ? stream_length : 0, stream, blocksize,
+                metadata.jpeg, stop, &result.interrupted);
+            result.length = stream + good;
+            result.stream_progress |= good != 0;
+            if (result.interrupted || !metadata.has_length || good < stream_length) {
+                result.needs_more = !result.interrupted && good == available;
+                break;
+            }
+        }
+        else if (!metadata.has_length || stream_length > available) {
+            result.needs_more = metadata.has_length && stream_length > available;
+            break;
+        }
+        uint64_t tail = pdf_partial_skip_space(data, stream + stream_length, length, stop);
+        if (tail > length || length - tail < 9 || memcmp(data + tail, "endstream", 9)) {
+            break;
+        }
+        tail = pdf_partial_skip_space(data, tail + 9, length, stop);
+        if (tail > length || length - tail < 6 || memcmp(data + tail, "endobj", 6)) {
+            break;
+        }
+        result.length = tail + 6;
+        result.complete_length = result.length;
+        result.objects++;
+        cursor = result.length;
+    }
+finished:
+    if (stop && stop()) {
+        result.interrupted = true;
+    }
+    free(stack);
+    return result;
+}
+
+static bool pdf_prefix_checkpoint_requested(void) {
+    return atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)
+        || atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire);
+}
+
+static void pdf_partial_prefix_release(PDFPartialPrefix *prefix) {
+    if (prefix && atomic_fetch_sub_explicit(&prefix->references, 1,
+                                             memory_order_acq_rel) == 1) {
+        free(prefix);
+    }
+}
+
+// Preserve the longest parsed prefix without changing the active blockvector.
+static void pdf_preserve_partial_prefix(CarveInfo *candidate) {
+    if (!candidate || !candidate->b || scalpel_state.blocksize == 0) {
+        return;
+    }
+    uint64_t length = pdf_candidate_trusted_prefix_length(candidate);
+    PDFCarveState *state = carve_get_state(candidate->carvehashkey);
+    if (state && state->partial_prefix && length <= state->partial_prefix->length) {
+        pdf_free_carve_state((void **)&state);
+        return;
+    }
+    PDFPrefixScan scan = pdf_scan_forward_prefix(
+        (const unsigned char *)blockvector_get_data_pointer(candidate->b),
+        length, scalpel_state.blocksize, pdf_prefix_checkpoint_requested);
+    if ((scan.objects == 0 && !scan.stream_progress) || scan.length == 0
+        || (state && state->partial_prefix && scan.length <= state->partial_prefix->length)) {
+        pdf_free_carve_state((void **)&state);
+        return;
+    }
+    uint64_t count = CEILDIV(scan.length, scalpel_state.blocksize);
+    if (count > blockvector_get_num_blocks(candidate->b)
+        || count > (SIZE_MAX - sizeof(PDFPartialPrefix)) / sizeof(int64_t)) {
+        pdf_free_carve_state((void **)&state);
+        return;
+    }
+    PDFPartialPrefix *prefix = malloc(sizeof(*prefix) + count * sizeof(int64_t));
+    check_memory_allocation(prefix, __LINE__, __FILE__, "PDF partial mapping");
+    atomic_init(&prefix->references, 1);
+    prefix->length = scan.length;
+    prefix->count = count;
+    uint64_t image_blocks = CEILDIV(filemirror_filesize(scalpel_state.filemirror),
+                                    scalpel_state.blocksize);
+    // Keep the checked prefix even if its scan stopped for a checkpoint. Only
+    // the compact mapping is copied here, before the caller returns to idle.
+    for (uint64_t slot = 0; slot < count; slot++) {
+        int64_t actual = blockvector_get_actual_blocknumber(candidate->b, slot);
+        if (actual < 0 || (uint64_t)actual >= image_blocks) {
+            pdf_partial_prefix_release(prefix);
+            pdf_free_carve_state((void **)&state);
+            return;
+        }
+        prefix->actual[slot] = actual;
+    }
+    if (!state) {
+        state = calloc(1, sizeof(*state));
+        check_memory_allocation(state, __LINE__, __FILE__, "PDF carve state");
+        state->lin_L = -1;
+        state->lin_T = -1;
+        pdf_xref_search_state_init(&state->xref_search);
+    }
+    pdf_partial_prefix_release(state->partial_prefix);
+    state->partial_prefix = prefix;
+    carve_put_state(candidate->carvehashkey, state);
+    pdf_free_carve_state((void **)&state);
+}
+
+// Match a stream terminator at its declared block-local position. Whitespace
+// and the keyword may cross physical block boundaries.
+static bool pdf_partial_endstream_at(int64_t actual, uint64_t offset) {
+    const char marker[] = "endstream";
+    size_t matched = 0;
+    uint64_t visited = 0;
+    bool started = false;
+    for (;;) {
+        uint64_t available = 0;
+        const char *data = filemirror_actual_block_data_pointer(
+            scalpel_state.filemirror, actual, &available);
+        if (!data || offset >= available) {
+            return false;
+        }
+        while (offset < available) {
+            if ((visited++ & 1023) == 0 && pdf_prefix_checkpoint_requested()) {
+                return false;
+            }
+            unsigned char value = (unsigned char)data[offset++];
+            if (!started && pdf_lexical_space(value)) {
+                continue;
+            }
+            started = true;
+            if (matched == sizeof(marker) - 1) {
+                return pdf_lexical_space(value) || pdf_lexical_delimiter(value);
+            }
+            if (value != (unsigned char)marker[matched++]) {
+                return false;
+            }
+        }
+        if (actual == INT64_MAX) {
+            return false;
+        }
+        actual++;
+        offset = 0;
+    }
+}
+
+// Check a candidate JPEG continuation without copying its bytes. The parser
+// borrows the input solely for the existing exact-extent completion check.
+static bool pdf_partial_jpeg_complete(const unsigned char *data, size_t length) {
+    JpegStreamReassembler jpeg = {0};
+    jpeg.state = J_START;
+    jpeg.stream_length = length;
+    jpeg.fed = length;
+    jpeg.output = (unsigned char *)data;
+    jpeg.output_len = length;
+    for (size_t i = 0; i < length; i++) {
+        if ((i & 1023) == 0 && pdf_prefix_checkpoint_requested()) {
+            return false;
+        }
+        jpeg_feed_byte(&jpeg, data[i]);
+        if (jpeg.malformed) {
+            return false;
+        }
+    }
+    return pdf_jpeg_extent_complete(&jpeg);
+}
+
+// Continue a retained body when its final checked stream crosses a gap. A
+// declared stream length locates possible tail runs; the body parser must then
+// finish that stream and its object. Later unfinished data is retained only if
+// its entire prefix parses up to a known coverage, source-reuse, or image bound.
+// This search neither replaces the main assembly nor promotes a file to VALIDATED.
+static void pdf_extend_partial_prefix(CarveInfo *candidate) {
+    if (!candidate || !candidate->b || !scalpel_state.write_promising
+        || scalpel_state.blocksize == 0) {
+        return;
+    }
+    PDFCarveState *state = carve_get_state(candidate->carvehashkey);
+    if (!state || !state->partial_prefix) {
+        pdf_free_carve_state((void **)&state);
+        return;
+    }
+    const uint64_t bsz = scalpel_state.blocksize;
+    const uint64_t image_size = filemirror_filesize(scalpel_state.filemirror);
+    const uint64_t total = CEILDIV(image_size, bsz);
+    const uint64_t maximum = scalpel_state.search_specs[candidate->needleidx].MAXIMUMSIZE;
+    const uint64_t source_length = state->partial_search_active
+        ? state->partial_search_length : state->partial_prefix->length;
+    uint64_t source_count = source_length / bsz;
+    unsigned char *data = NULL;
+    roaring64_bitmap_t *source_blocks = NULL;
+    if (source_length == 0 || source_length % bsz != 0
+        || source_length > SIZE_MAX || source_length >= maximum
+        || source_count > state->partial_prefix->count || total > INT64_MAX) {
+        goto finished;
+    }
+    data = malloc((size_t)source_length);
+    check_memory_allocation(data, __LINE__, __FILE__, "PDF partial search data");
+    source_blocks = roaring64_bitmap_create();
+    check_memory_allocation(source_blocks, __LINE__, __FILE__, "PDF partial source blocks");
+    state->partial_search_active = true;
+    state->partial_search_length = source_length;
+    for (uint64_t slot = 0; slot < source_count; slot++) {
+        if ((slot & 255) == 0 && pdf_prefix_checkpoint_requested()) {
+            goto save;
+        }
+        int64_t actual = state->partial_prefix->actual[slot];
+        uint64_t available = 0;
+        const char *block = filemirror_actual_block_data_pointer(
+            scalpel_state.filemirror, actual, &available);
+        if (actual < 0 || !block || available < bsz) {
+            goto finished;
+        }
+        memcpy(data + slot * bsz, block, (size_t)bsz);
+        roaring64_bitmap_add(source_blocks, (uint64_t)actual);
+    }
+    PDFPrefixScan original = pdf_scan_forward_prefix(
+        data, source_length, (uint32_t)bsz, pdf_prefix_checkpoint_requested);
+    if (original.interrupted) {
+        goto save;
+    }
+    if ((!original.stream_flate && !original.stream_jpeg)
+        || original.stream_length == 0 || original.length != source_length
+        || original.stream_offset > maximum
+        || original.stream_length > maximum - original.stream_offset) {
+        goto finished;
+    }
+    uint64_t stream_end = original.stream_offset + original.stream_length;
+    if (stream_end <= source_length) {
+        goto finished;
+    }
+    uint64_t tail_blocks = (stream_end - source_length) / bsz;
+    for (; (uint64_t)state->partial_search_next < total; state->partial_search_next++) {
+        int64_t end_actual = state->partial_search_next;
+        if (pdf_prefix_checkpoint_requested()) {
+            goto save;
+        }
+        if ((uint64_t)end_actual < tail_blocks
+            || filemirror_apparent_blocknumber(scalpel_state.filemirror, end_actual) < 0
+            || filemirror_actual_block_covered(scalpel_state.filemirror, end_actual)
+            || !pdf_partial_endstream_at(end_actual, stream_end % bsz)) {
+            if (pdf_prefix_checkpoint_requested()) {
+                goto save;
+            }
+            continue;
+        }
+        int64_t run_start = end_actual - (int64_t)tail_blocks;
+        uint64_t limit = image_size - (uint64_t)run_start * bsz;
+        if (limit > maximum - source_length) {
+            limit = maximum - source_length;
+        }
+        if (limit > SIZE_MAX - source_length) {
+            limit = SIZE_MAX - source_length;
+        }
+        uint64_t wanted = tail_blocks * bsz;
+        if (wanted > limit || limit - wanted < 2 * bsz) {
+            wanted = limit;
+        }
+        else {
+            wanted += 2 * bsz;
+        }
+        uint64_t copied = 0;
+        bool anchor_checked = false;
+        while (wanted > copied) {
+            bool bounded = false;
+            data = realloc(data, (size_t)(source_length + wanted));
+            check_memory_allocation(data, __LINE__, __FILE__, "PDF partial continuation");
+            while (copied < wanted) {
+                if (pdf_prefix_checkpoint_requested()) {
+                    goto save;
+                }
+                int64_t actual = run_start + (int64_t)(copied / bsz);
+                if (roaring64_bitmap_contains(source_blocks, (uint64_t)actual)
+                    || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+                    bounded = true;
+                    break;
+                }
+                if (filemirror_apparent_blocknumber(scalpel_state.filemirror, actual) < 0) {
+                    break;
+                }
+                uint64_t available = 0;
+                const char *block = filemirror_actual_block_data_pointer(
+                    scalpel_state.filemirror, actual, &available);
+                uint64_t take = wanted - copied;
+                if (!block || available == 0) {
+                    break;
+                }
+                if (take > available) {
+                    take = available;
+                }
+                memcpy(data + source_length + copied, block, (size_t)take);
+                copied += take;
+                if (take < bsz) {
+                    break;
+                }
+            }
+            PDFPrefixScan scan = pdf_scan_forward_prefix(data, source_length + copied,
+                (uint32_t)bsz, pdf_prefix_checkpoint_requested);
+            bounded |= copied == image_size - (uint64_t)run_start * bsz;
+            uint64_t retained = scan.complete_length;
+            if (bounded && !scan.interrupted && scan.length == source_length + copied) {
+                retained = scan.length;
+            }
+            if (scan.complete_length > stream_end && scan.objects > original.objects
+                && retained > state->partial_prefix->length) {
+                if (original.stream_jpeg && !anchor_checked) {
+                    anchor_checked = pdf_partial_jpeg_complete(data + original.stream_offset,
+                                                               (size_t)original.stream_length);
+                    if (!anchor_checked) {
+                        if (pdf_prefix_checkpoint_requested()) {
+                            goto save;
+                        }
+                        break;
+                    }
+                }
+                uint64_t count = CEILDIV(retained, bsz);
+                if (count <= (SIZE_MAX - sizeof(PDFPartialPrefix)) / sizeof(int64_t)) {
+                    PDFPartialPrefix *best = malloc(sizeof(*best) + count * sizeof(int64_t));
+                    check_memory_allocation(best, __LINE__, __FILE__, "PDF continued partial mapping");
+                    atomic_init(&best->references, 1);
+                    best->length = retained;
+                    best->count = count;
+                    memcpy(best->actual, state->partial_prefix->actual,
+                           (size_t)source_count * sizeof(int64_t));
+                    for (uint64_t slot = source_count; slot < count; slot++) {
+                        best->actual[slot] = run_start + (int64_t)(slot - source_count);
+                    }
+                    pdf_partial_prefix_release(state->partial_prefix);
+                    state->partial_prefix = best;
+                }
+            }
+            if (scan.interrupted || pdf_prefix_checkpoint_requested()) {
+                goto save;
+            }
+            if (copied < wanted || wanted == limit
+                || (!scan.needs_more && scan.length < source_length + copied)) {
+                break;
+            }
+            wanted = wanted > limit / 2 ? limit : wanted * 2;
+        }
+    }
+finished:
+    state->partial_search_active = false;
+    state->partial_search_length = 0;
+    state->partial_search_next = 0;
+save:
+    free(data);
+    roaring64_bitmap_free(source_blocks);
+    carve_put_state(candidate->carvehashkey, state);
+    pdf_free_carve_state((void **)&state);
+}
+
+// Capture initial bytes before the backend trims the candidate for reassembly.
+static void pdf_candidate_preserve_prefix(CarveInfo *candidate, bool *validates,
+                                           uint64_t *validates_to, bool *promising) {
+    (void)validates_to;
+    if (!*validates && *promising && !candidate->deposited && !scalpel_state.no_defrag) {
+        pdf_preserve_partial_prefix(candidate);
+    }
+}
+
+// Publish at most one retained prefix after search, without replacing its result.
+static void pdf_write_partial_prefix(CarveInfo *candidate) {
+    if (!scalpel_state.write_promising) {
+        return;
+    }
+    PDFCarveState *state = carve_get_state(candidate->carvehashkey);
+    PDFPartialPrefix *prefix = state ? state->partial_prefix : NULL;
+    if (!prefix) {
+        pdf_free_carve_state((void **)&state);
+        return;
+    }
+    BlockVector *partial = NULL;
+    init_blockvector(scalpel_state.filemirror, &partial, prefix->count, true);
+    uint64_t count = 0;
+    uint64_t image_size = filemirror_filesize(scalpel_state.filemirror);
+    uint64_t image_blocks = CEILDIV(image_size, scalpel_state.blocksize);
+    for (; count < prefix->count; count++) {
+        int64_t actual = prefix->actual[count];
+        if (actual < 0 || (uint64_t)actual >= image_blocks) {
+            break;
+        }
+        int64_t apparent = filemirror_apparent_blocknumber(scalpel_state.filemirror, actual);
+        if (apparent < 0) {
+            break;
+        }
+        blockvector_set_apparent_blocknumber(partial, count, apparent);
+    }
+    if (count != 0) {
+        uint64_t length = count == prefix->count ? prefix->length
+                                                : count * (uint64_t)scalpel_state.blocksize;
+        uint64_t available = count * (uint64_t)scalpel_state.blocksize;
+        if ((uint64_t)prefix->actual[count - 1] == image_blocks - 1
+            && image_size % scalpel_state.blocksize != 0) {
+            available -= scalpel_state.blocksize - image_size % scalpel_state.blocksize;
+        }
+        if (length > available) {
+            length = available;
+        }
+        resize_blockvector(partial, count);
+        blockvector_set_data_length(partial, available);
+        inflate_blockvector(partial);
+        // Check the unused bytes of the retained final block without extending
+        // the search mapping or changing its exact saved length.
+        if (count == prefix->count && length < available) {
+            PDFPrefixScan scan = pdf_scan_forward_prefix(
+                (const unsigned char *)blockvector_get_data_pointer(partial),
+                available, scalpel_state.blocksize, pdf_prefix_checkpoint_requested);
+            if (!scan.interrupted && scan.length > length && scan.length <= available) {
+                length = scan.length;
+            }
+        }
+        blockvector_set_data_length(partial, length);
+        BlockVector *original = candidate->b;
+        CarveInfoFlavor flavor = candidate->flavor;
+        candidate->b = partial;
+        candidate->flavor = PROMISING;
+        write_candidate(&candidate, true);
+        candidate->b = original;
+        candidate->flavor = flavor;
+    }
+    free_blockvector(&partial);
+    pdf_free_carve_state((void **)&state);
 }
 
 #ifdef PDFTESTING

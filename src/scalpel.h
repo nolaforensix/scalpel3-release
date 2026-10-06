@@ -1,38 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it
-// under the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option) any
-// later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT
-// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
-// details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with
-// this program.  If not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//-----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another
-// program such that the resulting executable or library forms a single
-// combined work constitutes creation of a derivative work under the GPL.
-// Any party distributing such a combined work must make the entire source
-// code available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary
-// product or requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact:
-// Golden G. Richard III (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // scalpel3 is a complete rewrite of the open source scalpel, which was
 // originally developed by Golden G. Richard III in 2005 and then enhanced by
 // both Vico Marziale and Golden G. Richard until ~2013. Earlier versions of
@@ -243,7 +234,6 @@ typedef enum CarveInfoFlavor {
 } CarveInfoFlavor;
 
 #if !defined(SCALPEL3_EXTERNAL)
-#include "dirname.h"
 #include "filemirror.h"
 #include "scalpelsimd.h"
 #include "exe_vision/unix/elf_onnx.h"
@@ -400,7 +390,7 @@ typedef enum SearchType {
 #define CHECKPOINT_SLOT_COUNT 2U
 #define CHECKPOINT_MANIFEST_FILE_COUNT 3U
 #define CHECKPOINT_MANIFEST_MUTABLE_FILE_COUNT 2U
-#define CHECKPOINT_FORMAT_VERSION 3U
+#define CHECKPOINT_FORMAT_VERSION 5U
 #define CHECKPOINT_MANIFEST_MAGIC "S3CPMAN3"
 #define CHECKPOINT_CURRENT_MAGIC "S3CPCUR3"
 #define CHECKPOINT_MAGIC_SIZE 8U
@@ -995,14 +985,15 @@ typedef struct ScalpelState {
   bool no_cp_validation;                  // allow checkpoint restart w/o checkpoint      (O)
                                           // validation
 
-  // MoDiCo block classifier (optional reassembly block prioritization).
-  // Rebuilt at startup every run (incl. resume); not checkpointed.
-  bool modico_enabled;                    // MoDiCo prioritization active this run?       (O)
+  // MoDiCo block classifier (optional reassembly block prioritization). Prior confidence values
+  // may be restored from a verified external cache. Checkpoints retain the effective ranking
+  // metadata below along with block scores; inference sessions are not restored.
+  bool modico_enabled;                    // MoDiCo prioritization active this run?       (C)
   int *modico_spec_to_class;              // [modico_num_specs] spec idx -> MoDiCo class
                                           // index, or -1 if the type has no MoDiCo class.
-                                          // NULL when MoDiCo is disabled.                 (O)
+                                          // NULL when MoDiCo is disabled.                 (C)
   uint32_t modico_num_specs;              // length of modico_spec_to_class (base specs
-                                          // captured at startup)                         (O)
+                                          // captured at startup)                         (C)
 } ScalpelState;
 
 
@@ -1019,11 +1010,16 @@ void destroy_candidate(CarveInfo **candidate);
 void *carve_get_state(void *hashkey);
 void carve_put_state(void *hashkey, void *state);
 void *block_get_state(void *hashkey);
+bool block_state_exists(void *hashkey);
 void block_put_state(void *hashkey, void *state);
 void delete_from_reassembly_queue(CarveInfo *c);
 
 // prototypes for visible common.c functions
 
+bool checkpoint_modico_serialization(ScalpelState *state, FILE *fp,
+                                     StateSerialization mode);
+char *scalpel_path_basename(const char *path);
+size_t scalpel_path_basename_len(const char *name);
 int get_terminal_width(void);
 void portable_srandom(uint64_t seed);
 uint64_t portable_random(void);
@@ -1140,6 +1136,7 @@ noreturn void handle_error(ScalpelError error, char *str, int line, const char *
 
 // prototypes for visible reassembly.c functions
 void reassembly_share_work(int id, CarveInfo *candidate);
+int reassembly_share_work_count(int id, CarveInfo *candidate);
 bool reassembly_check_kill_queue(ThreadWork *work,
                                  CarveInfo **candidate,
                                  uuid_string_t uuidp,

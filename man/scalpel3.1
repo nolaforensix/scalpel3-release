@@ -51,8 +51,9 @@ blockmap_filename
 
 .SH DESCRIPTION
 .PP
-Recover contiguous or fragmented data from an image file (typically sourced from a non-volatile
-storage device), based on file type-specific configurations.
+Recover contiguous or fragmented data from an image file (typically sourced from a storage
+device), using configurations for each file type. Create the associated blockmap with
+\fBcrblockmap\fR(1) before carving. Options must precede the two filenames.
 
 .SH OPTIONS
 .PP
@@ -63,14 +64,15 @@ rejected.
 
 .TP
 .B -a
-Turn off aggressive memory allocation, to reduce overhead.  Default is on.
-Leave this on unless you experience out of memory errors or excessive swapping.
+Reduce aggressive memory allocation. The default favors performance; use this
+option to reduce memory use if allocation failures or excessive swapping occur.
 
 .TP
 .BI -A " #"
 Create a checkpoint and stop execution after a specified number of seconds in the fragmented reassembly
 phase of execution. This option is not checkpointed and must be specified on every execution where this behavior
-is desired.
+is desired. Must be between 10 and 2147483647 seconds. The limit does not
+include earlier phases; shutdown waits for a safe checkpoint.
 
 .TP
 .B -b
@@ -117,59 +119,78 @@ physical CPU cores for determining thread pool sizes. On systems with
 hyperthreading, it may be beneficial to increase the number of perceived CPU
 cores using -e.  On Apple Silicon systems, the number of performance cores is
 used to size thread pools and -e can be used to experimentally increase the
-sizes of thread pools.
+sizes of thread pools. Must be between 1 and 65536. Explicit
+\fB-r\fR, \fB-s\fR, \fB-t\fR, and \fB-u\fR settings override their
+respective pool sizes; \fB-e\fR is not a process-wide thread limit.
 
 .TP
 .BI -F " #"
 Create a checkpoint and stop execution when a new file hasn't been validated for
 a specified number of seconds in the fragmented reassembly phase of
 execution. This option is not checkpointed and must be specified on every
-execution where this behavior is desired.
+execution where this behavior is desired. Must be between 10 and 2147483647
+seconds. Shutdown waits for a safe checkpoint.
 
 .TP
 .BI -g " #"
-Set reassembly gallop factor.
+Set reassembly gallop factor. Accepts zero or a power of two; zero disables
+galloping. The default is 16.
 
 .TP
 .BI -G " #"
-Set reassembly gallop limit.
+Set reassembly gallop limit in blocks. Accepts zero or a power of two and
+must be at least the gallop factor. The default is 16384.
 
 .TP
 .B -h
-Print this help message and then exit.
+Print command-line help and then exit.
 
 .TP
 .BI -H " phase"
 Stop after the required phase.  The supported phases are
 \fBblock-validation\fR and \fBheader-footer\fR.
-\fB-H block-validation\fR runs MoDiCo and all regular block validators,
+\fB-H block-validation\fR runs block classification as configured by
+\fB-y\fR, \fB-D\fR, and the active file types,
 writes \fIblockclassification.dat\fR, and exits before header/footer
 searching.  \fB-H header-footer\fR performs the same block-validation phase,
 then writes \fIheadersfooters.dat\fR and exits.  The latter mode therefore
-produces both databases.  This option is not compatible with \fB-c\fR.
+produces both databases. These databases are also written during normal
+carving; \fB-H\fR only selects where execution stops.
+This option is not compatible with \fB-c\fR or \fB-R\fR.
 
 .TP
 .BI -i " #"
-Set minimum number of validated files to trigger checkpoint and blockmap swap.
+Set the number of newly validated files that triggers a periodic checkpoint
+and blockmap swap during fragmented recovery.
 This overrides VALIDATION_CP_THRESHOLD in scalpel.h.  This option
 is not checkpointed and must be specified on every execution where this behavior is desired.
-Must be between 1 and 65536.
+Must be between 1 and 65536; the default is 10000. Other checkpoint triggers
+remain active.
 
 .TP
 .BI -I " secs"
-Set automatic checkpointing interval (in seconds).  This overrides CHECKPOINTING_INTERVAL in scalpel.h.  This option
-is not checkpointed and must be specified on every execution where this behavior is desired.
-Must be between 5 and 65536.
+Set the periodic checkpoint interval in seconds, overriding
+PERIODIC_CHECKPOINTING_INTERVAL in scalpel.h (default 300). These checkpoints
+synchronize work and blockmaps in memory; they are not recovery checkpoints.
+An initial scheduling sweep uses 120-second intervals, and other triggers
+can also cause synchronization. Recovery checkpoints are written separately
+every 900 seconds during fragmented recovery.
+This option is not checkpointed and must be specified again when resuming.
+Must be between 5 and 65536. Intervals longer than 900 seconds cannot delay
+the recovery checkpoint.
 
 .TP
 .BI -j " #"
 Treat blocks in the image before the specified block number as covered.
 This option in conjunction with -k allows execution of scalpel3 against a window of blocks in the input file.
+Block numbers start at zero; the specified block is included in the window.
 
 .TP
 .BI -k " #"
 Treat blocks in the image after the specified block number as covered.  This option in
 conjunction with -j allows execution of scalpel3 against a window of blocks in the input file.
+The specified block is included in the window. Both endpoints must be in
+the image, with the start no greater than the end.
 
 .TP
 .B -L
@@ -194,7 +215,7 @@ should generally be left on.
 Set output directory for carved files. Only one active scalpel3 process may
 use an output directory at a time. Scalpel3 enforces this with a persistent
 \fI.scalpel3.lock\fR file in the base output directory. The file may remain
-after Scalpel3 exits; only its operating-system lock, not its presence,
+after Scalpel3 exits; only its operating system lock, not its presence,
 indicates that an invocation is active. Newly created Scalpel3 directories
 and files are accessible only to the invoking user (modes 0700 and 0600,
 respectively). Permissions may be changed externally when output must be
@@ -202,7 +223,9 @@ shared.
 
 .TP
 .B -O
-Don't organize carved files into subdirectories. Default is organize.
+Omit the numbered subdirectories for each file type. The VALIDATED,
+PROMISING, and INPROGRESS directories remain. The default is to organize
+output by file type.
 
 .TP
 .B -p
@@ -221,15 +244,22 @@ Specify block/cluster size. Default is 512 bytes. Must be between 512 and
 
 .TP
 .B -R
-Resume from checkpoint.
+Resume from checkpoint in the output directory selected by \fB-o\fR.
+Saved recovery settings are restored; do not repeat options such as
+\fB-q\fR, \fB-w\fR, \fB-y\fR, \fB-D\fR, \fB-U\fR, or \fB-z\fR.
+Thread counts, the execution provider, and checkpoint/stop intervals can
+be selected for the resumed run. Supply the image and blockmap filenames
+again and retain the executable that created the checkpoint.
 
 .TP
 .BI -r " #"
-Specify the maximum number of threads per filemirror pool.
+Specify the maximum number of threads per filemirror pool (1 through 65536).
+The default is the detected core count, or the value supplied with \fB-e\fR.
 
 .TP
 .BI -s " #"
-Specify the maximum number of reassembly threads.
+Specify the maximum number of reassembly threads (1 through 65536).
+The default is the detected core count, or the value supplied with \fB-e\fR.
 
 .TP
 .B -S
@@ -237,16 +267,20 @@ Turn off reassembly thread work sharing. Default is on.
 
 .TP
 .BI -t " #"
-Specify the maximum number of search threads.
+Specify the maximum number of search threads (1 through 65536).
+The default is the detected core count, or the value supplied with \fB-e\fR.
 
 .TP
 .BI -u " #"
-Specify the maximum number of validation threads.
+Specify the maximum number of validation threads (1 through 65536).
+The default is the detected core count, or the value supplied with \fB-e\fR.
 
 .TP
 .BI -U " filetype[,filetype]..."
 Deactivate carving for one or more file types, e.g., \fB-U JPG\fR or
 \fB-U JPG,PNG\fR. This option may be specified more than once.
+Names are case insensitive and must match the list from \fB-L\fR;
+duplicate names are rejected, including across repeated options.
 Not compatible with \fB-z\fR.
 
 .TP
@@ -259,9 +293,11 @@ Print copyright information and exit.
 
 .TP
 .B -w
-Write promising candidates that didn't validate completely. The default is to only
-write fully validated files, to save disk space, but you probably want this on if
-partial results are useful (e.g., initial fragments of photographic images).
+Write PROMISING candidates as well as VALIDATED files. PROMISING output may
+contain useful partial files or complete files for which the validator lacks
+enough evidence to declare success. It may also contain incorrect
+reconstructions and should be independently examined. The default omits
+PROMISING payloads to save disk space.
 
 .TP
 .B -x
@@ -285,11 +321,12 @@ fatal error rather than a silent CPU run; use \fB-Y cpu\fR to intentionally
 select CPU inference. When the \fBCUDA_VISIBLE_DEVICES\fR environment variable is set, it
 filters and reorders the CUDA devices as usual, and \fB-Y\fR device ids name
 the visible devices. When \fB-Y\fR selects a proper subset of the GPUs,
-scalpel3 confines the whole process to those devices, so excluded GPUs are
-never touched, not even by runtime bookkeeping allocations.
+scalpel3 restricts CUDA visibility to those devices so inference and runtime
+allocations stay on the selected GPUs.
 .sp
 On Apple Silicon, \fBcoreml\fR uses the matching graph-cut MoDiCo model by
-default.  \fBcoreml-legacy\fR selects the original MoDiCo model for comparison
+default when it is installed, otherwise it uses the original model.
+\fBcoreml-legacy\fR selects the original MoDiCo model for comparison
 or rollback, and \fBcoreml-graphcut\fR explicitly requires the graph-cut model.
 These two selectors still use the normal CoreML provider for other AI
 components; they only change which MoDiCo artifact is loaded.
@@ -299,12 +336,13 @@ components; they only change which MoDiCo artifact is loaded.
 .BI -z " filetype[,filetype]..."
 Carve only one or more specified file types, e.g., \fB-z JPG\fR or
 \fB-z JPG,PNG\fR. This option may be specified more than once. Not compatible
-with \fB-U\fR.
+with \fB-U\fR. Names are case insensitive and must match \fB-L\fR;
+duplicate names are rejected, including across repeated options.
 
 .SH OUTPUT DATABASES
 After block validation completes, scalpel3 atomically writes
 \fIblockclassification.dat\fR in the output directory.  It contains a
-versioned header, the block size and block count, the final file-type and
+versioned header, the block size and block count, the final file type and
 subtype mapping, and the column-major block confidence table produced by
 MoDiCo and the regular block validators.  Duplicate blocks are represented by
 their exemplars in the associated blockmap.
@@ -323,7 +361,8 @@ checkpoint transaction so it may be updated independently; restored
 candidates are reconciled with the blockmap supplied to the resumed run.
 .PP
 After header/footer searching completes, scalpel3 writes
-\fIheadersfooters.dat\fR in the output directory.
+\fIheadersfooters.dat\fR in the output directory. Use \fBdumpbt\fR(1) and
+\fBdumphf\fR(1) to inspect the respective databases.
 
 .SH CONFIGURATION FILE
 Unlike previous versions of scalpel, scalpel3 requires recompilation
@@ -339,6 +378,72 @@ models, can be located.  It does not select the executable: checkpoint
 compatibility uses the hash of the scalpel3 binary that is actually running.
 This variable is not required for the informational \fB-h\fR, \fB-L\fR, and
 \fB-V\fR options.
+.TP
+.B SCALPEL3_NO_MODICO
+If set, disable MoDiCo unless an explicit \fB-y\fR option overrides it.
+Other block validators are unaffected.
+.TP
+.B SCALPEL3_MODICO_DIR
+Override the model directory, normally
+\fI${SCALPEL3_HOME}/src/exe_vision/unix\fR.
+.TP
+.B SCALPEL3_MODICO_CLASSMAP
+Override the class-name mapping file, normally \fIclass_names.json\fR in
+the MoDiCo model directory.
+.TP
+.B SCALPEL3_MODICO_INTRA_THREADS
+Set ONNX Runtime's intra-op thread count for MoDiCo. Zero lets ONNX Runtime
+choose. By default, CPU inference uses at most 12 logical cores; accelerator
+providers use zero. This is separate from Scalpel3's thread pools.
+.TP
+.B SCALPEL3_MODICO_CACHE
+Override the pathname of the reusable MoDiCo confidence cache. By default,
+scalpel3 uses the input blockmap pathname with \fI.modico\fR appended. Set this
+variable to \fBoff\fR, \fBfalse\fR, \fBno\fR, or \fB0\fR to disable cache reuse.
+The cache is accepted only when its evidence image, initial blockmap, model,
+execution provider, confidence policy, and file type mapping all match the
+current run. Regular block validators still run after a cache hit.
+.TP
+.B SCALPEL3_MODICO_TENSORRT
+On Linux with CUDA, scalpel3 automatically uses FP32 TensorRT for standard
+native-histogram MoDiCo models with block sizes of 4096 bytes or larger when a
+compatible cached engine exists or the expected workload is large enough to
+repay a cold engine build. Smaller block sizes and short cold workloads use
+native CUDA. Set this variable to \fBoff\fR, \fBfalse\fR, \fBno\fR, \fBnone\fR,
+or \fB0\fR to force native CUDA; any other value forces TensorRT for comparison.
+If TensorRT is unavailable, scalpel3 falls back to CUDA without disabling
+MoDiCo.
+.TP
+.B SCALPEL3_MODICO_TENSORRT_CACHE
+Override the root directory for persistent TensorRT engine and timing caches.
+Cache entries are separated by model hash, ONNX Runtime version, TensorRT
+version, GPU identity, and inference profile. A disabled value bypasses
+TensorRT and uses CUDA directly.
+.TP
+.B SCALPEL3_MODICO_TENSORRT_CACHE_MAX_MIB
+Set the maximum total size of the persistent TensorRT cache. The default is
+512 MiB. Inactive least recently used entries are removed when necessary.
+.TP
+.B SCALPEL3_MODICO_TENSORRT_CACHE_MAX_AGE_DAYS
+Set the maximum age of an inactive TensorRT cache entry. The default is 30
+days.
+.TP
+.B SCALPEL3_MODICO_TENSORRT_COLD_MIN_BLOCKS
+Override the expected-block threshold for building a cold TensorRT engine.
+.TP
+.B SCALPEL3_MODICO_COREML_CACHE_DIR
+Override the compiled CoreML model cache directory, normally
+\fI$HOME/Library/Caches/scalpel3/modico-coreml\fR. An empty value,
+\fBoff\fR, \fBfalse\fR, \fBnone\fR, or \fB0\fR disables this cache,
+not CoreML inference.
+.TP
+.B SCALPEL3_MODICO_COREML_CACHE_MAX_MIB
+Set the maximum total size of the persistent Core ML cache. The default is
+512 MiB.
+.TP
+.B SCALPEL3_MODICO_COREML_CACHE_MAX_AGE_DAYS
+Set the maximum age of an inactive Core ML cache entry. The default is 30
+days. Active TensorRT and Core ML sessions are protected from cache pruning.
 
 .SH EXIT STATUS
 Returns zero after successful carving and for the informational \fB-h\fR,
@@ -369,7 +474,13 @@ warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 .BR modblockmap (1),
 .BR crblockmap (1),
 .BR cmpblockmaps (1),
-.BR blockmapfs (1)
+.BR blockmapfs (1),
+.BR scalpel3-ctl (1),
+.BR dumphf (1),
+.BR dumpbt (1),
+.BR mergeblockmap (1),
+.BR mergecps (1),
+.BR diskviz (1)
 
 More information on scalpel3 appears in the README.md file, distributed
 with the scalpel3 source code.

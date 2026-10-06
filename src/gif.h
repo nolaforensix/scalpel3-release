@@ -1,76 +1,37 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-// ----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
-//
-// Please see LICENSING.md and README.md for further information.
-//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
-
-//
 // gif validators for scalpel3 (c) 2021-2026 by Golden G. Richard III.
 //
 // These are based in part on giffix, which is a part of giflib v5.
 //
-// GGRIII: This code is not yet optimized.
-//
-// OPUS47 fix set applied (2026-04-16):
-//   G1,G2 Interlaced and no-MAD frames no longer advance reliable_pos
-//         unconditionally. Previously the bytes-per-row statistics alone
-//         let wrong blocks inside interlaced/missing-palette frames ride
-//         the checkpoint forward. Now we require the tail probe to confirm
-//         EOI termination (frame_saw_eoi) before advancing. Without that
-//         signal the frame's bytes stay un-anchored for checkpoint purposes.
-//   G3,G4 Hard-coded "sub-block length >= 250" heuristic replaced with
-//         encoder-derived full-size threshold (max observed sub-block
-//         length minus 4). Legitimate GIFs produced by encoders that use
-//         smaller uniform sub-blocks no longer get demoted or rejected.
-//         Applied in both gif_block_validate and gif_validate_core
-//         predecode/per-frame phases.
-//   G5    Cross-frame MAD gate previously skipped whenever either frame
-//         had a local color table, leaving inter-frame boundaries with
-//         LCTs unguarded. Now always evaluated; threshold is relaxed from
-//         700 to 2000 when the palette may differ across the boundary.
-//   G7    Reassembly "accept barely enough" shortcuts now require either
-//         trial_advanced_bytes (validates_to >= oldlength) OR
-//         score_advanced. Prior score_not_regressed was too weak —
-//         ambiguous ties on wrong-data heuristics could claim the slot.
-//   G8    Weak-validation guard now requires BOTH score_advanced AND
-//         local_forward_choice. Previously either one was enough.
-//   G9    Dead `replay_fastforward` variable removed.
-//   G10   Probe-state fields only saved when the trial made forward
-//         progress (reliable_pos / ImageNum / outer_last_good_mad_pos
-//         exceeds the stored value). Non-advancing trials no longer
-//         overwrite good probe snapshots.
-//
-// NOT CHANGED: G6 (tail probe thresholds) and G11 (LZW min_code_size=1
-// input space) were flagged as concerns in the fault report but not root
-// causes of current false-validations; their current behavior is retained.
+// Validation combines GIF structure, LZW decoding, sub-block alignment,
+// frame and row checkpoints, pixel differences, and compressed-data
+// consumption. Reassembly uses this evidence to rank candidate blocks and
+// confirm displaced runs before committing them.
 //
 #if ! defined(SCALPEL_GIF_H)
 #define SCALPEL_GIF_H
@@ -88,7 +49,12 @@
 #define GIF_REASSEMBLY_PRESTART_DISTANCE_MAX GIF_REASSEMBLY_LOCAL_DISTANCE_MAX
 #define GIF_REASSEMBLY_GAP_SCAN_WINDOW GIF_REASSEMBLY_LOCAL_DISTANCE_MAX
 #define GIF_REASSEMBLY_RETURN_SCAN_WINDOW 64
-#define GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS 4
+#define GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS 8
+#define GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS 512
+#define GIF_REASSEMBLY_RETURN_REGRESSION_PROBE_BLOCKS \
+  GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS
+#define GIF_REASSEMBLY_RETURN_PROOF_SHIFT 16
+#define GIF_REASSEMBLY_RETURN_PROOF_MASK UINT32_C(0xffff)
 #define GIF_REASSEMBLY_LOOKAHEAD_LIMIT 64
 #define GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS 8
 #define GIF_REASSEMBLY_PHASE_ANCHOR_BACKFILL \
@@ -172,8 +138,8 @@ typedef struct GIFLZWState {
   // Code table
   uint16_t prefix[GIF_LZW_MAX_CODES];
   uint8_t  suffix[GIF_LZW_MAX_CODES];
-  // FIX 8: First-character cache — eliminates O(chain_length) prefix walk
-  // in KwKwK special case. Maintained incrementally on table additions.
+  // Cache each code's first character for constant-time KwKwK decoding.
+  // Entries are maintained incrementally as the code table grows.
   uint8_t  first_char[GIF_LZW_MAX_CODES];
   uint16_t next_code;           // next available table entry
   uint8_t  code_size;           // current bits per code (min+1 to 12)
@@ -308,6 +274,9 @@ typedef struct GIFCarveState {
   bool reassembly_return_deferred;
   uint32_t reassembly_prefix_anchor_trials;
   bool reassembly_actual_backscan_active;
+  // The low and high 16-bit halves hold the remaining proven displaced-run
+  // and return-path block counts in existing checkpoint-layout padding.
+  uint32_t reassembly_return_chain_blocks;
   int64_t reassembly_actual_backscan_anchor;
   int64_t reassembly_actual_backscan_next;
   bool reassembly_actual_run_rescue_pending;
@@ -331,7 +300,7 @@ typedef struct GIFCarveState {
   bool reassembly_scan_cursor_actual_valid;
   int64_t reassembly_scan_cursor_actual;
   uint64_t reassembly_scan_cursor_length;
-  bool reassembly_live_retry_used;
+  bool reassembly_seed_scan_started;
   bool reassembly_preserved_frontier;
 } GIFCarveState;
 
@@ -394,7 +363,7 @@ static inline bool gif_lzw_init(GIFLZWState *s, GIFMemIO *mem) {
   for (uint16_t i = 0; i < s->clear_code; i++) {
     s->prefix[i] = UINT16_MAX;  // no prefix (literal)
     s->suffix[i] = (uint8_t)i;
-    s->first_char[i] = (uint8_t)i;  // FIX 8: literals are their own first char
+    s->first_char[i] = (uint8_t)i;
   }
   return true;
 }
@@ -423,6 +392,12 @@ static inline void gif_reassembly_copy_runtime_fields(
     GIFCarveState *dst, const GIFCarveState *src);
 static inline uint32_t gif_reassembly_effective_plateau_blocks(
     const GIFCarveState *state);
+static inline uint32_t gif_reassembly_proven_chain_blocks(
+    const GIFCarveState *state);
+static inline uint32_t gif_reassembly_proven_return_blocks(
+    const GIFCarveState *state);
+static inline void gif_reassembly_set_return_proof(
+    GIFCarveState *state, uint32_t chain_blocks, uint32_t return_blocks);
 static inline bool gif_reassembly_subblock_phase_from_data(
     const unsigned char *data, uint64_t length, uint32_t *offset_out,
     uint8_t *threshold_out);
@@ -431,6 +406,9 @@ static inline bool gif_reassembly_get_phase_hint(
     uint8_t *threshold_out);
 static inline bool gif_reassembly_block_matches_phase_transition(
     int64_t apparentblocknumber, uint32_t offset);
+static inline bool gif_reassembly_block_phase_continuation(
+    int64_t apparentblocknumber, uint32_t offset, uint8_t threshold,
+    uint32_t minimum_headers, uint32_t *next_offset_out);
 static inline bool gif_reassembly_block_matches_phase_hint(
     int64_t apparentblocknumber, uint32_t offset, uint8_t threshold);
 static inline bool gif_reassembly_block_matches_phase_probe_hint(
@@ -442,11 +420,15 @@ static inline int64_t gif_reassembly_phase_choice(
 static inline int64_t gif_reassembly_phase_probe_choice(
     CarveInfo *candidate, uint64_t slot, int64_t scan_start,
     int64_t scan_count, int64_t previous_apparentblocknumber,
-    GIFCarveState *state, int64_t *resume_after_out);
+    GIFCarveState *state, int64_t *resume_after_out,
+    bool include_local_forward);
 static inline int64_t gif_reassembly_completion_probe_choice(
     CarveInfo *candidate, uint64_t slot, int64_t scan_start,
     int64_t scan_count, int64_t previous_apparentblocknumber,
     GIFCarveState *state, int64_t *resume_after_out);
+static inline uint32_t gif_reassembly_probe_adjacent_completion(
+    CarveInfo *candidate, const GIFCarveState *base_state,
+    int64_t first_apparentblocknumber);
 
 static inline bool gif_reassembly_normalize_candidate(int id,
     CarveInfo *candidate, uuid_string_t uuidp, uuid_string_t uuidc,
@@ -805,12 +787,23 @@ static inline bool gif_reassembly_apparent_in_return_window(
 
 static inline bool gif_reassembly_choice_in_return_window(
     const GIFCarveState *state, int64_t current_apparentblocknumber) {
+  int64_t apparent_blocks;
   int64_t current_actualblocknumber;
 
   if (!state
       || !state->reassembly_return_pending
       || current_apparentblocknumber < 0) {
     return false;
+  }
+
+  apparent_blocks =
+      (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
+  if (apparent_blocks <= 0) {
+    return false;
+  }
+  current_apparentblocknumber %= apparent_blocks;
+  if (current_apparentblocknumber < 0) {
+    current_apparentblocknumber += apparent_blocks;
   }
 
   if (state->reassembly_return_actual_valid
@@ -998,6 +991,8 @@ static inline void gif_reassembly_copy_runtime_fields(
       src->reassembly_return_actual_valid;
   dst->reassembly_return_actual = src->reassembly_return_actual;
   dst->reassembly_return_deferred = src->reassembly_return_deferred;
+  dst->reassembly_return_chain_blocks =
+      src->reassembly_return_chain_blocks;
   dst->reassembly_prefix_anchor_trials =
       src->reassembly_prefix_anchor_trials;
   dst->reassembly_actual_backscan_active =
@@ -1038,7 +1033,7 @@ static inline void gif_reassembly_copy_runtime_fields(
   dst->reassembly_scan_cursor_actual = src->reassembly_scan_cursor_actual;
   dst->reassembly_scan_cursor_length =
       src->reassembly_scan_cursor_length;
-  dst->reassembly_live_retry_used = src->reassembly_live_retry_used;
+  dst->reassembly_seed_scan_started = src->reassembly_seed_scan_started;
 }
 
 static inline bool gif_reassembly_current_apparent_block_valid(
@@ -1053,6 +1048,43 @@ static inline bool gif_reassembly_current_apparent_block_valid(
   return (uint64_t)apparentblocknumber < apparent_blocks;
 }
 
+static inline uint32_t gif_reassembly_proven_chain_blocks(
+    const GIFCarveState *state) {
+  if (!state || !state->reassembly_return_pending) {
+    return 0;
+  }
+
+  return state->reassembly_return_chain_blocks
+         & GIF_REASSEMBLY_RETURN_PROOF_MASK;
+}
+
+static inline uint32_t gif_reassembly_proven_return_blocks(
+    const GIFCarveState *state) {
+  if (!state || !state->reassembly_return_pending) {
+    return 0;
+  }
+
+  return state->reassembly_return_chain_blocks
+         >> GIF_REASSEMBLY_RETURN_PROOF_SHIFT;
+}
+
+static inline void gif_reassembly_set_return_proof(
+    GIFCarveState *state, uint32_t chain_blocks, uint32_t return_blocks) {
+  if (!state) {
+    return;
+  }
+
+  if (chain_blocks > GIF_REASSEMBLY_RETURN_PROOF_MASK) {
+    chain_blocks = GIF_REASSEMBLY_RETURN_PROOF_MASK;
+  }
+  if (return_blocks > GIF_REASSEMBLY_RETURN_PROOF_MASK) {
+    return_blocks = GIF_REASSEMBLY_RETURN_PROOF_MASK;
+  }
+
+  state->reassembly_return_chain_blocks =
+      (return_blocks << GIF_REASSEMBLY_RETURN_PROOF_SHIFT) | chain_blocks;
+}
+
 static inline void gif_reassembly_set_return_start(
     GIFCarveState *state, int64_t apparentblocknumber, bool deferred) {
   int64_t actualblocknumber = -1;
@@ -1064,6 +1096,7 @@ static inline void gif_reassembly_set_return_start(
   if (!gif_reassembly_current_apparent_block_valid(apparentblocknumber)) {
     state->reassembly_return_pending = false;
     state->reassembly_return_deferred = false;
+    state->reassembly_return_chain_blocks = 0;
     state->reassembly_return_start = -1;
     state->reassembly_return_actual_valid = false;
     state->reassembly_return_actual = -1;
@@ -1073,6 +1106,7 @@ static inline void gif_reassembly_set_return_start(
   state->reassembly_return_pending = true;
   state->reassembly_return_start = apparentblocknumber;
   state->reassembly_return_deferred = deferred;
+  state->reassembly_return_chain_blocks = 0;
   state->reassembly_return_actual_valid = false;
   state->reassembly_return_actual = -1;
 
@@ -1092,6 +1126,7 @@ static inline void gif_reassembly_clear_return_start(GIFCarveState *state) {
 
   state->reassembly_return_pending = false;
   state->reassembly_return_deferred = false;
+  state->reassembly_return_chain_blocks = 0;
   state->reassembly_return_start = -1;
   state->reassembly_return_actual_valid = false;
   state->reassembly_return_actual = -1;
@@ -1561,6 +1596,105 @@ static inline void gif_reassembly_validate_local_probe(
     CarveInfo *candidate, GIFCarveState *state,
     GIFValidationSummary *summary) {
   gif_reassembly_validate_local_impl(candidate, state, summary);
+}
+
+static inline uint32_t gif_reassembly_probe_adjacent_completion(
+    CarveInfo *candidate, const GIFCarveState *base_state,
+    int64_t first_apparentblocknumber) {
+  uint64_t old_blocks;
+  uint64_t apparent_blocks;
+  uint64_t oldlengths[GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS] = {0};
+  uint32_t appended_blocks = 0;
+  uint32_t last_probed_blocks = 0;
+  uint32_t proven_blocks = 0;
+  GIFCarveState trial_state = {0};
+  GIFValidationSummary trial_summary = {0};
+
+  if (!candidate || !candidate->b || !base_state
+      || first_apparentblocknumber < 0) {
+    return 0;
+  }
+
+  old_blocks = blockvector_get_num_blocks(candidate->b);
+  apparent_blocks =
+      filemirror_apparent_blocks(scalpel_state.filemirror);
+  if ((uint64_t)first_apparentblocknumber >= apparent_blocks) {
+    return 0;
+  }
+
+  while (appended_blocks < GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS) {
+    uint64_t apparent_index;
+    int64_t apparentblocknumber;
+    int64_t actualblocknumber;
+    uint64_t slot;
+
+    apparent_index =
+        (uint64_t)first_apparentblocknumber + appended_blocks;
+    if (apparent_index > (uint64_t)INT64_MAX
+        || apparent_index >= apparent_blocks
+        || apparent_block_in_blockvector(candidate->b,
+                                         (int64_t)apparent_index)
+        || gif_reassembly_checkpoint_requested()) {
+      break;
+    }
+    apparentblocknumber = (int64_t)apparent_index;
+
+    actualblocknumber = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparentblocknumber);
+    if (actualblocknumber < 0
+        || filemirror_get_blocktype(scalpel_state.filemirror,
+                                    actualblocknumber,
+                                    candidate->needleidx)
+               == BLOCK_CONFIDENCE_INVALID
+        || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                           actualblocknumber)) {
+      break;
+    }
+
+    slot = old_blocks + appended_blocks;
+    resize_blockvector(candidate->b, slot + 1);
+    blockvector_set_apparent_blocknumber(candidate->b, slot,
+                                         apparentblocknumber);
+    oldlengths[appended_blocks] =
+        inflate_blockvector_single_block(candidate->b, slot);
+    appended_blocks++;
+
+    // Probe powers of two so long compressed-data plateaus require only
+    // logarithmically many full validator calls.
+    if ((appended_blocks & (appended_blocks - 1)) != 0
+        && appended_blocks < GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS) {
+      continue;
+    }
+
+    trial_state = *base_state;
+    gif_reassembly_validate_local_probe(candidate, &trial_state,
+                                        &trial_summary);
+    last_probed_blocks = appended_blocks;
+    if (trial_summary.validates) {
+      proven_blocks = appended_blocks;
+      break;
+    }
+  }
+
+  if (proven_blocks == 0 && appended_blocks > last_probed_blocks) {
+    trial_state = *base_state;
+    gif_reassembly_validate_local_probe(candidate, &trial_state,
+                                        &trial_summary);
+    if (trial_summary.validates) {
+      proven_blocks = appended_blocks;
+    }
+  }
+
+  while (appended_blocks > 0) {
+    uint64_t slot = old_blocks + appended_blocks - 1;
+
+    deflate_blockvector_single_block(candidate->b, slot,
+                                     oldlengths[appended_blocks - 1]);
+    resize_blockvector(candidate->b, slot);
+    appended_blocks--;
+  }
+
+  return proven_blocks;
 }
 
 static inline void gif_reassembly_refresh_candidate_state(
@@ -2925,6 +3059,9 @@ static inline bool gif_reassembly_get_phase_hint(
     CarveInfo *candidate, GIFCarveState *state, uint32_t *offset_out,
     uint8_t *threshold_out) {
   uint64_t data_length;
+  GIFCarveState cold_state = {0};
+  GIFCarveState runtime_state = {0};
+  GIFValidationSummary cold_summary = {0};
 
   if (!candidate || !state || !offset_out || !threshold_out) {
     return false;
@@ -2940,6 +3077,28 @@ static inline bool gif_reassembly_get_phase_hint(
     *threshold_out = state->reassembly_phase_hint_threshold;
     return true;
   }
+
+  // A speculative plateau can move the committed prefix beyond the saved
+  // decoder snapshot. Refresh once for this prefix length before evaluating
+  // displaced blocks, then retain all reassembly bookkeeping.
+  runtime_state = *state;
+  gif_reassembly_validate_local_probe(candidate, &cold_state, &cold_summary);
+  if (gif_reassembly_debug_candidate(candidate)) {
+    lock_fprintf(stderr,
+            "[gifdbg] phase-state-refresh start=%" PRId64
+            " length=%" PRIu64 " validates=%d validates_to=%" PRIu64
+            " state_valid=%d checkpoint=%" PRIu64
+            " snap_valid=%d snap_pos=%" PRIu64 " hash=%" PRIu64 "\n",
+            blockvector_get_actual_blocknumber(candidate->b, 0),
+            data_length, cold_summary.validates ? 1 : 0,
+            cold_summary.validates_to, cold_state.valid ? 1 : 0,
+            cold_state.checkpoint_curpos, cold_state.snap_valid ? 1 : 0,
+            cold_state.snap_pos,
+            XXH3_64bits(blockvector_get_data_pointer(candidate->b),
+                        data_length));
+  }
+  gif_reassembly_copy_runtime_fields(&cold_state, &runtime_state);
+  *state = cold_state;
 
   state->reassembly_phase_hint_checked = true;
   state->reassembly_phase_hint_valid = false;
@@ -2993,6 +3152,47 @@ static inline bool gif_reassembly_block_matches_phase_hint(
     pos += 1U + (uint64_t)subblock_len;
   }
 
+  return true;
+}
+
+static inline bool gif_reassembly_block_phase_continuation(
+    int64_t apparentblocknumber, uint32_t offset, uint8_t threshold,
+    uint32_t minimum_headers, uint32_t *next_offset_out) {
+  uint64_t pos = offset;
+  uint32_t headers = 0;
+
+  if (apparentblocknumber < 0
+      || threshold == 0
+      || minimum_headers == 0
+      || !next_offset_out
+      || scalpel_state.blocksize == 0
+      || offset >= scalpel_state.blocksize) {
+    return false;
+  }
+
+  while (pos < scalpel_state.blocksize) {
+    unsigned char subblock_len = 0;
+
+    if (!get_apparent_block_bytes(scalpel_state.filemirror,
+                                  apparentblocknumber, pos, 1,
+                                  &subblock_len)
+        || subblock_len < threshold
+        || pos > UINT64_MAX - 1U - (uint64_t)subblock_len) {
+      return false;
+    }
+
+    pos += 1U + (uint64_t)subblock_len;
+    headers++;
+  }
+
+  if (headers < minimum_headers
+      || pos - (uint64_t)scalpel_state.blocksize
+             >= (uint64_t)scalpel_state.blocksize) {
+    return false;
+  }
+
+  *next_offset_out =
+      (uint32_t)(pos - (uint64_t)scalpel_state.blocksize);
   return true;
 }
 
@@ -3573,7 +3773,9 @@ static inline bool gif_reassembly_probe_followon(
 static inline bool gif_reassembly_probe_nonlocal_return(
     int id, CarveInfo *candidate, uint64_t oldlength,
     const GIFCarveState *base_state, int64_t actualblocknumber,
-    int64_t previous_apparentblocknumber,
+    int64_t previous_apparentblocknumber, int64_t return_scan_window,
+    bool matching_gap_only, bool allow_return_regression,
+    uint32_t return_confirm_blocks,
     GIFValidationSummary *summary_out, uint32_t *chain_blocks_out,
     uint32_t *return_blocks_out, int64_t *return_start_out) {
   uint64_t slot = blockvector_get_num_blocks(candidate->b) - 1;
@@ -3589,12 +3791,21 @@ static inline bool gif_reassembly_probe_nonlocal_return(
   uint64_t first_oldlength = 0;
   uint64_t chain_oldlengths[GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS - 1] = {0};
   uint32_t chain_blocks = 1;
+  uint32_t best_chain_blocks = 1;
+  uint32_t best_return_blocks = 0;
+  int64_t best_return_start = -1;
+  uint32_t chain_phase_offset = 0;
+  bool chain_phase_valid = false;
   GIFCarveState chain_state = {0};
   GIFCarveState trial_state = {0};
   GIFValidationSummary chain_summary = {0};
   GIFValidationSummary best_summary = {0};
   GIFValidationSummary trial_summary = {0};
   bool ok = false;
+  bool classified_chain_start = false;
+  bool strict_return_proof =
+      allow_return_regression
+      || (base_state && base_state->reassembly_return_pending);
 
   memset(summary_out, 0, sizeof(*summary_out));
   if (chain_blocks_out) {
@@ -3609,8 +3820,15 @@ static inline bool gif_reassembly_probe_nonlocal_return(
   (void)id;
 
   if (!candidate || previous_apparentblocknumber < 0
-      || first_apparent < 0 || apparent_blocks == 0) {
+      || first_apparent < 0 || apparent_blocks == 0
+      || return_scan_window <= 0 || return_confirm_blocks == 0
+      || return_confirm_blocks
+             > GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS) {
     return false;
+  }
+
+  if ((uint64_t)return_scan_window > apparent_blocks) {
+    return_scan_window = (int64_t)apparent_blocks;
   }
 
   if (base_state && base_state->reassembly_return_pending
@@ -3635,6 +3853,11 @@ static inline bool gif_reassembly_probe_nonlocal_return(
     return false;
   }
 
+  classified_chain_start =
+      filemirror_get_blocktype(scalpel_state.filemirror, actualblocknumber,
+                               candidate->needleidx)
+      == BLOCK_CONFIDENCE_VALID;
+
   deflate_blockvector_single_block(candidate->b, slot, oldlength);
   blockvector_set_apparent_blocknumber(candidate->b, slot, first_apparent);
   first_oldlength = inflate_blockvector_single_block(candidate->b, slot);
@@ -3642,103 +3865,89 @@ static inline bool gif_reassembly_probe_nonlocal_return(
   if (base_state) {
     chain_state = *base_state;
   }
-  gif_reassembly_validate_local_probe(candidate, &chain_state, &best_summary);
+  gif_reassembly_validate_local_probe(candidate, &chain_state, &chain_summary);
+  best_summary = chain_summary;
+  if (base_state
+      && base_state->reassembly_phase_hint_valid
+      && base_state->reassembly_phase_hint_length == oldlength) {
+    chain_phase_valid = gif_reassembly_block_phase_continuation(
+        first_apparent, base_state->reassembly_phase_hint_offset,
+        base_state->reassembly_phase_hint_threshold,
+        GIF_REASSEMBLY_PHASE_PROBE_MIN_HEADERS, &chain_phase_offset);
+  }
   ok = true;
 
-  while (chain_blocks < GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS) {
-    int64_t next_apparent = first_apparent + (int64_t)chain_blocks;
-    int64_t next_actual;
-    uint64_t chain_slot = old_blocks + (uint64_t)chain_blocks - 1;
-    uint64_t chain_oldlength;
-    GIFCarveState prior_chain_state = chain_state;
+  for (;;) {
+    int64_t first_return_offset =
+        matching_gap_only ? (int64_t)chain_blocks : 0;
+    int64_t last_return_offset =
+        matching_gap_only ? first_return_offset + 1 : return_scan_window;
 
-    if ((uint64_t)next_apparent >= apparent_blocks
-        || apparent_block_in_blockvector(candidate->b, next_apparent)) {
+    if (first_return_offset >= return_scan_window) {
       break;
     }
 
-    next_actual =
-        filemirror_actual_blocknumber(scalpel_state.filemirror, next_apparent);
-    if (next_actual < 0
-        || filemirror_get_blocktype(scalpel_state.filemirror, next_actual,
-                                    candidate->needleidx)
-               == BLOCK_CONFIDENCE_INVALID
-        || filemirror_actual_block_covered(scalpel_state.filemirror,
-                                           next_actual)) {
-      break;
-    }
+    for (int64_t j = first_return_offset;
+         j < last_return_offset;
+         ++j) {
+      int64_t return_apparent =
+          (return_start + j) % (int64_t)apparent_blocks;
+      int64_t return_actual;
+      uint64_t return_slot = old_blocks + (uint64_t)chain_blocks - 1;
+      uint64_t return_oldlengths[
+          GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS] = {0};
+      uint32_t return_blocks = 0;
+      uint32_t last_probed_blocks = 0;
+      GIFValidationSummary return_summary = {0};
+      bool select_return = false;
+      bool return_collides_with_chain = false;
+      bool return_regressed = false;
+      int summary_cmp;
 
-    if (gif_reassembly_checkpoint_requested()) {
-      break;
-    }
+      if (apparent_block_in_blockvector(candidate->b, return_apparent)) {
+        continue;
+      }
 
-    resize_blockvector(candidate->b, chain_slot + 1);
-    blockvector_set_apparent_blocknumber(candidate->b, chain_slot,
-                                         next_apparent);
-    chain_oldlength =
-        inflate_blockvector_single_block(candidate->b, chain_slot);
-    gif_reassembly_validate_local_probe(candidate, &chain_state,
-                                        &trial_summary);
-    if (gif_reassembly_compare_probe_summary(&trial_summary,
-                                             &best_summary) > 0) {
-      best_summary = trial_summary;
-      chain_oldlengths[chain_blocks - 1] = chain_oldlength;
-      chain_blocks++;
-      continue;
-    }
+      return_actual =
+          filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                        return_apparent);
+      if (return_actual < 0
+          || filemirror_get_blocktype(scalpel_state.filemirror, return_actual,
+                                      candidate->needleidx)
+                 == BLOCK_CONFIDENCE_INVALID
+          || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                             return_actual)) {
+        continue;
+      }
 
-    chain_state = prior_chain_state;
-    deflate_blockvector_single_block(candidate->b, chain_slot,
-                                     chain_oldlength);
-    resize_blockvector(candidate->b, chain_slot);
-    break;
-  }
-  chain_summary = best_summary;
+      if (gif_reassembly_checkpoint_requested()) {
+        break;
+      }
 
-  for (int64_t j = 0;
-       j < GIF_REASSEMBLY_RETURN_SCAN_WINDOW && (uint64_t)j < apparent_blocks;
-       ++j) {
-    int64_t return_apparent = (return_start + j) % (int64_t)apparent_blocks;
-    int64_t return_actual;
-    uint64_t return_slot = old_blocks + (uint64_t)chain_blocks - 1;
-    uint64_t return_oldlengths[GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS] = {0};
-    uint32_t return_blocks = 0;
-    GIFValidationSummary return_summary = {0};
-
-    if (apparent_block_in_blockvector(candidate->b, return_apparent)) {
-      continue;
-    }
-
-    return_actual =
-        filemirror_actual_blocknumber(scalpel_state.filemirror,
-                                      return_apparent);
-    if (return_actual < 0
-        || filemirror_get_blocktype(scalpel_state.filemirror, return_actual,
-                                    candidate->needleidx)
-               == BLOCK_CONFIDENCE_INVALID
-        || filemirror_actual_block_covered(scalpel_state.filemirror,
-                                           return_actual)) {
-      continue;
-    }
-
-    if (gif_reassembly_checkpoint_requested()) {
-      break;
-    }
-
-    resize_blockvector(candidate->b, return_slot + 1);
-    blockvector_set_apparent_blocknumber(candidate->b, return_slot,
-                                         return_apparent);
-    return_oldlengths[0] = inflate_blockvector_single_block(candidate->b,
-                                                           return_slot);
-    trial_state = chain_state;
-    gif_reassembly_validate_local_probe(candidate, &trial_state,
-                                        &trial_summary);
-    if (gif_reassembly_compare_probe_summary(&trial_summary,
-                                             &chain_summary) > 0) {
+      resize_blockvector(candidate->b, return_slot + 1);
+      blockvector_set_apparent_blocknumber(candidate->b, return_slot,
+                                           return_apparent);
+      return_oldlengths[0] =
+          inflate_blockvector_single_block(candidate->b, return_slot);
+      trial_state = chain_state;
+      gif_reassembly_validate_local_probe(candidate, &trial_state,
+                                          &trial_summary);
+      // A valid return can cross an LZW boundary that temporarily lowers the
+      // parser score, so probe a short contiguous prefix before rejecting it.
       return_summary = trial_summary;
       return_blocks = 1;
-
-      while (return_blocks < GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS) {
+      last_probed_blocks = 1;
+      return_regressed =
+          gif_reassembly_compare_probe_summary(&trial_summary,
+                                               &chain_summary) < 0;
+      if (return_regressed && !strict_return_proof) {
+        deflate_blockvector_single_block(candidate->b, return_slot,
+                                         return_oldlengths[0]);
+        resize_blockvector(candidate->b, return_slot);
+        continue;
+      }
+      while (!return_summary.validates
+             && return_blocks < return_confirm_blocks) {
         int64_t next_return_apparent =
             (return_apparent + (int64_t)return_blocks)
             % (int64_t)apparent_blocks;
@@ -3747,6 +3956,11 @@ static inline bool gif_reassembly_probe_nonlocal_return(
 
         if (apparent_block_in_blockvector(candidate->b,
                                           next_return_apparent)) {
+          if (next_return_apparent >= first_apparent
+              && (uint64_t)(next_return_apparent - first_apparent)
+                     < chain_blocks) {
+            return_collides_with_chain = true;
+          }
           break;
         }
 
@@ -3764,67 +3978,230 @@ static inline bool gif_reassembly_probe_nonlocal_return(
         }
 
         resize_blockvector(candidate->b, next_return_slot + 1);
-        blockvector_set_apparent_blocknumber(candidate->b,
-                                             next_return_slot,
+        blockvector_set_apparent_blocknumber(candidate->b, next_return_slot,
                                              next_return_apparent);
         return_oldlengths[return_blocks] =
-            inflate_blockvector_single_block(candidate->b,
-                                             next_return_slot);
+            inflate_blockvector_single_block(candidate->b, next_return_slot);
+        return_blocks++;
+
+        // Validation cost grows with the return prefix. Probe powers of two
+        // so long semantic plateaus require logarithmically many decoder
+        // calls while still finding a short confirmation quickly.
+        if ((return_blocks & (return_blocks - 1)) != 0
+            && return_blocks < return_confirm_blocks) {
+          continue;
+        }
+
+        trial_state = chain_state;
         gif_reassembly_validate_local_probe(candidate, &trial_state,
                                             &trial_summary);
-        if (gif_reassembly_compare_probe_summary(&trial_summary,
-                                                 &return_summary) <= 0) {
-          deflate_blockvector_single_block(
-              candidate->b, next_return_slot,
-              return_oldlengths[return_blocks]);
-          resize_blockvector(candidate->b, next_return_slot);
+        last_probed_blocks = return_blocks;
+        return_summary = trial_summary;
+        return_regressed =
+            gif_reassembly_compare_probe_summary(&trial_summary,
+                                                 &chain_summary) < 0;
+        if (return_regressed
+            && (!strict_return_proof
+                || return_blocks
+                       >= GIF_REASSEMBLY_RETURN_REGRESSION_PROBE_BLOCKS)) {
           break;
         }
-
-        return_summary = trial_summary;
-        return_blocks++;
       }
 
-      if ((!return_blocks_out
-           && gif_reassembly_compare_probe_summary(&return_summary,
-                                                    &best_summary) > 0)
-          || (return_blocks_out
-              && (return_blocks > *return_blocks_out
-                  || (return_blocks == *return_blocks_out
-                      && gif_reassembly_compare_probe_summary(
-                             &return_summary, &best_summary) > 0)))) {
+      if (!return_regressed && last_probed_blocks < return_blocks) {
+        trial_state = chain_state;
+        gif_reassembly_validate_local_probe(candidate, &trial_state,
+                                            &trial_summary);
+        last_probed_blocks = return_blocks;
+        if (gif_reassembly_compare_probe_summary(&trial_summary,
+                                                 &chain_summary) < 0) {
+          return_regressed = true;
+        }
+        else {
+          return_summary = trial_summary;
+        }
+      }
+
+      // A return path that reaches its displaced chain would have to reuse
+      // physical blocks, so it cannot represent a complete file.
+      // GIF parsing can remain on a semantic plateau for several correct
+      // blocks. Keep the bounded return trial only when the complete probe
+      // eventually produces stronger evidence than the displaced chain.
+      if ((strict_return_proof && return_collides_with_chain
+           && !return_summary.validates)
+          || return_regressed
+          || (!return_summary.validates
+              && gif_reassembly_compare_probe_summary(&return_summary,
+                                                      &chain_summary) <= 0)) {
+        while (return_blocks > 0) {
+          uint64_t return_index = return_slot + return_blocks - 1;
+          deflate_blockvector_single_block(
+              candidate->b, return_index,
+              return_oldlengths[return_blocks - 1]);
+          resize_blockvector(candidate->b, return_index);
+          return_blocks--;
+        }
+        continue;
+      }
+
+      summary_cmp = gif_reassembly_compare_probe_summary(
+          &return_summary, &best_summary);
+
+      if (return_summary.validates != best_summary.validates) {
+        select_return = return_summary.validates;
+      }
+      else if ((return_blocks > 0) != (best_return_blocks > 0)) {
+        select_return = return_blocks > 0;
+      }
+      else if (summary_cmp != 0) {
+        select_return = summary_cmp > 0;
+      }
+      else if (return_blocks != best_return_blocks) {
+        select_return = return_blocks > best_return_blocks;
+      }
+      else if (return_blocks > 0 && chain_blocks != best_chain_blocks) {
+        select_return = chain_blocks < best_chain_blocks;
+      }
+
+      if (select_return) {
         best_summary = return_summary;
-        if (return_blocks_out) {
-          *return_blocks_out = return_blocks;
-        }
-        if (return_start_out) {
-          *return_start_out = return_apparent;
-        }
+        best_chain_blocks = chain_blocks;
+        best_return_blocks = return_blocks;
+        best_return_start = return_apparent;
+      }
+
+      while (return_blocks > 0) {
+        uint64_t return_index = return_slot + return_blocks - 1;
+        deflate_blockvector_single_block(
+            candidate->b, return_index,
+            return_oldlengths[return_blocks - 1]);
+        resize_blockvector(candidate->b, return_index);
+        return_blocks--;
+      }
+
+      if (best_return_blocks == return_confirm_blocks
+          && best_chain_blocks == chain_blocks) {
+        break;
       }
     }
-    else {
-      deflate_blockvector_single_block(candidate->b, return_slot,
-                                       return_oldlengths[0]);
-      resize_blockvector(candidate->b, return_slot);
-      continue;
-    }
 
-    while (return_blocks > 0) {
-      uint64_t return_index = return_slot + return_blocks - 1;
-      deflate_blockvector_single_block(candidate->b, return_index,
-                                       return_oldlengths[return_blocks - 1]);
-      resize_blockvector(candidate->b, return_index);
-      return_blocks--;
-    }
-
-    if (return_blocks_out
-        && *return_blocks_out == GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS) {
+    if (best_summary.validates
+        || chain_blocks >= GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS) {
       break;
+    }
+
+    {
+      int64_t next_apparent = first_apparent + (int64_t)chain_blocks;
+      int64_t next_actual;
+      uint64_t chain_slot = old_blocks + (uint64_t)chain_blocks - 1;
+      uint64_t chain_oldlength;
+      uint32_t next_chain_phase_offset = 0;
+      bool next_chain_phase_valid = false;
+      GIFCarveState prior_chain_state = chain_state;
+
+      if ((uint64_t)next_apparent >= apparent_blocks
+          || apparent_block_in_blockvector(candidate->b, next_apparent)) {
+        break;
+      }
+
+      next_actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                                  next_apparent);
+      if (next_actual < 0
+          || filemirror_get_blocktype(scalpel_state.filemirror, next_actual,
+                                      candidate->needleidx)
+                 == BLOCK_CONFIDENCE_INVALID
+          || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                             next_actual)
+          || gif_reassembly_checkpoint_requested()) {
+        break;
+      }
+
+      resize_blockvector(candidate->b, chain_slot + 1);
+      blockvector_set_apparent_blocknumber(candidate->b, chain_slot,
+                                           next_apparent);
+      chain_oldlength =
+          inflate_blockvector_single_block(candidate->b, chain_slot);
+      if (chain_phase_valid) {
+        next_chain_phase_valid = gif_reassembly_block_phase_continuation(
+            next_apparent, chain_phase_offset,
+            base_state->reassembly_phase_hint_threshold,
+            GIF_REASSEMBLY_PHASE_PROBE_MIN_HEADERS,
+            &next_chain_phase_offset);
+      }
+      gif_reassembly_validate_local_probe(candidate, &chain_state,
+                                          &trial_summary);
+      int chain_cmp =
+          gif_reassembly_compare_probe_summary(&trial_summary,
+                                               &chain_summary);
+      uint64_t required_chain_progress =
+          scalpel_state.blocksize > GIF_REASSEMBLY_VALIDATE_SLACK
+              ? (uint64_t)scalpel_state.blocksize
+                    - GIF_REASSEMBLY_VALIDATE_SLACK
+              : 1;
+      bool chain_has_full_block_evidence =
+          chain_summary.validates
+          || (chain_summary.validates_to >= oldlength
+              && chain_summary.validates_to - oldlength
+                     >= required_chain_progress - 1);
+      bool preserve_phase_plateau =
+          chain_cmp == 0
+          && (next_chain_phase_valid || chain_has_full_block_evidence
+              || classified_chain_start);
+      if (gif_reassembly_debug_candidate(candidate)) {
+        lock_fprintf(stderr,
+                "[gifdbg] phase-probe-chain start=%" PRId64
+                " first=%" PRId64 " next=%" PRId64
+                " blocks=%u cmp=%d phase=%d full=%d"
+                " vt=%" PRIu64 " frames=%u checkpoint=%" PRIu64
+                " good=%" PRIu64 " normal=%" PRIu64 "\n",
+                blockvector_get_actual_blocknumber(candidate->b, 0),
+                first_apparent, next_apparent, chain_blocks + 1,
+                chain_cmp, next_chain_phase_valid ? 1 : 0,
+                chain_has_full_block_evidence ? 1 : 0,
+                trial_summary.validates_to,
+                trial_summary.score.completed_frames,
+                trial_summary.score.checkpoint_curpos,
+                trial_summary.score.last_good_row_pos,
+                trial_summary.score.last_normal_pos);
+      }
+      if (chain_cmp < 0 || (chain_cmp == 0 && !preserve_phase_plateau)) {
+        chain_state = prior_chain_state;
+        deflate_blockvector_single_block(candidate->b, chain_slot,
+                                         chain_oldlength);
+        resize_blockvector(candidate->b, chain_slot);
+        break;
+      }
+
+      chain_oldlengths[chain_blocks - 1] = chain_oldlength;
+      chain_summary = trial_summary;
+      chain_phase_valid = next_chain_phase_valid;
+      chain_phase_offset = next_chain_phase_offset;
+      chain_blocks++;
+      if (best_return_blocks == 0) {
+        int best_cmp = gif_reassembly_compare_probe_summary(
+            &chain_summary, &best_summary);
+
+        // A phase-consistent chain remains useful structural evidence while
+        // the decoder is between semantic checkpoints.
+        if (best_cmp > 0
+            || (best_cmp == 0
+                && chain_phase_valid
+                && chain_blocks > best_chain_blocks)) {
+          best_summary = chain_summary;
+          best_chain_blocks = chain_blocks;
+        }
+      }
     }
   }
 
   if (chain_blocks_out) {
-    *chain_blocks_out = chain_blocks;
+    *chain_blocks_out = best_chain_blocks;
+  }
+  if (return_blocks_out) {
+    *return_blocks_out = best_return_blocks;
+  }
+  if (return_start_out) {
+    *return_start_out = best_return_start;
   }
 
   while (chain_blocks > 1) {
@@ -3854,15 +4231,25 @@ static inline bool gif_reassembly_probe_nonlocal_potential(
     GIFValidationSummary *summary_out) {
   GIFValidationSummary best_summary = {0};
   GIFValidationSummary trial_summary = {0};
+  bool allow_return_regression = false;
   bool ok = false;
 
   memset(summary_out, 0, sizeof(*summary_out));
+  allow_return_regression =
+      gif_reassembly_committed_actual_gap_count(candidate, oldlength) > 0
+      && filemirror_get_blocktype(scalpel_state.filemirror,
+                                  actualblocknumber,
+                                  candidate->needleidx)
+             == BLOCK_CONFIDENCE_VALID;
 
   ok = gif_reassembly_probe_followon(id, candidate, oldlength, base_state,
                                      actualblocknumber, &best_summary);
   if (gif_reassembly_probe_nonlocal_return(id, candidate, oldlength,
                                            base_state, actualblocknumber,
                                            previous_apparentblocknumber,
+                                           GIF_REASSEMBLY_RETURN_SCAN_WINDOW,
+                                           false, allow_return_regression,
+                                           GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS,
                                            &trial_summary, NULL, NULL, NULL)
       && (!ok
           || gif_reassembly_compare_probe_summary(&trial_summary,
@@ -3880,7 +4267,8 @@ static inline bool gif_reassembly_probe_nonlocal_potential(
 static inline int64_t gif_reassembly_phase_probe_choice(
     CarveInfo *candidate, uint64_t slot, int64_t scan_start,
     int64_t scan_count, int64_t previous_apparentblocknumber,
-    GIFCarveState *state, int64_t *resume_after_out) {
+    GIFCarveState *state, int64_t *resume_after_out,
+    bool include_local_forward) {
   int64_t apparent_blocks;
   int64_t toconsider;
   int64_t local_forward_cutoff = -1;
@@ -3891,13 +4279,22 @@ static inline int64_t gif_reassembly_phase_probe_choice(
   uint8_t phase_threshold = 0;
   uint64_t oldlength;
   uint64_t required_validates_to;
+  uint64_t minimum_probe_validates_to;
   uint32_t probes = 0;
   uint32_t probe_limit = GIF_REASSEMBLY_PHASE_PROBE_SCAN_LIMIT;
   bool wrap_prefix_first = false;
   bool backfill_mode = false;
+  bool deep_return_mode = false;
+  bool classified_anchor_pass = false;
   uint32_t best_chain_blocks = UINT32_MAX;
   uint32_t best_return_blocks = 0;
   int64_t best_return_start = -1;
+  bool best_local_chain_proven = false;
+  bool best_local_chain_progress = false;
+  bool best_overlaps_return_window = false;
+  bool strict_phase_proof =
+      include_local_forward
+      || (state && state->reassembly_return_pending);
   GIFValidationSummary best_probe_summary = {0};
 
   if (resume_after_out) {
@@ -3909,6 +4306,7 @@ static inline int64_t gif_reassembly_phase_probe_choice(
   }
 
   oldlength = blockvector_get_data_length(candidate->b);
+  classified_anchor_pass = include_local_forward;
   if (state->reassembly_phase_scan_exhausted
       && state->reassembly_phase_scan_exhausted_length == oldlength) {
     if (gif_reassembly_debug_candidate(candidate)) {
@@ -3948,6 +4346,11 @@ static inline int64_t gif_reassembly_phase_probe_choice(
       + (uint64_t)scalpel_state.blocksize
             * GIF_REASSEMBLY_PHASE_PROBE_MIN_BLOCKS
       - 1;
+  minimum_probe_validates_to =
+      oldlength + (uint64_t)scalpel_state.blocksize - 1;
+  if (minimum_probe_validates_to >= GIF_REASSEMBLY_VALIDATE_SLACK) {
+    minimum_probe_validates_to -= GIF_REASSEMBLY_VALIDATE_SLACK;
+  }
 
   apparent_blocks =
       (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
@@ -3971,13 +4374,14 @@ static inline int64_t gif_reassembly_phase_probe_choice(
     local_forward_cutoff =
         previous_apparentblocknumber + GIF_REASSEMBLY_GAP_SCAN_WINDOW;
     wrap_prefix_first =
-        local_forward_cutoff < apparent_blocks
+        !include_local_forward
+        && local_forward_cutoff < apparent_blocks
         && scan_start > local_forward_cutoff;
   }
 
 phase_probe_restart:
   probes = 0;
-  probe_limit = backfill_mode
+  probe_limit = backfill_mode || classified_anchor_pass
                     ? GIF_REASSEMBLY_PHASE_PROBE_SCAN_LIMIT
                           * GIF_REASSEMBLY_PHASE_ANCHOR_BACKFILL
                     : GIF_REASSEMBLY_PHASE_PROBE_SCAN_LIMIT;
@@ -4003,8 +4407,14 @@ phase_probe_restart:
     for (int64_t j = 0; j < pass_count; j++) {
       int64_t apparentblocknumber = (pass_start + j) % apparent_blocks;
       int64_t anchor_actualblocknumber;
+      BlockValidationDecision anchor_confidence;
+      bool retry_local_forward =
+          include_local_forward
+          && previous_apparentblocknumber >= 0
+          && apparentblocknumber == previous_apparentblocknumber + 1;
 
       if (gif_reassembly_checkpoint_requested()) {
+        gif_reassembly_set_scan_cursor(state, apparentblocknumber, oldlength);
         gif_reassembly_store_state(candidate, state);
         return -1;
       }
@@ -4024,17 +4434,11 @@ phase_probe_restart:
         goto phase_probe_complete;
       }
 
-      if (previous_apparentblocknumber >= 0
-          && apparentblocknumber > previous_apparentblocknumber
-          && apparentblocknumber <= local_forward_cutoff) {
-        continue;
-      }
-
-      if (!gif_reassembly_slot_allows_choice(candidate, slot,
-                                             apparentblocknumber)
-          || apparent_block_in_blockvector(candidate->b, apparentblocknumber)
-          || !gif_reassembly_block_matches_phase_probe_hint(
-                 apparentblocknumber, phase_offset, phase_threshold)) {
+      if ((!retry_local_forward
+           && !gif_reassembly_slot_allows_choice(candidate, slot,
+                                                 apparentblocknumber))
+          || apparent_block_in_blockvector(candidate->b,
+                                           apparentblocknumber)) {
         continue;
       }
 
@@ -4045,9 +4449,19 @@ phase_probe_restart:
                                                   anchor_actualblocknumber)) {
         continue;
       }
+      anchor_confidence = filemirror_get_blocktype(
+          scalpel_state.filemirror, anchor_actualblocknumber,
+          candidate->needleidx);
+      if ((classified_anchor_pass
+           && anchor_confidence != BLOCK_CONFIDENCE_VALID)
+          || (!retry_local_forward
+              && !gif_reassembly_block_matches_phase_probe_hint(
+                     apparentblocknumber, phase_offset, phase_threshold))) {
+        continue;
+      }
 
       for (int backfill = backfill_mode ? 1 : 0;
-           backfill <= (backfill_mode
+           backfill <= (backfill_mode || classified_anchor_pass
                             ? GIF_REASSEMBLY_PHASE_ANCHOR_BACKFILL
                             : 0);
            backfill++) {
@@ -4059,6 +4473,12 @@ phase_probe_restart:
         uint32_t probe_chain_blocks = 0;
         uint32_t probe_return_blocks = 0;
         int64_t probe_return_start = -1;
+        bool deep_probe_ok;
+        bool local_chain_proven;
+        bool local_chain_progress;
+        bool overlaps_return_window = false;
+        bool probe_is_local_retry = false;
+        bool return_path_proven = false;
 
         if (probe_actualblocknumber < 0) {
           continue;
@@ -4066,12 +4486,13 @@ phase_probe_restart:
 
         probe_apparentblocknumber = filemirror_apparent_blocknumber(
             scalpel_state.filemirror, probe_actualblocknumber);
+        probe_is_local_retry =
+            retry_local_forward
+            && probe_apparentblocknumber == apparentblocknumber;
         if (probe_apparentblocknumber < 0
-            || (previous_apparentblocknumber >= 0
-                && probe_apparentblocknumber > previous_apparentblocknumber
-                && probe_apparentblocknumber <= local_forward_cutoff)
-            || !gif_reassembly_slot_allows_choice(
-                   candidate, slot, probe_apparentblocknumber)
+            || (!probe_is_local_retry
+                && !gif_reassembly_slot_allows_choice(
+                       candidate, slot, probe_apparentblocknumber))
             || apparent_block_in_blockvector(candidate->b,
                                              probe_apparentblocknumber)
             || !gif_reassembly_actual_block_is_giflike(
@@ -4080,6 +4501,8 @@ phase_probe_restart:
         }
 
         if (gif_reassembly_checkpoint_requested()) {
+          gif_reassembly_set_scan_cursor(state, probe_apparentblocknumber,
+                                         oldlength);
           gif_reassembly_store_state(candidate, state);
           return -1;
         }
@@ -4089,35 +4512,107 @@ phase_probe_restart:
         }
         probes++;
 
-        if (!gif_reassembly_probe_followon(
-                0, candidate, oldlength, state, probe_actualblocknumber,
-                &probe_summary)) {
-          if (gif_reassembly_debug_candidate(candidate)) {
-            fprintf(stderr,
-                    "[gifdbg] phase-probe-no-follow start=%" PRId64
-                    " prev=%" PRId64 " choice=%" PRId64
-                    " actual=%" PRId64 " backfill=%d probes=%u\n",
-                    blockvector_get_actual_blocknumber(candidate->b, 0),
-                    previous_apparentblocknumber, probe_apparentblocknumber,
-                    probe_actualblocknumber, backfill, probes);
-          }
-          continue;
-        }
+        gif_reassembly_probe_score(0, candidate, oldlength, state,
+                                   probe_actualblocknumber, &probe_summary);
 
         if (gif_reassembly_debug_candidate(candidate)) {
           fprintf(stderr,
                   "[gifdbg] phase-probe-trial start=%" PRId64
                   " prev=%" PRId64 " choice=%" PRId64
                   " actual=%" PRId64 " backfill=%d probe_vt=%" PRIu64
-                  " required=%" PRIu64 " probes=%u\n",
+                  " required=%" PRIu64 " probes=%u"
+                  " score=(frames=%u,checkpoint=%" PRIu64
+                  ",good=%" PRIu64 ",normal=%" PRIu64 ")\n",
                   blockvector_get_actual_blocknumber(candidate->b, 0),
                   previous_apparentblocknumber, probe_apparentblocknumber,
                   probe_actualblocknumber, backfill,
-                  probe_summary.validates_to, required_validates_to, probes);
+                  probe_summary.validates_to, required_validates_to, probes,
+                  probe_summary.score.completed_frames,
+                  probe_summary.score.checkpoint_curpos,
+                  probe_summary.score.last_good_row_pos,
+                  probe_summary.score.last_normal_pos);
         }
 
+        // A conservative boundary cap can hide all progress in the first
+        // displaced block, so confirm every phase-matched candidate against
+        // the nearby return path before rejecting it.
+        deep_probe_ok = gif_reassembly_probe_nonlocal_return(
+            0, candidate, oldlength, state, probe_actualblocknumber,
+            previous_apparentblocknumber,
+            GIF_REASSEMBLY_GAP_SCAN_WINDOW, true, strict_phase_proof,
+            deep_return_mode
+                ? GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS
+                : GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS,
+            &deep_summary,
+            &probe_chain_blocks, &probe_return_blocks,
+            &probe_return_start);
+        if (deep_probe_ok && probe_return_blocks > 0
+            && (uint64_t)probe_chain_blocks
+                   <= (UINT64_MAX - oldlength)
+                          / (uint64_t)scalpel_state.blocksize) {
+          uint64_t return_progress_floor =
+              oldlength
+              + (uint64_t)probe_chain_blocks
+                    * (uint64_t)scalpel_state.blocksize;
+
+          return_path_proven =
+              deep_summary.validates_to >= return_progress_floor;
+        }
+        if (gif_reassembly_debug_candidate(candidate)) {
+          lock_fprintf(stderr,
+                       "[gifdbg] phase-probe-return start=%" PRId64
+                       " choice=%" PRId64 " ok=%d chain=%u return=%u"
+                       " return_start=%" PRId64 " progress=%d vt=%" PRIu64
+                       " score=(frames=%u,checkpoint=%" PRIu64
+                       ",good=%" PRIu64 ",normal=%" PRIu64 ")\n",
+                       blockvector_get_actual_blocknumber(candidate->b, 0),
+                       probe_apparentblocknumber, deep_probe_ok ? 1 : 0,
+                       probe_chain_blocks, probe_return_blocks,
+                       probe_return_start, return_path_proven ? 1 : 0,
+                       deep_summary.validates_to,
+                       deep_summary.score.completed_frames,
+                       deep_summary.score.checkpoint_curpos,
+                       deep_summary.score.last_good_row_pos,
+                       deep_summary.score.last_normal_pos);
+        }
+        if (deep_probe_ok
+            && gif_reassembly_compare_probe_summary(&deep_summary,
+                                                    &probe_summary) > 0) {
+          probe_summary = deep_summary;
+        }
+        if (!return_path_proven) {
+          probe_return_blocks = 0;
+          probe_return_start = -1;
+        }
+        else if (strict_phase_proof
+                 && probe_apparentblocknumber >= probe_return_start
+                 && (uint64_t)(probe_apparentblocknumber
+                               - probe_return_start)
+                        < GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS) {
+          overlaps_return_window = true;
+        }
+
+        local_chain_progress =
+            probe_summary.validates_to >= minimum_probe_validates_to
+            || probe_summary.score.checkpoint_curpos
+                   > minimum_probe_validates_to
+            || probe_summary.score.last_good_row_pos
+                   > minimum_probe_validates_to
+            || probe_summary.score.last_normal_pos
+                   > minimum_probe_validates_to;
+        local_chain_proven =
+            probe_return_blocks == 0
+            && probe_chain_blocks
+                   == GIF_REASSEMBLY_NONLOCAL_CHAIN_PROBE_BLOCKS
+            && probe_apparentblocknumber > previous_apparentblocknumber
+            && probe_apparentblocknumber <= local_forward_cutoff;
+
+        // A phase-matched block that parses through its full extent is strong
+        // evidence by itself. A complete local phase chain is equivalent
+        // evidence when the decoder remains on a long semantic plateau.
         if (probe_summary.validates
-            || probe_summary.validates_to >= required_validates_to) {
+            || probe_summary.validates_to >= minimum_probe_validates_to
+            || local_chain_proven) {
           BlockValidationDecision confidence =
               filemirror_get_blocktype(scalpel_state.filemirror,
                                        probe_actualblocknumber,
@@ -4127,25 +4622,96 @@ phase_probe_restart:
                                        scalpel_state.filemirror,
                                        probe_actualblocknumber)
                                  : 0;
+          bool proven_return = probe_return_blocks > 0;
+          bool best_proven_return = best_return_blocks > 0;
+          bool probe_return_dominated = false;
+          bool best_return_dominated = false;
           int cmp;
           bool select_probe = false;
 
-          if (gif_reassembly_probe_nonlocal_return(
-                  0, candidate, oldlength, state, probe_actualblocknumber,
-                  previous_apparentblocknumber, &deep_summary,
-                  &probe_chain_blocks, &probe_return_blocks,
-                  &probe_return_start)
-              && gif_reassembly_compare_probe_summary(&deep_summary,
-                                                      &probe_summary) > 0) {
-            probe_summary = deep_summary;
+          if (proven_return && best_local_chain_proven
+              && best_local_chain_progress
+              && best_choice >= 0 && probe_return_start >= 0) {
+            uint64_t local_blocks_to_return =
+                probe_return_start >= best_choice
+                    ? (uint64_t)(probe_return_start - best_choice)
+                    : (uint64_t)apparent_blocks
+                          - (uint64_t)best_choice
+                          + (uint64_t)probe_return_start;
+
+            probe_return_dominated =
+                local_blocks_to_return < best_chain_blocks
+                && probe_chain_blocks > local_blocks_to_return
+                && !probe_summary.validates
+                && probe_summary.score.completed_frames
+                       <= best_probe_summary.score.completed_frames;
+          }
+          if (best_proven_return && local_chain_proven
+              && local_chain_progress
+              && best_return_start >= 0) {
+            uint64_t local_blocks_to_return =
+                best_return_start >= probe_apparentblocknumber
+                    ? (uint64_t)(best_return_start
+                                 - probe_apparentblocknumber)
+                    : (uint64_t)apparent_blocks
+                          - (uint64_t)probe_apparentblocknumber
+                          + (uint64_t)best_return_start;
+
+            best_return_dominated =
+                local_blocks_to_return < probe_chain_blocks
+                && best_chain_blocks > local_blocks_to_return
+                && !best_probe_summary.validates
+                && best_probe_summary.score.completed_frames
+                       <= probe_summary.score.completed_frames;
           }
 
           cmp = best_choice < 0
                     ? 1
                     : gif_reassembly_compare_probe_summary(
                           &probe_summary, &best_probe_summary);
+
+          // Progress after the displaced chain establishes both that run and
+          // the point where the original stream resumes. Without that proof,
+          // a complete local phase chain has stronger provenance than a
+          // distant path that can parse as an unrelated GIF. When both paths
+          // prove a return, prefer the shorter excursion before comparing
+          // decoded frame progress.
           if (best_choice < 0) {
             select_probe = true;
+          }
+          else if (probe_return_dominated) {
+            select_probe = false;
+          }
+          else if (best_return_dominated) {
+            select_probe = true;
+          }
+          else if (proven_return != best_proven_return) {
+            select_probe = proven_return;
+          }
+          else if (proven_return
+                   && probe_summary.validates
+                          != best_probe_summary.validates) {
+            select_probe = probe_summary.validates;
+          }
+          else if (strict_phase_proof
+                   && proven_return
+                   && overlaps_return_window
+                          != best_overlaps_return_window) {
+            // Equivalent displaced runs should not consume blocks that their
+            // predicted forward return path may need later.
+            select_probe = !overlaps_return_window;
+          }
+          else if (local_chain_proven != best_local_chain_proven) {
+            select_probe = local_chain_proven;
+          }
+          else if (proven_return
+                   && probe_chain_blocks != best_chain_blocks) {
+            select_probe = probe_chain_blocks < best_chain_blocks;
+          }
+          else if (probe_summary.score.completed_frames
+                   != best_probe_summary.score.completed_frames) {
+            select_probe = probe_summary.score.completed_frames
+                           > best_probe_summary.score.completed_frames;
           }
           else if (probe_summary.validates != best_probe_summary.validates) {
             select_probe = probe_summary.validates;
@@ -4153,18 +4719,14 @@ phase_probe_restart:
           else if (probe_return_blocks != best_return_blocks) {
             select_probe = probe_return_blocks > best_return_blocks;
           }
-          else if (probe_return_blocks > 0
-                   && probe_chain_blocks != best_chain_blocks) {
-            select_probe = probe_chain_blocks < best_chain_blocks;
+          else if (cmp != 0) {
+            select_probe = cmp > 0;
           }
           else if (confidence != best_confidence) {
             select_probe = confidence > best_confidence;
           }
           else if (reserved != best_reserved) {
             select_probe = reserved < best_reserved;
-          }
-          else {
-            select_probe = cmp > 0;
           }
 
           if (select_probe) {
@@ -4174,7 +4736,14 @@ phase_probe_restart:
             best_chain_blocks = probe_chain_blocks;
             best_return_blocks = probe_return_blocks;
             best_return_start = probe_return_start;
+            best_local_chain_proven = local_chain_proven;
+            best_local_chain_progress = local_chain_progress;
+            best_overlaps_return_window = overlaps_return_window;
             best_probe_summary = probe_summary;
+            if (probe_is_local_retry
+                && (proven_return || local_chain_proven)) {
+              goto phase_probe_complete;
+            }
           }
         }
       }
@@ -4183,8 +4752,65 @@ phase_probe_restart:
 
 phase_probe_complete:
   if (best_choice >= 0) {
+    if (!best_probe_summary.validates
+        && (best_chain_blocks > 1
+            || best_return_blocks
+                   == GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS)) {
+      int64_t best_actualblocknumber = filemirror_actual_blocknumber(
+          scalpel_state.filemirror, best_choice);
+      GIFValidationSummary extended_summary = {0};
+      uint32_t extended_chain_blocks = 0;
+      uint32_t extended_return_blocks = 0;
+      int64_t extended_return_start = -1;
+
+      // Only the selected candidate receives a deeper return-path probe, and
+      // it is retained only when it produces additional structural evidence.
+      // This avoids making every candidate pay the larger validation cost.
+      if (best_actualblocknumber >= 0
+          && gif_reassembly_probe_nonlocal_return(
+                 0, candidate, oldlength, state, best_actualblocknumber,
+                 previous_apparentblocknumber,
+                 GIF_REASSEMBLY_GAP_SCAN_WINDOW, true,
+                 strict_phase_proof,
+                 GIF_REASSEMBLY_DEEP_RETURN_CONFIRM_BLOCKS,
+                 &extended_summary, &extended_chain_blocks,
+                 &extended_return_blocks, &extended_return_start)
+          && gif_reassembly_compare_probe_summary(&extended_summary,
+                                                  &best_probe_summary) > 0
+          && extended_return_blocks > best_return_blocks) {
+        best_probe_summary = extended_summary;
+        best_chain_blocks = extended_chain_blocks;
+        best_return_blocks = extended_return_blocks;
+        best_return_start = extended_return_start;
+      }
+    }
+
     if (best_return_blocks > 0 && best_return_start >= 0) {
-      gif_reassembly_set_return_start(state, best_return_start, true);
+      uint32_t committed_return_blocks = best_return_blocks;
+      bool defer_return = best_chain_blocks > 1;
+
+      // Deep lookahead can establish that a return path is promising without
+      // proving every intervening block. Re-evaluate long paths in bounded
+      // segments unless the probe validated the complete GIF.
+      if (!best_probe_summary.validates
+          && committed_return_blocks > GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS) {
+        committed_return_blocks = GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS;
+      }
+      gif_reassembly_set_return_start(state, best_return_start,
+                                      defer_return);
+      gif_reassembly_set_return_proof(state, best_chain_blocks,
+                                      committed_return_blocks);
+      gif_reassembly_store_state(candidate, state);
+    }
+    else if (best_chain_blocks > 1 && apparent_blocks > 0) {
+      int64_t after_chain =
+          (best_choice + (int64_t)best_chain_blocks) % apparent_blocks;
+
+      // The phase probe validated this contiguous chain as a unit. Preserve
+      // that exact proof so semantic plateaus can be committed one block at a
+      // time, then resume ordinary selection immediately after the chain.
+      gif_reassembly_set_return_start(state, after_chain, true);
+      gif_reassembly_set_return_proof(state, best_chain_blocks, 0);
       gif_reassembly_store_state(candidate, state);
     }
     if (resume_after_out) {
@@ -4210,8 +4836,19 @@ phase_probe_complete:
     return best_choice;
   }
 
+  if (classified_anchor_pass) {
+    classified_anchor_pass = false;
+    goto phase_probe_restart;
+  }
+
+  if (!deep_return_mode) {
+    deep_return_mode = true;
+    goto phase_probe_restart;
+  }
+
   if (!backfill_mode) {
     backfill_mode = true;
+    deep_return_mode = false;
     goto phase_probe_restart;
   }
 
@@ -4495,6 +5132,7 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
   bool plateau_wrap_resume = false;
   bool preserved_frontier_resume = false;
   bool active_scan_slot = false;
+  bool deferred_scan_cursor = false;
   bool scan_cursor_stale = false;
   candidate->fastpath = false;
 
@@ -4522,19 +5160,22 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
     resume_current_slot = false;
     candidate->no_initial_block_extension = false;
   }
-  if (resume_current_slot
-      && gif_state.reassembly_scan_cursor_valid
-      && gif_state.reassembly_scan_cursor >= 0
-      && gif_state.reassembly_scan_cursor_length
-             == blockvector_get_data_length(candidate->b)) {
-    candidate->block_choice_start = gif_state.reassembly_scan_cursor;
-  }
-  else if (gif_state.reassembly_scan_cursor_valid
-           && (!resume_current_slot
-               || gif_state.reassembly_scan_cursor_length
-                      != blockvector_get_data_length(candidate->b))) {
-    gif_reassembly_clear_scan_cursor(&gif_state);
-    scan_cursor_stale = true;
+  if (gif_state.reassembly_scan_cursor_valid
+      && gif_state.reassembly_scan_cursor >= 0) {
+    if (gif_state.reassembly_scan_cursor_length
+        == blockvector_get_data_length(candidate->b)) {
+      if (resume_current_slot) {
+        candidate->block_choice_start = gif_state.reassembly_scan_cursor;
+      }
+      else {
+        deferred_scan_cursor = true;
+      }
+    }
+    else if (gif_state.reassembly_scan_cursor_length
+             < blockvector_get_data_length(candidate->b)) {
+      gif_reassembly_clear_scan_cursor(&gif_state);
+      scan_cursor_stale = true;
+    }
   }
   resume_plateau_blocks = gif_reassembly_effective_plateau_blocks(&gif_state);
   if (resume_current_slot
@@ -4650,18 +5291,32 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
          the slot immediately after a correct wrap frontier. */
       candidate->block_choice_start = gif_state.reassembly_return_start;
     }
+    else if (gif_state.reassembly_return_pending
+             && !gif_state.reassembly_return_deferred
+             && gif_state.reassembly_return_start >= 0) {
+      candidate->block_choice_start = gif_state.reassembly_return_start;
+    }
+    else if (next_apparent >= 0
+             && next_apparent
+                    < (int64_t)filemirror_apparent_blocks(
+                           scalpel_state.filemirror)
+             && !apparent_block_in_blockvector(candidate->b,
+                                                next_apparent)) {
+      // Continue from an accepted gap jump before reconsidering the skipped
+      // physical window. A separately proven return path takes precedence.
+      candidate->block_choice_start = next_apparent;
+    }
     else if (local_gap_start >= 0
-        && !apparent_block_in_blockvector(candidate->b, local_gap_start)) {
+             && !apparent_block_in_blockvector(candidate->b,
+                                                local_gap_start)) {
       candidate->block_choice_start = local_gap_start;
     }
     else if (filemirror_apparent_blocks(scalpel_state.filemirror) > 0
-             && !gif_state.reassembly_return_deferred
-             && (gif_state.reassembly_return_pending
-                 || (resume_plateau_blocks > 0
-                     && gif_state.reassembly_return_start >= 0
-                     && next_apparent
-                            >= (int64_t)filemirror_apparent_blocks(
-                                   scalpel_state.filemirror)))) {
+             && resume_plateau_blocks > 0
+             && gif_state.reassembly_return_start >= 0
+             && next_apparent
+                    >= (int64_t)filemirror_apparent_blocks(
+                           scalpel_state.filemirror)) {
       uint64_t apparent_blocks =
           filemirror_apparent_blocks(scalpel_state.filemirror);
       int64_t wrapped_next = next_apparent % (int64_t)apparent_blocks;
@@ -4701,6 +5356,11 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
         gif_reassembly_resume_choice_start(candidate, 0);
   }
 
+  if (deferred_scan_cursor
+      && !gif_state.reassembly_return_pending) {
+    candidate->block_choice_start = gif_state.reassembly_scan_cursor;
+  }
+
   if (blockvector_get_num_blocks(candidate->b)
       > (resume_current_slot ? 0 : 1)) {
     uint64_t committed_tail_index =
@@ -4715,6 +5375,16 @@ static inline void gif_reassembly_prepare_for_extension(CarveInfo *candidate) {
       && committed_tail_apparent >= gif_state.reassembly_return_start
       && candidate->block_choice_start >= 0
       && candidate->block_choice_start < gif_state.reassembly_return_start) {
+    candidate->block_choice_start = gif_state.reassembly_return_start;
+  }
+
+  // Once a displaced chain has been confirmed, its return window takes
+  // precedence over a scan cursor left by the active speculative slot.
+  if (gif_state.reassembly_return_pending
+      && !gif_state.reassembly_return_deferred
+      && gif_state.reassembly_return_start >= 0
+      && !gif_reassembly_choice_in_return_window(
+             &gif_state, candidate->block_choice_start)) {
     candidate->block_choice_start = gif_state.reassembly_return_start;
   }
 
@@ -4744,6 +5414,8 @@ static inline int64_t gif_reassembly_get_block_choice(
   int64_t scan_contiguous_choice = -1;
   int64_t scan_best_reserved = INT64_MAX;
   int64_t scan_contiguous_reserved = INT64_MAX;
+  uint32_t phase_offset = 0;
+  uint8_t phase_threshold = 0;
   uint64_t committed_blocks = 0;
   uint64_t slot = 0;
   uint64_t evaluated;
@@ -4758,6 +5430,7 @@ static inline int64_t gif_reassembly_get_block_choice(
   bool return_window_phase = false;
   bool choice_removed = false;
   bool anchor_yield_tried = false;
+  bool immediate_path_is_known_gap = false;
   BlockValidationDecision scan_blocktype = BLOCK_CONFIDENCE_INVALID;
   BlockValidationDecision scan_best_confidence = BLOCK_CONFIDENCE_INVALID;
   BlockValidationDecision scan_contiguous_confidence = BLOCK_CONFIDENCE_INVALID;
@@ -4841,6 +5514,35 @@ static inline int64_t gif_reassembly_get_block_choice(
     immediate_next = start_apparentblocknumber + 1;
   }
 
+  if (immediate_next >= 0 && immediate_next < count) {
+    actualblocknumber = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, immediate_next);
+    // Covered and zero blocks cannot continue the candidate. A jump in
+    // actual positions means the blockmap removed covered blocks between
+    // these apparent neighbors.
+    immediate_path_is_known_gap =
+        actualblocknumber >= 0
+        && (filemirror_actual_block_covered(scalpel_state.filemirror,
+                                            actualblocknumber)
+            || filemirror_actual_block_is_zero(scalpel_state.filemirror,
+                                               actualblocknumber)
+            || (previous_actualblocknumber >= 0
+                && actualblocknumber != previous_actualblocknumber + 1));
+    if (gif_reassembly_debug_candidate(candidate)) {
+      fprintf(stderr,
+              "[gifdbg] immediate-path start=%" PRId64
+              " prev_apparent=%" PRId64 " prev_actual=%" PRId64
+              " next_apparent=%" PRId64 " next_actual=%" PRId64
+              " known_gap=%d committed_gaps=%u\n",
+              blockvector_get_actual_blocknumber(candidate->b, 0),
+              previous_apparentblocknumber, previous_actualblocknumber,
+              immediate_next, actualblocknumber,
+              immediate_path_is_known_gap ? 1 : 0,
+              gif_reassembly_committed_actual_gap_count(
+                  candidate, blockvector_get_data_length(candidate->b)));
+    }
+  }
+
   if (gif_state.reassembly_return_pending
       && gif_state.reassembly_return_deferred
       && gif_state.reassembly_return_start >= 0
@@ -4848,6 +5550,7 @@ static inline int64_t gif_reassembly_get_block_choice(
       && (immediate_next >= count
           || apparent_block_in_blockvector(candidate->b, immediate_next))) {
     gif_state.reassembly_return_deferred = false;
+    gif_state.reassembly_return_chain_blocks = 0;
     gif_reassembly_store_state(candidate, &gif_state);
     candidate->block_choice_start = gif_state.reassembly_return_start;
   }
@@ -4870,12 +5573,29 @@ static inline int64_t gif_reassembly_get_block_choice(
       && start_apparentblocknumber >= 0
       && count > 0) {
     int64_t scan_end = immediate_next + GIF_REASSEMBLY_GAP_SCAN_WINDOW;
+    int64_t seed_scan_start = immediate_next;
 
     if (scan_end > count) {
       scan_end = count;
     }
 
-    for (block_choice = immediate_next; block_choice < scan_end; ++block_choice) {
+    if (gif_state.reassembly_seed_scan_started
+        && candidate->block_choice_start >= immediate_next) {
+      if (candidate->block_choice_start < scan_end) {
+        seed_scan_start = candidate->block_choice_start;
+      }
+      else {
+        seed_scan_start = scan_end;
+      }
+    }
+    else {
+      gif_state.reassembly_seed_scan_started = true;
+      gif_reassembly_store_state(candidate, &gif_state);
+    }
+
+    for (block_choice = seed_scan_start;
+         block_choice < scan_end;
+         ++block_choice) {
       if (apparent_block_in_blockvector(candidate->b, block_choice)) {
         continue;
       }
@@ -4905,6 +5625,32 @@ static inline int64_t gif_reassembly_get_block_choice(
       blockvector_remove_choice(candidate->b, slot, block_choice);
       return block_choice;
     }
+  }
+
+  if (block_choice < 0
+      && committed_blocks > 1
+      && (local_gap_start >= 0 || immediate_path_is_known_gap)
+      && previous_apparentblocknumber >= 0
+      && !gif_state.reassembly_return_pending
+      && gif_reassembly_committed_actual_gap_count(
+             candidate, blockvector_get_data_length(candidate->b))
+             >= GIF_REASSEMBLY_PHASE_MIN_PRIOR_GAPS) {
+    // After several discontinuities, a nearby block can preserve an LZW
+    // plateau while hiding a displaced continuation. Prefer a classified
+    // anchor only when a bounded phase probe also proves its return path.
+    anchor_resume_start = -1;
+    block_choice = gif_reassembly_phase_probe_choice(
+        candidate, slot, immediate_next, count,
+        previous_apparentblocknumber, &gif_state, &anchor_resume_start, true);
+    if (block_choice >= 0) {
+      if (anchor_resume_start >= 0) {
+        candidate->block_choice_start = anchor_resume_start;
+      }
+      blockvector_remove_choice(candidate->b, slot, block_choice);
+      choice_removed = true;
+      goto done;
+    }
+    block_choice = -1;
   }
 
   if (immediate_next >= 0
@@ -4954,6 +5700,35 @@ static inline int64_t gif_reassembly_get_block_choice(
     }
   }
 
+  if (block_choice < 0
+      && immediate_next >= 0
+      && immediate_next < count
+      && committed_blocks > 1
+      && !gif_state.reassembly_return_pending
+      && !immediate_path_is_known_gap
+      && !apparent_block_in_blockvector(candidate->b, immediate_next)
+      && gif_reassembly_get_phase_hint(candidate, &gif_state,
+                                       &phase_offset, &phase_threshold)
+      && (candidate->block_choice_start != immediate_next
+          || !gif_reassembly_block_matches_phase_probe_hint(
+                 immediate_next, phase_offset, phase_threshold))) {
+    // Resolve an unexplained discontinuity before a plausible local path can
+    // hide it, including when an earlier gap has already been committed.
+    anchor_resume_start = -1;
+    block_choice = gif_reassembly_phase_probe_choice(
+        candidate, slot, immediate_next, count,
+        previous_apparentblocknumber, &gif_state, &anchor_resume_start, true);
+    if (block_choice >= 0) {
+      if (anchor_resume_start >= 0) {
+        candidate->block_choice_start = anchor_resume_start;
+      }
+      blockvector_remove_choice(candidate->b, slot, block_choice);
+      choice_removed = true;
+      goto done;
+    }
+    block_choice = -1;
+  }
+
   full_scan_count = count;
   prestart_scan_active =
       prestart_gap_start >= 0
@@ -4970,6 +5745,7 @@ static inline int64_t gif_reassembly_get_block_choice(
              >= previous_apparentblocknumber + 1
                   + GIF_REASSEMBLY_GAP_SCAN_WINDOW) {
     gif_state.reassembly_return_deferred = false;
+    gif_state.reassembly_return_chain_blocks = 0;
     gif_reassembly_store_state(candidate, &gif_state);
     candidate->block_choice_start = gif_state.reassembly_return_start;
   }
@@ -5031,7 +5807,8 @@ static inline int64_t gif_reassembly_get_block_choice(
       anchor_resume_start = -1;
       block_choice = gif_reassembly_phase_probe_choice(
           candidate, slot, candidate->block_choice_start, full_scan_count,
-          previous_apparentblocknumber, &gif_state, &anchor_resume_start);
+          previous_apparentblocknumber, &gif_state, &anchor_resume_start,
+          false);
       if (block_choice >= 0) {
         if (anchor_resume_start >= 0) {
           candidate->block_choice_start = anchor_resume_start;
@@ -5150,8 +5927,14 @@ static inline int64_t gif_reassembly_get_block_choice(
     int64_t offset;
 
     if (gif_state.reassembly_return_actual_valid) {
-      int64_t current_actual = filemirror_actual_blocknumber(
-          scalpel_state.filemirror, candidate->block_choice_start);
+      int64_t current_actual;
+      int64_t normalized_start =
+          candidate->block_choice_start % full_scan_count;
+      if (normalized_start < 0) {
+        normalized_start += full_scan_count;
+      }
+      current_actual = filemirror_actual_blocknumber(
+          scalpel_state.filemirror, normalized_start);
       offset = current_actual - gif_state.reassembly_return_actual;
     }
     else {
@@ -5182,7 +5965,7 @@ static inline int64_t gif_reassembly_get_block_choice(
     anchor_resume_start = -1;
     block_choice = gif_reassembly_phase_probe_choice(
         candidate, slot, candidate->block_choice_start, full_scan_count,
-        previous_apparentblocknumber, &gif_state, &anchor_resume_start);
+        previous_apparentblocknumber, &gif_state, &anchor_resume_start, false);
     if (block_choice >= 0) {
       if (anchor_resume_start >= 0) {
         candidate->block_choice_start = anchor_resume_start;
@@ -5344,6 +6127,7 @@ restart_scan:
         && gif_state.reassembly_return_deferred
         && gif_state.reassembly_return_start >= 0) {
       gif_state.reassembly_return_deferred = false;
+      gif_state.reassembly_return_chain_blocks = 0;
       gif_reassembly_store_state(candidate, &gif_state);
       candidate->block_choice_start = gif_state.reassembly_return_start;
       local_forward_phase = false;
@@ -5381,7 +6165,8 @@ restart_scan:
       anchor_resume_start = -1;
       block_choice = gif_reassembly_phase_probe_choice(
           candidate, slot, local_forward_end, full_scan_count,
-          previous_apparentblocknumber, &gif_state, &anchor_resume_start);
+          previous_apparentblocknumber, &gif_state, &anchor_resume_start,
+          false);
     }
 
     if (block_choice < 0) {
@@ -5524,8 +6309,59 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
     int64_t start_apparentblocknumber = -1;
     uint64_t trusted_plateau_blocks = 0;
     int64_t saved_return_start = -1;
+    uint32_t remaining_chain_blocks = 0;
+    uint32_t remaining_return_blocks = 0;
+    bool advanced_confirmed_chain = false;
+    bool completed_confirmed_chain = false;
+    bool advanced_confirmed_return = false;
+    bool returned_to_displacement_source = false;
 
     gif_reassembly_load_state(candidate, &gif_state);
+    remaining_chain_blocks =
+        gif_reassembly_proven_chain_blocks(&gif_state);
+    remaining_return_blocks =
+        gif_reassembly_proven_return_blocks(&gif_state);
+    if (gif_state.reassembly_return_pending
+        && remaining_chain_blocks > 0
+        && current_apparent != gif_state.reassembly_return_start) {
+      remaining_chain_blocks--;
+      advanced_confirmed_chain = true;
+      if (remaining_chain_blocks == 0) {
+        gif_state.reassembly_return_deferred = false;
+        completed_confirmed_chain = true;
+        candidate->block_choice_start = gif_state.reassembly_return_start;
+        if (remaining_return_blocks == 0) {
+          gif_reassembly_clear_return_start(&gif_state);
+        }
+      }
+      else {
+        gif_state.reassembly_return_deferred = true;
+        candidate->block_choice_start = current_apparent + 1;
+      }
+      gif_reassembly_set_return_proof(&gif_state,
+                                      remaining_chain_blocks,
+                                      remaining_return_blocks);
+    }
+    if (gif_state.reassembly_return_pending
+        && !advanced_confirmed_chain
+        && !gif_state.reassembly_return_deferred
+        && remaining_chain_blocks == 0
+        && remaining_return_blocks > 0
+        && current_apparent == gif_state.reassembly_return_start) {
+      remaining_return_blocks--;
+
+      if (remaining_return_blocks > 0) {
+        gif_reassembly_set_return_start(&gif_state,
+                                        current_apparent + 1, false);
+        gif_reassembly_set_return_proof(&gif_state, 0,
+                                        remaining_return_blocks);
+        candidate->block_choice_start = gif_state.reassembly_return_start;
+      }
+      else {
+        gif_reassembly_clear_return_start(&gif_state);
+      }
+      advanced_confirmed_return = true;
+    }
     saved_return_start = gif_state.reassembly_return_start;
     if (scalpel_state.blocksize > 0) {
       start_apparentblocknumber =
@@ -5535,13 +6371,76 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
               candidate, blockvector_get_data_length(candidate->b));
     }
 
+    // A validated jump back to the source position after a contiguous
+    // displaced run is a return, not the beginning of another gap.
     if (!gif_state.reassembly_return_pending
+        && current_apparent > previous_apparent + GIF_REASSEMBLY_LOCAL_DISTANCE_MAX) {
+      uint64_t committed_blocks = blockvector_get_num_blocks(candidate->b);
+
+      if (committed_blocks >= 3) {
+        uint64_t displaced_end = committed_blocks - 2;
+        uint64_t displaced_start = displaced_end;
+
+        while (displaced_start > 0) {
+          int64_t run_current = blockvector_get_apparent_blocknumber(
+              candidate->b, displaced_start);
+          int64_t run_previous = blockvector_get_apparent_blocknumber(
+              candidate->b, displaced_start - 1);
+
+          if (run_current < 0 || run_previous < 0
+              || run_current != run_previous + 1) {
+            break;
+          }
+          displaced_start--;
+        }
+
+        if (displaced_start > 0) {
+          int64_t displaced_first = blockvector_get_apparent_blocknumber(
+              candidate->b, displaced_start);
+          int64_t source_anchor = blockvector_get_apparent_blocknumber(
+              candidate->b, displaced_start - 1);
+          uint64_t displaced_blocks =
+              displaced_end - displaced_start + 1;
+
+          if (displaced_first >= 0 && source_anchor >= 0
+              && displaced_first < source_anchor
+              && displaced_blocks < (uint64_t)INT64_MAX
+              && (uint64_t)source_anchor
+                     <= (uint64_t)INT64_MAX - displaced_blocks - 1
+              && current_apparent
+                     == source_anchor + (int64_t)displaced_blocks + 1) {
+            uint32_t completion_blocks = 0;
+
+            returned_to_displacement_source = true;
+            if (current_apparent < INT64_MAX
+                && (uint64_t)current_apparent + 1 < apparent_blocks) {
+              // A source rejoin can land inside compressed image data where
+              // individual blocks expose no new structural checkpoint. Prove
+              // a bounded adjacent completion before carrying that plateau.
+              completion_blocks = gif_reassembly_probe_adjacent_completion(
+                  candidate, &gif_state, current_apparent + 1);
+              gif_reassembly_set_return_start(&gif_state,
+                                              current_apparent + 1, false);
+              gif_reassembly_set_return_proof(
+                  &gif_state, 0,
+                  completion_blocks > 0
+                      ? completion_blocks
+                      : GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS);
+              candidate->block_choice_start = current_apparent + 1;
+            }
+          }
+        }
+      }
+    }
+
+    if (!advanced_confirmed_return
+        && !gif_state.reassembly_return_pending
+        && !returned_to_displacement_source
         && previous_apparent >= 0
         && current_apparent > previous_apparent + GIF_REASSEMBLY_LOCAL_DISTANCE_MAX
         && previous_apparent + 1 < (int64_t)apparent_blocks) {
-      gif_reassembly_set_return_start_near_actual(candidate, &gif_state,
-                                                  previous_apparent + 1,
-                                                  previous_actual, true);
+      gif_reassembly_set_return_start(&gif_state, previous_apparent + 1,
+                                      true);
       saved_return_start = gif_state.reassembly_return_start;
     }
 
@@ -5583,7 +6482,11 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
       gif_state.reassembly_trusted_plateau_blocks = 0;
     }
 
-    if (gif_state.reassembly_trusted_plateau_blocks > 0
+    if (advanced_confirmed_return) {
+      // The exact return sequence and its length were established by the
+      // bounded phase probe; its cursor was advanced above.
+    }
+    else if (gif_state.reassembly_trusted_plateau_blocks > 0
         && saved_return_start >= 0
         && previous_apparent >= saved_return_start
         && current_apparent >= saved_return_start
@@ -5641,6 +6544,8 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
           previous_actual, true);
     }
     else if (gif_state.reassembly_return_pending
+             && !completed_confirmed_chain
+             && !returned_to_displacement_source
              && current_apparent >= 0
              && previous_apparent >= 0
              && current_apparent > previous_apparent
@@ -5652,13 +6557,18 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
               % (int64_t)apparent_blocks,
           false);
       gif_state.reassembly_return_deferred = false;
+      gif_state.reassembly_return_chain_blocks = 0;
     }
 
     gif_state.reassembly_prefix_anchor_trials = 0;
     gif_state.reassembly_actual_backscan_active = false;
     gif_state.reassembly_actual_backscan_anchor = -1;
     gif_state.reassembly_actual_backscan_next = -1;
-    gif_reassembly_clear_scan_cursor(&gif_state);
+    if (!gif_state.reassembly_scan_cursor_valid
+        || gif_state.reassembly_scan_cursor_length
+               < blockvector_get_data_length(candidate->b)) {
+      gif_reassembly_clear_scan_cursor(&gif_state);
+    }
     gif_state.reassembly_completion_probe_exhausted = false;
     gif_state.reassembly_completion_probe_exhausted_length = 0;
     gif_reassembly_clear_actual_run_rescue(&gif_state);
@@ -5669,7 +6579,8 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
               " prev_app=%" PRId64 " cur_app=%" PRId64
               " prev_actual=%" PRId64
               " return_pending=%d return_deferred=%d"
-              " return_start=%" PRId64 " return_actual=%" PRId64 "\n",
+              " return_start=%" PRId64 " return_actual=%" PRId64
+              " source_return=%d\n",
               blockvector_get_actual_blocknumber(candidate->b, 0),
               previous_apparent, current_apparent, previous_actual,
               gif_state.reassembly_return_pending ? 1 : 0,
@@ -5677,7 +6588,8 @@ static inline void gif_reassembly_extension_successful(CarveInfo *candidate) {
               gif_state.reassembly_return_start,
               gif_state.reassembly_return_actual_valid
                   ? gif_state.reassembly_return_actual
-                  : -1);
+                  : -1,
+              returned_to_displacement_source ? 1 : 0);
     }
 
     gif_reassembly_store_state(candidate, &gif_state);
@@ -5727,12 +6639,17 @@ static inline void gif_reassembly_checkpoint_flush(CarveInfo *candidate) {
       && saved_best_reaches_materialized
       && (!preserve_frontier || speculative_best_beyond_materialized);
   bool keep_prestart_plateau = false;
+  bool saved_scan_cursor_for_original = false;
   uint64_t saved_trusted_plateau_allowance = 0;
   uint32_t saved_checkpoint_plateau_blocks = 0;
   GIFCarveState cold_state = {0};
   GIFCarveState saved_state = {0};
 
   gif_reassembly_load_state(candidate, &saved_state);
+  saved_scan_cursor_for_original =
+      saved_state.reassembly_scan_cursor_valid
+      && saved_state.reassembly_scan_cursor >= 0
+      && saved_state.reassembly_scan_cursor_length == original_length;
   if (gif_reassembly_debug_candidate(candidate)) {
     fprintf(stderr,
             "[gifdbg] ckpt-enter start=%" PRId64
@@ -5901,14 +6818,33 @@ static inline void gif_reassembly_checkpoint_flush(CarveInfo *candidate) {
   if (preserve_scan_slot
       && saved_block_choice_start >= 0
       && blockvector_get_data_length(candidate->b) == original_length) {
-    gif_reassembly_set_scan_cursor(&saved_state, saved_block_choice_start,
-                                   original_length);
+    if (!saved_scan_cursor_for_original) {
+      gif_reassembly_set_scan_cursor(&saved_state, saved_block_choice_start,
+                                     original_length);
+    }
   }
-  else {
+  else if (!saved_scan_cursor_for_original) {
     gif_reassembly_clear_scan_cursor(&saved_state);
   }
 
-  gif_reassembly_copy_runtime_fields(&cold_state, &saved_state);
+  if (blockvector_get_data_length(candidate->b) == original_length) {
+    gif_reassembly_copy_runtime_fields(&cold_state, &saved_state);
+  }
+  else if (saved_state.reassembly_scan_cursor_valid
+           && saved_state.reassembly_scan_cursor_length
+                  > blockvector_get_data_length(candidate->b)) {
+    // A cold-safe prefix must rebuild length-dependent return and probe
+    // state. The deferred cursor remains valid for the later scan position
+    // because it is also tied to the original candidate length.
+    cold_state.reassembly_scan_cursor_valid = true;
+    cold_state.reassembly_scan_cursor = saved_state.reassembly_scan_cursor;
+    cold_state.reassembly_scan_cursor_actual_valid =
+        saved_state.reassembly_scan_cursor_actual_valid;
+    cold_state.reassembly_scan_cursor_actual =
+        saved_state.reassembly_scan_cursor_actual;
+    cold_state.reassembly_scan_cursor_length =
+        saved_state.reassembly_scan_cursor_length;
+  }
   cold_state.reassembly_preserved_frontier = preserve_frontier;
   gif_reassembly_store_state(candidate, &cold_state);
 
@@ -6006,10 +6942,15 @@ static inline void gif_reassembly_did_not_validate(
   bool current_is_local_gap = false;
   bool current_is_prestart_gap = false;
   bool current_is_local_forward = false;
+  bool current_is_phase_aligned_adjacent = false;
+  bool current_is_confirmed_path = false;
+  bool has_committed_actual_gap = false;
   bool trial_preserves_length = false;
   uint64_t committed_prestart_tail_blocks = 0;
   uint64_t committed_blocks = 0;
   uint64_t trusted_plateau_blocks = 0;
+  uint32_t proven_chain_blocks = 0;
+  uint32_t proven_return_blocks = 0;
   uint64_t prestart_accept_allowance =
       (uint64_t)scalpel_state.blocksize + GIF_REASSEMBLY_VALIDATE_SLACK;
   GIFCarveState gif_state = {0};
@@ -6032,6 +6973,10 @@ static inline void gif_reassembly_did_not_validate(
         gif_reassembly_committed_prestart_tail_blocks(candidate, oldlength);
   }
   gif_reassembly_load_state(candidate, &gif_state);
+  has_committed_actual_gap =
+      gif_reassembly_committed_actual_gap_count(candidate, oldlength) > 0;
+  proven_chain_blocks = gif_reassembly_proven_chain_blocks(&gif_state);
+  proven_return_blocks = gif_reassembly_proven_return_blocks(&gif_state);
   gif_reassembly_capture_score_from_state(base_state, &base_score);
   trusted_plateau_blocks = committed_prestart_tail_blocks;
   if (gif_state.reassembly_trusted_plateau_blocks > trusted_plateau_blocks) {
@@ -6054,6 +6999,35 @@ static inline void gif_reassembly_did_not_validate(
       previous_apparentblocknumber >= 0
       && gif_reassembly_local_forward_choice(previous_apparentblocknumber,
                                              current_apparentblocknumber);
+  current_is_phase_aligned_adjacent =
+      previous_apparentblocknumber >= 0
+      && current_apparentblocknumber == previous_apparentblocknumber + 1
+      && gif_state.reassembly_phase_hint_valid
+      && gif_state.reassembly_phase_hint_length == oldlength
+      && gif_reassembly_block_matches_phase_probe_hint(
+             current_apparentblocknumber,
+             gif_state.reassembly_phase_hint_offset,
+             gif_state.reassembly_phase_hint_threshold);
+  if (gif_state.reassembly_return_pending
+      && (proven_chain_blocks > 0 || proven_return_blocks > 0)) {
+    int64_t next_choice = current_apparentblocknumber + 1;
+    int64_t apparent_blocks =
+        (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
+
+    if (apparent_blocks > 0 && next_choice >= apparent_blocks) {
+      next_choice %= apparent_blocks;
+    }
+    if (proven_chain_blocks > 0) {
+      current_is_confirmed_path =
+          current_apparentblocknumber != gif_state.reassembly_return_start
+          && candidate->block_choice_start == next_choice;
+    }
+    else if (!gif_state.reassembly_return_deferred
+             && proven_return_blocks > 0) {
+      current_is_confirmed_path =
+          current_apparentblocknumber == gif_state.reassembly_return_start;
+    }
+  }
   prestart_accept_allowance +=
       trusted_plateau_blocks * (uint64_t)scalpel_state.blocksize;
   locality_anchor = gif_reassembly_effective_locality_anchor(
@@ -6097,12 +7071,60 @@ static inline void gif_reassembly_did_not_validate(
       || trial_advanced_bytes
       || gif_reassembly_score_advanced(&trial_summary->score, &base_score);
 
+  if (current_is_confirmed_path) {
+    // The bounded phase probe has already validated this displaced block and
+    // its return sequence together. Commit each proven block only while the
+    // standalone trial remains promising and structurally nonregressing.
+    if (no_best_yet
+        && trial_summary->promising
+        && trial_preserves_length
+        && gif_reassembly_score_not_regressed(&trial_summary->score,
+                                              &base_score)) {
+      candidate->best_validates_to =
+          gif_reassembly_preserve_committed_best(candidate,
+                                                 trial_summary->validates_to);
+      candidate->newblock = current_actualblocknumber;
+      *best_summary = *trial_summary;
+      if (trial_state) {
+        *best_state = *trial_state;
+        *best_state_valid = true;
+      }
+      *stop_scanning_out = true;
+      return;
+    }
+
+    gif_reassembly_clear_return_start(&gif_state);
+    gif_reassembly_store_state(candidate, &gif_state);
+  }
+
   if (current_is_local_forward
       && gif_state.reassembly_return_pending
       && gif_state.reassembly_return_deferred
       && gif_state.reassembly_return_start >= 0
       && !trial_advanced_bytes) {
+    // A deep probe has already confirmed this displaced run and its return.
+    // Preserve the expected adjacent chain block when it introduces no
+    // structural regression, even if it ends inside a semantic plateau.
+    if (no_best_yet
+        && proven_chain_blocks > 0
+        && trial_preserves_length
+        && gif_reassembly_score_not_regressed(&trial_summary->score,
+                                              &base_score)) {
+      candidate->best_validates_to =
+          gif_reassembly_preserve_committed_best(candidate,
+                                                 trial_summary->validates_to);
+      candidate->newblock = current_actualblocknumber;
+      *best_summary = *trial_summary;
+      if (trial_state) {
+        *best_state = *trial_state;
+        *best_state_valid = true;
+      }
+      *stop_scanning_out = true;
+      return;
+    }
+
     gif_state.reassembly_return_deferred = false;
+    gif_state.reassembly_return_chain_blocks = 0;
     gif_reassembly_store_state(candidate, &gif_state);
     candidate->block_choice_start = gif_state.reassembly_return_start;
     return;
@@ -6142,6 +7164,59 @@ static inline void gif_reassembly_did_not_validate(
                                       trial_summary, base_state);
     *stop_scanning_out = true;
     return;
+  }
+
+  if (no_best_yet
+      && current_is_seed_forward
+      && trial_state
+      && base_state
+      && trial_preserves_length
+      && !trial_advanced_bytes
+      && gif_reassembly_score_not_regressed(&trial_summary->score,
+                                            &base_score)) {
+    GIFValidationSummary seed_path_summary = {0};
+    uint32_t seed_chain_blocks = 0;
+    uint32_t seed_return_blocks = 0;
+    int64_t seed_return_start = -1;
+    bool seed_path_proven = gif_reassembly_probe_nonlocal_return(
+        id, candidate, oldlength, base_state, current_actualblocknumber,
+        previous_apparentblocknumber, GIF_REASSEMBLY_GAP_SCAN_WINDOW,
+        false, false, GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS,
+        &seed_path_summary,
+        &seed_chain_blocks, &seed_return_blocks, &seed_return_start);
+
+    if (gif_reassembly_checkpoint_requested()) {
+      gif_reassembly_interrupt_scan(stop_scanning_out,
+                                    checkpoint_interrupted_out);
+      return;
+    }
+
+    // A seed block may end inside a long compressed-data plateau. Commit it
+    // only when a bounded scan also proves the later return path and advances
+    // structural evidence beyond the one-block trial.
+    if (seed_path_proven
+        && seed_return_start >= 0
+        && seed_return_blocks > 0
+        && (seed_path_summary.validates
+            || seed_return_blocks == GIF_REASSEMBLY_RETURN_CONFIRM_BLOCKS)
+        && gif_reassembly_compare_probe_summary(&seed_path_summary,
+                                                trial_summary) > 0
+        && gif_reassembly_score_advanced(&seed_path_summary.score,
+                                         &base_score)) {
+      candidate->best_validates_to =
+          gif_reassembly_preserve_committed_best(candidate,
+                                                 trial_summary->validates_to);
+      candidate->newblock = current_actualblocknumber;
+      *best_summary = *trial_summary;
+      *best_state = *trial_state;
+      gif_reassembly_set_return_start(best_state, seed_return_start,
+                                      seed_chain_blocks > 1);
+      gif_reassembly_set_return_proof(best_state, seed_chain_blocks,
+                                      seed_return_blocks);
+      *best_state_valid = true;
+      *stop_scanning_out = true;
+      return;
+    }
   }
 
   if (no_best_yet
@@ -6257,6 +7332,29 @@ static inline void gif_reassembly_did_not_validate(
       && current_apparentblocknumber == start_apparentblocknumber - 1) {
     gif_state.reassembly_prestart_exhausted = true;
     gif_reassembly_store_state(candidate, &gif_state);
+  }
+
+  // Keep phase-aligned blocks serialized until a physical gap establishes a
+  // fragmented path. After that gap, accept byte-level progress here, but let
+  // the block selector compare semantic plateaus with displaced alternatives.
+  if (no_best_yet
+      && current_is_phase_aligned_adjacent
+      && trial_preserves_length
+      && (trial_advanced_bytes || !has_committed_actual_gap)
+      && !gif_state.reassembly_return_pending
+      && gif_reassembly_score_not_regressed(&trial_summary->score,
+                                            &base_score)) {
+    candidate->best_validates_to =
+        gif_reassembly_preserve_committed_best(candidate,
+                                               trial_summary->validates_to);
+    candidate->newblock = current_actualblocknumber;
+    *best_summary = *trial_summary;
+    if (trial_state) {
+      *best_state = *trial_state;
+      *best_state_valid = true;
+    }
+    *stop_scanning_out = true;
+    return;
   }
 
   if (no_best_yet
@@ -6784,6 +7882,7 @@ static inline void gif_reassembly_did_not_validate(
     bool best_is_strong = false;
     bool preserve_local_tie = false;
     bool prefer_local_current_tie = false;
+    bool compare_full_block_followon = false;
     int locality_cmp = 0;
 
     if (gif_reassembly_checkpoint_requested()) {
@@ -6810,6 +7909,20 @@ static inline void gif_reassembly_did_not_validate(
     }
     semantic_cmp = gif_reassembly_compare_score(&trial_summary->score,
                                                 &best_probe.score);
+
+    // When nonlocal choices consume the same full block, compare their
+    // bounded continuations before trusting shallow semantic differences.
+    compare_full_block_followon =
+        !near_tie
+        && defer_distance
+        && !trial_summary->validates
+        && !best_probe.validates
+        && trial_summary->validates_to == best_probe.validates_to
+        && trial_summary->validates_to >= oldlength
+        && trial_summary->validates_to - oldlength + 1
+               + GIF_REASSEMBLY_VALIDATE_SLACK
+               >= (uint64_t)scalpel_state.blocksize;
+
     if (previous_apparentblocknumber >= 0) {
       locality_cmp = gif_reassembly_compare_locality(
           locality_anchor, current_apparentblocknumber,
@@ -6923,7 +8036,8 @@ static inline void gif_reassembly_did_not_validate(
       cmp = gif_reassembly_compare_probe_summary(&current_lookahead,
                                                  &best_lookahead);
     }
-    if (cmp == 0 && defer_distance && ! small_gap_semantic_tie
+    if ((cmp == 0 || compare_full_block_followon)
+        && defer_distance && ! small_gap_semantic_tie
         && ! preserve_local_tie) {
       bool current_has_followon =
           gif_reassembly_probe_nonlocal_potential(
@@ -7413,14 +8527,10 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
             || gif_reassembly_choice_in_return_window(&base_state,
                                                       block_choice);
 
-        // OPUS47/G8: require BOTH score_advanced AND local_forward_choice
-        // before accepting a validates=true trial. Previously either one
-        // alone was enough, which let trials accept on score advancement
-        // without a sensibly local block choice (or vice versa), inflating
-        // committed frontiers off of coincidental trailer hits in wrong
-        // data. A recorded return-window choice is also sensible after a
-        // proven backward island, so do not force those terminal jumps to
-        // masquerade as local forward extensions.
+        // Weak validation must improve structural evidence and use either a
+        // physically local continuation or a confirmed return window. This
+        // prevents coincidental trailers in unrelated data from advancing the
+        // committed frontier.
         if (! weak_validation
             && (! gif_reassembly_score_advanced(&trial_summary.score,
                                                 &base_score)
@@ -7659,6 +8769,7 @@ static inline void gif_reassembly(ThreadWork *work, CarveInfo **c,
         blockvector_set_apparent_blocknumber(
             candidate->b, blockvector_get_num_blocks(candidate->b) - 1,
             block_choice);
+        blockvector_set_data_length_to_mapped_extent(candidate->b);
         inflate_blockvector(candidate->b);
         if (committed_length < blockvector_get_data_length(candidate->b)) {
           gif_reassembly_load_state_raw(candidate, &backtrack_state);
@@ -7758,7 +8869,6 @@ static inline int gif_lzw_decode_code(GIFLZWState *s, uint16_t code) {
     if (s->prev_code == UINT16_MAX || s->prev_code >= GIF_LZW_MAX_CODES) {
       return -1;
     }
-    // FIX 8: O(1) first-character lookup via cache (was O(chain_length) walk)
     s->out_stack[s->out_stack_top++] = s->first_char[s->prev_code];
     // Then push prev_code's full string
     code = s->prev_code;
@@ -7831,7 +8941,7 @@ static inline int64_t gif_lzw_decode_row(GIFLZWState *s,
         && npix > 0) {
       s->prefix[s->next_code] = s->prev_code;
       s->suffix[s->next_code] = s->out_stack[npix - 1];
-      s->first_char[s->next_code] = s->first_char[s->prev_code];  // FIX 8
+      s->first_char[s->next_code] = s->first_char[s->prev_code];
       s->next_code++;
 
       // Increase code size when table grows past current capacity
@@ -7846,10 +8956,8 @@ static inline int64_t gif_lzw_decode_row(GIFLZWState *s,
     // If we fill the row before exhausting the stack, the remaining
     // pixels stay in out_stack (with out_stack_top tracking how many
     // are left) for the next row call.
-    // FIX 1: Pre-clear out_stack_top before the emit loop. If the else
-    // branch fires (row fills mid-code), it overrides with the correct
-    // leftover count. Previously, an unconditional clear AFTER the loop
-    // inside the pixels_out >= img_width check destroyed saved leftovers.
+    // Clear the stack before emitting. If the row fills mid-code, preserve the
+    // remaining pixels for the next row.
     s->out_stack_top = 0;
     for (int i = npix - 1; i >= 0; i--) {
       if (pixels_out < img_width) {
@@ -7878,6 +8986,7 @@ static inline void gif_finish_tail_probe(GIFLZWState *orig,
   uint64_t tail_start = mem.curpos;
   uint32_t nonclear_codes = 0;
   bool saw_eoi = s.saw_eoi;
+  bool reached_subblock_terminator = false;
   uint32_t guard = 0;
 
   if (s.out_stack_top > 0) {
@@ -7886,8 +8995,13 @@ static inline void gif_finish_tail_probe(GIFLZWState *orig,
   }
 
   while (!saw_eoi && mem.curpos < mem.length) {
+    uint64_t read_start = mem.curpos;
     int32_t code = gif_lzw_read_code(&s, &mem);
     if (code < 0) {
+      // A zero-length sub-block ends the compressed stream. The code reader
+      // consumes that byte, so no further sub-block walk is necessary.
+      reached_subblock_terminator =
+          mem.curpos == read_start + 1 && mem.data[read_start] == 0;
       break;
     }
     if ((uint16_t)code == s.clear_code) {
@@ -7908,7 +9022,7 @@ static inline void gif_finish_tail_probe(GIFLZWState *orig,
           && npix > 0) {
         s.prefix[s.next_code] = s.prev_code;
         s.suffix[s.next_code] = s.out_stack[npix - 1];
-        s.first_char[s.next_code] = s.first_char[s.prev_code];  // FIX 8
+        s.first_char[s.next_code] = s.first_char[s.prev_code];
         s.next_code++;
         if (s.next_code >= (1u << s.code_size)
             && s.code_size < GIF_LZW_MAX_BITS) {
@@ -7919,25 +9033,26 @@ static inline void gif_finish_tail_probe(GIFLZWState *orig,
       s.out_stack_top = 0;
       nonclear_codes++;
     }
-    // FIX 4: Raised from *4 (16384) to *8 (32768). Covers edge case where
-    // many clear codes interleave with data codes in legitimate tails.
-    // *64 was proposed but rejected as excessive CPU cost on corrupt data.
+    // Permit clear codes interleaved with legitimate tail data while bounding
+    // work on corrupt input.
     if (++guard > GIF_LZW_MAX_CODES * 8) {
       break;
     }
   }
 
   s.sb_buf_pos = s.sb_buf_len;
-  while (mem.curpos < mem.length) {
-    uint8_t sb = mem.data[mem.curpos++];
-    if (sb == 0) {
-      break;
+  if (!reached_subblock_terminator) {
+    while (mem.curpos < mem.length) {
+      uint8_t sb = mem.data[mem.curpos++];
+      if (sb == 0) {
+        break;
+      }
+      if (mem.curpos + sb > mem.length) {
+        mem.curpos = mem.length;
+        break;
+      }
+      mem.curpos += sb;
     }
-    if (mem.curpos + sb > mem.length) {
-      mem.curpos = mem.length;
-      break;
-    }
-    mem.curpos += sb;
   }
 
   if (tail_bytes_out) {
@@ -8322,15 +9437,10 @@ static inline uint32_t gif_block_validate(char *data, uint64_t length, BlockVali
   // It does not attempt to identify which GIF file a block belongs to (same-phase blocks from
   // different GIF files will both pass).
   if (! header_anchor && structural_decision == BLOCK_CONFIDENCE_VALID && length >= 512) {
-    // OPUS47/G3,G4: derive the "full sub-block" threshold from what the
-    // encoder actually used, rather than hard-coding 250. The GIF spec
-    // allows any 1..255 byte sub-blocks. Real files vary, and a 250 cutoff
-    // demoted legitimate blocks whose encoder used smaller uniform sizes.
-    //
-    // Strategy: walk sub-blocks from offset 0 recording the largest length
-    // we see. The encoder's "full" size is near that maximum. Threshold at
-    // max - 4 gives a small tolerance for legal variation while rejecting
-    // random data (which has no uniform stride).
+    // Derive the full sub-block threshold from the encoder's observed maximum.
+    // GIF permits lengths from 1 through 255, so a fixed threshold would reject
+    // valid encoders that consistently use smaller sub-blocks. A tolerance of
+    // four bytes permits legal variation while retaining a useful stride test.
     uint64_t sb_base = UINT64_MAX;
     uint64_t sp = 0;
     uint8_t max_sb_len = 0;
@@ -8665,8 +9775,8 @@ static inline void gif_validate_core(char *data, uint64_t length,
         }
         if (sp >= length) { break; }
         sp++;  // skip LZW minimum code size byte
-        // OPUS47/G3,G4: derive full-sub-block threshold from observed max
-        // sub-block length in this frame, rather than a hard 250 cutoff.
+        // Derive this frame's full sub-block threshold from its observed
+        // maximum length.
         uint8_t frame_max_sb = 0;
         {
           uint64_t probe = sp;
@@ -8753,15 +9863,10 @@ static inline void gif_validate_core(char *data, uint64_t length,
             }
             walk += 1 + sb_len;
           }
-          // OPUS47/G12: if the walk reached a natural terminator (0x00 sub-block
-          // followed by a valid GIF marker) OR a natural short sub-block
-          // ending, the sub-block chain from scan_sb_base through frame_sb_end
-          // is structurally valid — the walk followed actual length bytes and
-          // reached a recognized end. The fixed-stride probe that used to run
-          // here produced false positives on valid files with non-uniform
-          // sub-block sizes (e.g. 253/254 alternating) because the predicted
-          // probe positions drift from the actual sub-block header positions
-          // over hundreds of strides. Skip probe when walk succeeded.
+          // A walk that reaches a natural terminator or short final sub-block
+          // has followed the actual length fields to a recognized frame end.
+          // Do not apply a fixed-stride probe in that case because legal,
+          // nonuniform sub-block sizes cause predicted positions to drift.
           bool walk_succeeded = natural_frame_end;
           // Check block boundaries within this frame's full-size region.
           // Use 8 probes at consecutive stride positions after each boundary.
@@ -8981,8 +10086,7 @@ static inline void gif_validate_core(char *data, uint64_t length,
       {
         uint64_t sp = image_data_start + 1;  // skip LZW minimum code size byte
         outer_sb_base = UINT64_MAX;
-        // OPUS47/G3: derive full-size threshold from the encoder's observed
-        // maximum rather than a fixed 250 cutoff.
+        // Derive the full-size threshold from the encoder's observed maximum.
         uint8_t outer_max_sb = 0;
         {
           uint64_t probe = sp;
@@ -9088,10 +10192,9 @@ static inline void gif_validate_core(char *data, uint64_t length,
       // without a stored previous row leaves it false for one row, skipping
       // a MAD comparison over bytes the earlier call already validated.
       bool mad_prev_seeded = false;
-      // OPUS47/G1,G2: frame-scope flag set by the tail probe when it
-      // confirms EOI termination. For no-MAD frames (interlaced, missing
-      // palette, small) this is the only integrity signal available — we
-      // refuse to advance reliable_pos past the frame otherwise.
+      // The tail probe sets this after confirming EOI termination. For frames
+      // without MAD evidence, this is the required integrity signal for
+      // advancing reliable_pos past the frame.
       bool frame_saw_eoi = false;
       if (!is_interlaced && ActiveColorMap && color_count > 0
           && img_width >= 8) {
@@ -9214,20 +10317,15 @@ static inline void gif_validate_core(char *data, uint64_t length,
                                 &finish_nonclear_codes,
                                 &finish_saw_eoi);
           if (finish_saw_eoi) {
-            frame_saw_eoi = true;  // OPUS47/G1,G2 anchor signal
+            frame_saw_eoi = true;
           }
           // No-EOI tails should be tiny and inert. Once compressed data keeps
           // going without ever reaching EOI, we are almost certainly decoding
           // through grafted data from a later file.
           //
-          // OPUS47/G13: original (tail>=128 OR codes>0) false-positive-tripped
-          // on valid animated GIFs whose LZW streams occasionally don't emit
-          // an explicit EOI before the sub-block terminator — the remaining
-          // bytes are just sub-block padding, not garbage, and produce large
-          // tails but zero non-clear codes. Relax to: trip only when we have
-          // BOTH a large tail AND at least one non-clear code, OR an absurdly
-          // large tail alone. True graft from a later file produces many
-          // non-clear codes as it keeps consuming data.
+          // Some valid streams reach the sub-block terminator without an
+          // explicit EOI and leave inert padding. Reject only when a large tail
+          // also contains non-clear codes, or when either signal is extreme.
           if (!finish_saw_eoi &&
               ((finish_tail_bytes >= 2048 && finish_nonclear_codes > 0)
                || finish_tail_bytes >= 8192
@@ -9239,9 +10337,8 @@ static inline void gif_validate_core(char *data, uint64_t length,
           // strong sign that we jumped into later compressed data. In sampled
           // ground-truth GIFs this tail stays tiny. Large tails are grafts.
           //
-          // OPUS47/G13: original (tail>=64 OR codes>8) was too aggressive.
-          // Relax: require large tail AND post-EOI codes together, or very
-          // large tail alone, or many post-EOI codes alone.
+          // After EOI, require a large tail and additional codes together, or
+          // an extreme value for either signal alone.
           if (finish_saw_eoi &&
               ((finish_tail_bytes >= 1024 && finish_nonclear_codes >= 4)
                || finish_tail_bytes >= 4096
@@ -9290,7 +10387,6 @@ static inline void gif_validate_core(char *data, uint64_t length,
         }
 
         uint64_t bytes_consumed = mem.curpos - pos_before;
-        // OPUS47/G9: replay_fastforward was dead (always false). Removed.
         if (in_replay && replay_checkpoint_curpos > 0
             && mem.curpos >= replay_checkpoint_curpos) {
           in_replay = false;
@@ -9333,14 +10429,9 @@ static inline void gif_validate_core(char *data, uint64_t length,
             }
             if (xf_samples > 4) {
               double xf_mad = xf_mad_sum / (double)xf_samples;
-              // OPUS47/G5: previously skipped cross-frame MAD entirely when
-              // either frame used a local color table, leaving inter-frame
-              // boundaries with LCTs unguarded. Now always check, but use a
-              // relaxed threshold when the palette may differ so legitimate
-              // per-frame-palette animations don't false-positive. Wrong
-              // data produces xf_mad typically in the thousands regardless
-              // of palette matching, so the relaxed threshold still catches
-              // the attack case.
+              // Local color tables can legitimately change the palette between
+              // frames, so use a relaxed cross-frame threshold when either
+              // frame has one.
               double xf_threshold =
                   (frame_lcmap || prev_frame_had_lcmap) ? 2000.0 : 700.0;
               if (xf_mad > xf_threshold) {
@@ -9419,13 +10510,9 @@ static inline void gif_validate_core(char *data, uint64_t length,
             // Adaptive threshold: use the running average as a baseline, with a
             // high floor to avoid false positives on high-contrast correct data.
             //
-            // OPUS47/G11: original (avg*3, floor 100, streak>=8) fired on
-            // legitimate animated-GIF frames with scene changes or high-
-            // contrast rows. Relax to (avg*5, floor 300, streak>=16) so
-            // single-row spikes don't trip and short high-contrast bursts
-            // don't either; genuinely wrong-block reassemblies produce
-            // sustained random-RGB streams with MAD an order of magnitude
-            // over these thresholds, so the relaxed gate still catches them.
+            // Use a generous adaptive threshold and require a sustained streak
+            // so scene changes and short high-contrast bursts do not look like
+            // wrong-block reassembly.
             double avg_mad = (mad_count > 0) ? running_mad_sum / (double)mad_count : 0.0;
             double threshold = avg_mad * 5.0;
             if (threshold < 300.0) {
@@ -9537,13 +10624,9 @@ static inline void gif_validate_core(char *data, uint64_t length,
       // from advancing past undetected wrong data that the LZW decoder
       // tolerated.
       //
-      // OPUS47/G1,G2: for no-MAD frames (interlaced, missing palette, too
-      // small) we only advance reliable_pos past the frame when the LZW
-      // decoder reached a clean EOI code. Without MAD there is no per-row
-      // pixel-level integrity check; bytes-per-row statistics alone allow
-      // wrong blocks to pass whenever their LZW output is "plausibly" sized.
-      // Requiring saw_eoi ensures at least that the stream structure
-      // terminated legitimately.
+      // For frames without MAD evidence, advance reliable_pos only after a
+      // clean EOI. Plausible consumption alone is not enough to establish that
+      // the compressed stream terminated legitimately.
       if (mad_active && last_good_mad_pos > reliable_pos) {
         reliable_pos = last_good_mad_pos;
         outer_last_good_mad_pos = last_good_mad_pos;
@@ -9635,12 +10718,9 @@ done:
       existing_ckpt = existing.checkpoint_curpos;
     }
 
-    // OPUS47/G10: only persist probe_* fields when this trial actually made
-    // forward progress past whatever was stored before. Saving probe info
-    // from a failed trial lets later probe consumers read numbers that
-    // describe nothing useful, and in pathological cases can regress an
-    // earlier valid probe. The canonical (non-probe) state save below still
-    // has its own ckpt_safe gate.
+    // Persist probe fields only after forward progress so a failed trial cannot
+    // replace stronger evidence. The canonical state save below has its own
+    // checkpoint-safety gate.
     if (reliable_pos > existing.probe_checkpoint_curpos
         || (ImageNum >= 0
             && (uint32_t)ImageNum > existing.probe_completed_frames)
@@ -9804,7 +10884,7 @@ done:
             ? best_anchor_blk_end : cur_limit;
       }
       else {
-        *validates_to = mem.curpos - 1;
+        *validates_to = mem.curpos > 0 ? mem.curpos - 1 : 0;
       }
   }
   else if (mem.errpos > 0) {

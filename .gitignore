@@ -93,6 +93,13 @@ src/modblockmap
 src/scalpel3
 src/scalpel3-ctl
 src/hpcscalpel3
+src/diskviz
+src/dumpbt
+src/dumphf
+src/mergecps
+src/scalpel-output/
+src/SCALPEL3_DATA
+src/exe_vision/unix/elf_unet.onnx
 
 src/libbacktrace/
 
@@ -114,3 +121,22 @@ RARTEST/
 
 # 7Z development
 src/7zTest
+
+# Local development notes and ad hoc validator checks.
+__pycache__/
+/.scalpel3_onnx.conf
+/.aider.chat.history.md
+/src/.claude/
+/src/.claude-octopus/
+/src/.codex
+/CODE_REVIEW_2026-07.md
+/ELF_FRAGMENT_RECOVERY.md
+/LINUX_QUALIFICATION_PROMPT.md
+/MODICO_APPLE_GPU_EXPERIMENT.md
+/MODICO_APPLE_PERFORMANCE_QUESTION.md
+/MODICO_SUBSYSTEM.md
+/src/DEVELOPMENT_WORKLIST.md
+/src/*TODO.md
+/src/possible-png-pub.md
+/src/TESTS/check_mp3_headerless.py
+/src/TESTS/test_*.py

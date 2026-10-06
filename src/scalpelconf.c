@@ -1,35 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//-----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
-//
+
 // scalpel3 file type configuration and information file.
 //
 // This configuration file defines important information about specific file types that scalpel3
@@ -58,7 +52,7 @@
 // exe_vision/unix/class_names.json or be explicitly mapped to one in modico_classmap.c. The class
 // names file is model metadata; it is not the list of Scalpel file types. Do NOT add names to
 // class_names.json unless the MoDiCo model has been retrained/exported with the same class order.
-// For alternate Scalpel names that share an existing byte-level class (e.g., fzip uses zip), add an
+// For alternate Scalpel names that share an existing byte-level class, add an
 // alias in modico_classmap.c instead. If no mapping exists, Scalpel still works normally, but MoDiCo
 // will not populate block confidence values for that file type.
 //
@@ -109,7 +103,7 @@
 // stored.) A validator normally returns the same needleidx it was passed. However, if it recognizes
 // the block as a more specific SUBTYPE of its file type, it returns that subtype's needleidx and the
 // framework records the decision against the subtype rather than the base file type. For example,
-// csv_master_block_validate() creates a "csv-<N>col" subtype via add_file_subtype() and returns the
+// csv_master_block_validate() creates an "<N>-col.csv" subtype via add_file_subtype() and returns the
 // new subtype's needleidx.
 //
 // o BATCHEDBLOCKVALIDATOR is an alternative to BLOCKVALIDATOR and is MUTUALLY EXCLUSIVE with it (a
@@ -141,11 +135,26 @@
 // state with carving candidates (see below). See scalpel.h for a function prototype for
 // FILEVALIDATOR and then look at one of the established file types (e.g., "abc.h") for an example.
 //
+// o CANDIDATEVALIDATOR is optional. Leave it unset when FILEVALIDATOR provides the complete
+// decision. Define it when candidate processing additionally requires the block mapping or changes
+// to the candidate that FILEVALIDATOR cannot perform, such as assigning an output subtype or
+// preserving a partial recovery's mapping. See elf_candidate_validate_layout() for a mapping check.
+// The backend calls it after FILEVALIDATOR during contiguous validation and generic reassembly,
+// passing the current validates, validates_to and promising results, which it may revise.
+// validates_to is an inclusive byte offset, just as for FILEVALIDATOR. The candidate belongs to the
+// caller; the callback must not destroy it. Like FILEVALIDATOR, this function must be thread-safe
+// and keep persistent candidate state through the carve state API. A custom REASSEMBLYFUNC that
+// bypasses reassembly_check_validation() must apply the same candidate checks before accepting a
+// result. Checks performed only during reassembly do not protect contiguous validation.
+// This is not a checkpoint callback. Supporting fragmentation or checkpoints alone does not require
+// it, and saved validator state must still be reconciled with any candidate changes after a
+// blockmap update.
+//
 // o REASSEMBLYFUNC defines an optional custom reassembly function. The default (if unspecified) is
 // the generic LR_reassembly() function, which performs best-effort, left-to-right reassembly. This
 // function must be thread-safe. It must also be stateless, aside from the use of the API for
 // 'state' in carving candidates. If files associated with a file type cannot be generated in a
-// left-to-right fashion (e.g., ZIP files, which contain critial metata at the end of the file),
+// left-to-right fashion (e.g., ZIP files, which contain critical metadata at the end of the file),
 // then a custom reassembly function must be written. See LR_reassembly() in reassembly.c for
 // extensive documentation on this process.
 //
@@ -248,6 +257,8 @@
 //
 // void *block_get_state(void *hashkey);
 //
+// bool block_state_exists(void *hashkey);
+//
 // void block_put_state(void *hashkey, void *state);
 //
 // IMPORTANT:
@@ -263,6 +274,9 @@
 // ...modify state...
 // block_put_state(key, p);
 // your_free_function(p);
+//
+// When only presence matters, block_state_exists() avoids allocating a copy and does not transfer
+// ownership of any state to the caller.
 //
 // The copy of the state in the hash table is free automatically when the blocks are covered.
 //
@@ -363,10 +377,27 @@
 #include "abc.h"
 #include "csv.h"
 #include "elf.h"
-// #include "fzip.h"
+#include "exe.h"
+#include "avi.h"
+#include "mov.h"
+#include "asf.h"
+#include "flv.h"
+#include "mpeg.h"
+#include "mbox.h"
+#include "html.h"
+#include "text.h"
+#include "sqlite.h"
 #include "mp3.h"
 #include "zip.h"
-// #include "rar.h"
+#include "cfbf.h"
+#include "rtf.h"
+#include "tnef.h"
+#include "calendar.h"
+#include "biff.h"
+#include "onenote.h"
+#include "access.h"
+#include "pst.h"
+#include "rar.h"
 #include "123.h"
 #include "pdf.h"
 // #include "fpdf.h"
@@ -472,7 +503,8 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
 
     // CSV files
     //
-    // NOTES: SEARCHTYPE_BLOCK_ONLY is used and no attempt is made to reassemble identified blocks
+    // NOTES: SEARCHTYPE_BLOCK_ONLY is used. Blocks containing repeated records with a consistent
+    // dialect and field count are recovered individually; no attempt is made to reassemble them.
     //
     {
       .FILETYPE = "csv",
@@ -511,7 +543,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .MASTER = false,
       .CASESENSITIVE = true,
       .MINIMUMSIZE = 4096,
-      .MAXIMUMSIZE = 268435456,
+      .MAXIMUMSIZE = EXE_MAXIMUM_FILE_SIZE,
       .HEADER = {0},
       .HEADERFUNC = elf_header_discovery,
       .FOOTER = {0},
@@ -533,58 +565,712 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .REASSEMBLYFUNC = elf_reassembly
     },
 
-    // Unfragmented 32-bit ZIP files + modern Microsoft Office file formats (e.g., .docx, .pptx,
-    // etc.)
+    // Microsoft Portable Executable images, including executables, libraries,
+    // drivers, and managed assemblies.
+    //
+    {
+      .FILETYPE = "exe",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = 512,
+      .MAXIMUMSIZE = 268435456,
+      .HEADER = {0},
+      .HEADERFUNC = exe_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = NULL,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .FILEVALIDATOR = exe_file_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = exe_serialize_carve_state,
+      .CLONECARVESTATEFUNC = exe_clone_carve_state,
+      .FREECARVESTATEFUNC = exe_free_carve_state,
+      .PRINTCARVESTATEFUNC = exe_print_carve_state,
+      .REASSEMBLYFUNC = exe_reassembly
+    },
+
+    // Audio Video Interleave containers, including classic AVI and OpenDML AVI files.
+    //
+    {
+      .FILETYPE = "avi",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = AVI_RIFF_HEADER_SIZE + AVI_CHUNK_HEADER_SIZE,
+      .MAXIMUMSIZE = AVI_MAX_ARCHIVE_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = avi_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = avi_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = avi_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = avi_file_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = avi_serialize_carve_state,
+      .CLONECARVESTATEFUNC = avi_clone_carve_state,
+      .FREECARVESTATEFUNC = avi_free_carve_state,
+      .PRINTCARVESTATEFUNC = avi_print_carve_state,
+      .REASSEMBLYFUNC = avi_reassembly
+    },
+
+    // QuickTime containers, including MOV files without an ftyp box.
+    //
+    {
+      .FILETYPE = "mov",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = ISOBMFF_MINIMUM_SIZE,
+      .MAXIMUMSIZE = ISOBMFF_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = mov_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = isobmff_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = isobmff_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = mov_file_validate,
+      .CANDIDATEVALIDATOR = isobmff_candidate_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = isobmff_serialize_carve_state,
+      .CLONECARVESTATEFUNC = isobmff_clone_carve_state,
+      .FREECARVESTATEFUNC = isobmff_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = isobmff_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = isobmff_print_carve_state,
+      .REASSEMBLYFUNC = isobmff_reassembly
+    },
+
+    // ISO Base Media File Format containers, including MP4 and fragmented MP4.
+    //
+    {
+      .FILETYPE = "mp4",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = ISOBMFF_MINIMUM_SIZE,
+      .MAXIMUMSIZE = ISOBMFF_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = mp4_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = isobmff_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = isobmff_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = mp4_file_validate,
+      .CANDIDATEVALIDATOR = isobmff_candidate_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = isobmff_serialize_carve_state,
+      .CLONECARVESTATEFUNC = isobmff_clone_carve_state,
+      .FREECARVESTATEFUNC = isobmff_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = isobmff_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = isobmff_print_carve_state,
+      .REASSEMBLYFUNC = isobmff_reassembly
+    },
+
+    // Advanced Systems Format containers. ASF files containing a Windows
+    // Media video codec are assigned to the dormant wmv subtype after
+    // validation.
+    //
+    {
+      .FILETYPE = "asf",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = ASF_MINIMUM_SIZE,
+      .MAXIMUMSIZE = ASF_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = asf_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = NULL,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = asf_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = asf_file_validate,
+      .CANDIDATEVALIDATOR = asf_candidate_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = asf_serialize_carve_state,
+      .CLONECARVESTATEFUNC = asf_clone_carve_state,
+      .FREECARVESTATEFUNC = asf_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = asf_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = asf_print_carve_state,
+      .REASSEMBLYFUNC = asf_reassembly
+    },
+
+    {
+      .FILETYPE = "wmv",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = ASF_MINIMUM_SIZE,
+      .MAXIMUMSIZE = ASF_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = asf_no_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = NULL,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = NULL,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_DISABLED,
+      .FILEVALIDATOR = asf_file_validate,
+      .CANDIDATEVALIDATOR = asf_candidate_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = asf_serialize_carve_state,
+      .CLONECARVESTATEFUNC = asf_clone_carve_state,
+      .FREECARVESTATEFUNC = asf_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = asf_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = asf_print_carve_state,
+      .REASSEMBLYFUNC = asf_reassembly
+    },
+
+    // Flash Video containers.
+    //
+    {
+      .FILETYPE = "flv",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = FLV_MINIMUM_SIZE,
+      .MAXIMUMSIZE = FLV_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = flv_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = flv_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = flv_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = flv_file_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = flv_serialize_carve_state,
+      .CLONECARVESTATEFUNC = flv_clone_carve_state,
+      .FREECARVESTATEFUNC = flv_free_carve_state,
+      .PRINTCARVESTATEFUNC = flv_print_carve_state,
+      .REASSEMBLYFUNC = flv_reassembly
+    },
+
+    // MPEG program streams, transport streams, and elementary video streams.
+    //
+    {
+      .FILETYPE = "mpg",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = MPEG_MINIMUM_SIZE,
+      .MAXIMUMSIZE = MPEG_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = mpeg_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = mpeg_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = mpeg_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = mpeg_file_validate,
+      .CANDIDATEVALIDATOR = mpeg_candidate_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = mpeg_serialize_carve_state,
+      .CLONECARVESTATEFUNC = mpeg_clone_carve_state,
+      .FREECARVESTATEFUNC = mpeg_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = mpeg_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = mpeg_print_carve_state,
+      .REASSEMBLYFUNC = mpeg_reassembly
+    },
+
+    // RFC messages and Unix mbox streams.
+    //
+    {
+      .FILETYPE = "mbox",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = MBOX_MINIMUM_SIZE,
+      .MAXIMUMSIZE = MBOX_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = mbox_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = mbox_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = mbox_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = mbox_file_validate,
+      .CANDIDATEVALIDATOR = mbox_candidate_validate,
+      .REASSEMBLYFUNC = mbox_reassembly,
+      .SERIALIZECARVESTATEFUNC = mbox_serialize_carve_state,
+      .CLONECARVESTATEFUNC = mbox_clone_carve_state,
+      .FREECARVESTATEFUNC = mbox_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = mbox_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = mbox_print_carve_state,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false
+    },
+
+    // HTML documents, including legacy HTML and XHTML syntax.
+    //
+    {
+      .FILETYPE = "html",
+      .MASTER = false,
+      .CASESENSITIVE = false,
+      .MINIMUMSIZE = HTML_MINIMUM_SIZE,
+      .MAXIMUMSIZE = HTML_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = html_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = html_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = html_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = html_file_validate,
+      .CANDIDATEVALIDATOR = html_candidate_validate,
+      .REASSEMBLYFUNC = html_reassembly,
+      .SERIALIZECARVESTATEFUNC = html_serialize_carve_state,
+      .CLONECARVESTATEFUNC = html_clone_carve_state,
+      .FREECARVESTATEFUNC = html_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = html_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = html_print_carve_state,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false
+    },
+
+    // Strongly textual, block-aligned runs with a non-text terminal boundary.
+    // Plain text has no reliable intrinsic fragmentation evidence.
+    //
+    {
+      .FILETYPE = "txt",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = TEXT_MINIMUM_SIZE,
+      .MAXIMUMSIZE = TEXT_MAXIMUM_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = text_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = NULL,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = text_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = text_file_validate,
+      .REASSEMBLYFUNC = text_reassembly,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false
+    },
+
+    // SQLite 3 databases.
+    //
+    {
+      .FILETYPE = "sqlite",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = SQLITE_MINIMUM_PAGE_SIZE,
+      .MAXIMUMSIZE = UINT64_C(1099511627776),
+      .HEADER = {0},
+      .HEADERFUNC = sqlite_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = NULL,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = sqlite_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = sqlite_file_validate,
+      .PRIORITY = PRIORITY_HIGHEST,
+      .NO_DEFRAG = false,
+      .SERIALIZECARVESTATEFUNC = sqlite_serialize_carve_state,
+      .CLONECARVESTATEFUNC = sqlite_clone_carve_state,
+      .FREECARVESTATEFUNC = sqlite_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = sqlite_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = sqlite_print_carve_state,
+      .REASSEMBLYFUNC = sqlite_reassembly
+    },
+
+    // ZIP, ZIP64, and modern Microsoft Office package formats.
     //
     {
       .FILETYPE = "zip",
       .MASTER = false,
       .CASESENSITIVE = true,
-      .MINIMUMSIZE = 512,
-      .MAXIMUMSIZE = 500000000,
-      .HEADER = "|\x50\x4b\x03\x04|",
+      .MINIMUMSIZE = ZIP_LOCAL_HEADER_SIZE + ZIP_CENTRAL_HEADER_SIZE
+                     + ZIP_EOCD_SIZE,
+      .MAXIMUMSIZE = UINT64_C(1099511627776),
+      .HEADER = "/\x50\x4b\x03\x04|\x50\x4b\x30\x30\x50\x4b\x03\x04/",
       .HEADERFUNC = NULL,
       .FOOTER = {0},
-      .FOOTERFUNC = NULL,
+      .FOOTERFUNC = zip_footer_discovery,
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
-      .BLOCKVALIDATOR = zip_block_validate,
-      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
-      .FILEVALIDATOR = zip_file_validate,
-      .PRIORITY = PRIORITY_SIGMA,
-      .NO_DEFRAG = true},
+      .FILEVALIDATOR = zip_file_validate_seed,
+      .CANDIDATEVALIDATOR = cfbf_zip_candidate_validate,
+      .SERIALIZECARVESTATEFUNC = zip_serialize_carve_state,
+      .CLONECARVESTATEFUNC = zip_clone_carve_state,
+      .FREECARVESTATEFUNC = zip_free_carve_state,
+      .PRINTCARVESTATEFUNC = zip_print_carve_state,
+      .REASSEMBLYFUNC = zip_reassembly,
+      .PRIORITY = PRIORITY_SIGMA},
 
-    // Fragmented ZIP files
+    // RAR4 and RAR5 archives.
     //
-    // {
-    //   .FILETYPE = "fzip",
-    //   .MASTER = false,
-    //   .MINIMUMSIZE = 1024,
-    //   .MAXIMUMSIZE = 1000000000,
-    //   .HEADER = {0},
-    //   .FOOTER = "|somethingsomethingsomething|",
-    //   .FOOTERFUNC = NULL,
-    //   .BLOCKVALIDATOR = fzip_block_validate,
-    //   .SEARCHTYPE = SEARCHTYPE_BACKWARD,
-    //   .REASSEMBLYFUNC = fzip_reassembly,
-    //   .PRIORITY = PRIORITY_SIGMA,
-    // },
+    {
+      .FILETYPE = "rar",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = 20,
+      .MAXIMUMSIZE = UINT64_C(1099511627776),
+      .HEADER = "/\x52\x61\x72\x21\x1a\x07\\x{00}|\x52\x61\x72\x21\x1a\x07\x01\\x{00}/",
+      .FOOTER = "/\xc4\x3d\x7b\\x{00}\x40\x07\\x{00}|\x1d\x77\x56\x51\x03\x05\x04\\x{00}/",
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .FILEVALIDATOR = rar_file_validate,
+      .CANDIDATEVALIDATOR = rar_candidate_validate,
+      .SERIALIZECARVESTATEFUNC = rar_serialize_carve_state,
+      .CLONECARVESTATEFUNC = rar_clone_carve_state,
+      .FREECARVESTATEFUNC = rar_free_carve_state,
+      .PRINTCARVESTATEFUNC = rar_print_carve_state,
+      .REASSEMBLYFUNC = rar_reassembly,
+      .PRIORITY = PRIORITY_SIGMA,
+      .NO_DEFRAG = false},
 
-  //   {
-  //     .FILETYPE = "rar",
-  //     .MASTER = false,
-  //     .MINIMUMSIZE = 512,
-  //       .MAXIMUMSIZE = 500000000,
-  //       // RAR 5, RAR 4, Legacy RAR
-  //       .HEADER = "/\x52\x61\x72\x21\x1A\x07\x01\\x{00}|\x52\x61\x72\x21\x1A\x07\\x{00}|\x52\x45\x7E\x5E/",
-  //       .FOOTER = {0}, // Legacy RAR having no footer requires us to process footer discovery in the validators
-  //       // .FOOTER = "/\x1D\x77\x56\x51\x03\x05\x04\\x{00}|\xC4\x3D\x7B\\x{00}\x40\x07\\x{00}|\\x{00}/",
-  //       .SEARCHTYPE = SEARCHTYPE_FORWARD,
-  //       .BLOCKVALIDATOR = rar_block_validate,
-  //       .FILEVALIDATOR = rar_file_validate,
-  //       // .REASSEMBLYFUNC = LR_reassembly,
-	// .PRIORITY = PRIORITY_SIGMA,
-  //       .NO_DEFRAG = true,
-  //   },
+    // Microsoft Compound File Binary containers. The generic CFBF entry is
+    // the only entry that performs header discovery. Once a container fully
+    // validates, cfbf_candidate_classify() assigns it to one of the dormant
+    // semantic entries below without creating duplicate carving candidates.
+    //
+    {
+      .FILETYPE = "cfbf",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = 512,
+      .MAXIMUMSIZE = UINT64_C(4294967296),
+      .HEADER = "|\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1|",
+      .FOOTER = {0},
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .FILEVALIDATOR = cfbf_file_validate,
+      .CANDIDATEVALIDATOR = cfbf_candidate_classify,
+      .REASSEMBLYFUNC = cfbf_reassembly,
+      .SERIALIZECARVESTATEFUNC = cfbf_serialize_carve_state,
+      .CLONECARVESTATEFUNC = cfbf_clone_carve_state,
+      .FREECARVESTATEFUNC = cfbf_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = cfbf_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = cfbf_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+#define CFBF_SEMANTIC_SEARCH_SPEC(type_name)                    \
+    {                                                           \
+      .FILETYPE = type_name,                                    \
+      .MASTER = false,                                          \
+      .CASESENSITIVE = true,                                    \
+      .MINIMUMSIZE = 512,                                       \
+      .MAXIMUMSIZE = UINT64_C(4294967296),                      \
+      .HEADER = {0},                                            \
+      .HEADERFUNC = cfbf_no_header_discovery,                   \
+      .FOOTER = {0},                                            \
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,                         \
+      .FILEVALIDATOR = cfbf_file_validate,                      \
+      .CANDIDATEVALIDATOR = cfbf_candidate_classify,            \
+      .REASSEMBLYFUNC = cfbf_reassembly,                        \
+      .SERIALIZECARVESTATEFUNC = cfbf_serialize_carve_state,    \
+      .CLONECARVESTATEFUNC = cfbf_clone_carve_state,            \
+      .FREECARVESTATEFUNC = cfbf_free_carve_state,              \
+      .SIZEOFCARVESTATEFUNC = cfbf_sizeof_carve_state,          \
+      .PRINTCARVESTATEFUNC = cfbf_print_carve_state,            \
+      .PRIORITY = PRIORITY_SIGMA                                \
+    }
+
+    CFBF_SEMANTIC_SEARCH_SPEC("doc"),
+    CFBF_SEMANTIC_SEARCH_SPEC("dot"),
+    CFBF_SEMANTIC_SEARCH_SPEC("xls"),
+    CFBF_SEMANTIC_SEARCH_SPEC("xlt"),
+    CFBF_SEMANTIC_SEARCH_SPEC("xla"),
+    CFBF_SEMANTIC_SEARCH_SPEC("ppt"),
+    CFBF_SEMANTIC_SEARCH_SPEC("ppa"),
+    CFBF_SEMANTIC_SEARCH_SPEC("msg"),
+    CFBF_SEMANTIC_SEARCH_SPEC("oft"),
+    CFBF_SEMANTIC_SEARCH_SPEC("pub"),
+    CFBF_SEMANTIC_SEARCH_SPEC("vsd"),
+    CFBF_SEMANTIC_SEARCH_SPEC("mpp"),
+    CFBF_SEMANTIC_SEARCH_SPEC("obd"),
+    CFBF_SEMANTIC_SEARCH_SPEC("office-encrypted"),
+
+#undef CFBF_SEMANTIC_SEARCH_SPEC
+
+    // Rich Text Format documents. The validator parses nested groups,
+    // escaped delimiters, control words, and binary payloads.
+    //
+    {
+      .FILETYPE = "rtf",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = RTF_MINIMUM_SIZE,
+      .MAXIMUMSIZE = UINT64_C(1073741824),
+      .HEADER = "|\x7b\x5c\x72\x74\x66|",
+      .FOOTER = {0},
+      .FOOTERFUNC = rtf_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = rtf_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = rtf_file_validate,
+      .CANDIDATEVALIDATOR = rtf_candidate_validate,
+      .REASSEMBLYFUNC = rtf_reassembly,
+      .SERIALIZECARVESTATEFUNC = rtf_serialize_carve_state,
+      .CLONECARVESTATEFUNC = rtf_clone_carve_state,
+      .FREECARVESTATEFUNC = rtf_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = rtf_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = rtf_print_carve_state,
+      .NO_DEFRAG = false,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+    // Transport Neutral Encapsulation Format streams. Each attribute carries
+    // its own length and checksum, allowing exact validation of complete
+    // contiguous streams and verified progress during fragmented recovery.
+    //
+    {
+      .FILETYPE = "tnef",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = TNEF_MINIMUM_SIZE,
+      .MAXIMUMSIZE = UINT64_C(4294967296),
+      .HEADER = "|\x78\x9f\x3e\x22|",
+      .FOOTER = {0},
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .FILEVALIDATOR = tnef_file_validate,
+      .CANDIDATEVALIDATOR = tnef_candidate_validate,
+      .REASSEMBLYFUNC = tnef_reassembly,
+      .SERIALIZECARVESTATEFUNC = tnef_serialize_carve_state,
+      .CLONECARVESTATEFUNC = tnef_clone_carve_state,
+      .FREECARVESTATEFUNC = tnef_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = tnef_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = tnef_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+    // iCalendar records, including nested event, task, journal, alarm, and
+    // timezone components.
+    //
+    {
+      .FILETYPE = "ics",
+      .MASTER = false,
+      .CASESENSITIVE = false,
+      .MINIMUMSIZE = CALENDAR_MINIMUM_ICS_SIZE,
+      .MAXIMUMSIZE = UINT64_C(1073741824),
+      .HEADER = "/\xef\xbb\xbf" "BEGIN:VCALENDAR|BEGIN:VCALENDAR/",
+      .FOOTER = {0},
+      .FOOTERFUNC = ics_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = calendar_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = ics_file_validate,
+      .CANDIDATEVALIDATOR = calendar_candidate_validate,
+      .REASSEMBLYFUNC = calendar_reassembly,
+      .SERIALIZECARVESTATEFUNC = calendar_serialize_carve_state,
+      .CLONECARVESTATEFUNC = calendar_clone_carve_state,
+      .FREECARVESTATEFUNC = calendar_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = calendar_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = calendar_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+    // vCard contact records. Sequential cards in one source file are parsed
+    // as one recoverable stream.
+    //
+    {
+      .FILETYPE = "vcf",
+      .MASTER = false,
+      .CASESENSITIVE = false,
+      .MINIMUMSIZE = CALENDAR_MINIMUM_VCF_SIZE,
+      .MAXIMUMSIZE = UINT64_C(1073741824),
+      .HEADER = "/\xef\xbb\xbf" "BEGIN:VCARD|BEGIN:VCARD/",
+      .FOOTER = {0},
+      .FOOTERFUNC = vcf_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = calendar_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = vcf_file_validate,
+      .CANDIDATEVALIDATOR = calendar_candidate_validate,
+      .REASSEMBLYFUNC = calendar_reassembly,
+      .SERIALIZECARVESTATEFUNC = calendar_serialize_carve_state,
+      .CLONECARVESTATEFUNC = calendar_clone_carve_state,
+      .FREECARVESTATEFUNC = calendar_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = calendar_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = calendar_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+    // Raw BIFF2-BIFF4 worksheets and related pre-CFBF Excel streams.
+    //
+    {
+      .FILETYPE = "xls-raw",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = BIFF_MINIMUM_SIZE,
+      .MAXIMUMSIZE = UINT64_C(1073741824),
+      .HEADER = {0},
+      .HEADERFUNC = biff_header_discovery,
+      .FOOTER = {0},
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .FILEVALIDATOR = biff_file_validate,
+      .CANDIDATEVALIDATOR = biff_candidate_validate,
+      .REASSEMBLYFUNC = biff_reassembly,
+      .SERIALIZECARVESTATEFUNC = biff_serialize_carve_state,
+      .CLONECARVESTATEFUNC = biff_clone_carve_state,
+      .FREECARVESTATEFUNC = biff_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = biff_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = biff_print_carve_state,
+      .NO_DEFRAG = false,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+    // OneNote section files. Both revision stores and package stores use the
+    // same file type GUID but carry different internal storage formats.
+    //
+    {
+      .FILETYPE = "one",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = ONENOTE_MINIMUM_PACKAGE_SIZE,
+      .MAXIMUMSIZE = UINT64_C(4294967296),
+      .HEADER = {0},
+      .HEADERFUNC = onenote_section_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = onenote_section_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .FILEVALIDATOR = onenote_section_file_validate,
+      .CANDIDATEVALIDATOR = onenote_candidate_validate,
+      .REASSEMBLYFUNC = onenote_reassembly,
+      .SERIALIZECARVESTATEFUNC = onenote_serialize_carve_state,
+      .CLONECARVESTATEFUNC = onenote_clone_carve_state,
+      .FREECARVESTATEFUNC = onenote_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = onenote_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = onenote_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+    // OneNote table-of-contents files.
+    //
+    {
+      .FILETYPE = "onetoc2",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = ONENOTE_MINIMUM_PACKAGE_SIZE,
+      .MAXIMUMSIZE = UINT64_C(4294967296),
+      .HEADER = {0},
+      .HEADERFUNC = onenote_toc_header_discovery,
+      .FOOTER = {0},
+      .FOOTERFUNC = onenote_toc_footer_discovery,
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .FILEVALIDATOR = onenote_toc_file_validate,
+      .CANDIDATEVALIDATOR = onenote_candidate_validate,
+      .REASSEMBLYFUNC = onenote_reassembly,
+      .SERIALIZECARVESTATEFUNC = onenote_serialize_carve_state,
+      .CLONECARVESTATEFUNC = onenote_clone_carve_state,
+      .FREECARVESTATEFUNC = onenote_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = onenote_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = onenote_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+    // Microsoft Jet and ACE databases. The access entry performs discovery;
+    // validated databases are assigned to the appropriate dormant subtype.
+    // Microsoft Project MPD databases are identified by their internal schema.
+    //
+    {
+      .FILETYPE = "access",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = ACCESS_JET3_PAGE_SIZE * UINT64_C(2),
+      .MAXIMUMSIZE = ACCESS_MAXIMUM_DATABASE_SIZE,
+      .HEADER = {0},
+      .HEADERFUNC = access_header_discovery,
+      .FOOTER = {0},
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = access_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = access_file_validate,
+      .CANDIDATEVALIDATOR = access_candidate_classify,
+      .REASSEMBLYFUNC = access_reassembly,
+      .SERIALIZECARVESTATEFUNC = access_serialize_carve_state,
+      .CLONECARVESTATEFUNC = access_clone_carve_state,
+      .FREECARVESTATEFUNC = access_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = access_sizeof_carve_state,
+      .PRINTCARVESTATEFUNC = access_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+#define ACCESS_SEMANTIC_SEARCH_SPEC(type_name)                  \
+    {                                                           \
+      .FILETYPE = type_name,                                    \
+      .MASTER = false,                                          \
+      .CASESENSITIVE = true,                                    \
+      .MINIMUMSIZE = ACCESS_JET3_PAGE_SIZE * UINT64_C(2),       \
+      .MAXIMUMSIZE = ACCESS_MAXIMUM_DATABASE_SIZE,              \
+      .HEADER = {0},                                            \
+      .HEADERFUNC = access_no_header_discovery,                 \
+      .FOOTER = {0},                                            \
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,                         \
+      .BLOCKVALIDATOR = access_block_validate,                  \
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY, \
+      .FILEVALIDATOR = access_file_validate,                    \
+      .CANDIDATEVALIDATOR = access_candidate_classify,          \
+      .REASSEMBLYFUNC = access_reassembly,                      \
+      .SERIALIZECARVESTATEFUNC = access_serialize_carve_state,   \
+      .CLONECARVESTATEFUNC = access_clone_carve_state,           \
+      .FREECARVESTATEFUNC = access_free_carve_state,             \
+      .SIZEOFCARVESTATEFUNC = access_sizeof_carve_state,          \
+      .PRINTCARVESTATEFUNC = access_print_carve_state,           \
+      .PRIORITY = PRIORITY_SIGMA                                \
+    }
+
+    ACCESS_SEMANTIC_SEARCH_SPEC("mdb"),
+    ACCESS_SEMANTIC_SEARCH_SPEC("accdb"),
+    ACCESS_SEMANTIC_SEARCH_SPEC("mpd"),
+
+#undef ACCESS_SEMANTIC_SEARCH_SPEC
+
+    // Personal Folder File containers. The PFF entry performs discovery;
+    // validated containers are assigned to PST, OST, or PAB output.
+    //
+    {
+      .FILETYPE = "pff",
+      .MASTER = false,
+      .CASESENSITIVE = true,
+      .MINIMUMSIZE = PST_HEADER_MINIMUM_SIZE,
+      .MAXIMUMSIZE = PST_MAXIMUM_FILE_SIZE,
+      .HEADER = "|\x21\x42\x44\x4e|",
+      .FOOTER = {0},
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,
+      .BLOCKVALIDATOR = pst_block_validate,
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,
+      .FILEVALIDATOR = pst_file_validate,
+      .CANDIDATEVALIDATOR = pst_candidate_classify,
+      .REASSEMBLYFUNC = pst_reassembly,
+      .SERIALIZECARVESTATEFUNC = pst_serialize_carve_state,
+      .CLONECARVESTATEFUNC = pst_clone_carve_state,
+      .FREECARVESTATEFUNC = pst_free_carve_state,
+      .SIZEOFCARVESTATEFUNC = NULL,
+      .PRINTCARVESTATEFUNC = pst_print_carve_state,
+      .PRIORITY = PRIORITY_SIGMA
+    },
+
+#define PST_SEMANTIC_SEARCH_SPEC(type_name)                    \
+    {                                                          \
+      .FILETYPE = type_name,                                   \
+      .MASTER = false,                                         \
+      .CASESENSITIVE = true,                                   \
+      .MINIMUMSIZE = PST_HEADER_MINIMUM_SIZE,                  \
+      .MAXIMUMSIZE = PST_MAXIMUM_FILE_SIZE,                    \
+      .HEADER = {0},                                           \
+      .HEADERFUNC = pst_no_header_discovery,                   \
+      .FOOTER = {0},                                           \
+      .SEARCHTYPE = SEARCHTYPE_FORWARD,                        \
+      .BLOCKVALIDATOR = pst_block_validate,                    \
+      .BLOCKVALIDATIONSCOPE = BLOCK_VALIDATION_REASSEMBLY_ONLY,\
+      .FILEVALIDATOR = pst_file_validate,                      \
+      .CANDIDATEVALIDATOR = pst_candidate_classify,            \
+      .REASSEMBLYFUNC = pst_reassembly,                        \
+      .SERIALIZECARVESTATEFUNC = pst_serialize_carve_state,    \
+      .CLONECARVESTATEFUNC = pst_clone_carve_state,            \
+      .FREECARVESTATEFUNC = pst_free_carve_state,              \
+      .SIZEOFCARVESTATEFUNC = NULL,                          \
+      .PRINTCARVESTATEFUNC = pst_print_carve_state,            \
+      .PRIORITY = PRIORITY_SIGMA                               \
+    }
+
+    PST_SEMANTIC_SEARCH_SPEC("pst"),
+    PST_SEMANTIC_SEARCH_SPEC("ost"),
+    PST_SEMANTIC_SEARCH_SPEC("pab"),
+
+#undef PST_SEMANTIC_SEARCH_SPEC
 
     // MP3 files
     //
@@ -660,6 +1346,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
       .BLOCKVALIDATOR = pdf_block_validate,
       .FILEVALIDATOR = pdf_file_validate,
+      .CANDIDATEVALIDATOR = pdf_candidate_preserve_prefix,
       .SERIALIZEBLOCKSTATEFUNC   = pdf_serialize_block_state,
       .CLONEBLOCKSTATEFUNC       = pdf_clone_block_state,
       .FREEBLOCKSTATEFUNC        = pdf_free_block_state,

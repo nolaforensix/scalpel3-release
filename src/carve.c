@@ -1,40 +1,34 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-//-----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
-//
-// Please see LICENSE.md and README.md for further information.
-//
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
 #include "scalpel.h"
 #include "modico_onnx_global.h"  // MoDiCo session + mc_* inference API (carve.c uses it directly)
 #include "gpu_meminfo.h"         // central accelerator-memory query + batch planner
 #include "onnx_providers.h"      // resolved ONNX execution provider + GPU device list
+#include <openssl/evp.h>
 #include <poll.h>
 
 // track header/footer patterns that require thread-based searching
@@ -306,6 +300,7 @@ static void prune_uuid_from_promising_queue(uuid_t uuid);
 static void sync_promising_and_kill_queues(void);
 static bool primary_uuid_is_killed(uuid_t uuid);
 static bool queue_kill_uuid(uuid_t uuid);
+static bool claim_primary_uuid(uuid_t uuid);
 static void queue_partial_cleanup(uuid_t uuid);
 static void cleanup_partial_artifacts(uuid_t uuid);
 static void reconcile_partial_artifacts_on_restore(void);
@@ -1152,6 +1147,30 @@ static bool queue_kill_uuid(uuid_t uuid) {
 }
 
 
+// atomically add a primary UUID to the kill queue. true is returned only to
+// the first validating member of a work-sharing family.
+static bool claim_primary_uuid(uuid_t uuid) {
+
+  bool claimed = false;
+
+  if (uuid_is_null(uuid)) {
+    return false;
+  }
+
+  lock_queue(&kill_queue);
+  if (! nolock_element_in_queue(&kill_queue, uuid)) {
+    nolock_add_to_queue_priority_relaxed(&kill_queue, uuid,
+                                         INT_MAX - time(NULL));
+    atomic_fetch_add_explicit(&kill_queue_generation, 1,
+                              memory_order_release);
+    claimed = true;
+  }
+  unlock_queue(&kill_queue);
+
+  return claimed;
+}
+
+
 // return a bitmask describing currently requested checkpoint operations.
 static uint32_t checkpoint_requested_mask(void) {
 
@@ -1948,9 +1967,13 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
 
-  // now serialize the scalpel_state.search_specs array, omitting MASTER file types from
-  // serialization / deserialization, since MASTER file types will not be used to create new file
-  // subtypes after the block validation phase
+  if (! checkpoint_modico_serialization(&scalpel_state, fp, mode)) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "Invalid MoDiCo checkpoint metadata",
+                 __LINE__, __FILE__);
+  }
+
+  // MASTER bodies are unused after block validation, but their identity must survive
+  // -z/-U compaction so the saved block classification columns still match.
 
   for (i = 0; i < scalpel_state.num_specs; i++) {
     if (fb(&(scalpel_state.search_specs[i].MASTER), sizeof(scalpel_state.search_specs[i].MASTER), 1, fp) != 1) {
@@ -1959,14 +1982,37 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
 
-    if (scalpel_state.search_specs[i].MASTER) {
-      continue;
-    }
-
     if (fb(scalpel_state.search_specs[i].FILETYPE, MAX_STRING_LENGTH, 1, fp) != 1) {
       perror("scalpel_state FILETYPE");
       // fatal
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+
+    if (fb(&(scalpel_state.search_specs[i].mastertype), sizeof(scalpel_state.search_specs[i].mastertype), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "File type origin", __LINE__, __FILE__);
+    }
+    if (mode == DESERIALIZE) {
+      uint32_t initial_count = 0;
+      while (INITIAL_SEARCH_SPECS[initial_count].FILETYPE[0]) {
+        initial_count++;
+      }
+      if (scalpel_state.search_specs[i].mastertype < 0
+          || (uint32_t)scalpel_state.search_specs[i].mastertype >= initial_count
+          || ! memchr(scalpel_state.search_specs[i].FILETYPE, '\0', MAX_STRING_LENGTH)) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, "Invalid file type identity", __LINE__, __FILE__);
+      }
+    }
+    if (scalpel_state.search_specs[i].MASTER) {
+      if (mode == DESERIALIZE) {
+        uint32_t master = scalpel_state.search_specs[i].mastertype;
+        if (! INITIAL_SEARCH_SPECS[master].MASTER
+            || strcmp(scalpel_state.search_specs[i].FILETYPE, INITIAL_SEARCH_SPECS[master].FILETYPE)) {
+          handle_error(SCALPEL_ERROR_CHECKPOINT, "Invalid master file type", __LINE__, __FILE__);
+        }
+        copy_search_spec(&scalpel_state.search_specs[i], &INITIAL_SEARCH_SPECS[master]);
+        scalpel_state.search_specs[i].mastertype = master;
+      }
+      continue;
     }
 
     if (fb(&(scalpel_state.search_specs[i].CASESENSITIVE), sizeof(scalpel_state.search_specs[i].CASESENSITIVE), 1, fp) != 1) {
@@ -2035,12 +2081,6 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
 
-    if (fb(&(scalpel_state.search_specs[i].mastertype), sizeof(scalpel_state.search_specs[i].mastertype), 1, fp) != 1) {
-      perror("scalpel_state mastertype");
-      // fatal
-      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
-    }
-
     if (fb(&(scalpel_state.search_specs[i].SEARCHTYPE), sizeof(scalpel_state.search_specs[i].SEARCHTYPE), 1, fp) != 1) {
       perror("scalpel_state SEARCHTYPE");
       // fatal
@@ -2090,6 +2130,8 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
       scalpel_state.search_specs[i].BATCHEDBLOCKVALIDATOR =
           INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].BATCHEDBLOCKVALIDATOR;
       scalpel_state.search_specs[i].FILEVALIDATOR = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].FILEVALIDATOR;
+      scalpel_state.search_specs[i].CANDIDATEVALIDATOR =
+          INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].CANDIDATEVALIDATOR;
       scalpel_state.search_specs[i].DONTCARVE = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].DONTCARVE;
       scalpel_state.search_specs[i].REASSEMBLYFUNC = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].REASSEMBLYFUNC;
       scalpel_state.search_specs[i].SERIALIZECARVESTATEFUNC = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype]
@@ -2676,6 +2718,8 @@ void restore_checkpointed_scalpel_state(void) {
   }
   scalpel_state_serialization(DESERIALIZE,
                               restored_checkpoint.state_path);  // will not return on error
+  scalpel_log("MoDiCo checkpoint prioritization: %s (%" PRIu32 " saved file-type mappings).\n",
+               scalpel_state.modico_enabled ? "ON" : "OFF", scalpel_state.modico_num_specs);
 }
 
 
@@ -3203,7 +3247,8 @@ static void validate_file(CarveInfo *candidate, unsigned int id) {
     promising = false;
   }
 
-  if (promising && blockvector_get_data_length(candidate->b) > validates_to) {
+  if (promising && validates_to < UINT64_MAX
+      && blockvector_get_data_length(candidate->b) > validates_to + 1) {
     // the validator found a better limit on size of valid data for promising fragment
     if (validates_to + 1 < scalpel_state.blocksize) {
       blockvector_set_data_length(candidate->b, validates_to + 1);
@@ -3219,7 +3264,8 @@ static void validate_file(CarveInfo *candidate, unsigned int id) {
                    blockvector_get_data_length(candidate->b));
     }
   }
-  else if (validates && blockvector_get_data_length(candidate->b) > validates_to) {
+  else if (validates && validates_to < UINT64_MAX
+           && blockvector_get_data_length(candidate->b) > validates_to + 1) {
     // the validator found a better limit on size of valid data for validated file.
 
     blockvector_set_data_length(candidate->b, validates_to + 1);
@@ -3421,6 +3467,7 @@ static void validate_block(BlockInfo *blockinfo) {
     blockvector_set_apparent_blocknumber(candidate->b, 0,
                                          blockinfo->apparent_block);
     normalize_blockvector(candidate->b);
+    blockvector_set_data_length_to_mapped_extent(candidate->b);
     inflate_blockvector(candidate->b);
     if (validates_to + 1 < blockvector_get_data_length(candidate->b)) {
       blockvector_set_data_length(candidate->b, validates_to + 1);
@@ -3782,6 +3829,9 @@ done:
 // Native-histogram CUDA throughput is highest when an inference covers about
 // this much raw block data; the environment overrides remain available.
 #define MODICO_NATIVE_HISTOGRAM_BATCH_BYTES (64ULL * 1024ULL)
+// TensorRT's fused graph reaches its best steady-state throughput with smaller
+// batches than the native CUDA graph on the supported MoDiCo models.
+#define MODICO_TENSORRT_BATCH_BYTES (32ULL * 1024ULL)
 // MoDiCo expands each input byte into several wide feature tensors. This
 // working-set estimate includes allocator and execution-workspace headroom;
 // gpu_plan_batch() applies the current per-device VRAM budget to it.
@@ -3790,6 +3840,16 @@ done:
 // at a time; the actual claim size scales down on small images so every
 // worker gets several turns instead of one worker draining the whole image.
 #define MODICO_WORK_CHUNK_BLOCKS 4096
+
+// A reusable cache contains only MoDiCo's prior confidence columns. Structural validator decisions
+// are deliberately excluded and are recomputed on every fresh run.
+#define MODICO_CACHE_MAGIC "S3MODIC1"
+#define MODICO_CACHE_FOOTER_MAGIC "S3MCEND1"
+#define MODICO_CACHE_MAGIC_SIZE 8
+#define MODICO_CACHE_FORMAT_VERSION 2U
+#define MODICO_CACHE_POLICY_VERSION 1U
+#define MODICO_CACHE_PROVIDER_SIZE 32U
+#define MODICO_CACHE_HASH_BUFFER_BYTES (1024U * 1024U)
 
 // Margin-gated promotion to VALID(100): when a block's top predicted class beats
 // the runner-up by more than this softmax-probability margin, the spec on that
@@ -3841,6 +3901,34 @@ typedef struct ModicoWorker {
   bool interrupted;
 } ModicoWorker;
 
+typedef struct ModicoCacheIdentity {
+  uint32_t blocksize;
+  uint32_t mapped_specs;
+  uint64_t image_size;
+  uint64_t num_blocks;
+  uint64_t num_apparent_blocks;
+  uint64_t start_block;
+  uint64_t end_block;
+  uint64_t promote_margin_bits;
+  char provider[MODICO_CACHE_PROVIDER_SIZE];
+  unsigned char image_hash[SHA256_DIGEST_LENGTH];
+  unsigned char blockmap_hash[SHA256_DIGEST_LENGTH];
+  unsigned char model_hash[SHA256_DIGEST_LENGTH];
+  unsigned char mapping_hash[SHA256_DIGEST_LENGTH];
+} ModicoCacheIdentity;
+
+typedef struct ModicoCacheStats {
+  uint64_t classified;
+  uint64_t graded_writes;
+  uint64_t promoted;
+} ModicoCacheStats;
+
+typedef enum ModicoCacheResult {
+  MODICO_CACHE_MISS = 0,
+  MODICO_CACHE_HIT = 1,
+  MODICO_CACHE_INTERRUPTED = 2,
+} ModicoCacheResult;
+
 static void *modico_exit_watcher(void *arg);
 static int modico_max_batch_size(uint32_t blocksize);
 static int modico_cpu_batch_size(uint32_t blocksize);
@@ -3879,6 +3967,458 @@ static void modico_dump_decisions(FileMirror *fm, uint64_t num_blocks,
                                   const int *spec_to_class);
 static void modico_report_progress(ModicoWorker *worker, uint64_t done);
 static void *modico_worker_thread(void *arg);
+static bool modico_cache_path(char *path, size_t path_size);
+static bool modico_cache_hash_file(const char *path, const char *label,
+                                   unsigned char hash[SHA256_DIGEST_LENGTH]);
+static bool modico_cache_mapping_hash(
+    unsigned char hash[SHA256_DIGEST_LENGTH]);
+static bool modico_cache_identity(ModicoCacheIdentity *identity,
+                                  uint32_t mapped_specs,
+                                  double promote_margin);
+static bool modico_cache_write_header(FILE *fp,
+                                      const ModicoCacheIdentity *identity,
+                                      const ModicoCacheStats *stats);
+static bool modico_cache_read_header(FILE *fp,
+                                     ModicoCacheIdentity *identity,
+                                     ModicoCacheStats *stats);
+static bool modico_cache_identity_matches(
+    const ModicoCacheIdentity *stored,
+    const ModicoCacheIdentity *expected);
+static bool modico_cache_directory(const char *path, char *directory,
+                                   size_t directory_size);
+static ModicoCacheResult modico_cache_load(
+    const char *path, const ModicoCacheIdentity *identity,
+    ModicoCacheStats *stats);
+static bool modico_cache_save(const char *path,
+                              const ModicoCacheIdentity *identity,
+                              const ModicoCacheStats *stats);
+
+
+// select the reusable MoDiCo cache pathname.  By default it travels with the blockmap because the
+// image/blockmap pair defines the initial classification universe. SCALPEL3_MODICO_CACHE overrides
+// the pathname; "off", "false", "no", and "0" disable reuse.
+static bool modico_cache_path(char *path, size_t path_size) {
+
+  const char *configured = getenv("SCALPEL3_MODICO_CACHE");
+  int written;
+
+  if (! path || path_size == 0) {
+    return false;
+  }
+  if (configured && *configured) {
+    if (! strcasecmp(configured, "off") || ! strcasecmp(configured, "false")
+        || ! strcasecmp(configured, "no") || strcmp(configured, "0") == 0) {
+      path[0] = '\0';
+      return false;
+    }
+    return copy_string_complete(path, path_size, configured);
+  }
+
+  written = snprintf(path, path_size, "%s.modico", scalpel_state.blockmap_pathname);
+  if (written < 0 || (size_t)written >= path_size) {
+    path[0] = '\0';
+    return false;
+  }
+  return true;
+}
+
+
+// hash one cache dependency while honoring stop requests. A stop before restartable state exists
+// should end the current phase promptly rather than spending additional time hashing a large image.
+static bool modico_cache_hash_file(const char *path, const char *label,
+                                   unsigned char hash[SHA256_DIGEST_LENGTH]) {
+
+  unsigned char *buffer = NULL;
+  EVP_MD_CTX *context = NULL;
+  FILE *fp = NULL;
+  unsigned int hash_length = 0;
+  size_t count;
+  bool ok = false;
+
+  if (! path || ! *path || ! hash) {
+    return false;
+  }
+
+  buffer = (unsigned char *)malloc(MODICO_CACHE_HASH_BUFFER_BYTES);
+  check_memory_allocation(buffer, __LINE__, __FILE__, "MoDiCo cache hash buffer");
+  fp = fopen(path, "rb");
+  context = EVP_MD_CTX_new();
+  if (! fp || ! context || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
+    goto done;
+  }
+
+  while ((count = fread(buffer, 1, MODICO_CACHE_HASH_BUFFER_BYTES, fp)) > 0) {
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+        || EVP_DigestUpdate(context, buffer, count) != 1) {
+      goto done;
+    }
+  }
+  if (ferror(fp)
+      || EVP_DigestFinal_ex(context, hash, &hash_length) != 1
+      || hash_length != SHA256_DIGEST_LENGTH) {
+    goto done;
+  }
+  ok = true;
+
+ done:
+  if (! ok && scalpel_state.mode_verbose && label
+      && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+    lock_fprintf(stderr, "MoDiCo cache: unable to hash %s \"%s\".\n", label,
+                 path);
+  }
+  EVP_MD_CTX_free(context);
+  if (fp) {
+    fclose(fp);
+  }
+  free(buffer);
+  return ok;
+}
+
+
+// hash the semantic SearchSpec-to-model mapping rather than the class map pathname.  This captures
+// aliases and configuration order while allowing an unchanged mapping file to move between hosts.
+static bool modico_cache_mapping_hash(
+    unsigned char hash[SHA256_DIGEST_LENGTH]) {
+
+  EVP_MD_CTX *context = EVP_MD_CTX_new();
+  unsigned int hash_length = 0;
+  uint32_t num_specs = scalpel_state.modico_num_specs;
+  bool ok = false;
+
+  if (! context || ! scalpel_state.modico_spec_to_class
+      || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1
+      || EVP_DigestUpdate(context, &num_specs, sizeof(num_specs)) != 1) {
+    goto done;
+  }
+
+  for (uint32_t spec = 0; spec < num_specs; spec++) {
+    uint32_t name_length = (uint32_t)strlen(
+        scalpel_state.search_specs[spec].FILETYPE);
+    int class_index = scalpel_state.modico_spec_to_class[spec];
+
+    if (EVP_DigestUpdate(context, &name_length, sizeof(name_length)) != 1
+        || EVP_DigestUpdate(context,
+                            scalpel_state.search_specs[spec].FILETYPE,
+                            name_length) != 1
+        || EVP_DigestUpdate(context, &class_index, sizeof(class_index)) != 1) {
+      goto done;
+    }
+  }
+
+  if (EVP_DigestFinal_ex(context, hash, &hash_length) != 1
+      || hash_length != SHA256_DIGEST_LENGTH) {
+    goto done;
+  }
+  ok = true;
+
+ done:
+  EVP_MD_CTX_free(context);
+  return ok;
+}
+
+
+// build the complete identity for a reusable prior.  Provider is part of the identity because small
+// floating-point differences around a promotion boundary can otherwise change stored confidence.
+static bool modico_cache_identity(ModicoCacheIdentity *identity,
+                                  uint32_t mapped_specs,
+                                  double promote_margin) {
+
+  const char *model_path = modico_onnx_global_model_path();
+  const char *provider = modico_onnx_global_backend();
+  int written;
+
+  if (! identity || ! model_path || ! *model_path || ! provider || ! *provider) {
+    return false;
+  }
+
+  memset(identity, 0, sizeof(*identity));
+  identity->blocksize = scalpel_state.blocksize;
+  identity->mapped_specs = mapped_specs;
+  identity->image_size = filemirror_filesize(scalpel_state.filemirror);
+  identity->num_blocks = CEILDIV(identity->image_size, identity->blocksize);
+  identity->num_apparent_blocks = filemirror_apparent_blocks(
+      scalpel_state.filemirror);
+  identity->start_block = scalpel_state.start_block;
+  identity->end_block = scalpel_state.end_block;
+  memcpy(&identity->promote_margin_bits, &promote_margin,
+         sizeof(identity->promote_margin_bits));
+  written = snprintf(identity->provider, sizeof(identity->provider), "%s",
+                     provider);
+  if (written < 0 || (size_t)written >= sizeof(identity->provider)) {
+    return false;
+  }
+
+  return modico_cache_hash_file(scalpel_state.image_pathname, "image",
+                                identity->image_hash)
+      && modico_cache_hash_file(scalpel_state.blockmap_pathname, "blockmap",
+                                identity->blockmap_hash)
+      && modico_cache_hash_file(model_path, "model", identity->model_hash)
+      && modico_cache_mapping_hash(identity->mapping_hash);
+}
+
+
+static bool modico_cache_write_header(FILE *fp,
+                                      const ModicoCacheIdentity *identity,
+                                      const ModicoCacheStats *stats) {
+
+  uint32_t format_version = MODICO_CACHE_FORMAT_VERSION;
+  uint32_t policy_version = MODICO_CACHE_POLICY_VERSION;
+
+  return fp && identity && stats
+      && fwrite(MODICO_CACHE_MAGIC, 1, MODICO_CACHE_MAGIC_SIZE, fp)
+             == MODICO_CACHE_MAGIC_SIZE
+      && fwrite(&format_version, sizeof(format_version), 1, fp) == 1
+      && fwrite(&policy_version, sizeof(policy_version), 1, fp) == 1
+      && fwrite(identity, sizeof(*identity), 1, fp) == 1
+      && fwrite(stats, sizeof(*stats), 1, fp) == 1;
+}
+
+
+static bool modico_cache_read_header(FILE *fp,
+                                     ModicoCacheIdentity *identity,
+                                     ModicoCacheStats *stats) {
+
+  char magic[MODICO_CACHE_MAGIC_SIZE];
+  uint32_t format_version;
+  uint32_t policy_version;
+
+  return fp && identity && stats
+      && fread(magic, 1, sizeof(magic), fp) == sizeof(magic)
+      && memcmp(magic, MODICO_CACHE_MAGIC, sizeof(magic)) == 0
+      && fread(&format_version, sizeof(format_version), 1, fp) == 1
+      && format_version == MODICO_CACHE_FORMAT_VERSION
+      && fread(&policy_version, sizeof(policy_version), 1, fp) == 1
+      && policy_version == MODICO_CACHE_POLICY_VERSION
+      && fread(identity, sizeof(*identity), 1, fp) == 1
+      && fread(stats, sizeof(*stats), 1, fp) == 1;
+}
+
+
+static bool modico_cache_identity_matches(
+    const ModicoCacheIdentity *stored,
+    const ModicoCacheIdentity *expected) {
+
+  return stored && expected
+      && stored->blocksize == expected->blocksize
+      && stored->mapped_specs == expected->mapped_specs
+      && stored->image_size == expected->image_size
+      && stored->num_blocks == expected->num_blocks
+      && stored->num_apparent_blocks == expected->num_apparent_blocks
+      && stored->start_block == expected->start_block
+      && stored->end_block == expected->end_block
+      && stored->promote_margin_bits == expected->promote_margin_bits
+      && memcmp(stored->provider, expected->provider,
+                sizeof(stored->provider)) == 0
+      && memcmp(stored->image_hash, expected->image_hash,
+                SHA256_DIGEST_LENGTH) == 0
+      && memcmp(stored->blockmap_hash, expected->blockmap_hash,
+                SHA256_DIGEST_LENGTH) == 0
+      && memcmp(stored->model_hash, expected->model_hash,
+                SHA256_DIGEST_LENGTH) == 0
+      && memcmp(stored->mapping_hash, expected->mapping_hash,
+                SHA256_DIGEST_LENGTH) == 0;
+}
+
+
+static bool modico_cache_directory(const char *path, char *directory,
+                                   size_t directory_size) {
+
+  const char *slash;
+  size_t length;
+
+  if (! path || ! *path || ! directory || directory_size == 0) {
+    return false;
+  }
+  slash = strrchr(path, '/');
+  if (! slash) {
+    return copy_string_complete(directory, directory_size, ".");
+  }
+  length = slash == path ? 1 : (size_t)(slash - path);
+  if (length >= directory_size) {
+    return false;
+  }
+  memcpy(directory, path, length);
+  directory[length] = '\0';
+  return true;
+}
+
+
+// verify and restore a reusable prior. The payload is hashed before any column is installed, so a
+// truncated or corrupt cache cannot partially modify the live confidence table.
+static ModicoCacheResult modico_cache_load(
+    const char *path, const ModicoCacheIdentity *identity,
+    ModicoCacheStats *stats) {
+
+  ModicoCacheIdentity stored_identity;
+  ModicoCacheStats stored_stats;
+  unsigned char stored_payload_hash[SHA256_DIGEST_LENGTH];
+  unsigned char payload_hash[SHA256_DIGEST_LENGTH];
+  char footer_magic[MODICO_CACHE_MAGIC_SIZE];
+  unsigned char *column = NULL;
+  EVP_MD_CTX *context = NULL;
+  FILE *fp = NULL;
+  unsigned int hash_length = 0;
+  bool valid = false;
+
+  if (! path || ! *path || ! identity || ! stats) {
+    return MODICO_CACHE_MISS;
+  }
+  fp = fopen(path, "rb");
+  if (! fp) {
+    return MODICO_CACHE_MISS;
+  }
+  context = EVP_MD_CTX_new();
+  column = (unsigned char *)malloc((size_t)identity->num_blocks);
+  check_memory_allocation(column, __LINE__, __FILE__, "MoDiCo cache column");
+  if (! context
+      || ! modico_cache_read_header(fp, &stored_identity, &stored_stats)
+      || ! modico_cache_identity_matches(&stored_identity, identity)
+      || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
+    goto done;
+  }
+
+  for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
+    if (scalpel_state.modico_spec_to_class[spec] < 0) {
+      continue;
+    }
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      goto done;
+    }
+    if (fread(column, 1, (size_t)identity->num_blocks, fp)
+            != identity->num_blocks
+        || EVP_DigestUpdate(context, column,
+                            (size_t)identity->num_blocks) != 1) {
+      goto done;
+    }
+  }
+  if (fread(footer_magic, 1, sizeof(footer_magic), fp) != sizeof(footer_magic)
+      || memcmp(footer_magic, MODICO_CACHE_FOOTER_MAGIC,
+                sizeof(footer_magic)) != 0
+      || fread(stored_payload_hash, 1, sizeof(stored_payload_hash), fp)
+             != sizeof(stored_payload_hash)
+      || fgetc(fp) != EOF
+      || EVP_DigestFinal_ex(context, payload_hash, &hash_length) != 1
+      || hash_length != SHA256_DIGEST_LENGTH
+      || memcmp(stored_payload_hash, payload_hash,
+                SHA256_DIGEST_LENGTH) != 0) {
+    goto done;
+  }
+
+  if (fseek(fp, (long)(MODICO_CACHE_MAGIC_SIZE + sizeof(uint32_t) * 2
+                       + sizeof(ModicoCacheIdentity)
+                       + sizeof(ModicoCacheStats)), SEEK_SET) != 0) {
+    goto done;
+  }
+  for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
+    if (scalpel_state.modico_spec_to_class[spec] < 0) {
+      continue;
+    }
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      goto done;
+    }
+    if (fread(column, 1, (size_t)identity->num_blocks, fp)
+            != identity->num_blocks
+        || ! filemirror_replace_blocktype_column(scalpel_state.filemirror,
+                                                  spec, column,
+                                                  identity->num_blocks)) {
+      goto done;
+    }
+  }
+  *stats = stored_stats;
+  valid = true;
+
+ done:
+  EVP_MD_CTX_free(context);
+  fclose(fp);
+  free(column);
+  if (! valid
+      && atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                              memory_order_acquire)) {
+    return MODICO_CACHE_INTERRUPTED;
+  }
+  return valid ? MODICO_CACHE_HIT : MODICO_CACHE_MISS;
+}
+
+
+// write the prior to a temporary file, append a payload digest and completion marker, durably close
+// it, and atomically publish it.  Cache write failures are nonfatal because inference already
+// produced valid in-memory classifications for this run.
+static bool modico_cache_save(const char *path,
+                              const ModicoCacheIdentity *identity,
+                              const ModicoCacheStats *stats) {
+
+  unsigned char payload_hash[SHA256_DIGEST_LENGTH];
+  unsigned char *column = NULL;
+  char temporary_path[PATH_MAX];
+  char directory[PATH_MAX];
+  EVP_MD_CTX *context = NULL;
+  FILE *fp = NULL;
+  unsigned int hash_length = 0;
+  int written;
+  bool ok = false;
+
+  if (! path || ! *path || ! identity || ! stats
+      || ! modico_cache_directory(path, directory, sizeof(directory))) {
+    return false;
+  }
+  written = snprintf(temporary_path, sizeof(temporary_path), "%s.tmp.%ld",
+                     path, (long)getpid());
+  if (written < 0 || (size_t)written >= sizeof(temporary_path)) {
+    return false;
+  }
+
+  column = (unsigned char *)malloc((size_t)identity->num_blocks);
+  check_memory_allocation(column, __LINE__, __FILE__, "MoDiCo cache column");
+  context = EVP_MD_CTX_new();
+  fp = fopen(temporary_path, "wb");
+  if (! context || ! fp
+      || ! modico_cache_write_header(fp, identity, stats)
+      || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
+    goto done;
+  }
+
+  for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
+    if (scalpel_state.modico_spec_to_class[spec] < 0) {
+      continue;
+    }
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+        || ! filemirror_copy_blocktype_column(scalpel_state.filemirror, spec,
+                                              column, identity->num_blocks)
+        || fwrite(column, 1, (size_t)identity->num_blocks, fp)
+               != identity->num_blocks
+        || EVP_DigestUpdate(context, column,
+                            (size_t)identity->num_blocks) != 1) {
+      goto done;
+    }
+  }
+  if (EVP_DigestFinal_ex(context, payload_hash, &hash_length) != 1
+      || hash_length != SHA256_DIGEST_LENGTH
+      || fwrite(MODICO_CACHE_FOOTER_MAGIC, 1, MODICO_CACHE_MAGIC_SIZE, fp)
+             != MODICO_CACHE_MAGIC_SIZE
+      || fwrite(payload_hash, 1, sizeof(payload_hash), fp)
+             != sizeof(payload_hash)
+      || ! checkpoint_durable_close(fp)) {
+    fp = NULL;
+    goto done;
+  }
+  fp = NULL;
+  if (! checkpoint_atomic_replace(temporary_path, path, directory)) {
+    goto done;
+  }
+  ok = true;
+
+ done:
+  if (fp) {
+    fclose(fp);
+  }
+  if (! ok) {
+    unlink(temporary_path);
+  }
+  EVP_MD_CTX_free(context);
+  free(column);
+  return ok;
+}
+
 
 static void *modico_exit_watcher(void *arg) {
   ModicoExitWatcher *watcher = (ModicoExitWatcher *)arg;
@@ -4041,16 +4581,24 @@ static int modico_session_batch_size(mc_session_t *sess,
     if (mc_uses_native_histograms(sess)) {
       uint64_t target_batch =
           blocksize > 0
-              ? MODICO_NATIVE_HISTOGRAM_BATCH_BYTES / (uint64_t)blocksize
+              ? (mc_uses_tensorrt(sess)
+                     ? MODICO_TENSORRT_BATCH_BYTES
+                     : MODICO_NATIVE_HISTOGRAM_BATCH_BYTES)
+                    / (uint64_t)blocksize
               : 1;
       int batch = target_batch > 0 ? (int)target_batch : 1;
       const char *e = getenv("SCALPEL3_MODICO_BATCH");
+      bool forced_batch = false;
 
       if (e && *e) {
         int forced = atoi(e);
         if (forced > 0) {
           batch = forced;
+          forced_batch = true;
         }
+      }
+      if (! forced_batch && mc_uses_tensorrt(sess) && batch < 4) {
+        batch = 4;
       }
       if (batch > max_batch) {
         batch = max_batch;
@@ -4060,9 +4608,10 @@ static int modico_session_batch_size(mc_session_t *sess,
       }
 
       lock_fprintf(stdout,
-                   "[gpu_batch:modico-gpu%d] backend=cuda blocksize=%u "
+                   "[gpu_batch:modico-gpu%d] backend=%s blocksize=%u "
                    "batch=%d (native histograms, max=%d)\n",
-                   mc_cuda_device_id(sess), blocksize, batch, max_batch);
+                   mc_cuda_device_id(sess), mc_inference_backend(sess),
+                   blocksize, batch, max_batch);
       return batch;
     }
 
@@ -4313,6 +4862,7 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
 
   uint64_t first = 0;
   int first_settled = 0;
+  mc_set_run_batch_size(sess, first_n);
   result = modico_apply_batch(fm, sess, inbuf, logits, batch_actual,
                               assignments, first_n, blocksize, num_classes,
                               num_specs, spec_to_class, promote_margin,
@@ -4325,6 +4875,7 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
 
   uint64_t second = 0;
   int second_settled = 0;
+  mc_set_run_batch_size(sess, second_n);
   result = modico_apply_batch(fm, sess,
                               inbuf + (size_t)first_n * blocksize,
                               logits, batch_actual + first_n, assignments,
@@ -4335,6 +4886,7 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
   if (result == MC_INFERENCE_OK) {
     *settled_batch = first_settled < second_settled
                    ? first_settled : second_settled;
+    mc_set_run_batch_size(sess, *settled_batch);
   }
   return result;
 }
@@ -4574,6 +5126,58 @@ static void modico_populate_blocktypes(void) {
     }
   }
 
+  char cache_path[PATH_MAX];
+  ModicoCacheIdentity cache_identity;
+  ModicoCacheStats cache_stats;
+  bool cache_enabled = modico_cache_path(cache_path, sizeof(cache_path));
+  bool cache_identity_ready = false;
+
+  memset(&cache_identity, 0, sizeof(cache_identity));
+  memset(&cache_stats, 0, sizeof(cache_stats));
+  if (cache_enabled) {
+    struct timespec cache_start;
+    struct timespec cache_end;
+
+    clock_gettime(CLOCK_MONOTONIC, &cache_start);
+    cache_identity_ready = modico_cache_identity(&cache_identity,
+                                                 mapped_specs,
+                                                 promote_margin);
+    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                             memory_order_acquire)) {
+      modico_onnx_global_shutdown();
+      scalpel_log("MoDiCo cache verification interrupted by stop request.\n");
+      return;
+    }
+    if (cache_identity_ready) {
+      ModicoCacheResult cache_result = modico_cache_load(
+          cache_path, &cache_identity, &cache_stats);
+
+      clock_gettime(CLOCK_MONOTONIC, &cache_end);
+      double cache_seconds = (double)(cache_end.tv_sec - cache_start.tv_sec)
+          + (double)(cache_end.tv_nsec - cache_start.tv_nsec) / 1e9;
+      if (cache_result == MODICO_CACHE_HIT) {
+        scalpel_log("MoDiCo cache hit: restored %" PRIu64 " exemplar blocks "
+                    "and %" PRIu64 " confidence entries from %s in %.3f secs "
+                    "(MODICO_CACHE_SECS=%.3f).\n",
+                    cache_stats.classified, cache_stats.graded_writes,
+                    cache_path, cache_seconds, cache_seconds);
+        modico_dump_decisions(fm, num_blocks, num_specs, spec_to_class);
+        modico_onnx_global_shutdown();
+        return;
+      }
+      if (cache_result == MODICO_CACHE_INTERRUPTED) {
+        modico_onnx_global_shutdown();
+        scalpel_log("MoDiCo cache restore interrupted by stop request.\n");
+        return;
+      }
+      scalpel_log("MoDiCo cache miss: %s.\n", cache_path);
+    }
+    else {
+      scalpel_log("MoDiCo cache identity could not be established; "
+                  "classification will run without publishing a cache.\n");
+    }
+  }
+
   mc_session_t *sessions[MODICO_MAX_GPU_DEVICES];
   bool destroy_session[MODICO_MAX_GPU_DEVICES];
   int devices[MODICO_MAX_GPU_DEVICES];
@@ -4609,8 +5213,10 @@ static void modico_populate_blocktypes(void) {
         break;
       }
       mc_session_t *extra =
-          mc_create_session_with_accelerator_device(model_path, 0, "cuda",
-                                                    devices[i]);
+          mc_create_session_with_accelerator_device_for_workload(
+              model_path, 0, "cuda", devices[i],
+              (num_blocks + (uint64_t)requested_devices - 1)
+                  / (uint64_t)requested_devices);
       if (! extra) {
         setup_failure_device = devices[i];
         break;
@@ -4629,6 +5235,7 @@ static void modico_populate_blocktypes(void) {
         setup_failure_device = mc_cuda_device_id(sessions[i]);
         break;
       }
+      mc_set_run_batch_size(sessions[i], session_batches[i]);
     }
   }
 
@@ -4668,12 +5275,17 @@ static void modico_populate_blocktypes(void) {
       lock_fprintf(stdout, "%s%d", i ? "," : "",
                    mc_cuda_device_id(sessions[i]));
     }
+    lock_fprintf(stdout, ", inference backend=%s",
+                 mc_inference_backend(sess));
   }
   else {
     lock_fprintf(stdout, "MoDiCo execution provider: %s",
                  mc_execution_provider(sess));
     if (mc_uses_cuda(sess)) {
       lock_fprintf(stdout, " device=%d", mc_cuda_device_id(sess));
+    }
+    if (mc_uses_tensorrt(sess)) {
+      lock_fprintf(stdout, ", inference backend=tensorrt");
     }
   }
   lock_fprintf(stdout, ".\n");
@@ -4802,7 +5414,7 @@ static void modico_populate_blocktypes(void) {
           "subsequent_ort_run_avg_secs=%.6f "
           "output_processing_secs=%.6f table_write_secs=%.6f "
           "postprocess_batch_count=%" PRIu64 ".\n",
-          i, mc_execution_provider(sessions[i]),
+          i, mc_inference_backend(sessions[i]),
           timing.session_create_seconds,
           timing.input_conversion_seconds,
           timing.first_run_seconds,
@@ -4861,6 +5473,19 @@ static void modico_populate_blocktypes(void) {
                 classified, promoted, graded_writes, mc_secs, mc_secs);
 
     modico_dump_decisions(fm, num_blocks, num_specs, spec_to_class);
+
+    if (cache_enabled && cache_identity_ready) {
+      cache_stats.classified = classified;
+      cache_stats.graded_writes = graded_writes;
+      cache_stats.promoted = promoted;
+      if (modico_cache_save(cache_path, &cache_identity, &cache_stats)) {
+        scalpel_log("MoDiCo cache published: %s.\n", cache_path);
+      }
+      else if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
+                                      memory_order_acquire)) {
+        scalpel_log("MoDiCo cache could not be published: %s.\n", cache_path);
+      }
+    }
   }
 
   for (int i = 1; i < session_count; i++) {
@@ -5200,6 +5825,7 @@ static void validate_blocks(void) {
 static void prune_header_footer_database(void) {
 
   uint64_t i, k;
+  uint64_t filesize = filemirror_filesize(scalpel_state.filemirror);
   uint32_t needlenum;           // index of current file type
   SearchSpec *currentfilespec;  // current file type being processed
 
@@ -5214,7 +5840,8 @@ static void prune_header_footer_database(void) {
     // any headers that are covered or in a block of the incorrect type are pruned
     k = 0;
     for (i = 0; i < currentfilespec->offsets.numheaders; i++) {
-      if (filemirror_actual_location_covered(scalpel_state.filemirror, currentfilespec->offsets.headers[i])
+      if (currentfilespec->offsets.headers[i] >= filesize
+          || filemirror_actual_location_covered(scalpel_state.filemirror, currentfilespec->offsets.headers[i])
           || ! filemirror_get_blocktype(scalpel_state.filemirror, currentfilespec->offsets.headers[i] / scalpel_state.blocksize,
                                         needlenum)) {
         continue;
@@ -5260,7 +5887,8 @@ static void prune_header_footer_database(void) {
     // any footers that are covered or in a block of the incorrect type are pruned
     k = 0;
     for (i = 0; i < currentfilespec->offsets.numfooters; i++) {
-      if (filemirror_actual_location_covered(scalpel_state.filemirror, currentfilespec->offsets.footers[i])
+      if (currentfilespec->offsets.footers[i] >= filesize
+          || filemirror_actual_location_covered(scalpel_state.filemirror, currentfilespec->offsets.footers[i])
           || ! filemirror_get_blocktype(scalpel_state.filemirror, currentfilespec->offsets.footers[i] / scalpel_state.blocksize,
                                         needlenum)) {
         continue;
@@ -5302,11 +5930,10 @@ static void prune_header_footer_database(void) {
 // NOCARVE function can override the carving operation to avoid writing files that are, e.g., known
 // to be uninteresting.
 //
-// note: the same candidate may be encountered more than once due to work sharing. A hidden staging
-// reservation associated with the UUID-based filename prevents the same candidate from being written
-// twice without exposing an empty final file. For suppressed duplicates, the shadow blockmap is still
-// updated so covered blocks are not reused. This can result in blockmap updates that do not correspond
-// to carved files.
+// note: the same candidate may be encountered more than once due to work sharing. A primary UUID claim
+// ensures that only the first validating member of a work-sharing family is published and covers blocks.
+// A hidden staging reservation prevents duplicate publication of an identical UUID-based pathname
+// without exposing an empty final file.
 //
 // IMPORTANT: THIS FUNCTION DESTROYS THE 'candidate' unless preserve == true.
 void write_candidate(CarveInfo **candidatep, bool preserve) {
@@ -5323,6 +5950,7 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
   FilePublicationReservation reservation;
   bool dont_carve = false;
   bool too_small = false;
+  bool duplicate_validation = false;
   uuid_string_t uuidp;
   uuid_string_t uuidc;
 
@@ -5357,7 +5985,11 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
   if (candidate->flavor == VALIDATED
       && (candidate->partial_artifact_written || candidate->clone || candidate->cloned)
       && atomic_load_explicit(&kill_queue_initialized, memory_order_acquire)) {
-    if (! queue_kill_uuid(candidate->binuuid)) {
+    if (! claim_primary_uuid(candidate->binuuid)) {
+      duplicate_validation = true;
+      dont_carve = true;
+    }
+    if (uuid_is_null(candidate->binuuid)) {
       handle_error(SCALPEL_GENERAL_ABORT, "null candidate UUID", __LINE__, __FILE__);
     }
     queue_partial_cleanup(candidate->binuuid);
@@ -5639,14 +6271,15 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
     // only update the files written counter if something is actually written one more file written
     atomic_fetch_add_explicit(&scalpel_state.files_written, 1, memory_order_acq_rel);
   }
-  else if (candidate->flavor == VALIDATED && ! too_small) {
+  else if (candidate->flavor == VALIDATED && ! too_small
+           && ! duplicate_validation) {
     // suppressed validated candidate (duplicate or DONTCARVE)--still cover the blocks
     filemirror_update_blockmap(scalpel_state.filemirror, candidate->b);
   }
 
-  // remove fully validated candidates from reassembly queue, which mirrors carving operations being
-  // performed by threads
-  if (candidate->flavor == VALIDATED) {
+  // A destructive write ends this thread's work regardless of flavor. Preserved
+  // snapshots remain active and retain their queue mirror.
+  if (candidate->flavor == VALIDATED || ! preserve) {
     delete_from_reassembly_queue(candidate);
   }
 
@@ -7638,6 +8271,10 @@ void carve_files(void) {
     }
   }
   else {  // restoring from checkpoint
+    // The external blockmap may have changed since these offsets were saved.
+    // Prune before any covered offset is converted to an apparent location.
+    frame_message("PRUNING HEADER/FOOTER DATABASE");
+    prune_header_footer_database();
     // validate all fragments in the promising queue
     sync_and_validate_queues();
     atomic_store_explicit(&promising_initialized, true, memory_order_release);
@@ -9228,6 +9865,21 @@ void *block_get_state(void *blockhashkey) {
   }
 
   return NULL;
+}
+
+
+// return whether global state exists for a block hash key without cloning it.
+bool block_state_exists(void *blockhashkey) {
+
+  uint32_t needleidx = 0;
+
+  if (block_hash_key_valid(blockhashkey)) {
+    memcpy(&needleidx, blockhashkey, sizeof(needleidx));
+    return oa_hash_get(scalpel_state.search_specs[needleidx].block_state,
+                       blockhashkey) != NULL;
+  }
+
+  return false;
 }
 
 

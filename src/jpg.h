@@ -1,34 +1,29 @@
 //
-// Scalpel3 is Copyright(C) 2021 - 2026 by Golden G. Richard III and contributors.
+// SPDX-License-Identifier: GPL-3.0-only
 //
-// This program is free software : you can redistribute it and / or modify it under the terms of the
-// GNU General Public License as published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
 //
-// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
-// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-// General Public License for more details.
+// This file is part of Scalpel3.
 //
-// You should have received a copy of the GNU General Public License along with this program. If
-// not, see <https://www.gnu.org/licenses/>.
+// Scalpel3 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3 only.
 //
-// ----------------------------
-// Additional Integration Terms
-// ----------------------------
+// Scalpel3 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
 //
-// Linking or embedding Scalpel3 (statically or dynamically) into another program such that the
-// resulting executable or library forms a single combined work constitutes creation of a derivative
-// work under the GPL. Any party distributing such a combined work must make the entire source code
-// available under the terms of the GPL as well.
+// You should have received a copy of the GNU General Public License along
+// with Scalpel3. If not, see <https://www.gnu.org/licenses/>.
 //
-// Commercial entities wishing to use Scalpel3 in a closed-source or proprietary product or
-// requiring support must obtain a separate commercial license.
+// For proprietary or commercial use cases that require integration or
+// support, contact Golden G. Richard III (golden@cct.lsu.edu) to discuss
+// commercial licensing.
 //
-// For commercial licensing or questions about integration, contact: Golden G. Richard III
-// (golden@cct.lsu.edu).
+// Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
-// Please see LICENSE.md and README.md for further information.
-//
+
 // Forensic-grade JPEG validator for scalpel3 (c) 2021-2026 by Golden G. Richard III.
 //
 // GGRIII: This code is not yet optimized.
@@ -138,6 +133,7 @@
 #define JPG_MAX_SAMPLING 4
 #define JPG_MAX_CODE_LENGTH 16
 #define JPG_MAX_HUFFMAN_CODES 256
+#define JPG_HUFFMAN_PROFILE_CHECKPOINT_QUANTUM 16u
 
 typedef enum {
   JPG_VAL_OK = 0,
@@ -232,7 +228,205 @@ typedef struct JPGHuffmanCheckpoint {
   uint8_t expected_rst;
   int32_t dc_predictors[JPG_MAX_COMPONENTS];
   uint64_t current_block;
+  uint64_t dc_abs_sum;
+  uint64_t dc_samples;
+  uint64_t ac_abs_sum;
+  uint64_t ac_samples;
 } JPGHuffmanCheckpoint;
+
+typedef struct JPGHuffmanBlockProfile {
+  uint32_t *mcu_at_boundary;
+  uint64_t boundary_count;
+} JPGHuffmanBlockProfile;
+
+enum {
+  JPG_RUN_ORDER_GROUP_BATCH = 64,
+  JPG_RUN_ORDER_PRIMARY_GROUPS = 16,
+  JPG_RUN_ORDER_PHASE_SCAN = 1,
+  JPG_RUN_ORDER_PHASE_EXTERNAL_INSERT = 2,
+  JPG_RUN_ORDER_PHASE_INTERNAL_TRANSPOSE = 3,
+  JPG_RUN_ORDER_PHASE_EXHAUSTED = 4,
+  JPG_RUN_ORDER_KIND_NONE = 0,
+  JPG_RUN_ORDER_KIND_EXTERNAL_INSERT = 1,
+  JPG_RUN_ORDER_KIND_INTERNAL_TRANSPOSE = 2
+};
+
+enum {
+  JPG_HIDDEN_BOUNDARY_CHOICES = 32,
+  JPG_HIDDEN_BOUNDARY_SCAN_BATCH = 256,
+  JPG_FOOTER_TAIL_LOCAL_STARTS = 32
+};
+
+#define JPG_RUN_ORDER_STRONG_JOIN_SCORE 4.0
+#define JPG_RUN_ORDER_HIDDEN_BOUNDARY_SCORE 2.0
+#define JPG_FOREIGN_TAIL_RATE_WINDOW_BYTES 8192
+#define JPG_FOREIGN_TAIL_MIN_RATE_RATIO 1.25
+#define JPG_FOREIGN_TAIL_MIN_SEAM_SCORE 1.10
+
+typedef struct JPGRunOrderBoundary {
+  uint64_t first_block;
+  uint64_t last_block;
+  uint32_t boundary_row;
+  double seam_mad;
+  double baseline_mad;
+  double normalized;
+} JPGRunOrderBoundary;
+
+typedef struct JPGRunOrderProgress {
+  bool active;
+  bool page_after_valid;
+  bool scan_group_active;
+  bool transpose_trial_initialized;
+  bool fallback_rollback_valid;
+  uint8_t phase;
+  uint64_t signature;
+  uint64_t source_length;
+  uint64_t source_blocks;
+  int64_t first_apparent;
+  int64_t last_apparent;
+  double page_after_normalized;
+  uint64_t page_after_first_block;
+  uint64_t scan_next_block;
+  JPGRunOrderBoundary scan_group;
+  uint32_t group_count;
+  JPGRunOrderBoundary groups[JPG_RUN_ORDER_GROUP_BATCH];
+  uint32_t external_group;
+  uint64_t external_cut_next;
+  uint64_t external_blocks_next;
+  uint32_t transpose_i;
+  uint32_t transpose_j;
+  uint32_t transpose_k;
+  bool transpose_probe_mode;
+  bool transpose_refine_mode;
+  uint64_t transpose_cut_a;
+  uint64_t transpose_cut_b;
+  uint64_t transpose_cut_c;
+  uint64_t fallback_rollback_block;
+  double fallback_rollback_rate_ratio;
+  bool best_valid;
+  uint8_t best_kind;
+  uint32_t complete_hypotheses;
+  double best_max_join_score;
+  double best_total_join_score;
+  uint64_t best_cut_a;
+  uint64_t best_cut_b;
+  uint64_t best_cut_c;
+  uint64_t best_external_blocks;
+  uint32_t best_group_i;
+  uint32_t best_group_j;
+  uint32_t best_group_k;
+} JPGRunOrderProgress;
+
+typedef struct JPGHiddenBoundaryChoice {
+  int64_t actual_block;
+  double score;
+} JPGHiddenBoundaryChoice;
+
+typedef struct JPGHiddenBoundaryProgress {
+  bool active;
+  bool baseline_scan_initialized;
+  bool scan_complete;
+  bool scan_wrapped;
+  bool choices_ready;
+  bool previous_compatible;
+  bool rejected_successor_checked;
+  bool natural_scan_active;
+  bool natural_scan_complete;
+  bool natural_tail_search_initialized;
+  bool natural_probe_complete;
+  uint64_t origin_blocks;
+  uint64_t origin_length;
+  uint64_t trials;
+  uint32_t scan_batch_positions;
+  // Physical positions survive changes to the apparent view at checkpoints.
+  int64_t next_actual;
+  int64_t scan_wrap_actual;
+  int64_t natural_start_actual;
+  int64_t natural_limit_actual;
+  int64_t natural_next_actual;
+  uint64_t natural_available;
+  uint64_t natural_trial_next;
+  uint32_t choice_count;
+  uint32_t next_choice;
+  JPGHiddenBoundaryChoice choices[JPG_HIDDEN_BOUNDARY_CHOICES];
+} JPGHiddenBoundaryProgress;
+
+// Tail trials belong to a particular prefix. Physical positions remain stable
+// when recovered blocks are removed from the apparent address space.
+typedef struct JPGFooterTailProgress {
+  bool active;
+  bool complete;
+  bool interval_active;
+  bool local_complete;
+  uint64_t source_blocks;
+  uint64_t source_length;
+  uint64_t source_signature;
+  int64_t floor_actual;
+  int64_t footer_actual;
+  int64_t reverse_next_actual;
+  int64_t local_next_actual;
+  int64_t local_limit_actual;
+  uint64_t probes;
+  uint64_t full_trials;
+} JPGFooterTailProgress;
+
+typedef struct {
+  bool valid;
+  JDIMENSION boundary_row;
+  double seam_mad;
+  double baseline_mad;
+  double normalized;
+} JpgBoundaryScore;
+
+// Search decisions persist independently of the decoder cache. Once a saved
+// choice is selected, decoding can resume from the original prefix checkpoint.
+typedef struct JPGForwardScanChoice {
+  bool found;
+  bool validates;
+  bool has_followon_support;
+  bool restart_not_due;
+  bool have_boundary;
+  bool reaches_trial_end;
+  bool near_trial_end;
+  bool is_immediate;
+  int64_t actual;
+  uint64_t commit_validates_to;
+  uint64_t direct_validates_to;
+  uint64_t score_validates_to;
+  JpgBoundaryScore boundary;
+} JPGForwardScanChoice;
+
+typedef struct JPGForwardScanProgress {
+  bool active;
+  bool pass_complete;
+  bool baseline_seed_prepared;
+  bool progressive_seed_prepared;
+  bool baseline_seed_needs_search;
+  bool contiguous_tail_probed;
+  bool backward_choice_found;
+  uint32_t scan_mode;
+  uint32_t scan_pass;
+  uint64_t source_blocks;
+  uint64_t source_length;
+  uint64_t source_signature;
+  uint64_t view_blocks;
+  uint64_t view_signature;
+  int64_t next_actual;
+  int64_t natural_tail_actual;
+  JPGForwardScanChoice best;
+  JPGForwardScanChoice before_backward;
+} JPGForwardScanProgress;
+
+static inline int64_t jpg_reassembly_apparent_lower_bound(int64_t actual);
+static inline uint64_t jpg_forward_source_signature(CarveInfo *candidate,
+                                                     uint64_t blocks);
+static inline uint64_t jpg_forward_view_signature(void);
+static inline bool jpg_forward_source_matches(
+    CarveInfo *candidate, const JPGForwardScanProgress *progress,
+    uint64_t blocks, uint64_t length);
+static inline bool jpg_forward_progress_matches(
+    CarveInfo *candidate, const JPGForwardScanProgress *progress,
+    uint64_t blocks, uint64_t length, uint32_t scan_mode);
 
 // ============================================================================
 // Carve State: Full State for Checkpoint/Restore
@@ -249,6 +443,11 @@ typedef struct JPGCarveState {
   uint32_t fixed_prefix_blocks;   // initial promising prefix that reassembly must not rewrite
   bool reassembly_seed_checked;
   bool reassembly_seed_needs_search;
+  bool hidden_boundary_recovery;
+  uint32_t hidden_boundary_runs_committed;
+  bool hidden_rejected_range_valid;
+  int64_t hidden_rejected_first_actual;
+  int64_t hidden_rejected_last_actual;
 
   // Cached header parse results (skip structural validation on restore)
   bool have_sof;
@@ -277,7 +476,69 @@ typedef struct JPGCarveState {
   // Huffman bitstream checkpoint at last block boundary
   JPGHuffmanCheckpoint huff_checkpoint;
 
+  // Resumable search for complete EOI-bearing candidates whose physical run
+  // order does not decode. Visual seams rank hypotheses; full validation is
+  // still required before any mapping is accepted.
+  JPGRunOrderProgress run_order_progress;
+
+  // A hidden corruption boundary can leave a long, clean JPEG prefix whose
+  // next fragment begins anywhere in the image. Preserve the bounded search
+  // cursor and its strongest alternatives so checkpoints do not restart it.
+  JPGHiddenBoundaryProgress hidden_boundary_progress;
+
+  JPGFooterTailProgress footer_tail_progress;
+  JPGForwardScanProgress forward_scan_progress;
+
 } JPGCarveState;
+
+typedef struct JpgSavedRetrySearch JpgSavedRetrySearch;
+typedef struct JpgReassemblyRetrySearch JpgReassemblyRetrySearch;
+typedef struct JpgSavedRetryFrame JpgSavedRetryFrame;
+typedef struct JpgOOOBridgeChoice JpgOOOBridgeChoice;
+
+// Decoder snapshots stay cheap to copy; the stored state owns retry history.
+typedef struct {
+  JPGCarveState decoder;
+  JpgSavedRetrySearch *retry;
+} JPGStoredCarveState;
+
+static _Thread_local JpgReassemblyRetrySearch *jpg_active_retry_search;
+static _Thread_local void *jpg_active_retry_key;
+
+static inline bool jpg_serialize_carve_state(void **state, FILE *fp,
+                                             StateSerialization mode);
+static inline void *jpg_clone_carve_state(const void *state);
+static inline void jpg_free_carve_state(void **state);
+static inline size_t jpg_sizeof_carve_state(const void *state);
+static inline void jpg_retry_storage_free(JpgSavedRetrySearch **storage);
+static inline JpgSavedRetrySearch *
+jpg_retry_storage_clone(const JpgSavedRetrySearch *source);
+static inline bool jpg_retry_actual_available(int64_t actual);
+static inline bool jpg_retry_range_signature(int64_t start, uint64_t count,
+                                             uint64_t *signature);
+static inline bool jpg_retry_save_choice(JpgOOOBridgeChoice *choice,
+                                         uint64_t signature[2]);
+static inline bool jpg_retry_load_choice(JpgOOOBridgeChoice *choice,
+                                         const uint64_t signature[2]);
+static inline JpgSavedRetrySearch *
+jpg_retry_store(const JpgReassemblyRetrySearch *search);
+static inline void jpg_retry_load(const JpgSavedRetrySearch *saved,
+                                  JpgReassemblyRetrySearch *search);
+static inline bool jpg_retry_transfer(FILE *fp, void *value, size_t size,
+                                      StateSerialization mode);
+static inline bool jpg_retry_frame_valid(const JpgSavedRetryFrame *saved);
+static inline JPGCarveState *jpg_get_decoder_state(void *key);
+static inline void jpg_put_decoder_state(void *key,
+                                         const JPGCarveState *decoder);
+static inline void jpg_save_retry_checkpoint(CarveInfo *candidate);
+static inline void jpg_load_retry_checkpoint(CarveInfo *candidate,
+                                             JpgReassemblyRetrySearch *search);
+
+static inline void jpg_reassembly_finish_mapped_tail(CarveInfo *candidate,
+                                                     bool *validates,
+                                                     uint64_t *validates_to);
+static inline void jpg_reassembly_publish_exit_prefix(
+    CarveInfo *candidate, uint64_t validates_to);
 
 static inline bool jpg_tail_is_padding_only(const char *data,
                                             uint64_t start,
@@ -344,42 +605,30 @@ static inline uint64_t jpg_find_first_nonpadding(const char *data,
 // Carve State API Functions
 // ============================================================================
 
-// jpg_serialize_carve_state — serialize/deserialize JPGCarveState for checkpointing.
-// No internal pointers, so memcpy-safe via fwrite/fread.
-static inline bool jpg_serialize_carve_state(void **state, FILE *fp, StateSerialization mode) {
-  size_t (*fb)(void *ptr, size_t size, size_t nitems,
-               FILE *stream) = mode == SERIALIZE ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite
-                                                 : (size_t (*)(void *, size_t, size_t, FILE *))fread;
-  if (mode == DESERIALIZE) {
-    *state = malloc(sizeof(JPGCarveState));
-    check_memory_allocation(*state, __LINE__, __FILE__, "state");
+// Decoder trials stay pointer-free; retry ownership belongs to the stored state.
+static inline JPGCarveState *jpg_get_decoder_state(void *key) {
+  void *stored = carve_get_state(key);
+  if (!stored) {
+    return NULL;
   }
-  if (fb(*state, sizeof(JPGCarveState), 1, fp) != 1) {
-    perror("jpg carve state");
-    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  JPGStoredCarveState *value = stored;
+  jpg_retry_storage_free(&value->retry);
+  // The first member has the allocation's address and is freed by the caller.
+  return &value->decoder;
+}
+
+// Preserve saved alternatives unless the active search already owns them.
+static inline void jpg_put_decoder_state(void *key, const JPGCarveState *decoder) {
+  JPGStoredCarveState value = {.decoder = *decoder};
+  void *saved = NULL;
+  if (key != jpg_active_retry_key || !jpg_active_retry_search) {
+    saved = carve_get_state(key);
+    if (saved) {
+      value.retry = ((JPGStoredCarveState *)saved)->retry;
+    }
   }
-  return true;
-}
-
-// jpg_clone_carve_state — deep copy (no pointers, memcpy is sufficient).
-static inline void *jpg_clone_carve_state(const void *srcstate) {
-  JPGCarveState *d = (JPGCarveState *)malloc(sizeof(JPGCarveState));
-  check_memory_allocation(d, __LINE__, __FILE__, "d");
-  memcpy(d, srcstate, sizeof(JPGCarveState));
-  return d;
-}
-
-// jpg_free_carve_state — free state and NULL the pointer.
-static inline void jpg_free_carve_state(void **state) {
-  JPGCarveState **s = (JPGCarveState **)state;
-  free(*s);
-  *s = NULL;
-}
-
-// jpg_sizeof_carve_state — return sizeof for memcpy-based optimization.
-static inline size_t jpg_sizeof_carve_state(const void *state) {
-  (void)state;
-  return sizeof(JPGCarveState);
+  carve_put_state(key, &value);
+  jpg_free_carve_state(&saved);
 }
 
 // jpg_print_carve_state — display state for debugging.
@@ -1124,7 +1373,7 @@ typedef struct jpg_mem_source {
   unsigned long length;
   unsigned long curpos;
   long errpos;
-  long first_errpos;      // first error position during partial decode (swallowed errors only)
+  long first_errpos;      // first error or warning during image decoding
   uint32_t swallowed_error_count;  // total number of swallowed errors during partial decode
   unsigned char EOI[32];
   unsigned int jpeg_error;
@@ -1226,6 +1475,9 @@ static inline void jpg_output_message(j_common_ptr cinfo) {
   jpg_mem_source *cd = (jpg_mem_source *)(cinfo->client_data);
   cd->jpeg_error = cinfo->err->msg_code;
   cd->errpos = (long)jpg_bytes_consumed((j_decompress_ptr)cinfo, cd);
+  if (jpg_allow_partial_decode && cd->first_errpos < 0) {
+    cd->first_errpos = cd->errpos;
+  }
 }
 
 
@@ -1258,6 +1510,10 @@ typedef struct {
   double max_mcu_deviation;
   double max_dc_discontinuity;
   uint64_t dc_discontinuity_pos;
+  uint64_t dc_abs_sum;
+  uint64_t dc_samples;
+  uint64_t ac_abs_sum;
+  uint64_t ac_samples;
 } JpgMcuValidationResult;
 
 _Thread_local static JpgMcuValidationResult jpg_mcu_result;
@@ -1875,12 +2131,15 @@ static inline const char *jpg_huffman_failure_method(JpgHuffmanFailure failure) 
 //   ctx         — parsed JPEG structure (header tables, scan info, data pointer)
 //   restore     — if non-NULL and valid, resume Huffman decoding from this checkpoint
 //   save_to     — if non-NULL, save checkpoint state at the last good block boundary
+//   failure     — if non-NULL, identify the entropy failure class
+//   profile     — if non-NULL, record cumulative MCU counts at block boundaries
 //
 // Returns: 0 if no error found, or the byte position of the first detected error.
 static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
                                             JPGHuffmanCheckpoint *restore,
                                             JPGHuffmanCheckpoint *save_to,
-                                            JpgHuffmanFailure *failure) {
+                                            JpgHuffmanFailure *failure,
+                                            JPGHuffmanBlockProfile *profile) {
   if (failure) {
     *failure = JPG_HUFFMAN_FAILURE_NONE;
   }
@@ -1962,9 +2221,22 @@ static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
     memcpy(comp_dc_predictor, restore->dc_predictors, sizeof(comp_dc_predictor));
     checkpoint_block = restore->current_block;
     current_block = restore->current_block;
+    jpg_mcu_result.dc_abs_sum = restore->dc_abs_sum;
+    jpg_mcu_result.dc_samples = restore->dc_samples;
+    jpg_mcu_result.ac_abs_sum = restore->ac_abs_sum;
+    jpg_mcu_result.ac_samples = restore->ac_samples;
+  }
+  if (profile && profile->mcu_at_boundary
+      && checkpoint_block < profile->boundary_count) {
+    profile->mcu_at_boundary[checkpoint_block] = start_mcu;
   }
 
   for (uint32_t mcu = start_mcu; mcu < total_mcus; mcu++) {
+    if (profile && mcu % JPG_HUFFMAN_PROFILE_CHECKPOINT_QUANTUM == 0
+        && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                                memory_order_acquire)) {
+      return 0;
+    }
     last_mcu_start_pos = bs.byte_pos;
     jpg_mcu_result.mcu_count = mcu;
     jpg_mcu_result.mcus_since_restart = mcus_since_restart;
@@ -1987,7 +2259,9 @@ static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
     // produce dc_diffs of several thousand.
     if (!dc_calibrated && mcu >= start_mcu + JPG_DC_CALIBRATION_MCUS) {
       int32_t adaptive = max_observed_dc_diff * 10;
-      if (adaptive < 1000) adaptive = 1000;
+      if (adaptive < 1000) {
+        adaptive = 1000;
+      }
       if (adaptive < local_dc_threshold) {
         local_dc_threshold = adaptive;
       }
@@ -1998,6 +2272,18 @@ static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
     if (jpg_current_blocksize > 0) {
       uint64_t mcu_block = bs.byte_pos / jpg_current_blocksize;
       if (mcu_block > checkpoint_block) {
+        if (profile && profile->mcu_at_boundary
+            && profile->boundary_count > 0) {
+          uint64_t last_boundary = mcu_block;
+
+          if (last_boundary >= profile->boundary_count) {
+            last_boundary = profile->boundary_count - 1;
+          }
+          for (uint64_t boundary = checkpoint_block + 1;
+               boundary <= last_boundary; boundary++) {
+            profile->mcu_at_boundary[boundary] = mcu;
+          }
+        }
         checkpoint_block = mcu_block;
 
         // Save checkpoint at each block boundary crossing (last save wins)
@@ -2011,6 +2297,10 @@ static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
           save_to->expected_rst = expected_rst;
           memcpy(save_to->dc_predictors, comp_dc_predictor, sizeof(comp_dc_predictor));
           save_to->current_block = checkpoint_block;
+          save_to->dc_abs_sum = jpg_mcu_result.dc_abs_sum;
+          save_to->dc_samples = jpg_mcu_result.dc_samples;
+          save_to->ac_abs_sum = jpg_mcu_result.ac_abs_sum;
+          save_to->ac_samples = jpg_mcu_result.ac_samples;
         }
       }
     }
@@ -2062,12 +2352,16 @@ static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
           comp_dc_predictor[sc->comp_idx] += dc_diff;
         }
 
+        int32_t abs_dc_diff = (dc_diff < 0) ? -dc_diff : dc_diff;
+
+        jpg_mcu_result.dc_abs_sum += (uint64_t)abs_dc_diff;
+        jpg_mcu_result.dc_samples++;
+
         // advance at every boundary, including zero-difference symbols, so
         // the next MCU cannot repeat the same boundary check.
         if (jpg_current_blocksize > 0) {
           uint64_t dc_block = bs.byte_pos / jpg_current_blocksize;
           if (dc_block > current_block) {
-            int32_t abs_dc_diff = (dc_diff < 0) ? -dc_diff : dc_diff;
             if ((double)abs_dc_diff
                 > jpg_mcu_result.max_dc_discontinuity) {
               jpg_mcu_result.max_dc_discontinuity = (double)abs_dc_diff;
@@ -2142,6 +2436,8 @@ static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
           }
           return last_mcu_start_pos > 0 ? last_mcu_start_pos : bs.byte_pos;
         }
+        jpg_mcu_result.ac_abs_sum += (uint64_t)ac_block_sum;
+        jpg_mcu_result.ac_samples++;
 
       }
     }
@@ -2492,7 +2788,7 @@ static inline JpgEmbeddedJpegEvidence jpg_embedded_exif_evidence(
   jpg_dc_threshold = INT32_MAX;
   huffman_error = jpg_huffman_validate(&embedded_context, NULL,
                                        &embedded_checkpoint,
-                                       &huffman_failure);
+                                       &huffman_failure, NULL);
   JpgMcuValidationResult embedded_mcu_result = jpg_mcu_result;
   jpg_mcu_result = saved_mcu_result;
   jpg_max_observed_dc_diff = saved_max_observed_dc_diff;
@@ -2629,9 +2925,8 @@ compute_result:;
   else {
     *validates_to = (jpg_last_good_pos > 0) ? (uint64_t)(jpg_last_good_pos - 1) : 0;
   }
-  // If partial decode swallowed errors, cap validates_to at the first swallowed
-  // error position. This only fires for errors during jpeg_read_coefficients
-  // (not header-phase warnings), so it won't affect correct files.
+  // Preserve the first decoder failure even when later input exhaustion
+  // replaces the current error. Header warnings do not define this frontier.
   if (! ok && jpg_cd.first_errpos > 0 && (uint64_t)jpg_cd.first_errpos < *validates_to) {
     *validates_to = (uint64_t)(jpg_cd.first_errpos - 1);
   }
@@ -2762,14 +3057,6 @@ static inline double jpg_row_mad(const uint8_t *a, const uint8_t *b, JDIMENSION 
 }
 
 typedef struct {
-  bool valid;
-  JDIMENSION boundary_row;
-  double seam_mad;
-  double baseline_mad;
-  double normalized;
-} JpgBoundaryScore;
-
-typedef struct {
   const char *data;
   uint8_t *pixels;
   uint64_t prefix_length;
@@ -2779,6 +3066,10 @@ typedef struct {
 } JpgBoundaryPreviewCache;
 
 static _Thread_local JpgBoundaryPreviewCache *jpg_boundary_preview_cache;
+
+static inline bool jpg_reassembly_checkpoint_requested(void) {
+  return atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire);
+}
 
 static inline void jpg_boundary_preview_cache_invalidate(void) {
   if (!jpg_boundary_preview_cache) {
@@ -2791,6 +3082,7 @@ static inline void jpg_boundary_preview_cache_invalidate(void) {
 
 static inline uint8_t *jpg_decode_preview_scaled(char *data, uint64_t length,
                                                  unsigned int scale_denom,
+                                                 bool checkpoint_sensitive,
                                                  JDIMENSION *stride_out,
                                                  JDIMENSION *rows_out) {
   struct jpeg_decompress_struct cinfo;
@@ -2851,6 +3143,13 @@ static inline uint8_t *jpg_decode_preview_scaled(char *data, uint64_t length,
     while (cinfo.output_scanline < cinfo.output_height) {
       JSAMPROW row = (uint8_t *)pixels + (uint64_t)cinfo.output_scanline * stride;
 
+      if (checkpoint_sensitive
+          && (cinfo.output_scanline & 31u) == 0
+          && jpg_reassembly_checkpoint_requested()) {
+        free((void *)pixels);
+        pixels = NULL;
+        goto preview_done;
+      }
       if (jpeg_read_scanlines(&cinfo, &row, 1) != 1) {
         break;
       }
@@ -2871,6 +3170,7 @@ static inline JpgBoundaryScore jpg_decode_boundary_scaled(
     char *data,
     uint64_t length,
     unsigned int scale_denom,
+    bool checkpoint_sensitive,
     const uint8_t *prefix,
     JDIMENSION prefix_stride,
     JDIMENSION prefix_rows) {
@@ -2947,6 +3247,9 @@ static inline JpgBoundaryScore jpg_decode_boundary_scaled(
                             "jpg_boundary_rows");
     previous = (uint8_t *)row_storage;
     current = previous + stride;
+    if (checkpoint_sensitive && jpg_reassembly_checkpoint_requested()) {
+      goto boundary_decode_done;
+    }
     {
       JSAMPROW row = previous;
 
@@ -2961,6 +3264,11 @@ static inline JpgBoundaryScore jpg_decode_boundary_scaled(
       JSAMPROW row = current;
       double pair_mad;
 
+      if (checkpoint_sensitive
+          && (cinfo.output_scanline & 31u) == 0
+          && jpg_reassembly_checkpoint_requested()) {
+        goto boundary_decode_done;
+      }
       if (jpeg_read_scanlines(&cinfo, &row, 1) != 1) {
         break;
       }
@@ -3002,6 +3310,11 @@ static inline JpgBoundaryScore jpg_decode_boundary_scaled(
     while (cinfo.output_scanline < cinfo.output_height) {
       JSAMPROW row = current;
 
+      if (checkpoint_sensitive
+          && (cinfo.output_scanline & 31u) == 0
+          && jpg_reassembly_checkpoint_requested()) {
+        goto boundary_decode_done;
+      }
       if (jpeg_read_scanlines(&cinfo, &row, 1) != 1) {
         break;
       }
@@ -3030,7 +3343,8 @@ static inline JpgBoundaryScore jpg_boundary_score_scaled(
     char *data,
     uint64_t prefix_length,
     uint64_t full_length,
-    unsigned int scale_denom) {
+    unsigned int scale_denom,
+    bool checkpoint_sensitive) {
   JpgBoundaryScore result;
   JDIMENSION prefix_stride = 0;
   JDIMENSION prefix_rows = 0;
@@ -3038,6 +3352,9 @@ static inline JpgBoundaryScore jpg_boundary_score_scaled(
   bool cached_prefix = false;
 
   memset(&result, 0, sizeof(result));
+  if (checkpoint_sensitive && jpg_reassembly_checkpoint_requested()) {
+    return result;
+  }
   if (jpg_boundary_preview_cache
       && jpg_boundary_preview_cache->data == data
       && jpg_boundary_preview_cache->pixels
@@ -3050,6 +3367,7 @@ static inline JpgBoundaryScore jpg_boundary_score_scaled(
   }
   else {
     prefix = jpg_decode_preview_scaled(data, prefix_length, scale_denom,
+                                       checkpoint_sensitive,
                                        &prefix_stride, &prefix_rows);
     if (jpg_boundary_preview_cache && prefix) {
       jpg_boundary_preview_cache_invalidate();
@@ -3065,7 +3383,11 @@ static inline JpgBoundaryScore jpg_boundary_score_scaled(
   if (!prefix || prefix_stride == 0 || prefix_rows < 3) {
     goto boundary_done;
   }
+  if (checkpoint_sensitive && jpg_reassembly_checkpoint_requested()) {
+    goto boundary_done;
+  }
   result = jpg_decode_boundary_scaled(data, full_length, scale_denom,
+                                      checkpoint_sensitive,
                                       prefix, prefix_stride, prefix_rows);
 
 boundary_done:
@@ -3078,191 +3400,8 @@ boundary_done:
 static inline JpgBoundaryScore jpg_boundary_score(char *data,
                                                   uint64_t prefix_length,
                                                   uint64_t full_length) {
-  return jpg_boundary_score_scaled(data, prefix_length, full_length, 8);
-}
-
-static inline bool jpg_should_run_seam_detector(uint64_t length, uint32_t blocksize) {
-  if (blocksize == 0) {
-    return false;
-  }
-  // interior seam detection is only meaningful once the candidate has grown
-  // beyond the shallow header/prefix stage. Running it on 2-3 block prefixes
-  // falsely demotes both correct and incorrect partials to the first block.
-  return length >= (uint64_t)blocksize * 4;
-}
-
-// detect a strong interior seam in the decoded image. This is used only on the
-// ambiguous "truncated but still decodes" path, where wrong shifted tails often
-// introduce a large row-to-row discontinuity well before the bottom of the
-// image, while true tail truncations tend to confine corruption near the end.
-static inline bool jpg_detect_interior_seam(char *data, uint64_t length,
-                                            double *early_max_out, JDIMENSION *early_row_out) {
-  struct jpeg_decompress_struct cinfo;
-  struct jpg_error_mgr jerr;
-  jpg_mem_source cd;
-  uint8_t * volatile prev = NULL;
-  uint8_t * volatile cur = NULL;
-  volatile double total_mad = 0.0;
-  volatile uint32_t mad_count = 0;
-  volatile double early_max = 0.0;
-  volatile JDIMENSION early_row = 0;
-  volatile bool detected = false;
-
-  if (early_max_out) {
-    *early_max_out = 0.0;
-  }
-  if (early_row_out) {
-    *early_row_out = 0;
-  }
-
-  memset(&cd, 0, sizeof(cd));
-  cd.data = (unsigned char *)data;
-  cd.length = (unsigned long)length;
-  cd.EOI[0] = 0xFF;
-  cd.EOI[1] = JPEG_EOI;
-
-  jpeg_create_decompress(&cinfo);
-  cinfo.client_data = &cd;
-  cinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = jpg_handle_error;
-  jerr.pub.output_message = jpg_output_message;
-  jerr.pub.trace_level = 0;
-  cinfo.src = (struct jpeg_source_mgr *)(cinfo.mem->alloc_small)((j_common_ptr)&cinfo, JPOOL_PERMANENT,
-                                                                   sizeof(struct jpeg_source_mgr));
-  cinfo.src->init_source = jpg_init_source;
-  cinfo.src->fill_input_buffer = jpg_fill_input_buffer;
-  cinfo.src->skip_input_data = jpg_skip_input_data;
-  cinfo.src->resync_to_restart = jpeg_resync_to_restart;
-  cinfo.src->term_source = jpg_term_source;
-  cinfo.src->bytes_in_buffer = 0;
-  cinfo.src->next_input_byte = (unsigned char *)data;
-
-  jpg_allow_partial_decode = 1;
-  if (setjmp(jerr.setjmp_buffer)) {
-    goto seam_done;
-  }
-  if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
-    goto seam_done;
-  }
-  cinfo.out_color_space = JCS_RGB;
-  jpeg_start_decompress(&cinfo);
-
-  if (cinfo.output_height < 64 || cinfo.output_width == 0 || cinfo.output_components == 0) {
-    goto seam_done;
-  }
-
-  {
-    JDIMENSION stride = cinfo.output_width * cinfo.output_components;
-    JDIMENSION cutoff = (cinfo.output_height * 9) / 10;
-    JSAMPROW rp[1];
-
-    prev = (uint8_t *)malloc(stride);
-    cur = (uint8_t *)malloc(stride);
-    check_memory_allocation((void *)prev, __LINE__, __FILE__, "jpg_seam_prev");
-    check_memory_allocation((void *)cur, __LINE__, __FILE__, "jpg_seam_cur");
-
-    rp[0] = (JSAMPROW)prev;
-    if (jpeg_read_scanlines(&cinfo, rp, 1) != 1) {
-      goto seam_done;
-    }
-
-    while (cinfo.output_scanline < cinfo.output_height) {
-      rp[0] = (JSAMPROW)cur;
-      if (jpeg_read_scanlines(&cinfo, rp, 1) != 1) {
-        break;
-      }
-
-      JDIMENSION row = cinfo.output_scanline - 1;
-      double mad = jpg_row_mad((const uint8_t *)prev, (const uint8_t *)cur, stride);
-      total_mad += mad;
-      mad_count++;
-
-      if (row > 32 && row < cutoff && mad > early_max) {
-        early_max = mad;
-        early_row = row;
-      }
-
-      uint8_t *tmp = (uint8_t *)prev;
-      prev = cur;
-      cur = tmp;
-    }
-
-    if (mad_count >= 32) {
-      double mean_mad = total_mad / (double)mad_count;
-      /*
-       * A wrong inserted fragment often creates a single very strong interior
-       * seam. Keep this detector conservative: it only needs to catch the
-       * narrow class of candidates that otherwise validate cleanly to EOF.
-       */
-      if (early_row > 32
-          && early_max >= 40.0
-          && early_max >= mean_mad * 6.0) {
-        detected = true;
-      }
-    }
-  }
-
-seam_done:
-  jpg_allow_partial_decode = 0;
-  if (early_max_out) {
-    *early_max_out = early_max;
-  }
-  if (early_row_out) {
-    *early_row_out = early_row;
-  }
-  free((void *)prev);
-  free((void *)cur);
-  jpeg_destroy_decompress(&cinfo);
-  return detected;
-}
-
-static inline bool jpg_apply_libvalidate_seam_guard(char *data,
-                                                    uint64_t length,
-                                                    uint32_t blocksize,
-                                                    const JPGCarveState *local_state,
-                                                    bool *validates,
-                                                    uint64_t *validates_to,
-                                                    bool *promising) {
-  double seam_mad = 0.0;
-  JDIMENSION seam_row = 0;
-  uint64_t fallback;
-
-  if (!validates || !validates_to || !promising || !*validates
-      || !jpg_should_run_seam_detector(length, blocksize)) {
-    return false;
-  }
-
-  if (!jpg_detect_interior_seam(data, length, &seam_mad, &seam_row)) {
-    return false;
-  }
-
-  fallback = (length > blocksize) ? (length - blocksize - 1) : 0;
-  if (local_state && local_state->prev_validates_to + 1 < length) {
-    fallback = local_state->prev_validates_to;
-  }
-  if (length > 0 && fallback >= length) {
-    fallback = length - 1;
-  }
-
-  *validates = false;
-  *promising = true;
-  *validates_to = fallback;
-
-  if (!jpg_wrongblock_result.detected
-      || fallback + 1 < jpg_wrongblock_result.estimated_byte) {
-    jpg_wrongblock_result.detected = true;
-    jpg_wrongblock_result.estimated_byte = fallback + 1;
-    jpg_wrongblock_result.confidence = seam_mad;
-    jpg_wrongblock_result.method = "row_mad_seam";
-  }
-
-  if (jpg_validate_debug_enabled()) {
-    lock_fprintf(stderr,
-                 "[jpgvdbg] seam len=%" PRIu64 " row=%u mad=%.3f fallback=%" PRIu64 "\n",
-                 length, seam_row, seam_mad, fallback);
-  }
-
-  return true;
+  return jpg_boundary_score_scaled(data, prefix_length, full_length, 8,
+                                   false);
 }
 
 static inline uint64_t jpg_huffman_trusted_validates_to(
@@ -3572,18 +3711,24 @@ static inline uint32_t jpg_initial_prefix_blocks(const JPGCarveState *local_stat
 // Entropy-specific rules (invalid byte stuffing) are only applied when
 // had_scan is true, preventing false truncation of metadata-heavy files
 // where APP1/ICC/etc. spans many blocks before entropy data begins.
-// Scan forward for an 0xFF that is followed by a byte in [0x02, 0xBF] — the
-// invalid-marker-in-entropy signature. Returns the file byte offset of the
-// offending 0xFF, or 0 if none found in [start, end).
+// Scan forward for either EOI or an 0xFF followed by a byte in [0x02, 0xBF].
+// The latter is invalid inside entropy data. Returns the file byte offset of
+// the first event, or 0 if neither event occurs in [start, end).
 static inline uint64_t jpg_ff_find_invalid_marker(const uint8_t *data,
                                                   uint64_t start,
-                                                  uint64_t end) {
+                                                  uint64_t end,
+                                                  bool *saw_eoi) {
+  *saw_eoi = false;
   if (end < 2 || start + 1 >= end) {
     return 0;
   }
   for (uint64_t i = start; i + 1 < end; i++) {
     if (data[i] == 0xFF) {
       uint8_t next = data[i + 1];
+      if (next == M_EOI) {
+        *saw_eoi = true;
+        return i;
+      }
       if (next >= 0x02 && next <= 0xBF) {
         return i;
       }
@@ -3603,37 +3748,58 @@ static inline uint64_t jpg_ff_find_invalid_marker(const uint8_t *data,
 // entropy rule entirely (safer than false positives).
 static inline uint64_t jpg_ff_prescreen(const char *data, uint64_t length, uint32_t blocksize,
                                         uint64_t start_blk, uint64_t entropy_start_byte) {
+  uint64_t event_pos = 0;
+  uint64_t scan_limit = length;
+  bool saw_eoi = false;
+
   if (blocksize == 0 || length <= blocksize) {
     return length;
   }
+
   uint64_t num_blocks = length / blocksize;
+  if (entropy_start_byte > 0 && length > entropy_start_byte) {
+    uint64_t scan_start = start_blk * (uint64_t)blocksize;
+
+    if (scan_start < entropy_start_byte) {
+      scan_start = entropy_start_byte;
+    }
+    event_pos = jpg_ff_find_invalid_marker((const uint8_t *)data,
+                                           scan_start, length, &saw_eoi);
+    if (event_pos > 0) {
+      scan_limit = event_pos;
+    }
+  }
+
   for (uint64_t blk = start_blk; blk < num_blocks; blk++) {
     uint64_t block_start = blk * (uint64_t)blocksize;
     uint64_t block_end = block_start + blocksize;
-    if (block_end > length) block_end = length;
+
+    if (block_start >= scan_limit) {
+      break;
+    }
+    if (block_end > length) {
+      block_end = length;
+    }
     const uint8_t *block_data = (const uint8_t *)data + block_start;
 
-    // Second-header check — runs on every block past the first, regardless
-    // of entropy state: a spurious SOI inside a candidate means a different
-    // file starts at this block.
-    if (blk > 0 && block_end >= block_start + 2
+    // A block-aligned SOI after the outer scan begins marks the start of a
+    // different JPEG. SOI signatures before SOS may belong to thumbnails
+    // embedded in APP metadata and must not split the enclosing image.
+    if (blk > 0 && entropy_start_byte > 0
+        && block_start >= entropy_start_byte
+        && block_end >= block_start + 2
         && block_data[0] == 0xFF && block_data[1] == 0xD8) {
       return block_start;
     }
+  }
 
-    // Entropy scan only where we know we're past SOS.
-    if (entropy_start_byte > 0 && block_end > entropy_start_byte) {
-      uint64_t scan_start = block_start > entropy_start_byte
-                                ? block_start
-                                : entropy_start_byte;
-      uint64_t inv_pos = jpg_ff_find_invalid_marker(
-          (const uint8_t *)data, scan_start, block_end);
-      if (inv_pos > 0) {
-        // Truncate at the block containing the invalid marker so downstream
-        // keeps the prior validated prefix.
-        return block_start;
-      }
-    }
+  if (saw_eoi) {
+    return length;
+  }
+  if (event_pos > 0) {
+    // Truncate at the block containing the invalid marker so downstream keeps
+    // the prior validated prefix.
+    return (event_pos / blocksize) * blocksize;
   }
   return length;
 }
@@ -3712,8 +3878,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
   }
 
   // ---- Carve state restore: check for saved state from previous validation call ----
-  // OPUS47/J9: stack-allocate instead of calloc — JPGCarveState is ~1.4KB,
-  // well within thread stack, and saves ~N million allocator calls per run.
+  // Keep each trial's decoder state on the stack to avoid per-call allocation.
   bool restored = false;
   JPGCarveState local_state_storage;
   memset(&local_state_storage, 0, sizeof(local_state_storage));
@@ -3749,7 +3914,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
     }
   }
   else if (carvehashkey) {
-    JPGCarveState *saved = (JPGCarveState *)carve_get_state(carvehashkey);
+    JPGCarveState *saved = (JPGCarveState *)jpg_get_decoder_state(carvehashkey);
     if (saved && saved->valid && saved->checkpoint_pos > 0) {
       if (saved->checkpoint_pos <= length) {
         // Normal case: checkpoint is within current data
@@ -3778,7 +3943,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
           jpg_sanitize_resume_state(local_state, length, blocksize, false);
           restored = true;
           // Save the trimmed state back so future calls see the trimmed checkpoint
-          carve_put_state(carvehashkey, local_state);
+          jpg_put_decoder_state(carvehashkey, local_state);
         }
       }
     }
@@ -3872,6 +4037,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
         jpg_initial_prefix_blocks(local_state, length, blocksize);
     uint64_t initial_prefix_validates_to = 0;
     uint64_t structural_validates_to = 0;
+    uint64_t zero_run_prefix_validates_to = 0;
 
     if (blocksize > 0 && initial_prefix_blocks > 0) {
       initial_prefix_validates_to =
@@ -3887,6 +4053,15 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
       if (length > 0 && structural_validates_to >= length) {
         structural_validates_to = length - 1;
       }
+    }
+    // Whole zero blocks are legal inside marker metadata. Treat them as gap
+    // evidence only after the complete structural prefix containing SOS.
+    zero_run_prefix_validates_to =
+        initial_prefix_validates_to > structural_validates_to
+            ? initial_prefix_validates_to
+            : structural_validates_to;
+    if (local_state->prev_validates_to > zero_run_prefix_validates_to) {
+      zero_run_prefix_validates_to = local_state->prev_validates_to;
     }
 
     // Tighten the DC continuity check based on the trusted prefix. The
@@ -3914,7 +4089,8 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
                                          ? &local_state->huff_checkpoint : NULL;
     JpgHuffmanFailure huffman_failure;
     uint64_t huffman_error_pos =
-        jpg_huffman_validate(&ctx, huff_restore, &huff_save, &huffman_failure);
+        jpg_huffman_validate(&ctx, huff_restore, &huff_save,
+                             &huffman_failure, NULL);
     trusted_validates_to = jpg_huffman_trusted_validates_to(
         &huff_save, trusted_validates_to, local_state->checkpoint_pos);
 
@@ -3927,11 +4103,20 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
       {
         uint64_t zero_run_pos =
             jpg_find_interior_zero_run_after_prefix(data, length, blocksize,
-                                                    local_state->prev_validates_to,
+                                                    zero_run_prefix_validates_to,
                                                     huffman_error_pos);
         if (zero_run_pos > 0 && zero_run_pos < huffman_error_pos) {
           huffman_error_pos = zero_run_pos;
         }
+      }
+      if (!jpg_wrongblock_result.detected
+          || huffman_error_pos < jpg_wrongblock_result.estimated_byte) {
+        jpg_wrongblock_result.detected = true;
+        jpg_wrongblock_result.estimated_byte = huffman_error_pos;
+        jpg_wrongblock_result.confidence =
+            jpg_huffman_failure_is_hard(huffman_failure) ? 100.0 : 75.0;
+        jpg_wrongblock_result.method =
+            jpg_huffman_failure_method(huffman_failure);
       }
       *validates = false;
       *validates_to = huffman_error_pos - 1;
@@ -3954,7 +4139,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
       if (lib_validates) {
         validated_zero_run_pos =
             jpg_find_interior_zero_run_after_prefix(
-                data, length, blocksize, initial_prefix_validates_to,
+                data, length, blocksize, zero_run_prefix_validates_to,
                 lib_validates_to);
       }
       if (validated_zero_run_pos > 0) {
@@ -3972,10 +4157,6 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
         *promising = false;
       }
       else {
-        uint64_t zero_run_prefix_validates_to =
-            local_state->prev_validates_to > initial_prefix_validates_to
-                ? local_state->prev_validates_to
-                : initial_prefix_validates_to;
         uint64_t zero_run_pos =
             jpg_find_interior_zero_run_after_prefix(
                 data, length, blocksize,
@@ -4079,6 +4260,11 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
               local_state->reassembly_seed_checked;
           direct_state->reassembly_seed_needs_search =
               local_state->reassembly_seed_needs_search;
+          memcpy(&direct_state->run_order_progress,
+                 &local_state->run_order_progress,
+                 sizeof(direct_state->run_order_progress));
+          direct_state->footer_tail_progress = local_state->footer_tail_progress;
+          direct_state->forward_scan_progress = local_state->forward_scan_progress;
           jpg_save_header_to_state(direct_state, &ctx);
           if (huff_save.valid && huff_save.byte_pos <= length) {
             memcpy(&direct_state->huff_checkpoint, &huff_save,
@@ -4108,6 +4294,11 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
               local_state->reassembly_seed_checked;
           save_state->reassembly_seed_needs_search =
               local_state->reassembly_seed_needs_search;
+          memcpy(&save_state->run_order_progress,
+                 &local_state->run_order_progress,
+                 sizeof(save_state->run_order_progress));
+          save_state->footer_tail_progress = local_state->footer_tail_progress;
+          save_state->forward_scan_progress = local_state->forward_scan_progress;
           jpg_save_header_to_state(save_state, &ctx);
           if (save_huff_checkpoint) {
             memcpy(&save_state->huff_checkpoint, save_huff_checkpoint,
@@ -4129,7 +4320,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
                          save_state->fixed_prefix_blocks,
                          canonical_promising_state ? 1 : 0);
           }
-          carve_put_state(carvehashkey, save_state);
+          jpg_put_decoder_state(carvehashkey, save_state);
           free(save_state);
         }
       }
@@ -4164,6 +4355,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
     uint32_t initial_prefix_blocks =
         jpg_initial_prefix_blocks(NULL, length, blocksize);
     uint64_t initial_prefix_validates_to = 0;
+    uint64_t zero_run_prefix_validates_to = 0;
     uint64_t validated_zero_run_pos = 0;
     JpgEmbeddedJpegEvidence embedded_evidence;
     jpg_current_blocksize = blocksize;
@@ -4172,7 +4364,8 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
     JPGHuffmanCheckpoint huff_save;
     JpgHuffmanFailure huffman_failure;
     uint64_t huffman_error_pos =
-        jpg_huffman_validate(&ctx, NULL, &huff_save, &huffman_failure);
+        jpg_huffman_validate(&ctx, NULL, &huff_save,
+                             &huffman_failure, NULL);
     embedded_evidence = jpg_embedded_exif_evidence(
         (const uint8_t *)data, length);
     trusted_validates_to =
@@ -4191,10 +4384,14 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
         initial_prefix_validates_to = length - 1;
       }
     }
+    zero_run_prefix_validates_to =
+        initial_prefix_validates_to > structural_validates_to
+            ? initial_prefix_validates_to
+            : structural_validates_to;
     if (lib_validates) {
       validated_zero_run_pos =
           jpg_find_interior_zero_run_after_prefix(
-              data, length, blocksize, initial_prefix_validates_to,
+              data, length, blocksize, zero_run_prefix_validates_to,
               lib_validates_to);
     }
 
@@ -4207,7 +4404,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
       {
         uint64_t zero_run_pos =
             jpg_find_interior_zero_run_after_prefix(data, length, blocksize,
-                                                    initial_prefix_validates_to,
+                                                    zero_run_prefix_validates_to,
                                                     huffman_error_pos);
         if (zero_run_pos > 0 && zero_run_pos < huffman_error_pos) {
           huffman_error_pos = zero_run_pos;
@@ -4331,20 +4528,12 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
               ctx.mpf_compound_end > 0 ? ctx.mpf_compound_end - 1 : 0;
         }
       }
-      // OPUS47/J12: only override libjpeg's positive validation with a
-      // Huffman error when libjpeg did NOT validate all the way to the
-      // end of the data AND the remaining data is NOT trailing padding.
-      // When libjpeg stops at a valid EOI and the rest of the buffer is
-      // zero/0xFF padding (common when scalpel3 carves block-aligned
-      // regions that extend past the file's actual end), we want to
-      // accept the file and commit at libjpeg's last good byte. A
-      // Huffman "error" at an early block boundary in a libjpeg-valid
-      // file is a false positive (e.g. aggressive DC continuity check
-      // firing on a legitimate large DC swing). For true reassembly
-      // candidates with wrong tail blocks, libjpeg typically stops well
-      // before the end and the trailing bytes contain JPEG-ish garbage
-      // (non-padding), so this check still rejects those.
+      // A real EOI ends the JPEG even when its final disk block contains
+      // unrelated bytes. Only contradictory entropy evidence may override
+      // libjpeg's complete decode; continuity and magnitude checks are
+      // ranking heuristics and cannot establish corruption on their own.
       else if (huffman_error_pos > 0
+               && jpg_huffman_failure_is_hard(huffman_failure)
                && lib_validates_to + 1 < length
                && !jpg_tail_is_padding_only(data, lib_validates_to + 1, length)
                && lib_validates_to > huffman_error_pos + blocksize) {
@@ -4369,23 +4558,27 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
         {
           uint64_t zero_run_pos =
               jpg_find_interior_zero_run_after_prefix(data, length, blocksize,
-                                                      initial_prefix_validates_to,
+                                                      zero_run_prefix_validates_to,
                                                       huffman_error_pos);
           if (zero_run_pos > 0 && zero_run_pos < huffman_error_pos) {
             huffman_error_pos = zero_run_pos;
           }
         }
-        // when libjpeg decodes past a heuristic Huffman warning, prefer its
-        // frontier. Hard entropy failures remain authoritative because no
-        // valid continuation can contain an impossible code or coefficient
-        // run at the current bit alignment.
+        // During reassembly, libjpeg's farther decode remains useful as a
+        // tentative search frontier when the strict entropy decoder loses
+        // alignment. An explicit restart sequence violation remains
+        // authoritative. Final validation still requires a complete decode
+        // through a real EOI.
         //
         // Safety: if a large zero/padding run appears before lib_vt,
         // clamp to the start of that run. libjpeg accepts zero runs as
         // AC=0 coefficients and can be tricked into "validating" a
         // zero-filled gap that's actually reassembly garbage.
         uint64_t frontier = huffman_error_pos > 0 ? huffman_error_pos - 1 : 0;
-        if (lib_validates_to > frontier) {
+        if ((!jpg_huffman_failure_is_hard(huffman_failure)
+             || (direct_state
+                 && huffman_failure != JPG_HUFFMAN_FAILURE_RESTART_SEQUENCE))
+            && lib_validates_to > frontier) {
           uint64_t zero_run_in_disputed = jpg_find_interior_zero_run_after_prefix(
               data, length, blocksize, frontier, lib_validates_to);
           uint64_t trailing_zero =
@@ -4408,7 +4601,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
       else {
         uint64_t zero_run_pos =
             jpg_find_interior_zero_run_after_prefix(data, length, blocksize,
-                                                    initial_prefix_validates_to,
+                                                    zero_run_prefix_validates_to,
                                                     length - 1);
         uint64_t trailing_zero_pos =
             jpg_find_trailing_zero_run_start(data, length, blocksize,
@@ -4509,6 +4702,11 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
               local_state->reassembly_seed_checked;
           direct_state->reassembly_seed_needs_search =
               local_state->reassembly_seed_needs_search;
+          memcpy(&direct_state->run_order_progress,
+                 &local_state->run_order_progress,
+                 sizeof(direct_state->run_order_progress));
+          direct_state->footer_tail_progress = local_state->footer_tail_progress;
+          direct_state->forward_scan_progress = local_state->forward_scan_progress;
           jpg_save_header_to_state(direct_state, &ctx);
           if (huff_save.valid && huff_save.byte_pos <= length) {
             memcpy(&direct_state->huff_checkpoint, &huff_save,
@@ -4535,6 +4733,11 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
               local_state->reassembly_seed_checked;
           save->reassembly_seed_needs_search =
               local_state->reassembly_seed_needs_search;
+          memcpy(&save->run_order_progress,
+                 &local_state->run_order_progress,
+                 sizeof(save->run_order_progress));
+          save->footer_tail_progress = local_state->footer_tail_progress;
+          save->forward_scan_progress = local_state->forward_scan_progress;
           jpg_save_header_to_state(save, &ctx);
           if (save_huff_checkpoint) {
             memcpy(&save->huff_checkpoint, save_huff_checkpoint,
@@ -4556,7 +4759,7 @@ static inline void jpg_validate_core(char *data, uint64_t length, bool *validate
                          save->fixed_prefix_blocks,
                          canonical_promising_state ? 1 : 0);
           }
-          carve_put_state(carvehashkey, save);
+          jpg_put_decoder_state(carvehashkey, save);
           free(save);
         }
       }
@@ -4621,14 +4824,14 @@ static inline void jpg_file_validate(char *data, uint64_t length, bool *validate
 // ============================================================================
 
 static inline uint32_t jpg_reassembly_get_fixed_prefix_blocks(CarveInfo *candidate) {
-  void *state = carve_get_state(candidate->carvehashkey);
+  void *state = jpg_get_decoder_state(candidate->carvehashkey);
   uint32_t fixed_prefix_blocks = 1;
   if (state) {
     JPGCarveState *jpg_state = (JPGCarveState *)state;
     if (jpg_state->fixed_prefix_blocks > 0) {
       fixed_prefix_blocks = jpg_state->fixed_prefix_blocks;
     }
-    scalpel_state.search_specs[candidate->needleidx].FREECARVESTATEFUNC(&state);
+    free(state);
   }
   if (fixed_prefix_blocks > blockvector_get_num_blocks(candidate->b)) {
     fixed_prefix_blocks = blockvector_get_num_blocks(candidate->b);
@@ -4743,10 +4946,6 @@ static _Thread_local JPGReassemblyMaterializationCache
 
 static const int64_t JPG_REASS_BLOCK_CHOICE_CHECKPOINT = INT64_MIN;
 
-static inline bool jpg_reassembly_checkpoint_requested(void) {
-  return atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire);
-}
-
 static inline void jpg_reassembly_init_candidate(int id, CarveInfo *candidate,
                                                  uuid_string_t uuidp,
                                                  uuid_string_t uuidc) {
@@ -4806,13 +5005,13 @@ static inline bool jpg_reassembly_load_saved_state(CarveInfo *candidate,
   void *saved;
 
   memset(state, 0, sizeof(*state));
-  saved = carve_get_state(candidate->carvehashkey);
+  saved = jpg_get_decoder_state(candidate->carvehashkey);
   if (!saved) {
     return false;
   }
 
   memcpy(state, saved, sizeof(*state));
-  scalpel_state.search_specs[candidate->needleidx].FREECARVESTATEFUNC(&saved);
+  free(saved);
   return state->valid;
 }
 
@@ -4926,6 +5125,258 @@ static inline char *jpg_reassembly_materialize_candidate(CarveInfo *candidate,
   return cache->data;
 }
 
+#define JPG_REASS_FINAL_JOIN_SCORE_LIMIT 4.0
+
+enum {
+  JPG_REASS_FINAL_NONCONTIGUOUS_JOIN_MINIMUM = 2,
+  JPG_REASS_FINAL_SUSPICIOUS_JOIN_MINIMUM = 1
+};
+
+typedef struct JPGReassemblyPhysicalRun {
+  uint64_t source_slot;
+  uint64_t length;
+  int64_t first_actual;
+  int64_t last_actual;
+} JPGReassemblyPhysicalRun;
+
+static inline int jpg_reassembly_compare_physical_runs(const void *left,
+                                                       const void *right) {
+  const JPGReassemblyPhysicalRun *left_run =
+      (const JPGReassemblyPhysicalRun *)left;
+  const JPGReassemblyPhysicalRun *right_run =
+      (const JPGReassemblyPhysicalRun *)right;
+
+  if (left_run->first_actual < right_run->first_actual) {
+    return -1;
+  }
+  if (left_run->first_actual > right_run->first_actual) {
+    return 1;
+  }
+  return 0;
+}
+
+static inline bool jpg_reassembly_validate_direct(
+    CarveInfo *candidate, JPGCarveState *state, uint64_t *validates_to,
+    uint32_t fixed_prefix_blocks);
+static inline bool jpg_reassembly_requires_cold_validation(
+    CarveInfo *candidate, uint32_t fixed_prefix_blocks);
+
+// Early trials across a gap must be checked from the beginning of the file.
+static inline bool jpg_reassembly_requires_cold_validation(
+    CarveInfo *candidate, uint32_t fixed_prefix_blocks) {
+  return jpg_reassembly_has_gap(candidate, fixed_prefix_blocks)
+         && blockvector_get_num_blocks(candidate->b)
+                <= (uint64_t)fixed_prefix_blocks + 3;
+}
+
+// A complete libjpeg decode establishes syntactic validity but cannot prove
+// the order of independently relocated entropy runs. Preserve distinct valid
+// run orders as promising hypotheses. Without a second valid order, require
+// independent evidence of a suspicious join before treating a decoded
+// multi-run candidate as ambiguous. Requiring more than one relocated join
+// keeps an ordinary single-gap reconstruction conclusive.
+static inline bool jpg_reassembly_has_ambiguous_join_order(
+    CarveInfo *candidate) {
+  uint64_t num_blocks;
+  uint64_t noncontiguous_joins = 0;
+  uint64_t length = 0;
+  char *data;
+  uint32_t suspicious_joins = 0;
+
+  if (!candidate || !candidate->b || scalpel_state.blocksize == 0) {
+    return false;
+  }
+
+  num_blocks = blockvector_get_num_blocks(candidate->b);
+  for (uint64_t slot = 1; slot < num_blocks; slot++) {
+    const int64_t previous =
+        blockvector_get_actual_blocknumber(candidate->b, slot - 1);
+    const int64_t current =
+        blockvector_get_actual_blocknumber(candidate->b, slot);
+
+    if (previous < 0 || current != previous + 1) {
+      noncontiguous_joins++;
+    }
+  }
+  if (noncontiguous_joins
+      < JPG_REASS_FINAL_NONCONTIGUOUS_JOIN_MINIMUM) {
+    return false;
+  }
+
+  // A valid entropy stream can occasionally survive a permutation of whole
+  // physical runs. If physically ordering the same tail runs also produces a
+  // complete JPEG with fewer joins, retain that simpler reconstruction but do
+  // not claim that the format proves which of the two valid orders is correct.
+  if (noncontiguous_joins < SIZE_MAX / sizeof(JPGReassemblyPhysicalRun)) {
+    const uint64_t run_count = noncontiguous_joins + 1;
+    JPGReassemblyPhysicalRun *runs =
+        (JPGReassemblyPhysicalRun *)malloc(
+            (size_t)run_count * sizeof(*runs));
+    uint64_t run_index = 0;
+    uint64_t sorted_joins = 0;
+    uint64_t destination_slot = 0;
+    BlockVector *ordered = NULL;
+    bool usable = true;
+
+    check_memory_allocation(runs, __LINE__, __FILE__,
+                            "JPG physical run ordering");
+    memset(runs, 0, (size_t)run_count * sizeof(*runs));
+    runs[0].source_slot = 0;
+    runs[0].first_actual =
+        blockvector_get_actual_blocknumber(candidate->b, 0);
+    if (runs[0].first_actual < 0) {
+      usable = false;
+    }
+
+    for (uint64_t slot = 1; usable && slot < num_blocks; slot++) {
+      const int64_t previous =
+          blockvector_get_actual_blocknumber(candidate->b, slot - 1);
+      const int64_t current =
+          blockvector_get_actual_blocknumber(candidate->b, slot);
+
+      if (previous < 0 || current < 0) {
+        usable = false;
+        break;
+      }
+      if (current != previous + 1) {
+        runs[run_index].length =
+            slot - runs[run_index].source_slot;
+        runs[run_index].last_actual = previous;
+        run_index++;
+        runs[run_index].source_slot = slot;
+        runs[run_index].first_actual = current;
+      }
+    }
+    if (usable) {
+      runs[run_index].length =
+          num_blocks - runs[run_index].source_slot;
+      runs[run_index].last_actual =
+          blockvector_get_actual_blocknumber(candidate->b, num_blocks - 1);
+      usable = run_index + 1 == run_count;
+    }
+
+    if (usable) {
+      qsort(runs + 1, (size_t)(run_count - 1), sizeof(*runs),
+            jpg_reassembly_compare_physical_runs);
+      for (uint64_t index = 1; index < run_count; index++) {
+        if (runs[index].first_actual
+            != runs[index - 1].last_actual + 1) {
+          sorted_joins++;
+        }
+      }
+      usable = sorted_joins < noncontiguous_joins;
+    }
+
+    if (usable) {
+      CarveInfo ordered_candidate = *candidate;
+      JPGCarveState ordered_state;
+      uint64_t ordered_validates_to = 0;
+      const uint64_t original_length =
+          blockvector_get_data_length(candidate->b);
+      bool ordered_validates;
+
+      clone_blockvector(candidate->b, &ordered, false);
+      for (uint64_t index = 0; index < run_count; index++) {
+        for (uint64_t offset = 0; offset < runs[index].length; offset++) {
+          const int64_t apparent = blockvector_get_apparent_blocknumber(
+              candidate->b, runs[index].source_slot + offset);
+
+          blockvector_set_apparent_blocknumber(
+              ordered, destination_slot++, apparent);
+        }
+      }
+      deflate_blockvector(ordered);
+      blockvector_set_data_length(ordered, original_length);
+      inflate_blockvector(ordered);
+      ordered_candidate.b = ordered;
+      memset(&ordered_state, 0, sizeof(ordered_state));
+      ordered_validates = jpg_reassembly_validate_direct(
+          &ordered_candidate, &ordered_state, &ordered_validates_to,
+          jpg_reassembly_get_fixed_prefix_blocks(candidate));
+
+      if (ordered_validates && original_length > 0
+          && ordered_validates_to == original_length - 1) {
+        if (scalpel_state.write_promising) {
+          BlockVector *original = candidate->b;
+          const CarveInfoFlavor original_flavor = candidate->flavor;
+          const uint64_t original_validates_to =
+              candidate->best_validates_to;
+          CarveInfo *preserved_candidate = candidate;
+
+          candidate->b = ordered;
+          candidate->flavor = PROMISING;
+          candidate->best_validates_to = ordered_validates_to;
+          write_candidate(&preserved_candidate, true);
+          candidate->b = original;
+          candidate->flavor = original_flavor;
+          candidate->best_validates_to = original_validates_to;
+        }
+        if (jpg_reassembly_debug_candidate(candidate)) {
+          lock_fprintf(stderr,
+                       "[jpgdbg] final_join alternate physical runs=%" PRIu64
+                       " joins=%" PRIu64 "->%" PRIu64
+                       " preserved=%d\n",
+                       run_count, noncontiguous_joins, sorted_joins,
+                       scalpel_state.write_promising ? 1 : 0);
+        }
+        free_blockvector(&ordered);
+        free(runs);
+        return true;
+      }
+    }
+    if (ordered) {
+      free_blockvector(&ordered);
+    }
+    free(runs);
+  }
+
+  data = jpg_reassembly_materialize_candidate(candidate, &length);
+  if (!data || length == 0) {
+    return false;
+  }
+
+  for (uint64_t slot = 1; slot < num_blocks; slot++) {
+    const int64_t previous =
+        blockvector_get_actual_blocknumber(candidate->b, slot - 1);
+    const int64_t current =
+        blockvector_get_actual_blocknumber(candidate->b, slot);
+    uint64_t prefix_length;
+    JpgBoundaryScore boundary;
+
+    if (previous >= 0 && current == previous + 1) {
+      continue;
+    }
+    if (slot > UINT64_MAX / scalpel_state.blocksize) {
+      break;
+    }
+    prefix_length = slot * scalpel_state.blocksize;
+    if (prefix_length >= length) {
+      break;
+    }
+
+    boundary = jpg_boundary_score_scaled(data, prefix_length, length, 1,
+                                         false);
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr,
+                   "[jpgdbg] final_join slot=%" PRIu64
+                   " previous=%" PRId64 " current=%" PRId64
+                   " valid=%d normalized=%.3f\n",
+                   slot, previous, current, boundary.valid ? 1 : 0,
+                   boundary.normalized);
+    }
+    if (boundary.valid
+        && boundary.normalized >= JPG_REASS_FINAL_JOIN_SCORE_LIMIT) {
+      suspicious_joins++;
+      if (suspicious_joins
+          >= JPG_REASS_FINAL_SUSPICIOUS_JOIN_MINIMUM) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 static inline bool jpg_reassembly_validate_direct(CarveInfo *candidate,
                                                   JPGCarveState *state,
                                                   uint64_t *validates_to,
@@ -4936,8 +5387,7 @@ static inline bool jpg_reassembly_validate_direct(CarveInfo *candidate,
   char *materialized = jpg_reassembly_materialize_candidate(candidate,
                                                             &materialized_length);
   bool use_full_validation =
-      jpg_reassembly_has_gap(candidate, fixed_prefix_blocks)
-      && blockvector_get_num_blocks(candidate->b) <= (uint64_t)fixed_prefix_blocks + 3;
+      jpg_reassembly_requires_cold_validation(candidate, fixed_prefix_blocks);
 
   if (use_full_validation) {
     memset(state, 0, sizeof(*state));
@@ -4973,6 +5423,89 @@ static inline bool jpg_reassembly_validate_direct(CarveInfo *candidate,
                     candidate->needleidx, scalpel_state.blocksize,
                     NULL, state);
   return validates;
+}
+
+// Check the remaining bytes of an already mapped final block before searching
+// for another block. A rejected or interrupted trial preserves the exact prefix.
+// Validator state remains untouched; normal reassembly resumes it on acceptance.
+static inline void jpg_reassembly_finish_mapped_tail(
+    CarveInfo *candidate, bool *validates, uint64_t *validates_to) {
+  if (!candidate || !candidate->b || !validates || !validates_to
+      || *validates || scalpel_state.blocksize == 0
+      || jpg_reassembly_checkpoint_requested()) {
+    return;
+  }
+  uint64_t length = blockvector_get_data_length(candidate->b);
+  uint64_t count = blockvector_get_num_blocks(candidate->b);
+  uint64_t blocksize = scalpel_state.blocksize;
+  if (length == 0 || length % blocksize == 0
+      || count > UINT64_MAX / blocksize
+      || count != length / blocksize + 1) {
+    return;
+  }
+  int64_t apparent = blockvector_get_apparent_blocknumber(candidate->b, count - 1);
+  if (apparent < 0
+      || (uint64_t)apparent >= filemirror_apparent_blocks(scalpel_state.filemirror)) {
+    return;
+  }
+  int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror, apparent);
+  uint64_t available = 0;
+  if (actual < 0 || filemirror_actual_block_covered(scalpel_state.filemirror, actual)
+      || !filemirror_actual_block_data_pointer(scalpel_state.filemirror, actual,
+                                               &available)) {
+    return;
+  }
+  if (available > blocksize) {
+    available = blocksize;
+  }
+  uint64_t trial_length = (count - 1) * blocksize + available;
+  if (trial_length <= length) {
+    return;
+  }
+
+  JpgWrongBlockResult previous_wrongblock = jpg_wrongblock_result;
+  JPGCarveState trial_state = {0};
+  uint64_t trial_validates_to = 0;
+  blockvector_set_data_length(candidate->b, trial_length);
+  bool trial_validates = jpg_reassembly_validate_direct(
+      candidate, &trial_state, &trial_validates_to,
+      jpg_reassembly_get_fixed_prefix_blocks(candidate));
+  if (!jpg_reassembly_checkpoint_requested()
+      && trial_validates_to < trial_length
+      && (trial_validates
+          || (!jpg_wrongblock_result.detected
+              && trial_validates_to + 1 > length))) {
+    blockvector_set_data_length(candidate->b, trial_validates_to + 1);
+    inflate_blockvector(candidate->b);
+    *validates = trial_validates;
+    *validates_to = trial_validates_to;
+    return;
+  }
+  blockvector_set_data_length(candidate->b, length);
+  jpg_wrongblock_result = previous_wrongblock;
+}
+
+static inline bool jpg_reassembly_cold_validation_is_better(
+    bool cold_validates,
+    uint64_t cold_validates_to,
+    const JpgWrongBlockResult *cold_wrongblock,
+    uint64_t current_validates_to,
+    const JpgWrongBlockResult *current_wrongblock) {
+  if (cold_validates) {
+    return true;
+  }
+  if (cold_validates_to <= current_validates_to) {
+    return false;
+  }
+  if (!current_wrongblock || !current_wrongblock->detected) {
+    return true;
+  }
+
+  // A structural frontier beyond a known entropy failure is weaker evidence.
+  // Replace it only when the cold pass independently moves that failure.
+  return cold_wrongblock && cold_wrongblock->detected
+         && cold_wrongblock->estimated_byte
+                > current_wrongblock->estimated_byte;
 }
 
 static inline bool jpg_reassembly_candidate_is_progressive(
@@ -5026,6 +5559,7 @@ static inline bool jpg_reassembly_try_sorted_suffix_full_validation(
   };
   uint32_t fixed_prefix_blocks;
   uint64_t num_blocks;
+  uint64_t original_length;
   uint64_t max_suffix;
   uint64_t suffix_len = 0;
   int64_t suffix[JPG_REASS_SORTED_SUFFIX_MAX];
@@ -5038,6 +5572,7 @@ static inline bool jpg_reassembly_try_sorted_suffix_full_validation(
 
   fixed_prefix_blocks = jpg_reassembly_get_fixed_prefix_blocks(candidate);
   num_blocks = blockvector_get_num_blocks(candidate->b);
+  original_length = blockvector_get_data_length(candidate->b);
   if (num_blocks <= fixed_prefix_blocks + JPG_REASS_SORTED_SUFFIX_MIN) {
     return false;
   }
@@ -5126,6 +5661,7 @@ static inline bool jpg_reassembly_try_sorted_suffix_full_validation(
       for (uint64_t i = 0; i < trial_len; i++) {
         blockvector_set_apparent_blocknumber(candidate->b, start_idx + i, sorted[i]);
       }
+      blockvector_set_data_length_to_mapped_extent(candidate->b);
       deflate_blockvector(candidate->b);
       inflate_blockvector(candidate->b);
 
@@ -5145,6 +5681,7 @@ static inline bool jpg_reassembly_try_sorted_suffix_full_validation(
       for (uint64_t i = 0; i < suffix_len; i++) {
         blockvector_set_apparent_blocknumber(candidate->b, start_idx + i, suffix[i]);
       }
+      blockvector_set_data_length(candidate->b, original_length);
       deflate_blockvector(candidate->b);
       inflate_blockvector(candidate->b);
     }
@@ -6812,7 +7349,7 @@ static inline bool jpg_reassembly_gallop(CarveInfo *candidate,
         *validates = cold_validates;
         *validates_to = cold_validates_to;
         if (cold_state.valid) {
-          carve_put_state(candidate->carvehashkey, &cold_state);
+          jpg_put_decoder_state(candidate->carvehashkey, &cold_state);
         }
       }
     }
@@ -6879,10 +7416,155 @@ typedef struct JPGReassemblyForwardChoice {
   int64_t apparent;
   int64_t actual;
   uint64_t commit_validates_to;
+  uint64_t direct_validates_to;
   uint64_t score_validates_to;
   JpgBoundaryScore boundary;
   JPGCarveState state;
 } JPGReassemblyForwardChoice;
+
+static inline void jpg_forward_save_choice(
+    JPGForwardScanChoice *saved, const JPGReassemblyForwardChoice *choice);
+static inline bool jpg_forward_restore_choice(
+    JPGReassemblyForwardChoice *choice, const JPGForwardScanChoice *saved);
+static inline void jpg_forward_save_progress(
+    JPGForwardScanProgress *progress, uint32_t scan_pass, int64_t next_actual,
+    int64_t natural_tail_start, bool contiguous_tail_probed,
+    bool backward_choice_found, const JPGReassemblyForwardChoice *best,
+    const JPGReassemblyForwardChoice *before_backward);
+
+// Identify the source mapping without including a speculative final slot.
+static inline uint64_t jpg_forward_source_signature(CarveInfo *candidate,
+                                                     uint64_t blocks) {
+  uint64_t signature = 0;
+  for (uint64_t i = 0; i < blocks; i++) {
+    int64_t actual = blockvector_get_actual_blocknumber(candidate->b, i);
+    signature = XXH3_64bits_withSeed(&actual, sizeof(actual), signature);
+  }
+  return signature;
+}
+
+// Fingerprint the apparent view only when saving or restoring an interrupted
+// scan. A changed view can change adjacency and the evidence behind a score.
+static inline uint64_t jpg_forward_view_signature(void) {
+  int64_t actuals[256];
+  uint64_t blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  uint64_t signature = 0;
+  for (uint64_t first = 0; first < blocks;) {
+    uint64_t count = blocks - first;
+    if (count > 256) {
+      count = 256;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+      actuals[i] = filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                                (int64_t)(first + i));
+    }
+    signature = XXH3_64bits_withSeed(actuals, count * sizeof(actuals[0]),
+                                    signature);
+    first += count;
+  }
+  return signature;
+}
+
+// Prefix preparation does not depend on whether a decoder cache was produced.
+static inline bool jpg_forward_source_matches(
+    CarveInfo *candidate, const JPGForwardScanProgress *progress,
+    uint64_t blocks, uint64_t length) {
+  return progress->active && blocks > 0 && length > 0
+         && progress->source_blocks == blocks
+         && progress->source_length == length
+         && progress->source_signature
+                == jpg_forward_source_signature(candidate, blocks);
+}
+
+// Reuse search decisions only for the same bytes, block choices, and ordering.
+static inline bool jpg_forward_progress_matches(
+    CarveInfo *candidate, const JPGForwardScanProgress *progress,
+    uint64_t blocks, uint64_t length, uint32_t scan_mode) {
+  return jpg_forward_source_matches(candidate, progress, blocks, length)
+         && progress->scan_mode == scan_mode
+         && progress->scan_pass <= 7
+         && progress->view_blocks
+                == filemirror_apparent_blocks(scalpel_state.filemirror)
+         && progress->view_signature == jpg_forward_view_signature();
+}
+
+// Keep ranking evidence, but not a duplicate decoder cache for each choice.
+static inline void jpg_forward_save_choice(
+    JPGForwardScanChoice *saved, const JPGReassemblyForwardChoice *choice) {
+  saved->found = choice->found;
+  saved->validates = choice->validates;
+  saved->has_followon_support = choice->has_followon_support;
+  saved->restart_not_due = choice->restart_not_due;
+  saved->have_boundary = choice->have_boundary;
+  saved->reaches_trial_end = choice->reaches_trial_end;
+  saved->near_trial_end = choice->near_trial_end;
+  saved->is_immediate = choice->is_immediate;
+  saved->actual = choice->actual;
+  saved->commit_validates_to = choice->commit_validates_to;
+  saved->direct_validates_to = choice->direct_validates_to;
+  saved->score_validates_to = choice->score_validates_to;
+  saved->boundary = choice->boundary;
+}
+
+// The stored prefix decoder state remains usable when this block is selected.
+// If the competing choice is no longer available, repeat the scan rather than
+// accepting a weaker alternative from only the unvisited part of the image.
+static inline bool jpg_forward_restore_choice(
+    JPGReassemblyForwardChoice *choice, const JPGForwardScanChoice *saved) {
+  memset(choice, 0, sizeof(*choice));
+  choice->apparent = -1;
+  choice->actual = -1;
+  if (!saved->found) {
+    return true;
+  }
+  uint64_t image_blocks = CEILDIV(
+      filemirror_filesize(scalpel_state.filemirror), scalpel_state.blocksize);
+  if (saved->actual < 0 || (uint64_t)saved->actual >= image_blocks) {
+    return false;
+  }
+  int64_t apparent = filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                                    saved->actual);
+  if (apparent < 0
+      || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                         saved->actual)) {
+    return false;
+  }
+  choice->found = saved->found;
+  choice->validates = saved->validates;
+  choice->has_followon_support = saved->has_followon_support;
+  choice->restart_not_due = saved->restart_not_due;
+  choice->have_boundary = saved->have_boundary;
+  choice->reaches_trial_end = saved->reaches_trial_end;
+  choice->near_trial_end = saved->near_trial_end;
+  choice->is_immediate = saved->is_immediate;
+  choice->apparent = apparent;
+  choice->actual = saved->actual;
+  choice->commit_validates_to = saved->commit_validates_to;
+  choice->direct_validates_to = saved->direct_validates_to;
+  choice->score_validates_to = saved->score_validates_to;
+  choice->boundary = saved->boundary;
+  return true;
+}
+
+// Record the start of a trial. An interruption inside one of its probes must
+// repeat that trial, not skip work whose result is not yet known.
+static inline void jpg_forward_save_progress(
+    JPGForwardScanProgress *progress, uint32_t scan_pass, int64_t next_actual,
+    int64_t natural_tail_start, bool contiguous_tail_probed,
+    bool backward_choice_found, const JPGReassemblyForwardChoice *best,
+    const JPGReassemblyForwardChoice *before_backward) {
+  progress->active = true;
+  progress->pass_complete = false;
+  progress->scan_pass = scan_pass;
+  progress->next_actual = next_actual;
+  progress->natural_tail_actual = natural_tail_start >= 0
+      ? filemirror_actual_blocknumber(scalpel_state.filemirror, natural_tail_start)
+      : -1;
+  progress->contiguous_tail_probed = contiguous_tail_probed;
+  progress->backward_choice_found = backward_choice_found;
+  jpg_forward_save_choice(&progress->best, best);
+  jpg_forward_save_choice(&progress->before_backward, before_backward);
+}
 
 typedef struct {
   bool pending;
@@ -6962,8 +7644,8 @@ static inline bool jpg_reassembly_restore_fallback(
     blockvector_set_apparent_blocknumber(candidate->b, i,
                                          fallback->apparent_blocks[i]);
   }
-  inflate_blockvector(candidate->b);
   blockvector_set_data_length(candidate->b, fallback->length);
+  inflate_blockvector(candidate->b);
 
   candidate->best_validates_to = fallback->best_validates_to;
   candidate->newblock = fallback->newblock;
@@ -6971,7 +7653,7 @@ static inline bool jpg_reassembly_restore_fallback(
   candidate->chopped = fallback->chopped;
   candidate->fastpath = fallback->fastpath;
   if (fallback->have_prefix_state) {
-    carve_put_state(candidate->carvehashkey, &fallback->prefix_state);
+    jpg_put_decoder_state(candidate->carvehashkey, &fallback->prefix_state);
   }
 
   resize_blockvector(candidate->b, fallback->num_blocks + 1);
@@ -6982,7 +7664,7 @@ static inline bool jpg_reassembly_restore_fallback(
   *validates = choice.validates;
   *validates_to = choice.commit_validates_to;
   if (choice.have_state) {
-    carve_put_state(candidate->carvehashkey, &choice.state);
+    jpg_put_decoder_state(candidate->carvehashkey, &choice.state);
   }
   candidate->best_validates_to = *validates_to;
   candidate->newblock = choice.actual;
@@ -6997,6 +7679,42 @@ static inline bool jpg_reassembly_restore_fallback(
   return true;
 }
 
+// Publish the checked part of the current mapping on checkpoint-and-exit.
+// Ordinary checkpoints only save search state; they do not create partial files.
+static inline void jpg_reassembly_publish_exit_prefix(
+    CarveInfo *candidate, uint64_t validates_to) {
+  if (!candidate || !candidate->b || candidate->flavor == VALIDATED
+      || !scalpel_state.write_promising || scalpel_state.blocksize == 0
+      || !atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)
+      || !atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+      || validates_to == UINT64_MAX) {
+    return;
+  }
+  uint64_t length = blockvector_get_data_length(candidate->b);
+  if (validates_to == 0 || validates_to >= length) {
+    return;
+  }
+  uint64_t retained = validates_to + 1;
+  uint64_t count = 1 + (retained - 1) / scalpel_state.blocksize;
+  if (count > blockvector_get_num_blocks(candidate->b)) {
+    return;
+  }
+
+  BlockVector *partial = NULL;
+  clone_blockvector(candidate->b, &partial, false);
+  resize_blockvector(partial, count);
+  blockvector_set_data_length(partial, retained);
+  inflate_blockvector(partial);
+  BlockVector *original = candidate->b;
+  CarveInfoFlavor flavor = candidate->flavor;
+  candidate->b = partial;
+  candidate->flavor = PROMISING;
+  write_candidate(&candidate, true);
+  candidate->b = original;
+  candidate->flavor = flavor;
+  free_blockvector(&partial);
+}
+
 static inline bool jpg_reassembly_time_to_checkpoint(
     int id,
     CarveInfo *candidate,
@@ -7004,12 +7722,30 @@ static inline bool jpg_reassembly_time_to_checkpoint(
     uuid_string_t uuidc,
     JPGReassemblyFallback *fallback,
     bool *validates,
-    uint64_t *validates_to) {
-  if (fallback && fallback->pending
-      && jpg_reassembly_checkpoint_requested()) {
+    uint64_t *validates_to,
+    const JPGForwardScanProgress *forward_progress) {
+  if (!jpg_reassembly_checkpoint_requested()) {
+    jpg_reassembly_publish_exit_prefix(candidate, *validates_to);
+    return false;
+  }
+  if (fallback && fallback->pending) {
     (void)jpg_reassembly_restore_fallback(candidate, fallback, validates,
                                           validates_to);
   }
+  if (jpg_forward_source_matches(
+             candidate, forward_progress, blockvector_get_num_blocks(candidate->b),
+             blockvector_get_data_length(candidate->b))) {
+    JPGCarveState state;
+    (void)jpg_reassembly_load_saved_state(candidate, &state);
+    state.forward_scan_progress = *forward_progress;
+    state.forward_scan_progress.view_blocks =
+        filemirror_apparent_blocks(scalpel_state.filemirror);
+    state.forward_scan_progress.view_signature = jpg_forward_view_signature();
+    jpg_put_decoder_state(candidate->carvehashkey, &state);
+    *validates_to = forward_progress->source_length - 1;
+  }
+  jpg_reassembly_publish_exit_prefix(candidate, *validates_to);
+  jpg_save_retry_checkpoint(candidate);
   return reassembly_time_to_checkpoint(id, candidate, uuidp, uuidc);
 }
 
@@ -7026,10 +7762,13 @@ enum {
   JPG_REASS_OOO_BOUNDARY_SLACK = 4,
   JPG_REASS_OOO_ANCHOR_BACKSCAN_BLOCKS = 12,
   JPG_REASS_OOO_STRICT_ANCHOR_BACKSCAN_BLOCKS = 40,
+  JPG_REASS_OOO_PRIORITY_BACKSCAN_BLOCKS = 2048,
+  JPG_REASS_OOO_LOCAL_BACKSCAN_BLOCKS = 8192,
   JPG_REASS_OOO_RAW_ANCHOR_SCAN_MAX = 32768,
   JPG_REASS_OOO_MAX_TRIALS = 32768,
   JPG_REASS_BASELINE_SEED_PROBE_BYTES = 16 * 1024,
-  JPG_REASS_SMALL_BLOCK_BRIDGE_BYTES = 8 * 1024
+  JPG_REASS_SMALL_BLOCK_BRIDGE_BYTES = 8 * 1024,
+  JPG_REASS_BASELINE_SCATTER_PROBE_BYTES = 32 * 1024
 };
 
 #define JPG_REASS_PROGRESSIVE_RATE_LIMIT 0.08
@@ -7044,13 +7783,14 @@ enum {
 #define JPG_REASS_BASELINE_BRIDGE_SCORE_LIMIT 2.00
 #define JPG_REASS_BASELINE_SUFFIX_BOUNDARY_LIMIT 1.00
 #define JPG_REASS_BASELINE_CONTIGUOUS_BOUNDARY_RATIO 1.10
-#define JPG_REASS_BASELINE_FORWARD_BRIDGE_RATIO 0.90
+#define JPG_REASS_BASELINE_FORWARD_BRIDGE_RATIO 0.85
 #define JPG_REASS_SCATTER_LOOKAHEAD_RATIO 1.10
 #define JPG_REASS_SCATTER_LOOKAHEAD_SLACK 0.10
+#define JPG_REASS_BASELINE_DC_DISCONTINUITY_RATIO 1.50
 #define JPG_REASS_BASELINE_UNSUPPORTED_SCORE_LIMIT \
   (JPG_REASS_BASELINE_BRIDGE_SCORE_LIMIT * 4.0)
 
-typedef struct {
+typedef struct JpgOOOBridgeChoice {
   bool found;
   bool full_validates;
   bool direct_validates;
@@ -7061,6 +7801,9 @@ typedef struct {
   bool progressive_entropy_contiguous;
   bool baseline_rate_supported;
   bool dc_discontinuity_supported;
+  bool entropy_profile_supported;
+  bool hidden_boundary_candidate;
+  uint32_t hidden_boundary_rank;
   bool apparent_continuation;
   int64_t moved_start;
   uint64_t run_len;
@@ -7068,13 +7811,16 @@ typedef struct {
   uint64_t suffix_len;
   double progressive_entropy_score;
   double baseline_rate_deviation;
+  double entropy_profile_deviation;
+  double hidden_boundary_score;
   double max_dc_discontinuity;
   JpgBoundaryScore boundary;
   JpgBoundaryScore suffix_boundary;
 } JpgOOOBridgeChoice;
 
 enum {
-  JPG_REASS_BRIDGE_SHORTLIST_SIZE = 8,
+  JPG_REASS_BRIDGE_SHORTLIST_SIZE = JPG_HIDDEN_BOUNDARY_CHOICES,
+  JPG_REASS_DEFAULT_SHORTLIST_SIZE = 8,
   JPG_REASS_SCATTER_LOOKAHEAD_CHOICES = 3,
   JPG_REASS_RETRY_CHOICES = JPG_REASS_BRIDGE_SHORTLIST_SIZE * 2 + 1,
   JPG_REASS_RETRY_FRAMES = 16,
@@ -7102,6 +7848,7 @@ typedef struct {
   int64_t *apparent_blocks;
   JPGCarveState prefix_state;
   bool have_selected_choice;
+  bool defer_initial_retry;
   JpgOOOBridgeChoice selected_choice;
   double retry_priority;
   uint32_t next_choice;
@@ -7109,19 +7856,467 @@ typedef struct {
   JpgOOOBridgeChoice choices[JPG_REASS_RETRY_CHOICES];
 } JpgReassemblyRetryFrame;
 
-typedef struct {
+typedef struct JpgReassemblyRetrySearch {
   bool replay_started;
   uint32_t attempts;
   uint32_t frame_count;
   JpgReassemblyRetryFrame frames[JPG_REASS_RETRY_FRAMES];
 } JpgReassemblyRetrySearch;
 
+typedef struct {
+  int64_t first;
+  uint64_t count;
+} JpgRetryRun;
+
+struct JpgSavedRetryFrame {
+  JpgReassemblyRetryFrame frame;
+  uint64_t run_count;
+  JpgRetryRun *runs;
+  uint64_t selected_signature[2];
+  uint64_t signatures[JPG_REASS_RETRY_CHOICES][2];
+};
+
+struct JpgSavedRetrySearch {
+  bool replay_started;
+  uint32_t attempts;
+  uint32_t frame_count;
+  JpgSavedRetryFrame frames[JPG_REASS_RETRY_FRAMES];
+};
+
+// Release every saved prefix and its search state.
+static inline void jpg_retry_storage_free(JpgSavedRetrySearch **storage) {
+  if (!storage || !*storage) {
+    return;
+  }
+  for (uint32_t i = 0; i < (*storage)->frame_count; i++) {
+    free((*storage)->frames[i].runs);
+  }
+  free(*storage);
+  *storage = NULL;
+}
+
+// Give each stored state its own compact prefix runs.
+static inline JpgSavedRetrySearch *
+jpg_retry_storage_clone(const JpgSavedRetrySearch *source) {
+  if (!source) {
+    return NULL;
+  }
+  JpgSavedRetrySearch *copy = malloc(sizeof(*copy));
+  check_memory_allocation(copy, __LINE__, __FILE__, "jpg saved retries");
+  *copy = *source;
+  for (uint32_t i = 0; i < copy->frame_count; i++) {
+    const uint64_t count = copy->frames[i].run_count;
+    copy->frames[i].runs = malloc(count * sizeof(JpgRetryRun));
+    check_memory_allocation(copy->frames[i].runs, __LINE__, __FILE__,
+                            "jpg saved prefix");
+    memcpy(copy->frames[i].runs, source->frames[i].runs,
+           count * sizeof(JpgRetryRun));
+  }
+  return copy;
+}
+
+// Check bounds before accessing the actual block map.
+static inline bool jpg_retry_actual_available(int64_t actual) {
+  if (actual < 0 || !scalpel_state.blocksize) {
+    return false;
+  }
+  const uint64_t bytes = filemirror_filesize(scalpel_state.filemirror);
+  const uint64_t blocks =
+      bytes / scalpel_state.blocksize + (bytes % scalpel_state.blocksize != 0);
+  return (uint64_t)actual < blocks &&
+         !filemirror_actual_block_covered(scalpel_state.filemirror, actual);
+}
+
+// A saved range must describe the same physical blocks after remapping.
+static inline bool jpg_retry_range_signature(int64_t start, uint64_t count,
+                                             uint64_t *signature) {
+  const uint64_t available =
+      filemirror_apparent_blocks(scalpel_state.filemirror);
+  if (!count || start < 0 || (uint64_t)start > available ||
+      count > available - (uint64_t)start) {
+    return false;
+  }
+  uint64_t hash = UINT64_C(1469598103934665603);
+  for (uint64_t i = 0; i < count; i++) {
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, start + (int64_t)i);
+    if (!jpg_retry_actual_available(actual)) {
+      return false;
+    }
+    hash = (hash ^ (uint64_t)actual) * UINT64_C(1099511628211);
+  }
+  *signature = hash;
+  return true;
+}
+
+// Store physical starts and signatures for the moved run and optional suffix.
+static inline bool jpg_retry_save_choice(JpgOOOBridgeChoice *choice,
+                                         uint64_t signature[2]) {
+  if (!choice->found) {
+    return true;
+  }
+  if (!jpg_retry_range_signature(choice->moved_start, choice->run_len,
+                                 &signature[0]) ||
+      (choice->suffix_len &&
+       !jpg_retry_range_signature(choice->suffix_start, choice->suffix_len,
+                                  &signature[1]))) {
+    return false;
+  }
+  choice->moved_start = filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                                      choice->moved_start);
+  if (choice->suffix_len) {
+    choice->suffix_start = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, choice->suffix_start);
+  }
+  return true;
+}
+
+// Remap a choice only if coverage has left both source ranges intact.
+static inline bool jpg_retry_load_choice(JpgOOOBridgeChoice *choice,
+                                         const uint64_t signature[2]) {
+  if (!choice->found) {
+    return true;
+  }
+  uint64_t observed;
+  if (!jpg_retry_actual_available(choice->moved_start) ||
+      (choice->suffix_len &&
+       !jpg_retry_actual_available(choice->suffix_start))) {
+    return false;
+  }
+  choice->moved_start = filemirror_apparent_blocknumber(
+      scalpel_state.filemirror, choice->moved_start);
+  if (!jpg_retry_range_signature(choice->moved_start, choice->run_len,
+                                 &observed) ||
+      observed != signature[0]) {
+    return false;
+  }
+  if (choice->suffix_len) {
+    choice->suffix_start = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, choice->suffix_start);
+    if (!jpg_retry_range_signature(choice->suffix_start, choice->suffix_len,
+                                   &observed) ||
+        observed != signature[1]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Prefixes are compact physical runs; no trial bytes are retained or written.
+static inline JpgSavedRetrySearch *
+jpg_retry_store(const JpgReassemblyRetrySearch *search) {
+  if (!search || (!search->frame_count && !search->attempts)) {
+    return NULL;
+  }
+  JpgSavedRetrySearch *saved = calloc(1, sizeof(*saved));
+  check_memory_allocation(saved, __LINE__, __FILE__, "jpg retry checkpoint");
+  saved->replay_started = search->replay_started;
+  saved->attempts = search->attempts;
+  const uint64_t available =
+      filemirror_apparent_blocks(scalpel_state.filemirror);
+  for (uint32_t i = 0; i < search->frame_count; i++) {
+    const JpgReassemblyRetryFrame *frame = &search->frames[i];
+    JpgSavedRetryFrame *entry = &saved->frames[saved->frame_count];
+    entry->frame = *frame;
+    entry->frame.apparent_blocks = NULL;
+    entry->run_count = 0;
+    entry->runs = malloc(frame->num_blocks * sizeof(*entry->runs));
+    check_memory_allocation(entry->runs, __LINE__, __FILE__,
+                            "jpg retry physical runs");
+    for (uint64_t slot = 0; slot < frame->num_blocks; slot++) {
+      const int64_t apparent = frame->apparent_blocks[slot];
+      if (apparent < 0 || (uint64_t)apparent >= available) {
+        handle_error(SCALPEL_GENERAL_ABORT, "Invalid JPEG retry prefix",
+                     __LINE__, __FILE__);
+      }
+      const int64_t actual =
+          filemirror_actual_blocknumber(scalpel_state.filemirror, apparent);
+      if (entry->run_count &&
+          entry->runs[entry->run_count - 1].first +
+                  (int64_t)entry->runs[entry->run_count - 1].count ==
+              actual) {
+        entry->runs[entry->run_count - 1].count++;
+      }
+      else {
+        entry->runs[entry->run_count++] = (JpgRetryRun){actual, 1};
+      }
+    }
+    entry->runs = realloc(entry->runs, entry->run_count * sizeof(*entry->runs));
+    check_memory_allocation(entry->runs, __LINE__, __FILE__,
+                            "jpg compact retry prefix");
+    if (entry->frame.block_choice_start >= 0 &&
+        (uint64_t)entry->frame.block_choice_start < available) {
+      entry->frame.block_choice_start = filemirror_actual_blocknumber(
+          scalpel_state.filemirror, entry->frame.block_choice_start);
+    }
+    else if (entry->frame.block_choice_start >= 0) {
+      entry->frame.block_choice_start = INT64_MAX;
+    }
+    if (entry->frame.have_selected_choice &&
+        !jpg_retry_save_choice(&entry->frame.selected_choice,
+                               entry->selected_signature)) {
+      entry->frame.have_selected_choice = false;
+    }
+    for (uint32_t j = 0; j < frame->choice_count; j++) {
+      if (!jpg_retry_save_choice(&entry->frame.choices[j],
+                                 entry->signatures[j])) {
+        entry->frame.choices[j].found = false;
+      }
+    }
+    saved->frame_count++;
+  }
+  return saved;
+}
+
+// Restore surviving frames without resetting completed choices or attempts.
+static inline void jpg_retry_load(const JpgSavedRetrySearch *saved,
+                                  JpgReassemblyRetrySearch *search) {
+  if (!saved) {
+    return;
+  }
+  search->replay_started = saved->replay_started;
+  search->attempts = saved->attempts;
+  const uint64_t available =
+      filemirror_apparent_blocks(scalpel_state.filemirror);
+  for (uint32_t i = 0; i < saved->frame_count; i++) {
+    const JpgSavedRetryFrame *entry = &saved->frames[i];
+    const JpgReassemblyRetryFrame *source = &entry->frame;
+    if (source->num_blocks > available ||
+        source->num_blocks > SIZE_MAX / sizeof(int64_t)) {
+      continue;
+    }
+    JpgReassemblyRetryFrame *frame = &search->frames[search->frame_count];
+    *frame = *source;
+    frame->apparent_blocks =
+        malloc(frame->num_blocks * sizeof(*frame->apparent_blocks));
+    check_memory_allocation(frame->apparent_blocks, __LINE__, __FILE__,
+                            "jpg resumed retry prefix");
+    uint64_t slot = 0;
+    bool valid = true;
+    for (uint64_t j = 0; j < entry->run_count && valid; j++) {
+      for (uint64_t k = 0; k < entry->runs[j].count; k++) {
+        const int64_t actual = entry->runs[j].first + (int64_t)k;
+        if (!jpg_retry_actual_available(actual)) {
+          valid = false;
+          break;
+        }
+        const int64_t apparent =
+            filemirror_apparent_blocknumber(scalpel_state.filemirror, actual);
+        if (apparent < 0) {
+          valid = false;
+          break;
+        }
+        frame->apparent_blocks[slot++] = apparent;
+      }
+    }
+    if (!valid) {
+      free(frame->apparent_blocks);
+      memset(frame, 0, sizeof(*frame));
+      continue;
+    }
+    if (frame->block_choice_start == INT64_MAX) {
+      frame->block_choice_start = (int64_t)available;
+    }
+    else if (frame->block_choice_start >= 0) {
+      frame->block_choice_start =
+          jpg_reassembly_apparent_lower_bound(frame->block_choice_start);
+    }
+    if (frame->have_selected_choice &&
+        !jpg_retry_load_choice(&frame->selected_choice,
+                               entry->selected_signature)) {
+      frame->have_selected_choice = false;
+    }
+    frame->choice_count = 0;
+    frame->next_choice = 0;
+    for (uint32_t j = 0; j < source->choice_count; j++) {
+      JpgOOOBridgeChoice choice = source->choices[j];
+      if (choice.found &&
+          jpg_retry_load_choice(&choice, entry->signatures[j])) {
+        frame->choices[frame->choice_count++] = choice;
+        if (j < source->next_choice) {
+          frame->next_choice++;
+        }
+      }
+    }
+    search->frame_count++;
+  }
+}
+
+// Deep copy stored state, including its owned retry prefixes.
+static inline void *jpg_clone_carve_state(const void *state) {
+  const JPGStoredCarveState *source = state;
+  JPGStoredCarveState *copy = malloc(sizeof(*copy));
+  check_memory_allocation(copy, __LINE__, __FILE__, "jpg stored state");
+  *copy = *source;
+  copy->retry = jpg_retry_storage_clone(source->retry);
+  return copy;
+}
+
+// Release stored state and clear the caller's pointer.
+static inline void jpg_free_carve_state(void **state) {
+  if (state && *state) {
+    JPGStoredCarveState *value = *state;
+    jpg_retry_storage_free(&value->retry);
+    free(value);
+    *state = NULL;
+  }
+}
+
+// Owned pointers require the clone callback rather than a shallow memcpy.
+static inline size_t jpg_sizeof_carve_state(const void *state) {
+  (void)state;
+  return 0;
+}
+
+// Transfer one checkpoint field in the requested direction.
+static inline bool jpg_retry_transfer(FILE *fp, void *value, size_t size,
+                                      StateSerialization mode) {
+  return mode == SERIALIZE ? fwrite(value, size, 1, fp) == 1
+                           : fread(value, size, 1, fp) == 1;
+}
+
+// Check prefix geometry and count bounds before a frame can be restored.
+static inline bool jpg_retry_frame_valid(const JpgSavedRetryFrame *saved) {
+  const JpgReassemblyRetryFrame *frame = &saved->frame;
+  if (!frame->num_blocks || frame->num_blocks > INT64_MAX || !frame->length ||
+      !scalpel_state.blocksize ||
+      frame->num_blocks < 1 + (frame->length - 1) / scalpel_state.blocksize ||
+      frame->choice_count > JPG_REASS_RETRY_CHOICES ||
+      frame->next_choice > frame->choice_count || !saved->run_count ||
+      saved->run_count > frame->num_blocks) {
+    return false;
+  }
+  uint64_t total = 0;
+  for (uint64_t i = 0; i < saved->run_count; i++) {
+    const JpgRetryRun *run = &saved->runs[i];
+    if (run->first < 0 || !run->count ||
+        run->count > (uint64_t)INT64_MAX - (uint64_t)run->first ||
+        run->count > frame->num_blocks - total) {
+      return false;
+    }
+    total += run->count;
+  }
+  return total == frame->num_blocks;
+}
+
+// Checkpoint decoder state and compact retry history without serializing
+// ownership.
+static inline bool jpg_serialize_carve_state(void **state, FILE *fp,
+                                             StateSerialization mode) {
+  uint64_t magic = UINT64_C(0x4a50474657524434);
+  JPGStoredCarveState *value = mode == SERIALIZE ? *state : NULL;
+  bool okay = jpg_retry_transfer(fp, &magic, sizeof(magic), mode) &&
+              magic == UINT64_C(0x4a50474657524434);
+  if (mode == DESERIALIZE && okay) {
+    value = calloc(1, sizeof(*value));
+    check_memory_allocation(value, __LINE__, __FILE__, "jpg restored state");
+  }
+  uint32_t present = value && value->retry ? 1 : 0;
+  okay =
+      okay &&
+      jpg_retry_transfer(fp, &value->decoder, sizeof(value->decoder), mode) &&
+      jpg_retry_transfer(fp, &present, sizeof(present), mode) && present <= 1;
+  if (okay && present) {
+    if (mode == DESERIALIZE) {
+      value->retry = calloc(1, sizeof(*value->retry));
+      check_memory_allocation(value->retry, __LINE__, __FILE__,
+                              "jpg restored retries");
+    }
+    JpgSavedRetrySearch *saved = value->retry;
+    okay = jpg_retry_transfer(fp, &saved->replay_started,
+                              sizeof(saved->replay_started), mode) &&
+           jpg_retry_transfer(fp, &saved->attempts, sizeof(saved->attempts),
+                              mode) &&
+           saved->attempts <= JPG_REASS_RETRY_LIMIT &&
+           jpg_retry_transfer(fp, &saved->frame_count,
+                              sizeof(saved->frame_count), mode) &&
+           saved->frame_count <= JPG_REASS_RETRY_FRAMES;
+    if (!okay) {
+      saved->frame_count = 0;
+    }
+    for (uint32_t i = 0; okay && i < saved->frame_count; i++) {
+      JpgSavedRetryFrame *entry = &saved->frames[i];
+      okay =
+          jpg_retry_transfer(fp, &entry->frame, sizeof(entry->frame), mode) &&
+          entry->frame.apparent_blocks == NULL &&
+          jpg_retry_transfer(fp, &entry->run_count, sizeof(entry->run_count),
+                             mode) &&
+          entry->run_count > 0 &&
+          entry->run_count <= SIZE_MAX / sizeof(JpgRetryRun) &&
+          entry->run_count <= entry->frame.num_blocks;
+      if (okay && mode == DESERIALIZE) {
+        const off_t position = ftello(fp);
+        struct stat status;
+        okay = position >= 0 && fstat(fileno(fp), &status) == 0 &&
+               status.st_size >= position &&
+               entry->run_count <=
+                   (uint64_t)(status.st_size - position) / sizeof(JpgRetryRun);
+        if (okay) {
+          entry->runs = malloc(entry->run_count * sizeof(JpgRetryRun));
+          check_memory_allocation(entry->runs, __LINE__, __FILE__,
+                                  "jpg restored prefix runs");
+        }
+      }
+      okay = okay &&
+             jpg_retry_transfer(fp, entry->runs,
+                                entry->run_count * sizeof(JpgRetryRun), mode) &&
+             jpg_retry_frame_valid(entry) &&
+             jpg_retry_transfer(fp, entry->selected_signature,
+                                sizeof(entry->selected_signature), mode) &&
+             jpg_retry_transfer(fp, entry->signatures,
+                                sizeof(entry->signatures), mode);
+    }
+  }
+  if (!okay) {
+    if (mode == DESERIALIZE) {
+      jpg_free_carve_state((void **)&value);
+    }
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    return false;
+  }
+  if (mode == DESERIALIZE) {
+    *state = value;
+  }
+  return true;
+}
+
+// Snapshot the active search before returning its candidate for checkpointing.
+static inline void jpg_save_retry_checkpoint(CarveInfo *candidate) {
+  if (!candidate || candidate->carvehashkey != jpg_active_retry_key ||
+      !jpg_active_retry_search) {
+    return;
+  }
+  void *stored = carve_get_state(candidate->carvehashkey);
+  JPGStoredCarveState value = {0};
+  if (stored) {
+    value.decoder = ((JPGStoredCarveState *)stored)->decoder;
+  }
+  value.retry = jpg_retry_store(jpg_active_retry_search);
+  carve_put_state(candidate->carvehashkey, &value);
+  jpg_retry_storage_free(&value.retry);
+  jpg_free_carve_state(&stored);
+}
+
+// Transfer saved alternatives into the invocation's mutable search state.
+static inline void jpg_load_retry_checkpoint(CarveInfo *candidate,
+                                             JpgReassemblyRetrySearch *search) {
+  void *stored = carve_get_state(candidate->carvehashkey);
+  if (!stored) {
+    return;
+  }
+  JPGStoredCarveState *value = stored;
+  jpg_retry_load(value->retry, search);
+  jpg_retry_storage_free(&value->retry);
+  carve_put_state(candidate->carvehashkey, value);
+  jpg_free_carve_state(&stored);
+}
+
 static inline bool jpg_reassembly_baseline_bridge_beats_forward(
     const JpgOOOBridgeChoice *bridge,
     const JPGReassemblyForwardChoice *forward);
 
-static inline void jpg_reassembly_clear_retry_frame(
-    JpgReassemblyRetryFrame *frame) {
+static inline void
+jpg_reassembly_clear_retry_frame(JpgReassemblyRetryFrame *frame) {
   if (!frame) {
     return;
   }
@@ -7146,8 +8341,9 @@ static inline bool jpg_reassembly_same_bridge_choice(
   return left && right
          && left->moved_start == right->moved_start
          && left->run_len == right->run_len
-         && left->suffix_start == right->suffix_start
-         && left->suffix_len == right->suffix_len;
+         && left->suffix_len == right->suffix_len
+         && (left->suffix_len == 0
+             || left->suffix_start == right->suffix_start);
 }
 
 static inline void jpg_reassembly_add_retry_choice(
@@ -7179,6 +8375,9 @@ static inline double jpg_reassembly_retry_choice_score(
 
   if (!choice) {
     return HUGE_VAL;
+  }
+  if (choice->hidden_boundary_candidate) {
+    return (double)choice->hidden_boundary_rank;
   }
   if (choice->baseline_rate_supported) {
     score += 2.5 * choice->baseline_rate_deviation;
@@ -7300,8 +8499,16 @@ static inline void jpg_reassembly_save_retry_frame(
     jpg_reassembly_add_retry_choice(&frame, best_bridge, chosen, forward);
   }
   for (uint32_t i = 0; i < shortlist->entry_only_count; i++) {
+    JpgOOOBridgeChoice entry = shortlist->entry_only_choices[i];
+
+    // Entry-ranked retries establish only the transition into a displaced
+    // run. Normal forward selection then determines how far that run extends.
+    entry.full_validates = entry.direct_validates;
+    entry.suffix_start = -1;
+    entry.suffix_len = 0;
+    memset(&entry.suffix_boundary, 0, sizeof(entry.suffix_boundary));
     jpg_reassembly_add_retry_choice(
-        &frame, &shortlist->entry_only_choices[i], chosen, forward);
+        &frame, &entry, chosen, forward);
   }
   for (uint32_t i = 0; i < shortlist->count; i++) {
     jpg_reassembly_add_retry_choice(&frame, &shortlist->choices[i], chosen,
@@ -7313,6 +8520,11 @@ static inline void jpg_reassembly_save_retry_frame(
   jpg_reassembly_sort_retry_choices(&frame);
   if (chosen && chosen->found) {
     frame.have_selected_choice = true;
+    frame.defer_initial_retry =
+        !chosen->full_validates && chosen->suffix_len == 0
+        && best_bridge->suffix_len > 0
+        && chosen->moved_start == best_bridge->moved_start
+        && chosen->run_len == best_bridge->run_len;
     frame.selected_choice = *chosen;
     frame.retry_priority =
         jpg_reassembly_retry_choice_score(&frame.choices[0])
@@ -7362,17 +8574,30 @@ static inline void jpg_reassembly_save_retry_frame(
 static inline bool jpg_reassembly_retry_alternative_preferred(
     const JpgReassemblyRetrySearch *search) {
   const JpgReassemblyRetryFrame *frame;
+  const JpgOOOBridgeChoice *alternative;
 
-  if (!search || !search->replay_started || search->frame_count == 0) {
+  if (!search || search->frame_count == 0) {
     return false;
   }
   frame = &search->frames[search->frame_count - 1];
+  if (frame->next_choice >= frame->choice_count) {
+    return false;
+  }
+  alternative = &frame->choices[frame->next_choice];
+  if (!search->replay_started && frame->have_selected_choice
+      && frame->selected_choice.boundary.valid
+      && alternative->boundary.valid
+      && frame->selected_choice.boundary.normalized
+             < alternative->boundary.normalized
+                   * JPG_REASS_SCATTER_ENTRY_RATIO) {
+    return false;
+  }
   return frame->have_selected_choice
+         && !frame->defer_initial_retry
          && !frame->selected_choice.apparent_continuation
-         && frame->next_choice < frame->choice_count
+         && (search->replay_started || frame->retry_priority < 0.0)
          && jpg_reassembly_retry_choice_better(
-                &frame->choices[frame->next_choice],
-                &frame->selected_choice);
+                alternative, &frame->selected_choice);
 }
 
 typedef struct {
@@ -7482,7 +8707,7 @@ static inline bool jpg_reassembly_probe_baseline_entropy(
   memcpy(&huff_restore, &prefix_state->huff_checkpoint,
          sizeof(huff_restore));
   huffman_error_pos = jpg_huffman_validate(
-      &ctx, &huff_restore, &huff_save, &failure);
+      &ctx, &huff_restore, &huff_save, &failure, NULL);
   memcpy(&saved_mcu_result, &jpg_mcu_result, sizeof(saved_mcu_result));
 
   probe->supported = true;
@@ -8362,6 +9587,17 @@ static inline bool jpg_reassembly_try_contiguous_tail_validation(
                                      &trial_validates_to,
                                      fixed_prefix_blocks);
   if (!trial_validates) {
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr,
+                   "[jpgdbg] contiguous_tail_failed start=%" PRId64
+                   " blocks=%" PRIu64 " vt=%" PRIu64
+                   " wrong=%d method=%s\n",
+                   tail_start, tail_blocks, trial_validates_to,
+                   jpg_wrongblock_result.detected ? 1 : 0,
+                   jpg_wrongblock_result.detected
+                       && jpg_wrongblock_result.method
+                       ? jpg_wrongblock_result.method : "none");
+    }
     jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
                                          saved_length);
     return false;
@@ -8381,11 +9617,1738 @@ static inline bool jpg_reassembly_try_contiguous_tail_validation(
         filemirror_actual_blocknumber(scalpel_state.filemirror, last_apparent);
   }
   if (trial_state.valid) {
-    carve_put_state(candidate->carvehashkey, &trial_state);
+    jpg_put_decoder_state(candidate->carvehashkey, &trial_state);
   }
   jpg_reassembly_debug_dump("contiguous_tail_validated", candidate,
                             tail_start, trial_validates_to);
   return true;
+}
+
+// A permissive entropy decoder can consume blocks from another JPEG before a
+// later hard failure exposes the substitution. Rebuild a hypothesis on a
+// clone, progressively removing that speculative suffix, and retain it only
+// when the complete JPEG validator proves the replacement tail.
+static inline bool jpg_reassembly_try_suffix_rollback_tail_validation(
+    CarveInfo *candidate,
+    bool *validates,
+    uint64_t *validates_to,
+    uint32_t minimum_prefix_blocks,
+    uint64_t saved_num_blocks,
+    uint64_t saved_length,
+    int64_t tail_start) {
+  BlockVector *original;
+  BlockVector *hypothesis = NULL;
+  uint64_t maximum_rollback;
+
+  if (!candidate || !candidate->b || !validates || !validates_to
+      || scalpel_state.blocksize == 0 || tail_start < 0
+      || saved_num_blocks < 2) {
+    return false;
+  }
+  if (minimum_prefix_blocks == 0) {
+    minimum_prefix_blocks = 1;
+  }
+  if (minimum_prefix_blocks >= saved_num_blocks) {
+    return false;
+  }
+
+  original = candidate->b;
+  maximum_rollback = saved_num_blocks - minimum_prefix_blocks;
+  clone_blockvector(original, &hypothesis, false);
+  candidate->b = hypothesis;
+
+  for (uint64_t rollback = 1; rollback <= maximum_rollback; rollback++) {
+    uint64_t trial_blocks = saved_num_blocks - rollback;
+    uint64_t trial_length = trial_blocks * (uint64_t)scalpel_state.blocksize;
+
+    if (jpg_reassembly_checkpoint_requested()) {
+      break;
+    }
+    if (trial_length > saved_length) {
+      trial_length = saved_length;
+    }
+    if (jpg_reassembly_try_contiguous_tail_validation(
+            candidate, validates, validates_to, minimum_prefix_blocks,
+            trial_blocks, trial_length, tail_start)) {
+      free_blockvector(&original);
+      return true;
+    }
+  }
+
+  candidate->b = original;
+  free_blockvector(&hypothesis);
+  return false;
+}
+
+static inline bool jpg_run_order_boundary_better(
+    const JPGRunOrderBoundary *left,
+    const JPGRunOrderBoundary *right) {
+  if (left->normalized != right->normalized) {
+    return left->normalized > right->normalized;
+  }
+  return left->first_block < right->first_block;
+}
+
+static inline bool jpg_run_order_boundary_after_page(
+    const JPGRunOrderProgress *progress,
+    const JPGRunOrderBoundary *boundary) {
+  if (!progress->page_after_valid) {
+    return true;
+  }
+  if (boundary->normalized < progress->page_after_normalized) {
+    return true;
+  }
+  return boundary->normalized == progress->page_after_normalized
+         && boundary->first_block > progress->page_after_first_block;
+}
+
+static inline void jpg_run_order_insert_boundary(
+    JPGRunOrderProgress *progress,
+    const JPGRunOrderBoundary *boundary) {
+  uint32_t index;
+
+  if (!isfinite(boundary->normalized) || boundary->normalized <= 0.0
+      || !jpg_run_order_boundary_after_page(progress, boundary)) {
+    return;
+  }
+
+  if (progress->group_count < JPG_RUN_ORDER_GROUP_BATCH) {
+    index = progress->group_count++;
+    progress->groups[index] = *boundary;
+  }
+  else {
+    index = JPG_RUN_ORDER_GROUP_BATCH - 1;
+    if (!jpg_run_order_boundary_better(boundary,
+                                       &progress->groups[index])) {
+      return;
+    }
+    progress->groups[index] = *boundary;
+  }
+
+  while (index > 0
+         && jpg_run_order_boundary_better(&progress->groups[index],
+                                          &progress->groups[index - 1])) {
+    JPGRunOrderBoundary swap = progress->groups[index - 1];
+
+    progress->groups[index - 1] = progress->groups[index];
+    progress->groups[index] = swap;
+    index--;
+  }
+}
+
+static inline void jpg_run_order_finish_scan_group(
+    JPGRunOrderProgress *progress) {
+  if (!progress->scan_group_active) {
+    return;
+  }
+  jpg_run_order_insert_boundary(progress, &progress->scan_group);
+  memset(&progress->scan_group, 0, sizeof(progress->scan_group));
+  progress->scan_group_active = false;
+}
+
+static inline bool jpg_run_order_same_scan_group(
+    const JPGRunOrderBoundary *group,
+    const JpgBoundaryScore *score) {
+  return group->boundary_row == score->boundary_row
+         && group->seam_mad == score->seam_mad
+         && group->baseline_mad == score->baseline_mad
+         && group->normalized == score->normalized;
+}
+
+static inline bool jpg_reassembly_physically_contiguous(
+    const CarveInfo *candidate,
+    uint64_t blocks) {
+  if (!candidate || !candidate->b || blocks == 0
+      || blocks > blockvector_get_num_blocks(candidate->b)) {
+    return false;
+  }
+
+  for (uint64_t slot = 1; slot < blocks; slot++) {
+    int64_t previous_actual =
+        blockvector_get_actual_blocknumber(candidate->b, slot - 1);
+    int64_t current_actual =
+        blockvector_get_actual_blocknumber(candidate->b, slot);
+    int64_t previous_apparent =
+        blockvector_get_apparent_blocknumber(candidate->b, slot - 1);
+    int64_t current_apparent =
+        blockvector_get_apparent_blocknumber(candidate->b, slot);
+
+    if (previous_actual < 0 || current_actual != previous_actual + 1
+        || previous_apparent < 0
+        || current_apparent != previous_apparent + 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static inline uint64_t jpg_reassembly_last_eoi_length(
+    const char *data,
+    uint64_t length) {
+  if (!data || length < 2) {
+    return 0;
+  }
+  for (uint64_t pos = length - 1; pos > 0; pos--) {
+    if ((uint8_t)data[pos - 1] == 0xff
+        && (uint8_t)data[pos] == M_EOI) {
+      return pos + 1;
+    }
+  }
+  return 0;
+}
+
+static inline void jpg_run_order_boundary_range(
+    const JPGRunOrderBoundary *boundary,
+    uint64_t source_blocks,
+    uint64_t *minimum,
+    uint64_t *maximum) {
+  *minimum = boundary->first_block > 2
+             ? boundary->first_block - 2 : 1;
+  *maximum = boundary->last_block + 2;
+  if (*maximum >= source_blocks) {
+    *maximum = source_blocks - 1;
+  }
+}
+
+static inline void jpg_reassembly_commit_run_order_hypothesis(
+    CarveInfo *candidate,
+    BlockVector *original,
+    const JPGCarveState *trial_state,
+    uint64_t validates_to) {
+  free_blockvector(&original);
+  candidate->best_validates_to = validates_to;
+  candidate->newblock = blockvector_get_actual_blocknumber(
+      candidate->b, blockvector_get_num_blocks(candidate->b) - 1);
+  if (trial_state->valid) {
+    jpg_put_decoder_state(candidate->carvehashkey, (void *)trial_state);
+  }
+}
+
+static inline bool jpg_reassembly_run_order_join_score(
+    CarveInfo *candidate,
+    double *maximum_score,
+    double *total_score) {
+  uint64_t length = 0;
+  uint64_t num_blocks;
+  char *data;
+  uint32_t joins = 0;
+
+  if (!maximum_score || !total_score) {
+    return false;
+  }
+  *maximum_score = DBL_MAX;
+  *total_score = DBL_MAX;
+  if (!candidate || !candidate->b || scalpel_state.blocksize == 0) {
+    return false;
+  }
+  num_blocks = blockvector_get_num_blocks(candidate->b);
+  data = jpg_reassembly_materialize_candidate(candidate, &length);
+  if (!data || length == 0) {
+    return false;
+  }
+
+  *maximum_score = 0.0;
+  *total_score = 0.0;
+
+  for (uint64_t slot = 1; slot < num_blocks; slot++) {
+    const int64_t previous =
+        blockvector_get_actual_blocknumber(candidate->b, slot - 1);
+    const int64_t current =
+        blockvector_get_actual_blocknumber(candidate->b, slot);
+    uint64_t prefix_length;
+    JpgBoundaryScore boundary;
+
+    if (previous >= 0 && current == previous + 1) {
+      continue;
+    }
+    if (slot > UINT64_MAX / scalpel_state.blocksize) {
+      return false;
+    }
+    prefix_length = slot * (uint64_t)scalpel_state.blocksize;
+    if (prefix_length >= length) {
+      return false;
+    }
+    // Materialization reuses one thread-local buffer across hypotheses, so a
+    // pointer alone cannot identify cached decoded pixels from its old bytes.
+    jpg_boundary_preview_cache_invalidate();
+    boundary = jpg_boundary_score_scaled(data, prefix_length, length, 1,
+                                         true);
+    if (jpg_reassembly_checkpoint_requested()) {
+      return false;
+    }
+    if (!boundary.valid || !isfinite(boundary.normalized)) {
+      return false;
+    }
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr,
+                   "[jpgdbg] run_order_join slot=%" PRIu64
+                   " previous=%" PRId64 " current=%" PRId64
+                   " normalized=%.6f\n",
+                   slot, previous, current, boundary.normalized);
+    }
+    if (boundary.normalized > *maximum_score) {
+      *maximum_score = boundary.normalized;
+    }
+    *total_score += boundary.normalized;
+    joins++;
+  }
+  return joins > 0;
+}
+
+static inline bool jpg_reassembly_try_external_run_insertion(
+    CarveInfo *candidate,
+    uint64_t source_blocks,
+    uint64_t source_length,
+    uint64_t cut,
+    int64_t external_start,
+    uint64_t external_blocks,
+    uint32_t fixed_prefix_blocks,
+    bool *validates,
+    uint64_t *validates_to,
+    bool commit,
+    double *maximum_join_score,
+    double *total_join_score) {
+  BlockVector *original;
+  BlockVector *hypothesis = NULL;
+  JPGCarveState trial_state;
+  uint64_t destination = 0;
+  uint64_t trial_length;
+  uint64_t trial_validates_to = 0;
+  bool trial_validates;
+
+  if (!candidate || !candidate->b || !validates || !validates_to
+      || !maximum_join_score || !total_join_score
+      || source_blocks < 2 || cut == 0 || cut >= source_blocks
+      || external_start < 0 || external_blocks == 0
+      || external_blocks > UINT64_MAX - source_blocks
+      || external_blocks > (UINT64_MAX - source_length)
+                               / scalpel_state.blocksize) {
+    return false;
+  }
+  if (!jpg_reassembly_ooo_range_available(candidate, external_start,
+                                          external_blocks, -1, 0)
+      || jpg_reassembly_ooo_range_has_zero(external_start,
+                                          external_blocks)) {
+    return false;
+  }
+
+  trial_length = source_length
+                 + external_blocks * (uint64_t)scalpel_state.blocksize;
+  original = candidate->b;
+  init_blockvector(scalpel_state.filemirror, &hypothesis,
+                   source_blocks + external_blocks, false);
+
+  for (uint64_t source = 0; source < cut; source++) {
+    blockvector_set_apparent_blocknumber(
+        hypothesis, destination++,
+        blockvector_get_apparent_blocknumber(original, source));
+  }
+  for (uint64_t offset = 0; offset < external_blocks; offset++) {
+    blockvector_set_apparent_blocknumber(
+        hypothesis, destination++, external_start + (int64_t)offset);
+  }
+  for (uint64_t source = cut; source < source_blocks; source++) {
+    blockvector_set_apparent_blocknumber(
+        hypothesis, destination++,
+        blockvector_get_apparent_blocknumber(original, source));
+  }
+  blockvector_set_data_length(hypothesis, trial_length);
+  inflate_blockvector(hypothesis);
+  candidate->b = hypothesis;
+
+  if (!jpg_reassembly_run_order_join_score(
+          candidate, maximum_join_score, total_join_score)
+      || *maximum_join_score >= JPG_RUN_ORDER_STRONG_JOIN_SCORE) {
+    candidate->b = original;
+    free_blockvector(&hypothesis);
+    return false;
+  }
+  memset(&trial_state, 0, sizeof(trial_state));
+  trial_validates = jpg_reassembly_validate_direct(
+      candidate, &trial_state, &trial_validates_to, fixed_prefix_blocks);
+  if (!trial_validates || trial_validates_to + 1 != trial_length) {
+    candidate->b = original;
+    free_blockvector(&hypothesis);
+    return false;
+  }
+
+  if (!commit) {
+    candidate->b = original;
+    free_blockvector(&hypothesis);
+    return true;
+  }
+
+  *validates = true;
+  *validates_to = trial_validates_to;
+  jpg_reassembly_commit_run_order_hypothesis(
+      candidate, original, &trial_state, trial_validates_to);
+  return true;
+}
+
+static inline bool jpg_reassembly_try_internal_run_transpose(
+    CarveInfo *candidate,
+    uint64_t source_blocks,
+    uint64_t source_length,
+    uint64_t cut_a,
+    uint64_t cut_b,
+    uint64_t cut_c,
+    uint32_t fixed_prefix_blocks,
+    bool *validates,
+    uint64_t *validates_to,
+    bool commit,
+    double *maximum_join_score,
+    double *total_join_score) {
+  BlockVector *original;
+  BlockVector *hypothesis = NULL;
+  JPGCarveState trial_state;
+  uint64_t destination = 0;
+  uint64_t trial_validates_to = 0;
+  bool trial_validates;
+
+  if (!candidate || !candidate->b || !validates || !validates_to
+      || !maximum_join_score || !total_join_score
+      || cut_a == 0 || cut_a >= cut_b || cut_b >= cut_c
+      || cut_c >= source_blocks) {
+    return false;
+  }
+
+  original = candidate->b;
+  init_blockvector(scalpel_state.filemirror, &hypothesis,
+                   source_blocks, false);
+  for (uint64_t source = 0; source < cut_a; source++) {
+    blockvector_set_apparent_blocknumber(
+        hypothesis, destination++,
+        blockvector_get_apparent_blocknumber(original, source));
+  }
+  for (uint64_t source = cut_b; source < cut_c; source++) {
+    blockvector_set_apparent_blocknumber(
+        hypothesis, destination++,
+        blockvector_get_apparent_blocknumber(original, source));
+  }
+  for (uint64_t source = cut_a; source < cut_b; source++) {
+    blockvector_set_apparent_blocknumber(
+        hypothesis, destination++,
+        blockvector_get_apparent_blocknumber(original, source));
+  }
+  for (uint64_t source = cut_c; source < source_blocks; source++) {
+    blockvector_set_apparent_blocknumber(
+        hypothesis, destination++,
+        blockvector_get_apparent_blocknumber(original, source));
+  }
+  blockvector_set_data_length(hypothesis, source_length);
+  inflate_blockvector(hypothesis);
+  candidate->b = hypothesis;
+
+  if (!jpg_reassembly_run_order_join_score(
+          candidate, maximum_join_score, total_join_score)
+      || *maximum_join_score >= JPG_RUN_ORDER_STRONG_JOIN_SCORE) {
+    candidate->b = original;
+    free_blockvector(&hypothesis);
+    return false;
+  }
+  memset(&trial_state, 0, sizeof(trial_state));
+  trial_validates = jpg_reassembly_validate_direct(
+      candidate, &trial_state, &trial_validates_to, fixed_prefix_blocks);
+  if (!trial_validates || trial_validates_to + 1 != source_length) {
+    candidate->b = original;
+    free_blockvector(&hypothesis);
+    return false;
+  }
+
+  if (!commit) {
+    candidate->b = original;
+    free_blockvector(&hypothesis);
+    return true;
+  }
+
+  *validates = true;
+  *validates_to = trial_validates_to;
+  jpg_reassembly_commit_run_order_hypothesis(
+      candidate, original, &trial_state, trial_validates_to);
+  return true;
+}
+
+static inline bool jpg_run_order_hypothesis_better(
+    const JPGRunOrderProgress *progress,
+    double maximum_join_score,
+    double total_join_score) {
+  if (!progress->best_valid) {
+    return true;
+  }
+  if (maximum_join_score != progress->best_max_join_score) {
+    return maximum_join_score < progress->best_max_join_score;
+  }
+  return total_join_score < progress->best_total_join_score;
+}
+
+static inline void jpg_run_order_note_hypothesis(
+    JPGRunOrderProgress *progress,
+    uint8_t kind,
+    uint64_t cut_a,
+    uint64_t cut_b,
+    uint64_t cut_c,
+    uint64_t external_blocks,
+    uint32_t group_i,
+    uint32_t group_j,
+    uint32_t group_k,
+    double maximum_join_score,
+    double total_join_score) {
+  if (progress->complete_hypotheses < UINT32_MAX) {
+    progress->complete_hypotheses++;
+  }
+  if (!jpg_run_order_hypothesis_better(
+          progress, maximum_join_score, total_join_score)) {
+    return;
+  }
+  progress->best_valid = true;
+  progress->best_kind = kind;
+  progress->best_max_join_score = maximum_join_score;
+  progress->best_total_join_score = total_join_score;
+  progress->best_cut_a = cut_a;
+  progress->best_cut_b = cut_b;
+  progress->best_cut_c = cut_c;
+  progress->best_external_blocks = external_blocks;
+  progress->best_group_i = group_i;
+  progress->best_group_j = group_j;
+  progress->best_group_k = group_k;
+}
+
+static inline bool jpg_reassembly_apply_best_run_order_hypothesis(
+    CarveInfo *candidate,
+    JPGRunOrderProgress *progress,
+    uint64_t source_blocks,
+    uint64_t source_length,
+    uint32_t fixed_prefix_blocks,
+    bool *validates,
+    uint64_t *validates_to) {
+  double maximum_join_score = DBL_MAX;
+  double total_join_score = DBL_MAX;
+
+  if (!progress->best_valid) {
+    return false;
+  }
+  if (progress->best_kind == JPG_RUN_ORDER_KIND_EXTERNAL_INSERT) {
+    return jpg_reassembly_try_external_run_insertion(
+        candidate, source_blocks, source_length,
+        progress->best_cut_a, progress->last_apparent + 1,
+        progress->best_external_blocks, fixed_prefix_blocks,
+        validates, validates_to, true,
+        &maximum_join_score, &total_join_score);
+  }
+  if (progress->best_kind == JPG_RUN_ORDER_KIND_INTERNAL_TRANSPOSE) {
+    return jpg_reassembly_try_internal_run_transpose(
+        candidate, source_blocks, source_length,
+        progress->best_cut_a, progress->best_cut_b, progress->best_cut_c,
+        fixed_prefix_blocks, validates, validates_to, true,
+        &maximum_join_score, &total_join_score);
+  }
+  return false;
+}
+
+static inline bool jpg_reassembly_attach_contiguous_eoi(
+    CarveInfo *candidate,
+    uint64_t *source_length) {
+  uint64_t saved_blocks;
+  uint64_t saved_length;
+  int64_t tail_apparent;
+  int64_t limit;
+  int64_t next_header = -1;
+  int64_t next_footer = -1;
+  uint64_t append_blocks;
+  uint64_t materialized_length = 0;
+  char *materialized;
+
+  if (!candidate || !candidate->b || !source_length
+      || blockvector_get_num_blocks(candidate->b) == 0) {
+    return false;
+  }
+
+  saved_blocks = blockvector_get_num_blocks(candidate->b);
+  saved_length = blockvector_get_data_length(candidate->b);
+  tail_apparent = blockvector_get_apparent_blocknumber(
+      candidate->b, saved_blocks - 1);
+  limit = (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
+  if (tail_apparent < 0 || tail_apparent + 1 >= limit) {
+    return false;
+  }
+  if (jpg_reassembly_next_header_apparent(candidate, tail_apparent + 1,
+                                          &next_header)
+      && next_header < limit) {
+    limit = next_header;
+  }
+  if (!jpg_reassembly_next_footer_apparent(candidate, tail_apparent + 1,
+                                           limit, &next_footer)) {
+    return false;
+  }
+
+  append_blocks = (uint64_t)(next_footer - tail_apparent);
+  if (!jpg_reassembly_ooo_range_available(candidate, tail_apparent + 1,
+                                          append_blocks, -1, 0)) {
+    return false;
+  }
+  jpg_reassembly_ooo_append_range(candidate, tail_apparent + 1,
+                                  append_blocks);
+  materialized = jpg_reassembly_materialize_candidate(candidate,
+                                                       &materialized_length);
+  *source_length = jpg_reassembly_last_eoi_length(materialized,
+                                                  materialized_length);
+  if (*source_length <= saved_length
+      || materialized_length - *source_length
+             >= scalpel_state.blocksize) {
+    jpg_reassembly_ooo_restore_candidate(candidate, saved_blocks,
+                                         saved_length);
+    *source_length = 0;
+    return false;
+  }
+
+  blockvector_set_data_length(candidate->b, *source_length);
+  candidate->newblock = blockvector_get_actual_blocknumber(
+      candidate->b, blockvector_get_num_blocks(candidate->b) - 1);
+  return true;
+}
+
+static inline void jpg_run_order_advance_transpose_combination(
+    JPGRunOrderProgress *progress) {
+  progress->transpose_trial_initialized = false;
+  progress->transpose_k++;
+  if (progress->transpose_k < progress->group_count) {
+    return;
+  }
+  progress->transpose_j++;
+  if (progress->transpose_j + 1 < progress->group_count) {
+    progress->transpose_k = progress->transpose_j + 1;
+    return;
+  }
+  progress->transpose_i++;
+  if (progress->transpose_i + 2 < progress->group_count) {
+    progress->transpose_j = progress->transpose_i + 1;
+    progress->transpose_k = progress->transpose_j + 1;
+  }
+}
+
+static inline bool jpg_reassembly_find_foreign_tail_cut(
+    CarveInfo *candidate,
+    JpgValidationContext *context,
+    uint64_t source_blocks,
+    uint64_t *cut_out,
+    double *rate_ratio_out) {
+  JPGHuffmanBlockProfile profile;
+  JpgHuffmanFailure failure = JPG_HUFFMAN_FAILURE_NONE;
+  JpgMcuValidationResult saved_mcu_result;
+  uint32_t *mcu_at_boundary;
+  uint32_t saved_blocksize = jpg_current_blocksize;
+  int32_t saved_dc_threshold = jpg_dc_threshold;
+  int32_t saved_max_observed_dc_diff = jpg_max_observed_dc_diff;
+  size_t profile_entries;
+  uint64_t rate_window;
+  uint64_t best_cut = 0;
+  double best_ratio = 0.0;
+  JpgBoundaryScore boundary;
+
+  if (!candidate || !context || !cut_out || !rate_ratio_out
+      || !context->have_sof || !context->had_scan || context->is_progressive
+      || context->entropy_start == 0 || scalpel_state.blocksize == 0
+      || source_blocks < 3
+      || source_blocks > SIZE_MAX / sizeof(*mcu_at_boundary) - 1) {
+    return false;
+  }
+
+  profile_entries = (size_t)(source_blocks + 1);
+  mcu_at_boundary = malloc(profile_entries * sizeof(*mcu_at_boundary));
+  check_memory_allocation(mcu_at_boundary, __LINE__, __FILE__,
+                          "jpg foreign-tail MCU profile");
+  memset(mcu_at_boundary, 0xff,
+         profile_entries * sizeof(*mcu_at_boundary));
+  profile.mcu_at_boundary = mcu_at_boundary;
+  profile.boundary_count = source_blocks + 1;
+
+  memcpy(&saved_mcu_result, &jpg_mcu_result, sizeof(saved_mcu_result));
+  jpg_current_blocksize = scalpel_state.blocksize;
+  (void)jpg_huffman_validate(context, NULL, NULL, &failure, &profile);
+  memcpy(&jpg_mcu_result, &saved_mcu_result, sizeof(jpg_mcu_result));
+  jpg_current_blocksize = saved_blocksize;
+  jpg_dc_threshold = saved_dc_threshold;
+  jpg_max_observed_dc_diff = saved_max_observed_dc_diff;
+  if (jpg_reassembly_checkpoint_requested()) {
+    free(mcu_at_boundary);
+    return false;
+  }
+
+  rate_window = CEILDIV(JPG_FOREIGN_TAIL_RATE_WINDOW_BYTES,
+                        scalpel_state.blocksize);
+  if (rate_window == 0) {
+    rate_window = 1;
+  }
+
+  for (uint64_t cut = rate_window;
+       cut + rate_window < source_blocks; cut++) {
+    uint32_t left_start = mcu_at_boundary[cut - rate_window];
+    uint32_t center = mcu_at_boundary[cut];
+    uint32_t right_end = mcu_at_boundary[cut + rate_window];
+    uint64_t left_mcus;
+    uint64_t right_mcus;
+    double ratio;
+
+    if (left_start == UINT32_MAX || center == UINT32_MAX
+        || right_end == UINT32_MAX || center <= left_start
+        || right_end <= center) {
+      continue;
+    }
+    left_mcus = (uint64_t)center - left_start;
+    right_mcus = (uint64_t)right_end - center;
+    ratio = left_mcus > right_mcus
+              ? (double)left_mcus / (double)right_mcus
+              : (double)right_mcus / (double)left_mcus;
+    if (ratio < JPG_FOREIGN_TAIL_MIN_RATE_RATIO) {
+      continue;
+    }
+    if (ratio > best_ratio
+        || (ratio == best_ratio && (best_cut == 0 || cut < best_cut))) {
+      best_cut = cut;
+      best_ratio = ratio;
+    }
+  }
+
+  free(mcu_at_boundary);
+  if (best_cut == 0) {
+    return false;
+  }
+  jpg_boundary_preview_cache_invalidate();
+  boundary = jpg_boundary_score_scaled(
+      (char *)context->data,
+      best_cut * (uint64_t)scalpel_state.blocksize,
+      context->length, 8, true);
+  if (jpg_reassembly_checkpoint_requested()
+      || !boundary.valid || boundary.boundary_row <= 1
+      || boundary.baseline_mad <= 0.0
+      || !isfinite(boundary.normalized)
+      || boundary.normalized < JPG_FOREIGN_TAIL_MIN_SEAM_SCORE) {
+    return false;
+  }
+  *cut_out = best_cut;
+  *rate_ratio_out = best_ratio;
+  if (jpg_reassembly_debug_candidate(candidate)) {
+    lock_fprintf(stderr,
+                 "[jpgdbg] foreign_tail_cut block=%" PRIu64
+                 " rate_ratio=%.6f seam=%.6f\n",
+                 best_cut, best_ratio, boundary.normalized);
+  }
+  return true;
+}
+
+static inline bool jpg_reassembly_rollback_hidden_boundary(
+    CarveInfo *candidate,
+    uint64_t rollback_block,
+    bool *validates,
+    uint64_t *validates_to,
+    double rate_ratio) {
+  BlockVector *original;
+  BlockVector *prefix = NULL;
+  JPGCarveState prefix_state;
+  uint64_t original_blocks;
+  uint64_t prefix_length;
+  uint64_t prefix_validates_to = 0;
+  uint32_t prefix_fixed_blocks;
+  int64_t rejected_first;
+  int64_t rejected_last;
+  bool prefix_validates;
+
+  if (!candidate || !candidate->b || !validates || !validates_to
+      || scalpel_state.blocksize == 0 || rollback_block == 0
+      || rollback_block >= blockvector_get_num_blocks(candidate->b)
+      || rollback_block > UINT64_MAX / scalpel_state.blocksize) {
+    return false;
+  }
+
+  original = candidate->b;
+  original_blocks = blockvector_get_num_blocks(original);
+  rejected_first = blockvector_get_actual_blocknumber(
+      original, rollback_block);
+  rejected_last = rejected_first;
+  int64_t previous_apparent = blockvector_get_apparent_blocknumber(
+      original, rollback_block);
+  for (uint64_t slot = rollback_block + 1;
+       rejected_first >= 0 && slot < original_blocks; slot++) {
+    int64_t apparent;
+
+    if ((slot & 255u) == 0
+        && jpg_reassembly_checkpoint_requested()) {
+      return false;
+    }
+    apparent = blockvector_get_apparent_blocknumber(original, slot);
+    if (apparent != previous_apparent + 1) {
+      break;
+    }
+    previous_apparent = apparent;
+    rejected_last = blockvector_get_actual_blocknumber(original, slot);
+  }
+  prefix_length = rollback_block * (uint64_t)scalpel_state.blocksize;
+  prefix_fixed_blocks = rollback_block > UINT32_MAX
+                          ? UINT32_MAX : (uint32_t)rollback_block;
+  clone_blockvector(original, &prefix, false);
+  candidate->b = prefix;
+  resize_blockvector(prefix, rollback_block);
+  blockvector_set_data_length(prefix, prefix_length);
+  inflate_blockvector(prefix);
+  memset(&prefix_state, 0, sizeof(prefix_state));
+  prefix_validates = jpg_reassembly_validate_direct(
+      candidate, &prefix_state, &prefix_validates_to,
+      prefix_fixed_blocks);
+  if (!prefix_validates && prefix_state.valid
+      && !jpg_wrongblock_result.detected
+      && prefix_validates_to + 1 >= prefix_length) {
+    prefix_state.reassembly_seed_checked = true;
+    prefix_state.reassembly_seed_needs_search = true;
+    prefix_state.hidden_boundary_recovery = true;
+    prefix_state.hidden_boundary_runs_committed = 0;
+    prefix_state.hidden_rejected_range_valid = rejected_first >= 0;
+    prefix_state.hidden_rejected_first_actual = rejected_first;
+    prefix_state.hidden_rejected_last_actual = rejected_last;
+    free_blockvector(&original);
+    *validates = false;
+    *validates_to = prefix_length - 1;
+    candidate->best_validates_to = *validates_to;
+    candidate->newblock = blockvector_get_actual_blocknumber(
+        candidate->b, rollback_block - 1);
+    jpg_put_decoder_state(candidate->carvehashkey, &prefix_state);
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr,
+                   "[jpgdbg] hidden_boundary_rollback block=%" PRIu64
+                   " length=%" PRIu64 " rate_ratio=%.6f\n",
+                   rollback_block, prefix_length, rate_ratio);
+    }
+    return true;
+  }
+
+  candidate->b = original;
+  free_blockvector(&prefix);
+  return false;
+}
+
+// A foreign tail can be followed physically by the displaced JPEG suffix.
+// Test that one local replacement without disturbing the complete run-order
+// search needed when the missing run must instead be inserted internally.
+static inline bool jpg_reassembly_try_foreign_tail_successor(
+    CarveInfo *candidate,
+    const JPGCarveState *prefix_state,
+    uint64_t rollback_block,
+    int64_t source_last_apparent,
+    bool require_entropy_probe,
+    bool *validates,
+    uint64_t *validates_to) {
+  BlockVector *original;
+  BlockVector *hypothesis = NULL;
+  JpgReassemblyEntropyProbe probe;
+  uint64_t prefix_length;
+  uint32_t prefix_fixed_blocks;
+  int64_t tail_start;
+  bool trial_validates = false;
+  uint64_t trial_validates_to = 0;
+  uint64_t restored_length = 0;
+
+  if (!candidate || !candidate->b || !prefix_state
+      || !validates || !validates_to
+      || scalpel_state.blocksize == 0 || rollback_block == 0
+      || rollback_block >= blockvector_get_num_blocks(candidate->b)
+      || rollback_block > UINT64_MAX / scalpel_state.blocksize
+      || source_last_apparent < 0 || source_last_apparent == INT64_MAX) {
+    return false;
+  }
+
+  tail_start = source_last_apparent + 1;
+  prefix_length = rollback_block * (uint64_t)scalpel_state.blocksize;
+  prefix_fixed_blocks = rollback_block > UINT32_MAX
+                          ? UINT32_MAX : (uint32_t)rollback_block;
+  original = candidate->b;
+  clone_blockvector(original, &hypothesis, false);
+  candidate->b = hypothesis;
+
+  if (require_entropy_probe) {
+    memset(&probe, 0, sizeof(probe));
+    if (!jpg_reassembly_probe_baseline_entropy(
+            candidate, prefix_state, rollback_block, prefix_length,
+            tail_start, 1, -1, 0, &probe)
+        || !probe.supported || !probe.clean || !probe.reaches_probe_end) {
+      candidate->b = original;
+      free_blockvector(&hypothesis);
+      (void)jpg_reassembly_materialize_candidate(candidate, &restored_length);
+      return false;
+    }
+  }
+
+  if (!jpg_reassembly_try_contiguous_tail_validation(
+          candidate, &trial_validates, &trial_validates_to,
+          prefix_fixed_blocks, rollback_block, prefix_length, tail_start)
+      || !trial_validates) {
+    candidate->b = original;
+    free_blockvector(&hypothesis);
+    (void)jpg_reassembly_materialize_candidate(candidate, &restored_length);
+    return false;
+  }
+
+  free_blockvector(&original);
+  *validates = true;
+  *validates_to = trial_validates_to;
+  return true;
+}
+
+static inline bool jpg_reassembly_try_terminal_run_order_repair(
+    CarveInfo *candidate,
+    bool *validates,
+    uint64_t *validates_to,
+    uint32_t fixed_prefix_blocks,
+    bool allow_hidden_boundary_search,
+    bool *candidate_changed,
+    bool *checkpoint_hit) {
+  JPGCarveState state;
+  JPGRunOrderProgress *progress;
+  JpgValidationContext context;
+  uint64_t materialized_length = 0;
+  uint64_t source_length;
+  uint64_t source_blocks;
+  uint64_t signature;
+  uint64_t hidden_entropy_limit = 0;
+  bool hidden_boundary_search = false;
+  bool incomplete_mcu_tail_search = false;
+  char *materialized;
+
+  if (candidate_changed) {
+    *candidate_changed = false;
+  }
+  if (checkpoint_hit) {
+    *checkpoint_hit = false;
+  }
+  if (!candidate || !candidate->b || !validates || !validates_to
+      || scalpel_state.blocksize == 0
+      || blockvector_get_num_blocks(candidate->b) < 4) {
+    return false;
+  }
+
+  materialized = jpg_reassembly_materialize_candidate(candidate,
+                                                       &materialized_length);
+  source_length = jpg_reassembly_last_eoi_length(materialized,
+                                                 materialized_length);
+  if ((source_length == 0
+       || source_length + scalpel_state.blocksize < materialized_length)
+      && jpg_reassembly_attach_contiguous_eoi(candidate, &source_length)) {
+    materialized = jpg_reassembly_materialize_candidate(
+        candidate, &materialized_length);
+  }
+  if (jpg_reassembly_debug_candidate(candidate)) {
+    lock_fprintf(stderr,
+                 "[jpgdbg] run_order_gate materialized=%" PRIu64
+                 " eoi=%" PRIu64 " vt=%" PRIu64 " blocks=%" PRIu64
+                 "\n",
+                 materialized_length, source_length, *validates_to,
+                 blockvector_get_num_blocks(candidate->b));
+  }
+  if (source_length == 0) {
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr, "[jpgdbg] run_order_skip no_eoi\n");
+    }
+    return false;
+  }
+  incomplete_mcu_tail_search =
+      *validates_to + 1 <= source_length
+      && source_length - (*validates_to + 1)
+             <= (uint64_t)scalpel_state.blocksize
+                  + JPG_REASS_OOO_BOUNDARY_SLACK
+      && jpg_mcu_result.valid
+      && jpg_mcu_result.expected_mcus > 0
+      && jpg_mcu_result.mcu_count > 0
+      && jpg_mcu_result.mcu_count < jpg_mcu_result.expected_mcus
+      && jpg_mcu_result.final_byte_pos > jpg_mcu_result.entropy_start
+      && jpg_mcu_result.final_byte_pos <= source_length
+      && source_length - jpg_mcu_result.final_byte_pos
+             <= (uint64_t)scalpel_state.blocksize
+                  + JPG_REASS_OOO_BOUNDARY_SLACK;
+  hidden_boundary_search =
+      *validates_to + 1 < source_length
+      && source_length - (*validates_to + 1)
+             > (uint64_t)scalpel_state.blocksize
+                 + JPG_REASS_OOO_BOUNDARY_SLACK
+      && jpg_wrongblock_result.detected
+      && jpg_wrongblock_result.method
+      && strcmp(jpg_wrongblock_result.method,
+                "huffman_trailing_data") == 0
+      && jpg_mcu_result.valid
+      && jpg_mcu_result.expected_mcus > 0
+      && jpg_mcu_result.mcu_count == jpg_mcu_result.expected_mcus
+      && jpg_mcu_result.final_byte_pos > 0
+      && jpg_mcu_result.final_byte_pos < source_length;
+  if (hidden_boundary_search) {
+    hidden_entropy_limit = jpg_mcu_result.final_byte_pos;
+    if (!allow_hidden_boundary_search) {
+      return false;
+    }
+  }
+  if (*validates_to + 1 < source_length
+      && source_length - (*validates_to + 1)
+             > (uint64_t)scalpel_state.blocksize
+                 + JPG_REASS_OOO_BOUNDARY_SLACK
+      && !hidden_boundary_search && !incomplete_mcu_tail_search) {
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr,
+                   "[jpgdbg] run_order_skip unsupported_shortfall"
+                   " source=%" PRIu64 " vt=%" PRIu64 "\n",
+                   source_length, *validates_to);
+    }
+    return false;
+  }
+  source_blocks = CEILDIV(source_length, scalpel_state.blocksize);
+  if (source_blocks != blockvector_get_num_blocks(candidate->b)
+      || !jpg_reassembly_physically_contiguous(candidate, source_blocks)) {
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr,
+                   "[jpgdbg] run_order_skip layout source_blocks=%" PRIu64
+                   " vector_blocks=%" PRIu64 " contiguous=%d\n",
+                   source_blocks, blockvector_get_num_blocks(candidate->b),
+                   jpg_reassembly_physically_contiguous(candidate,
+                                                        source_blocks)
+                       ? 1 : 0);
+    }
+    return false;
+  }
+
+  memset(&context, 0, sizeof(context));
+  context.data = (const uint8_t *)materialized;
+  context.length = source_length;
+  (void)jpg_validate_structure(&context);
+  if (!context.have_sof || context.entropy_start == 0
+      || context.is_progressive) {
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr,
+                   "[jpgdbg] run_order_skip structure sof=%d entropy=%" PRIu64
+                   " progressive=%d\n",
+                   context.have_sof ? 1 : 0, context.entropy_start,
+                   context.is_progressive ? 1 : 0);
+    }
+    return false;
+  }
+
+  memset(&state, 0, sizeof(state));
+  if (!jpg_reassembly_load_saved_state(candidate, &state)) {
+    uint64_t rebuilt_validates_to = 0;
+
+    memset(&state, 0, sizeof(state));
+    (void)jpg_reassembly_validate_direct(candidate, &state,
+                                         &rebuilt_validates_to,
+                                         fixed_prefix_blocks);
+  }
+  if (!state.valid) {
+    if (jpg_reassembly_debug_candidate(candidate)) {
+      lock_fprintf(stderr, "[jpgdbg] run_order_skip no_state\n");
+    }
+    return false;
+  }
+
+  signature = XXH3_64bits(materialized, source_length);
+  signature ^= source_blocks * UINT64_C(0x9e3779b97f4a7c15);
+  progress = &state.run_order_progress;
+  if (!progress->active || progress->signature != signature
+      || progress->source_length != source_length
+      || progress->source_blocks != source_blocks) {
+    int64_t first_apparent = blockvector_get_apparent_blocknumber(
+        candidate->b, 0);
+    int64_t last_apparent = blockvector_get_apparent_blocknumber(
+        candidate->b, source_blocks - 1);
+
+    memset(progress, 0, sizeof(*progress));
+    progress->active = true;
+    progress->phase = JPG_RUN_ORDER_PHASE_SCAN;
+    progress->signature = signature;
+    progress->source_length = source_length;
+    progress->source_blocks = source_blocks;
+    progress->first_apparent = first_apparent;
+    progress->last_apparent = last_apparent;
+    progress->scan_next_block =
+        CEILDIV(context.entropy_start, scalpel_state.blocksize);
+    if (progress->scan_next_block < 1) {
+      progress->scan_next_block = 1;
+    }
+  }
+
+  if (incomplete_mcu_tail_search) {
+    uint64_t rollback_block = 0;
+    uint64_t trusted_prefix_length = *validates_to + 1;
+    uint64_t trusted_prefix_blocks = 0;
+    double rate_ratio = 0.0;
+
+    if (trusted_prefix_length % scalpel_state.blocksize == 0) {
+      trusted_prefix_blocks =
+          trusted_prefix_length / scalpel_state.blocksize;
+    }
+
+    if (progress->fallback_rollback_valid) {
+      rollback_block = progress->fallback_rollback_block;
+      rate_ratio = progress->fallback_rollback_rate_ratio;
+    }
+    else if (jpg_reassembly_find_foreign_tail_cut(
+                 candidate, &context, source_blocks,
+                 &rollback_block, &rate_ratio)) {
+      if (jpg_reassembly_try_foreign_tail_successor(
+              candidate, &state, rollback_block, progress->last_apparent,
+              false,
+              validates, validates_to)) {
+        return true;
+      }
+      progress->fallback_rollback_valid = true;
+      progress->fallback_rollback_block = rollback_block;
+      progress->fallback_rollback_rate_ratio = rate_ratio;
+    }
+    if (rollback_block != 0) {
+      if (jpg_reassembly_checkpoint_requested()) {
+        jpg_put_decoder_state(candidate->carvehashkey, &state);
+        if (checkpoint_hit) {
+          *checkpoint_hit = true;
+        }
+        return false;
+      }
+      // A terminal fragment can contain an incidental EOI immediately after a
+      // fully validated block boundary. If the rate-derived cut does not prove
+      // a complete replacement, test that local alternative before rollback.
+      if (trusted_prefix_blocks > 0
+          && trusted_prefix_blocks < source_blocks
+          && trusted_prefix_blocks != rollback_block
+          && jpg_reassembly_try_foreign_tail_successor(
+                 candidate, &state, trusted_prefix_blocks,
+                 progress->last_apparent, true,
+                 validates, validates_to)) {
+        return true;
+      }
+      if (jpg_reassembly_checkpoint_requested()) {
+        jpg_put_decoder_state(candidate->carvehashkey, &state);
+        if (checkpoint_hit) {
+          *checkpoint_hit = true;
+        }
+        return false;
+      }
+      if (jpg_reassembly_rollback_hidden_boundary(
+              candidate, rollback_block, validates, validates_to,
+              rate_ratio)) {
+        if (candidate_changed) {
+          *candidate_changed = true;
+        }
+        return false;
+      }
+      if (!jpg_reassembly_checkpoint_requested()) {
+        progress->fallback_rollback_valid = false;
+        progress->fallback_rollback_block = 0;
+        progress->fallback_rollback_rate_ratio = 0.0;
+      }
+    }
+    else if (trusted_prefix_blocks > 0
+             && trusted_prefix_blocks < source_blocks
+             && jpg_reassembly_try_foreign_tail_successor(
+                    candidate, &state, trusted_prefix_blocks,
+                    progress->last_apparent, true,
+                    validates, validates_to)) {
+      return true;
+    }
+    if (jpg_reassembly_checkpoint_requested()) {
+      jpg_put_decoder_state(candidate->carvehashkey, &state);
+      if (checkpoint_hit) {
+        *checkpoint_hit = true;
+      }
+      return false;
+    }
+  }
+
+  while (progress->phase != JPG_RUN_ORDER_PHASE_EXHAUSTED) {
+    if (progress->phase == JPG_RUN_ORDER_PHASE_SCAN) {
+      materialized = jpg_reassembly_materialize_candidate(
+          candidate, &materialized_length);
+      while (progress->scan_next_block < source_blocks) {
+        uint64_t block = progress->scan_next_block;
+        JpgBoundaryScore score;
+
+        if (jpg_reassembly_checkpoint_requested()) {
+          jpg_put_decoder_state(candidate->carvehashkey, &state);
+          if (checkpoint_hit) {
+            *checkpoint_hit = true;
+          }
+          return false;
+        }
+        score = jpg_boundary_score_scaled(
+            materialized, block * (uint64_t)scalpel_state.blocksize,
+            source_length, 8, true);
+        if (jpg_reassembly_checkpoint_requested()) {
+          jpg_put_decoder_state(candidate->carvehashkey, &state);
+          if (checkpoint_hit) {
+            *checkpoint_hit = true;
+          }
+          return false;
+        }
+        progress->scan_next_block++;
+
+        if (!score.valid) {
+          jpg_run_order_finish_scan_group(progress);
+          continue;
+        }
+        if (progress->scan_group_active
+            && jpg_run_order_same_scan_group(&progress->scan_group,
+                                             &score)) {
+          progress->scan_group.last_block = block;
+          continue;
+        }
+
+        jpg_run_order_finish_scan_group(progress);
+        progress->scan_group_active = true;
+        progress->scan_group.first_block = block;
+        progress->scan_group.last_block = block;
+        progress->scan_group.boundary_row = score.boundary_row;
+        progress->scan_group.seam_mad = score.seam_mad;
+        progress->scan_group.baseline_mad = score.baseline_mad;
+        progress->scan_group.normalized = score.normalized;
+      }
+      jpg_run_order_finish_scan_group(progress);
+      if (jpg_reassembly_debug_candidate(candidate)) {
+        lock_fprintf(stderr,
+                     "[jpgdbg] run_order_scan_complete groups=%u"
+                     " hidden=%d incomplete=%d\n",
+                     progress->group_count,
+                     hidden_boundary_search ? 1 : 0,
+                     incomplete_mcu_tail_search ? 1 : 0);
+      }
+      if (progress->group_count == 0) {
+        progress->phase = JPG_RUN_ORDER_PHASE_EXHAUSTED;
+        break;
+      }
+      if (hidden_boundary_search) {
+        for (uint32_t index = 0; index < progress->group_count; index++) {
+          const JPGRunOrderBoundary *group = &progress->groups[index];
+          const uint64_t boundary_byte =
+              group->first_block * (uint64_t)scalpel_state.blocksize;
+
+          if (group->boundary_row <= 1 || group->baseline_mad <= 0.0
+              || group->normalized < JPG_RUN_ORDER_HIDDEN_BOUNDARY_SCORE
+              || boundary_byte >= hidden_entropy_limit) {
+            continue;
+          }
+          if (jpg_reassembly_debug_candidate(candidate)) {
+            lock_fprintf(stderr,
+                         "[jpgdbg] hidden_boundary_group first=%" PRIu64
+                         " last=%" PRIu64 " row=%u score=%.6f\n",
+                         group->first_block, group->last_block,
+                         group->boundary_row, group->normalized);
+          }
+          if (jpg_reassembly_rollback_hidden_boundary(
+                  candidate, group->first_block, validates,
+                  validates_to, 0.0)) {
+            if (candidate_changed) {
+              *candidate_changed = true;
+            }
+            return false;
+          }
+          if (jpg_reassembly_checkpoint_requested()) {
+            jpg_put_decoder_state(candidate->carvehashkey, &state);
+            if (checkpoint_hit) {
+              *checkpoint_hit = true;
+            }
+            return false;
+          }
+        }
+        progress->phase = JPG_RUN_ORDER_PHASE_EXHAUSTED;
+        break;
+      }
+      progress->phase = JPG_RUN_ORDER_PHASE_EXTERNAL_INSERT;
+      progress->external_group = 0;
+      progress->external_cut_next = 0;
+      progress->external_blocks_next = 0;
+    }
+
+    if (progress->phase == JPG_RUN_ORDER_PHASE_EXTERNAL_INSERT) {
+      int64_t external_start = progress->last_apparent + 1;
+      int64_t next_header = -1;
+      uint64_t external_blocks = 0;
+
+      if (external_start >= 0
+          && jpg_reassembly_next_header_apparent(candidate, external_start,
+                                                 &next_header)
+          && next_header > external_start) {
+        external_blocks = (uint64_t)(next_header - external_start);
+      }
+      if (jpg_reassembly_debug_candidate(candidate)) {
+        lock_fprintf(stderr,
+                     "[jpgdbg] run_order_external start=%" PRId64
+                     " next_header=%" PRId64 " blocks=%" PRIu64
+                     " groups=%u\n",
+                     external_start, next_header, external_blocks,
+                     progress->group_count);
+      }
+
+      while (external_blocks > 0
+             && progress->external_group < progress->group_count) {
+        JPGRunOrderBoundary *group =
+            &progress->groups[progress->external_group];
+        uint64_t minimum;
+        uint64_t maximum;
+
+        jpg_run_order_boundary_range(group, source_blocks,
+                                     &minimum, &maximum);
+        if (progress->external_cut_next < minimum) {
+          progress->external_cut_next = minimum;
+          progress->external_blocks_next = external_blocks;
+        }
+        while (progress->external_cut_next <= maximum) {
+          uint64_t cut = progress->external_cut_next;
+          uint64_t trial_external_blocks = progress->external_blocks_next;
+
+          if (trial_external_blocks == 0
+              || trial_external_blocks > external_blocks) {
+            trial_external_blocks = external_blocks;
+            progress->external_blocks_next = trial_external_blocks;
+          }
+
+          if (jpg_reassembly_checkpoint_requested()) {
+            jpg_put_decoder_state(candidate->carvehashkey, &state);
+            if (checkpoint_hit) {
+              *checkpoint_hit = true;
+            }
+            return false;
+          }
+          {
+            double maximum_join_score = DBL_MAX;
+            double total_join_score = DBL_MAX;
+            bool complete_hypothesis;
+
+            complete_hypothesis = jpg_reassembly_try_external_run_insertion(
+                candidate, source_blocks, source_length, cut,
+                external_start, trial_external_blocks,
+                fixed_prefix_blocks, validates, validates_to, false,
+                &maximum_join_score, &total_join_score);
+            if (jpg_reassembly_checkpoint_requested()) {
+              jpg_put_decoder_state(candidate->carvehashkey, &state);
+              if (checkpoint_hit) {
+                *checkpoint_hit = true;
+              }
+              return false;
+            }
+            if (complete_hypothesis) {
+              jpg_run_order_note_hypothesis(
+                  progress, JPG_RUN_ORDER_KIND_EXTERNAL_INSERT,
+                  cut, 0, 0, trial_external_blocks,
+                  0, 0, 0,
+                  maximum_join_score, total_join_score);
+              if (jpg_reassembly_debug_candidate(candidate)) {
+                lock_fprintf(stderr,
+                             "[jpgdbg] run_order_complete external"
+                             " cut=%" PRIu64 " blocks=%" PRIu64
+                             " max=%.6f total=%.6f best=%.6f\n",
+                             cut, trial_external_blocks,
+                             maximum_join_score, total_join_score,
+                             progress->best_max_join_score);
+              }
+            }
+          }
+          progress->external_blocks_next--;
+          if (progress->external_blocks_next == 0) {
+            progress->external_cut_next++;
+            progress->external_blocks_next = external_blocks;
+          }
+        }
+        if (progress->best_valid
+            && progress->best_kind == JPG_RUN_ORDER_KIND_EXTERNAL_INSERT
+            && jpg_reassembly_apply_best_run_order_hypothesis(
+                   candidate, progress, source_blocks, source_length,
+                   fixed_prefix_blocks, validates, validates_to)) {
+          return true;
+        }
+        progress->external_group++;
+        progress->external_cut_next = 0;
+        progress->external_blocks_next = 0;
+      }
+
+      progress->phase = JPG_RUN_ORDER_PHASE_INTERNAL_TRANSPOSE;
+      progress->transpose_i = 0;
+      progress->transpose_j = 1;
+      progress->transpose_k = 2;
+      progress->transpose_probe_mode = true;
+      progress->transpose_refine_mode = false;
+      progress->transpose_trial_initialized = false;
+    }
+
+    if (progress->phase == JPG_RUN_ORDER_PHASE_INTERNAL_TRANSPOSE) {
+      while (progress->group_count >= 3
+             && progress->transpose_i + 2 < progress->group_count) {
+        const JPGRunOrderBoundary *ordered[3] = {
+          &progress->groups[progress->transpose_i],
+          &progress->groups[progress->transpose_j],
+          &progress->groups[progress->transpose_k]
+        };
+        uint64_t minimum[3];
+        uint64_t maximum[3];
+
+        for (uint32_t left = 0; left < 2; left++) {
+          for (uint32_t right = left + 1; right < 3; right++) {
+            if (ordered[right]->first_block < ordered[left]->first_block) {
+              const JPGRunOrderBoundary *swap = ordered[left];
+
+              ordered[left] = ordered[right];
+              ordered[right] = swap;
+            }
+          }
+        }
+        for (uint32_t index = 0; index < 3; index++) {
+          jpg_run_order_boundary_range(ordered[index], source_blocks,
+                                       &minimum[index], &maximum[index]);
+          if (progress->transpose_probe_mode) {
+            minimum[index] = ordered[index]->first_block;
+            maximum[index] = minimum[index] + 3;
+            if (maximum[index] >= source_blocks) {
+              maximum[index] = source_blocks - 1;
+            }
+          }
+        }
+        if (!progress->transpose_trial_initialized) {
+          progress->transpose_cut_a = minimum[0];
+          progress->transpose_cut_b = minimum[1];
+          progress->transpose_cut_c = minimum[2];
+          progress->transpose_trial_initialized = true;
+        }
+
+        while (progress->transpose_cut_a <= maximum[0]) {
+          uint64_t cut_a = progress->transpose_cut_a;
+          uint64_t cut_b = progress->transpose_cut_b;
+          uint64_t cut_c = progress->transpose_cut_c;
+
+          progress->transpose_cut_c++;
+          if (progress->transpose_cut_c > maximum[2]) {
+            progress->transpose_cut_c = minimum[2];
+            progress->transpose_cut_b++;
+            if (progress->transpose_cut_b > maximum[1]) {
+              progress->transpose_cut_b = minimum[1];
+              progress->transpose_cut_a++;
+            }
+          }
+
+          if (cut_a >= cut_b || cut_b >= cut_c) {
+            continue;
+          }
+          if (jpg_reassembly_checkpoint_requested()) {
+            progress->transpose_cut_a = cut_a;
+            progress->transpose_cut_b = cut_b;
+            progress->transpose_cut_c = cut_c;
+            jpg_put_decoder_state(candidate->carvehashkey, &state);
+            if (checkpoint_hit) {
+              *checkpoint_hit = true;
+            }
+            return false;
+          }
+          {
+            double maximum_join_score = DBL_MAX;
+            double total_join_score = DBL_MAX;
+            bool complete_hypothesis;
+
+            complete_hypothesis = jpg_reassembly_try_internal_run_transpose(
+                candidate, source_blocks, source_length,
+                cut_a, cut_b, cut_c, fixed_prefix_blocks,
+                validates, validates_to, false,
+                &maximum_join_score, &total_join_score);
+            if (jpg_reassembly_checkpoint_requested()) {
+              progress->transpose_cut_a = cut_a;
+              progress->transpose_cut_b = cut_b;
+              progress->transpose_cut_c = cut_c;
+              jpg_put_decoder_state(candidate->carvehashkey, &state);
+              if (checkpoint_hit) {
+                *checkpoint_hit = true;
+              }
+              return false;
+            }
+            if (complete_hypothesis) {
+              jpg_run_order_note_hypothesis(
+                  progress, JPG_RUN_ORDER_KIND_INTERNAL_TRANSPOSE,
+                  cut_a, cut_b, cut_c, 0,
+                  progress->transpose_i, progress->transpose_j,
+                  progress->transpose_k,
+                  maximum_join_score, total_join_score);
+              if (jpg_reassembly_debug_candidate(candidate)) {
+                lock_fprintf(stderr,
+                             "[jpgdbg] run_order_complete transpose"
+                             " cuts=%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                             " max=%.6f total=%.6f best=%.6f\n",
+                             cut_a, cut_b, cut_c,
+                             maximum_join_score, total_join_score,
+                             progress->best_max_join_score);
+              }
+            }
+          }
+        }
+        {
+          uint32_t primary_groups = progress->group_count;
+          bool probe_complete;
+          bool refinement_complete = progress->transpose_refine_mode;
+
+          if (primary_groups > JPG_RUN_ORDER_PRIMARY_GROUPS) {
+            primary_groups = JPG_RUN_ORDER_PRIMARY_GROUPS;
+          }
+          probe_complete = progress->transpose_probe_mode
+              && progress->transpose_i == 0
+              && progress->transpose_j == 1
+              && progress->transpose_k + 1 >= primary_groups;
+          jpg_run_order_advance_transpose_combination(progress);
+          if (refinement_complete) {
+            if (jpg_reassembly_apply_best_run_order_hypothesis(
+                    candidate, progress, source_blocks, source_length,
+                    fixed_prefix_blocks, validates, validates_to)) {
+              return true;
+            }
+            progress->transpose_refine_mode = false;
+          }
+          if (probe_complete) {
+            progress->transpose_probe_mode = false;
+            progress->transpose_trial_initialized = false;
+            if (progress->best_valid
+                && progress->best_kind
+                       == JPG_RUN_ORDER_KIND_INTERNAL_TRANSPOSE) {
+              progress->transpose_refine_mode = true;
+              progress->transpose_i = progress->best_group_i;
+              progress->transpose_j = progress->best_group_j;
+              progress->transpose_k = progress->best_group_k;
+            }
+            else {
+              progress->transpose_i = 0;
+              progress->transpose_j = 1;
+              progress->transpose_k = 2;
+            }
+          }
+        }
+      }
+
+      if (progress->group_count < JPG_RUN_ORDER_GROUP_BATCH) {
+        progress->phase = JPG_RUN_ORDER_PHASE_EXHAUSTED;
+        break;
+      }
+      progress->page_after_valid = true;
+      progress->page_after_normalized =
+          progress->groups[progress->group_count - 1].normalized;
+      progress->page_after_first_block =
+          progress->groups[progress->group_count - 1].first_block;
+      progress->phase = JPG_RUN_ORDER_PHASE_SCAN;
+      progress->scan_next_block =
+          CEILDIV(context.entropy_start, scalpel_state.blocksize);
+      if (progress->scan_next_block < 1) {
+        progress->scan_next_block = 1;
+      }
+      progress->scan_group_active = false;
+      progress->group_count = 0;
+      progress->transpose_trial_initialized = false;
+    }
+  }
+
+  if (jpg_reassembly_apply_best_run_order_hypothesis(
+          candidate, progress, source_blocks, source_length,
+          fixed_prefix_blocks, validates, validates_to)) {
+    return true;
+  }
+  jpg_put_decoder_state(candidate->carvehashkey, &state);
+  return false;
+}
+
+static inline bool jpg_reassembly_try_pending_hidden_rollback(
+    CarveInfo *candidate,
+    bool *validates,
+    uint64_t *validates_to) {
+  JPGCarveState state;
+  JPGRunOrderProgress *progress;
+  uint64_t materialized_length = 0;
+  uint64_t signature;
+  uint64_t rollback_block;
+  double rate_ratio;
+  char *materialized;
+
+  if (!candidate || !candidate->b || !validates || !validates_to) {
+    return false;
+  }
+  memset(&state, 0, sizeof(state));
+  if (!jpg_reassembly_load_saved_state(candidate, &state)) {
+    return false;
+  }
+  progress = &state.run_order_progress;
+  if (!progress->active || !progress->fallback_rollback_valid
+      || progress->source_blocks
+             != blockvector_get_num_blocks(candidate->b)
+      || progress->source_length == 0) {
+    return false;
+  }
+
+  materialized = jpg_reassembly_materialize_candidate(
+      candidate, &materialized_length);
+  if (!materialized || materialized_length < progress->source_length) {
+    progress->fallback_rollback_valid = false;
+    jpg_put_decoder_state(candidate->carvehashkey, &state);
+    return false;
+  }
+  signature = XXH3_64bits(materialized, progress->source_length);
+  signature ^= progress->source_blocks
+               * UINT64_C(0x9e3779b97f4a7c15);
+  if (signature != progress->signature) {
+    progress->fallback_rollback_valid = false;
+    jpg_put_decoder_state(candidate->carvehashkey, &state);
+    return false;
+  }
+
+  rollback_block = progress->fallback_rollback_block;
+  rate_ratio = progress->fallback_rollback_rate_ratio;
+  if (jpg_reassembly_rollback_hidden_boundary(
+          candidate, rollback_block, validates, validates_to, rate_ratio)) {
+    return true;
+  }
+  if (jpg_reassembly_checkpoint_requested()) {
+    jpg_put_decoder_state(candidate->carvehashkey, &state);
+    return false;
+  }
+  progress->fallback_rollback_valid = false;
+  progress->fallback_rollback_block = 0;
+  progress->fallback_rollback_rate_ratio = 0.0;
+  jpg_put_decoder_state(candidate->carvehashkey, &state);
+  return false;
+}
+
+// A terminal fragment can precede its JPEG header physically. Probe possible
+// starts of each such EOI-anchored run from the saved baseline entropy state;
+// only a run that resumes cleanly and completes through the real EOI is kept.
+static inline bool jpg_reassembly_try_preheader_tail_validation(
+    CarveInfo *candidate,
+    const JPGCarveState *prefix_state,
+    bool *validates,
+    uint64_t *validates_to,
+    uint32_t fixed_prefix_blocks,
+    uint64_t saved_num_blocks,
+    uint64_t saved_length,
+    uint64_t maximum_start_trials) {
+  uint64_t start_trials = 0;
+
+  if (!candidate || !candidate->b || !prefix_state || !validates
+      || !validates_to || !prefix_state->valid
+      || prefix_state->is_progressive
+      || !prefix_state->huff_checkpoint.valid
+      || saved_num_blocks == 0 || scalpel_state.blocksize == 0) {
+    return false;
+  }
+
+  const int64_t first_apparent = blockvector_get_apparent_blocknumber(
+      candidate->b, 0);
+  const int64_t apparent_blocks = (int64_t)filemirror_apparent_blocks(
+      scalpel_state.filemirror);
+  SearchSpec *spec = &scalpel_state.search_specs[candidate->needleidx];
+
+  if (jpg_reassembly_debug_candidate(candidate)) {
+    lock_fprintf(stderr,
+                 "[jpgdbg] preheader_tail begin blocks=%" PRIu64
+                 " length=%" PRIu64 " first=%" PRId64
+                 " footers=%" PRIu64 " huffman=%d\n",
+                 saved_num_blocks, saved_length, first_apparent,
+                 spec->offsets.numfooters,
+                 prefix_state->huff_checkpoint.valid ? 1 : 0);
+  }
+
+  if (first_apparent <= 0 || apparent_blocks <= 0
+      || saved_length >= spec->MAXIMUMSIZE) {
+    return false;
+  }
+
+  uint64_t maximum_tail_blocks = CEILDIV(
+      spec->MAXIMUMSIZE - saved_length, scalpel_state.blocksize);
+
+  for (uint64_t footer_cursor = spec->offsets.numfooters;
+       footer_cursor > 0; footer_cursor--) {
+    const uint64_t footer_index = footer_cursor - 1;
+    const int64_t footer_actual = (int64_t)(
+        spec->offsets.footers[footer_index] / scalpel_state.blocksize);
+    const int64_t footer_apparent = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, footer_actual);
+
+    if (footer_actual < 0 || footer_apparent < 0
+        || footer_apparent >= first_apparent
+        || jpg_reassembly_apparent_in_blockvector_strict(
+               candidate->b, footer_apparent)) {
+      continue;
+    }
+
+    int64_t first_start = footer_apparent
+                          - (int64_t)maximum_tail_blocks + 1;
+
+    if (first_start < 0) {
+      first_start = 0;
+    }
+    for (uint64_t header_index = 0;
+         header_index < spec->offsets.numheaders; header_index++) {
+      int64_t header_apparent = -1;
+
+      if (jpg_reassembly_header_anchor_apparent(
+              candidate, header_index, &header_apparent)
+          && header_apparent >= first_start
+          && header_apparent < footer_apparent) {
+        first_start = header_apparent + 1;
+      }
+    }
+
+    for (int64_t tail_start = footer_apparent;
+         tail_start >= first_start; tail_start--) {
+      if (maximum_start_trials > 0
+          && start_trials >= maximum_start_trials) {
+        jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                             saved_length);
+        return false;
+      }
+      start_trials++;
+      if (jpg_reassembly_checkpoint_requested()) {
+        jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                             saved_length);
+        return false;
+      }
+
+      uint64_t probe_blocks = (uint64_t)(footer_apparent - tail_start + 1);
+
+      if (probe_blocks > JPG_REASSEMBLY_PROBE_MAX_CHAIN) {
+        probe_blocks = JPG_REASSEMBLY_PROBE_MAX_CHAIN;
+      }
+      if (!jpg_reassembly_ooo_range_available(
+              candidate, tail_start, probe_blocks, -1, 0)
+          || jpg_reassembly_ooo_range_has_zero(tail_start, probe_blocks)) {
+        continue;
+      }
+
+      JpgReassemblyEntropyProbe probe;
+
+      memset(&probe, 0, sizeof(probe));
+      const bool probed = jpg_reassembly_probe_baseline_entropy(
+          candidate, prefix_state, saved_num_blocks, saved_length,
+          tail_start, probe_blocks, -1, 0, &probe);
+
+      if (jpg_reassembly_debug_candidate(candidate)
+          && (tail_start == first_start
+              || (probed && probe.supported && probe.clean))) {
+        lock_fprintf(stderr,
+                     "[jpgdbg] preheader_tail probe start=%" PRId64
+                     " footer=%" PRId64 " blocks=%" PRIu64
+                     " probed=%d supported=%d clean=%d reaches=%d"
+                     " frontier=%" PRIu64 " failure=%d\n",
+                     tail_start, footer_apparent, probe_blocks,
+                     probed ? 1 : 0, probe.supported ? 1 : 0,
+                     probe.clean ? 1 : 0,
+                     probe.reaches_probe_end ? 1 : 0,
+                     probe.frontier, probe.failure);
+      }
+      if (!probed || !probe.supported || !probe.clean
+          || !probe.reaches_probe_end) {
+        continue;
+      }
+
+      if (jpg_reassembly_try_contiguous_tail_validation(
+              candidate, validates, validates_to, fixed_prefix_blocks,
+              saved_num_blocks, saved_length, tail_start)
+          && *validates && !jpg_wrongblock_result.detected) {
+        return true;
+      }
+      jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                           saved_length);
+      *validates = false;
+    }
+  }
+
+  return false;
 }
 
 static inline bool jpg_reassembly_try_bridge_tail_validation(
@@ -8540,7 +11503,7 @@ static inline bool jpg_reassembly_try_bridge_tail_validation(
         filemirror_actual_blocknumber(scalpel_state.filemirror, last_apparent);
   }
   if (trial_state.valid) {
-    carve_put_state(candidate->carvehashkey, &trial_state);
+    jpg_put_decoder_state(candidate->carvehashkey, &trial_state);
   }
   jpg_reassembly_debug_dump("bridge_tail_validated", candidate,
                             moved_start, trial_validates_to);
@@ -8639,7 +11602,8 @@ static inline bool jpg_reassembly_try_ooo_candidate_run(
   reaches_probe_end =
       trial_frontier >= trial_end
       || (trial_end > trial_frontier
-          && trial_end - trial_frontier <= JPG_REASS_OOO_BOUNDARY_SLACK);
+          && trial_end - trial_frontier <= JPG_REASS_OOO_BOUNDARY_SLACK
+          && !jpg_wrongblock_result.detected);
   if ((reaches_probe_end || trial_validates)
       && (boundary_out || jpg_reassembly_debug_candidate(candidate))) {
     uint64_t boundary_length =
@@ -8693,9 +11657,7 @@ static inline bool jpg_reassembly_try_ooo_candidate_run(
   }
   if (!require_full_validate
       && !trial_validates && scalpel_state.blocksize > 0
-      && !(trial_frontier >= trial_end
-           || (trial_end > trial_frontier
-               && trial_end - trial_frontier <= JPG_REASS_OOO_BOUNDARY_SLACK))
+      && !reaches_probe_end
       && trial_frontier + 1 > saved_length + run_len * scalpel_state.blocksize) {
     uint64_t committed_len =
         CEILDIV(trial_frontier + 1, scalpel_state.blocksize)
@@ -8768,7 +11730,13 @@ static inline bool jpg_reassembly_try_ooo_candidate_run(
     *validates_to = trial_validates_to;
     candidate->best_validates_to = trial_validates_to;
     if (trial_state.valid) {
-      carve_put_state(candidate->carvehashkey, &trial_state);
+      if (trial_validates && prefix_state
+          && prefix_state->hidden_boundary_recovery) {
+        trial_state.hidden_boundary_recovery = false;
+        memset(&trial_state.hidden_boundary_progress, 0,
+               sizeof(trial_state.hidden_boundary_progress));
+      }
+      jpg_put_decoder_state(candidate->carvehashkey, &trial_state);
     }
     blockvector_set_data_length(candidate->b, trial_validates_to + 1);
     resize_blockvector(candidate->b,
@@ -8795,6 +11763,679 @@ static inline bool jpg_reassembly_try_ooo_candidate_run(
   return false;
 }
 
+// Recover two logical runs that both precede the current header run in the
+// image. Entropy decoding only rejects implausible first runs; a hypothesis is
+// committed only when adding the EOI-bearing second run validates the JPEG.
+static inline bool jpg_reassembly_try_preheader_two_run_validation(
+    CarveInfo *candidate,
+    const JPGCarveState *prefix_state,
+    bool *validates,
+    uint64_t *validates_to,
+    uint32_t fixed_prefix_blocks,
+    uint64_t saved_num_blocks,
+    uint64_t saved_length,
+    int64_t selected_moved_start) {
+  int64_t first_apparent;
+  int64_t search_start;
+  int64_t search_floor;
+
+  if (!candidate || !candidate->b || !prefix_state || !validates
+      || !validates_to || !prefix_state->valid
+      || prefix_state->is_progressive
+      || !prefix_state->huff_checkpoint.valid
+      || saved_num_blocks == 0 || scalpel_state.blocksize == 0) {
+    return false;
+  }
+
+  first_apparent = blockvector_get_apparent_blocknumber(candidate->b, 0);
+  if (first_apparent <= 0) {
+    return false;
+  }
+  if (selected_moved_start >= 0) {
+    if (selected_moved_start >= first_apparent) {
+      return false;
+    }
+    search_start = selected_moved_start;
+    search_floor = selected_moved_start;
+  }
+  else {
+    search_start = first_apparent - 1;
+    search_floor =
+        first_apparent - JPG_REASS_OOO_PRIORITY_BACKSCAN_BLOCKS;
+    if (search_floor < 0) {
+      search_floor = 0;
+    }
+  }
+
+  for (int64_t moved_start = search_start;
+       moved_start >= search_floor; moved_start--) {
+    uint64_t max_run_len = JPG_REASS_OOO_MAX_RUN;
+
+    if (jpg_reassembly_checkpoint_requested()) {
+      jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                           saved_length);
+      return false;
+    }
+    if (!jpg_reassembly_bridge_candidate_plausible(moved_start, false)) {
+      continue;
+    }
+    if ((uint64_t)(first_apparent - moved_start) < max_run_len) {
+      max_run_len = (uint64_t)(first_apparent - moved_start);
+    }
+
+    for (uint64_t run_len = max_run_len; run_len > 0; run_len--) {
+      JpgReassemblyEntropyProbe probe;
+      JPGCarveState trial_state;
+      uint64_t trial_validates_to = 0;
+      uint64_t trial_num_blocks;
+      uint64_t trial_length;
+      bool trial_validates;
+
+      if (jpg_reassembly_checkpoint_requested()) {
+        jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                             saved_length);
+        return false;
+      }
+      if (!jpg_reassembly_ooo_range_available(candidate, moved_start,
+                                              run_len, -1, 0)
+          || jpg_reassembly_ooo_range_has_zero(moved_start, run_len)) {
+        continue;
+      }
+      memset(&probe, 0, sizeof(probe));
+      if (!jpg_reassembly_probe_baseline_entropy(
+              candidate, prefix_state, saved_num_blocks, saved_length,
+              moved_start, run_len, -1, 0, &probe)
+          || !probe.supported || !probe.clean
+          || !probe.reaches_probe_end) {
+        continue;
+      }
+
+      jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                           saved_length);
+      jpg_reassembly_ooo_append_range(candidate, moved_start, run_len);
+      trial_num_blocks = blockvector_get_num_blocks(candidate->b);
+      trial_length = blockvector_get_data_length(candidate->b);
+      memcpy(&trial_state, prefix_state, sizeof(trial_state));
+      trial_validates = jpg_reassembly_validate_direct(
+          candidate, &trial_state, &trial_validates_to,
+          fixed_prefix_blocks);
+      if (trial_validates) {
+        *validates = true;
+        *validates_to = trial_validates_to;
+        blockvector_set_data_length(candidate->b, trial_validates_to + 1);
+        resize_blockvector(candidate->b,
+                           CEILDIV(trial_validates_to + 1,
+                                   scalpel_state.blocksize));
+        candidate->best_validates_to = trial_validates_to;
+        jpg_put_decoder_state(candidate->carvehashkey, &trial_state);
+        return true;
+      }
+      if (trial_state.valid && trial_state.huff_checkpoint.valid
+          && jpg_reassembly_try_preheader_tail_validation(
+                 candidate, &trial_state, validates, validates_to,
+                 fixed_prefix_blocks, trial_num_blocks, trial_length,
+                 JPG_REASS_OOO_SUFFIX_PROBE)) {
+        return true;
+      }
+      jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                           saved_length);
+      if (jpg_reassembly_checkpoint_requested()) {
+        return false;
+      }
+    }
+  }
+
+  jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                       saved_length);
+  return false;
+}
+
+static inline bool jpg_reassembly_try_hidden_rejected_successor(
+    CarveInfo *candidate,
+    JPGCarveState *prefix_state,
+    bool *validates,
+    uint64_t *validates_to,
+    uint32_t fixed_prefix_blocks,
+    uint64_t saved_num_blocks,
+    uint64_t saved_length) {
+  JPGHiddenBoundaryProgress *progress;
+  int64_t successor;
+  bool advanced;
+
+  if (!candidate || !candidate->b || !prefix_state || !validates
+      || !validates_to || !prefix_state->valid
+      || !prefix_state->hidden_boundary_recovery
+      || !prefix_state->hidden_rejected_range_valid
+      || prefix_state->hidden_rejected_last_actual == INT64_MAX) {
+    return false;
+  }
+
+  progress = &prefix_state->hidden_boundary_progress;
+  if (!progress->active) {
+    memset(progress, 0, sizeof(*progress));
+    progress->active = true;
+    progress->origin_blocks = saved_num_blocks;
+    progress->origin_length = saved_length;
+  }
+  if (progress->rejected_successor_checked
+      || progress->origin_blocks != saved_num_blocks
+      || progress->origin_length != saved_length) {
+    return false;
+  }
+
+  successor = jpg_reassembly_apparent_lower_bound(
+      prefix_state->hidden_rejected_last_actual + 1);
+  if (!jpg_reassembly_ooo_apparent_available(candidate, successor)
+      || !jpg_reassembly_bridge_candidate_plausible(successor, false)
+      || jpg_reassembly_ooo_range_has_zero(successor, 1)) {
+    progress->rejected_successor_checked = true;
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    return false;
+  }
+
+  advanced = jpg_reassembly_try_ooo_candidate_run(
+      candidate, prefix_state, true, validates, validates_to,
+      fixed_prefix_blocks, saved_num_blocks, saved_length,
+      successor, 1, -1, 0, false, true, true, NULL);
+  if (jpg_reassembly_checkpoint_requested()) {
+    if (!advanced) {
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    }
+    return advanced;
+  }
+  if (!advanced) {
+    progress->rejected_successor_checked = true;
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+  }
+  return advanced;
+}
+
+static inline bool jpg_reassembly_try_hidden_natural_run(
+    CarveInfo *candidate,
+    JPGCarveState *prefix_state,
+    bool *validates,
+    uint64_t *validates_to,
+    uint32_t fixed_prefix_blocks,
+    uint64_t saved_num_blocks,
+    uint64_t saved_length) {
+  JPGHiddenBoundaryProgress *progress;
+  JpgReassemblyEntropyProbe probe;
+  JPGCarveState commit_state;
+  int64_t tail_apparent;
+  int64_t natural_start;
+  int64_t rejected_start = -1;
+  int64_t next_header = -1;
+  uint64_t rejected_blocks = 0;
+  bool probed;
+
+  if (!candidate || !candidate->b || !prefix_state || !validates
+      || !validates_to || !prefix_state->valid
+      || !prefix_state->hidden_boundary_recovery) {
+    return false;
+  }
+  progress = &prefix_state->hidden_boundary_progress;
+  if (!progress->active || progress->natural_probe_complete
+      || saved_num_blocks != progress->origin_blocks + 1
+      || saved_length <= progress->origin_length) {
+    return false;
+  }
+  tail_apparent = blockvector_get_apparent_blocknumber(
+      candidate->b, saved_num_blocks - 1);
+  if (tail_apparent < 0) {
+    return false;
+  }
+
+  if (!progress->natural_scan_active) {
+    natural_start = tail_apparent + 1;
+    if (!jpg_reassembly_next_header_apparent(
+            candidate, natural_start, &next_header)
+        || next_header <= natural_start) {
+      progress->natural_probe_complete = true;
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+      return false;
+    }
+    progress->natural_scan_active = true;
+    progress->natural_start_actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, natural_start);
+    progress->natural_limit_actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, next_header);
+    progress->natural_next_actual = progress->natural_start_actual;
+    progress->natural_available = 0;
+  }
+
+  int64_t apparent = jpg_reassembly_apparent_lower_bound(
+      progress->natural_next_actual);
+  while (!progress->natural_scan_complete
+         && progress->natural_next_actual < progress->natural_limit_actual) {
+    if (apparent <= 0
+        || (uint64_t)apparent
+               >= filemirror_apparent_blocks(scalpel_state.filemirror)) {
+      progress->natural_scan_complete = true;
+      break;
+    }
+    int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent);
+    int64_t previous_actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent - 1);
+
+    if (jpg_reassembly_checkpoint_requested()) {
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+      return false;
+    }
+    if (actual != progress->natural_next_actual || previous_actual < 0
+        || actual != previous_actual + 1
+        || !jpg_reassembly_ooo_apparent_available(candidate, apparent)) {
+      progress->natural_scan_complete = true;
+      break;
+    }
+    progress->natural_available++;
+    progress->natural_next_actual = actual + 1;
+    apparent++;
+  }
+  if (progress->natural_next_actual >= progress->natural_limit_actual) {
+    progress->natural_scan_complete = true;
+  }
+  if (!progress->natural_scan_complete) {
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    return false;
+  }
+  natural_start = jpg_reassembly_apparent_lower_bound(
+      progress->natural_start_actual);
+  int64_t natural_end = jpg_reassembly_apparent_lower_bound(
+      progress->natural_limit_actual);
+  // A saved physical run must still be present in full before it is probed.
+  if (progress->natural_next_actual != progress->natural_limit_actual
+      || natural_start >= natural_end
+      || filemirror_actual_blocknumber(scalpel_state.filemirror, natural_start)
+             != progress->natural_start_actual
+      || (uint64_t)(natural_end - natural_start) != progress->natural_available
+      || progress->natural_available == 0) {
+    progress->natural_probe_complete = true;
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    return false;
+  }
+
+  if (prefix_state->hidden_rejected_range_valid
+      && prefix_state->hidden_rejected_first_actual >= 0
+      && prefix_state->hidden_rejected_last_actual
+             >= prefix_state->hidden_rejected_first_actual
+      && prefix_state->hidden_rejected_last_actual < INT64_MAX) {
+    rejected_start = jpg_reassembly_apparent_lower_bound(
+        prefix_state->hidden_rejected_first_actual);
+    int64_t rejected_end = jpg_reassembly_apparent_lower_bound(
+        prefix_state->hidden_rejected_last_actual + 1);
+    rejected_blocks = (uint64_t)(rejected_end - rejected_start);
+  }
+  if (rejected_blocks > 0) {
+    if (!progress->natural_tail_search_initialized) {
+      progress->natural_tail_search_initialized = true;
+      progress->natural_trial_next = progress->natural_available;
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    }
+    while (progress->natural_trial_next > 0) {
+      uint64_t run_len = progress->natural_trial_next;
+
+      if (jpg_reassembly_checkpoint_requested()) {
+        jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+        return false;
+      }
+      if (jpg_reassembly_debug_candidate(candidate)
+          && (run_len == progress->natural_available
+              || (run_len & 63u) == 0)) {
+        lock_fprintf(stderr,
+                     "[jpgdbg] hidden_tail_trial start=%" PRId64
+                     " blocks=%" PRIu64 " suffix=%" PRId64 "+%" PRIu64
+                     "\n",
+                     natural_start, run_len,
+                     rejected_start,
+                     rejected_blocks);
+      }
+      if (jpg_reassembly_try_ooo_candidate_run(
+              candidate, prefix_state, true, validates, validates_to,
+              fixed_prefix_blocks, saved_num_blocks, saved_length,
+              natural_start, run_len,
+              rejected_start,
+              rejected_blocks, true, false, true, NULL)) {
+        return true;
+      }
+      if (jpg_reassembly_checkpoint_requested()) {
+        jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+        return false;
+      }
+      progress->natural_trial_next--;
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    }
+  }
+
+  memset(&probe, 0, sizeof(probe));
+  probed = jpg_reassembly_probe_baseline_entropy(
+      candidate, prefix_state, saved_num_blocks, saved_length,
+      natural_start, progress->natural_available,
+      -1, 0, &probe);
+  if (jpg_reassembly_checkpoint_requested()) {
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    return false;
+  }
+  if (!probed || !probe.supported || !probe.clean
+      || !probe.reaches_probe_end) {
+    progress->natural_probe_complete = true;
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    return false;
+  }
+
+  if (jpg_reassembly_debug_candidate(candidate)) {
+    lock_fprintf(stderr,
+                 "[jpgdbg] hidden_natural_run start=%" PRId64
+                 " blocks=%" PRIu64 " frontier=%" PRIu64 "\n",
+                 natural_start, progress->natural_available,
+                 probe.frontier);
+  }
+  memcpy(&commit_state, prefix_state, sizeof(commit_state));
+  memset(&commit_state.hidden_boundary_progress, 0,
+         sizeof(commit_state.hidden_boundary_progress));
+  if (commit_state.hidden_boundary_runs_committed < UINT32_MAX) {
+    commit_state.hidden_boundary_runs_committed++;
+  }
+  progress->natural_probe_complete = true;
+  jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+  return jpg_reassembly_try_ooo_candidate_run(
+      candidate, &commit_state, true, validates, validates_to,
+      fixed_prefix_blocks, saved_num_blocks, saved_length,
+      natural_start, progress->natural_available,
+      -1, 0, false, true, true, NULL);
+}
+
+// Return the first apparent position whose physical block is at least actual.
+// This also gives a usable continuation when the saved physical block is covered.
+static inline int64_t jpg_reassembly_apparent_lower_bound(int64_t actual) {
+  int64_t low = 0;
+  int64_t high = (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
+
+  while (low < high) {
+    int64_t middle = low + (high - low) / 2;
+    int64_t mapped = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, middle);
+
+    if (mapped < actual) {
+      low = middle + 1;
+    }
+    else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+static inline bool jpg_reassembly_begin_footer_interval(
+    CarveInfo *candidate,
+    JPGFooterTailProgress *progress,
+    int64_t search_floor_actual,
+    int64_t apparent_blocks,
+    uint64_t maximum_tail_blocks) {
+  SearchSpec *spec;
+  int64_t next_footer = -1;
+  int64_t floor;
+
+  if (!candidate || !progress || search_floor_actual < 0
+      || maximum_tail_blocks == 0) {
+    return false;
+  }
+  floor = jpg_reassembly_apparent_lower_bound(search_floor_actual);
+  if (floor >= apparent_blocks
+      || !jpg_reassembly_next_footer_apparent(
+             candidate, floor, apparent_blocks, &next_footer)) {
+    return false;
+  }
+
+  if (maximum_tail_blocks < (uint64_t)(next_footer - floor + 1)) {
+    floor = next_footer - (int64_t)maximum_tail_blocks + 1;
+  }
+  spec = &scalpel_state.search_specs[candidate->needleidx];
+  for (uint64_t index = 0; index < spec->offsets.numheaders; index++) {
+    int64_t actual = (int64_t)(spec->offsets.headers[index]
+                               / scalpel_state.blocksize);
+    int64_t apparent = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, actual);
+
+    if (apparent >= floor && apparent < next_footer) {
+      floor = apparent + 1;
+    }
+  }
+  for (uint64_t index = 0; index < spec->offsets.numfooters; index++) {
+    int64_t actual = (int64_t)(spec->offsets.footers[index]
+                               / scalpel_state.blocksize);
+    int64_t apparent = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, actual);
+
+    if (apparent >= floor && apparent < next_footer) {
+      floor = apparent + 1;
+    }
+  }
+
+  int64_t local_limit = floor;
+  if (next_footer - floor >= JPG_FOOTER_TAIL_LOCAL_STARTS) {
+    local_limit += JPG_FOOTER_TAIL_LOCAL_STARTS - 1;
+  }
+  else {
+    local_limit = next_footer;
+  }
+  progress->interval_active = true;
+  progress->floor_actual = filemirror_actual_blocknumber(
+      scalpel_state.filemirror, floor);
+  progress->footer_actual = filemirror_actual_blocknumber(
+      scalpel_state.filemirror, next_footer);
+  progress->reverse_next_actual = progress->footer_actual;
+  progress->local_complete = false;
+  progress->local_next_actual = progress->floor_actual;
+  progress->local_limit_actual = filemirror_actual_blocknumber(
+      scalpel_state.filemirror, local_limit);
+  return true;
+}
+
+// Try EOI-anchored continuations for the current prefix. Nearby starts precede
+// a reverse sweep. Physical cursors survive changes to apparent block positions;
+// entropy checks reject mismatches, and complete validation decides acceptance.
+static inline bool jpg_reassembly_try_footer_tail(
+    CarveInfo *candidate,
+    JPGCarveState *prefix_state,
+    bool *validates,
+    uint64_t *validates_to,
+    uint32_t fixed_prefix_blocks,
+    uint64_t saved_num_blocks,
+    uint64_t saved_length) {
+  JPGFooterTailProgress *progress;
+  int64_t apparent_blocks;
+  int64_t tail_actual;
+  uint64_t maximum_tail_blocks;
+  uint64_t signature;
+
+  if (!candidate || !candidate->b || !prefix_state || !validates
+      || !validates_to || !prefix_state->valid
+      || prefix_state->is_progressive
+      || !prefix_state->huff_checkpoint.valid
+      || scalpel_state.blocksize == 0 || saved_num_blocks == 0
+      || saved_num_blocks > blockvector_get_num_blocks(candidate->b)
+      || saved_num_blocks > SIZE_MAX / sizeof(int64_t)) {
+    return false;
+  }
+
+  // A selected first block may still have a physically contiguous fragment
+  // to extend. Finish that bounded extension before searching for a tail.
+  if (prefix_state->hidden_boundary_recovery
+      && prefix_state->hidden_boundary_progress.active
+      && !prefix_state->hidden_boundary_progress.natural_probe_complete
+      && saved_num_blocks - 1
+             == prefix_state->hidden_boundary_progress.origin_blocks
+      && saved_length
+             > prefix_state->hidden_boundary_progress.origin_length) {
+    return false;
+  }
+
+  signature = 0;
+  for (uint64_t index = 0; index < saved_num_blocks; index++) {
+    int64_t actual = blockvector_get_actual_blocknumber(candidate->b, index);
+
+    signature = XXH3_64bits_withSeed(&actual, sizeof(actual), signature);
+  }
+  progress = &prefix_state->footer_tail_progress;
+  if (!progress->active
+      || progress->source_blocks != saved_num_blocks
+      || progress->source_length != saved_length
+      || progress->source_signature != signature) {
+    memset(progress, 0, sizeof(*progress));
+    progress->active = true;
+    progress->source_blocks = saved_num_blocks;
+    progress->source_length = saved_length;
+    progress->source_signature = signature;
+  }
+  if (progress->complete) {
+    return false;
+  }
+
+  tail_actual = blockvector_get_actual_blocknumber(
+      candidate->b, saved_num_blocks - 1);
+  apparent_blocks = (int64_t)filemirror_apparent_blocks(
+      scalpel_state.filemirror);
+  SearchSpec *spec = &scalpel_state.search_specs[candidate->needleidx];
+  if (tail_actual < 0 || tail_actual == INT64_MAX
+      || saved_length >= spec->MAXIMUMSIZE) {
+    progress->complete = true;
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    return false;
+  }
+  maximum_tail_blocks = CEILDIV(
+      spec->MAXIMUMSIZE - saved_length, scalpel_state.blocksize);
+  if (!progress->interval_active
+      && !jpg_reassembly_begin_footer_interval(
+             candidate, progress, tail_actual + 1,
+             apparent_blocks, maximum_tail_blocks)) {
+    progress->complete = true;
+    jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    return false;
+  }
+
+  while (!progress->complete) {
+    JpgReassemblyEntropyProbe probe;
+    int64_t tail_start = -1;
+    int64_t trial_actual = -1;
+    int64_t footer_apparent = jpg_reassembly_apparent_lower_bound(
+        progress->footer_actual);
+    uint64_t probe_blocks;
+    bool probed;
+    bool local_trial = false;
+
+    if (jpg_reassembly_checkpoint_requested()) {
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+      return false;
+    }
+    if (footer_apparent >= apparent_blocks
+        || filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                          footer_apparent)
+               != progress->footer_actual) {
+      progress->local_complete = true;
+      progress->reverse_next_actual = -1;
+    }
+    if (!progress->local_complete) {
+      tail_start = jpg_reassembly_apparent_lower_bound(
+          progress->local_next_actual);
+      if (tail_start < apparent_blocks) {
+        trial_actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror, tail_start);
+      }
+      if (trial_actual >= 0 && trial_actual <= progress->local_limit_actual) {
+        progress->local_next_actual = trial_actual + 1;
+        local_trial = true;
+      }
+      else {
+        progress->local_complete = true;
+      }
+    }
+    if (!local_trial) {
+      tail_start = jpg_reassembly_apparent_lower_bound(
+          progress->reverse_next_actual);
+      if (tail_start == apparent_blocks
+          || filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                            tail_start)
+                 > progress->reverse_next_actual) {
+        tail_start--;
+      }
+      trial_actual = tail_start >= 0
+                         ? filemirror_actual_blocknumber(
+                               scalpel_state.filemirror, tail_start) : -1;
+      if (trial_actual < progress->floor_actual) {
+        if (progress->footer_actual < INT64_MAX
+            && jpg_reassembly_begin_footer_interval(
+                   candidate, progress, progress->footer_actual + 1,
+                   apparent_blocks, maximum_tail_blocks)) {
+          continue;
+        }
+        progress->complete = true;
+        break;
+      }
+      progress->reverse_next_actual = trial_actual - 1;
+      if (trial_actual <= progress->local_limit_actual) {
+        continue;
+      }
+    }
+
+    if (!jpg_reassembly_ooo_apparent_available(candidate, tail_start)
+        || !jpg_reassembly_bridge_candidate_plausible(tail_start, false)
+        || jpg_reassembly_ooo_range_has_zero(tail_start, 1)) {
+      continue;
+    }
+    probe_blocks = (uint64_t)(footer_apparent - tail_start + 1);
+    if (probe_blocks > JPG_REASSEMBLY_PROBE_MAX_CHAIN) {
+      probe_blocks = JPG_REASSEMBLY_PROBE_MAX_CHAIN;
+    }
+    if (!jpg_reassembly_ooo_range_available(candidate, tail_start,
+                                             probe_blocks, -1, 0)
+        || jpg_reassembly_ooo_range_has_zero(tail_start, probe_blocks)) {
+      continue;
+    }
+
+    memset(&probe, 0, sizeof(probe));
+    progress->probes++;
+    probed = jpg_reassembly_probe_baseline_entropy(
+        candidate, prefix_state, saved_num_blocks, saved_length,
+        tail_start, probe_blocks, -1, 0, &probe);
+    if (!jpg_reassembly_checkpoint_requested()
+        && probed && probe.supported && probe.clean
+        && probe.reaches_probe_end) {
+      progress->full_trials++;
+      if (jpg_reassembly_debug_candidate(candidate)) {
+        lock_fprintf(stderr,
+                     "[jpgdbg] footer_tail actual=%" PRId64
+                     " footer_actual=%" PRId64 " full_trial=%" PRIu64 "\n",
+                     trial_actual, progress->footer_actual,
+                     progress->full_trials);
+      }
+      if (jpg_reassembly_try_contiguous_tail_validation(
+              candidate, validates, validates_to, fixed_prefix_blocks,
+              saved_num_blocks, saved_length, tail_start)
+          && *validates && !jpg_wrongblock_result.detected) {
+        return true;
+      }
+      jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                           saved_length);
+      *validates = false;
+    }
+    if (jpg_reassembly_checkpoint_requested()) {
+      if (local_trial) {
+        progress->local_next_actual = trial_actual;
+      }
+      else {
+        progress->reverse_next_actual = trial_actual;
+      }
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+      return false;
+    }
+  }
+
+  progress->complete = true;
+  jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+  return false;
+}
+
 static inline void jpg_reassembly_restore_retry_frame(
     CarveInfo *candidate,
     JpgReassemblyRetryFrame *frame) {
@@ -8807,15 +12448,15 @@ static inline void jpg_reassembly_restore_retry_frame(
     blockvector_set_apparent_blocknumber(candidate->b, i,
                                          frame->apparent_blocks[i]);
   }
-  inflate_blockvector(candidate->b);
   blockvector_set_data_length(candidate->b, frame->length);
+  inflate_blockvector(candidate->b);
   candidate->best_validates_to = frame->best_validates_to;
   candidate->newblock = frame->newblock;
   candidate->block_choice_start = frame->block_choice_start;
   candidate->chopped = frame->chopped;
   candidate->fastpath = frame->fastpath;
   if (frame->have_prefix_state) {
-    carve_put_state(candidate->carvehashkey, &frame->prefix_state);
+    jpg_put_decoder_state(candidate->carvehashkey, &frame->prefix_state);
   }
 }
 
@@ -8861,7 +12502,8 @@ static inline bool jpg_reassembly_restore_retry(
     CarveInfo *candidate,
     JpgReassemblyRetrySearch *search,
     bool *validates,
-    uint64_t *validates_to) {
+    uint64_t *validates_to,
+    bool latest_frame_only) {
   if (!candidate || !search || !validates || !validates_to) {
     return false;
   }
@@ -8870,22 +12512,35 @@ static inline bool jpg_reassembly_restore_retry(
          && search->attempts < JPG_REASS_RETRY_LIMIT) {
     JpgReassemblyRetryFrame *frame;
 
+    if (jpg_reassembly_checkpoint_requested()) {
+      return false;
+    }
+
     if (!search->replay_started) {
       uint32_t selected = UINT32_MAX;
 
-      for (uint32_t i = 0; i < search->frame_count; i++) {
-        if (search->frames[i].next_choice
-                >= search->frames[i].choice_count) {
-          continue;
+      if (latest_frame_only) {
+        selected = search->frame_count - 1;
+        if (search->frames[selected].next_choice
+                >= search->frames[selected].choice_count) {
+          selected = UINT32_MAX;
         }
-        if (search->frames[i].retry_priority < 0.0) {
-          selected = i;
-          break;
-        }
-        if (selected == UINT32_MAX
-            || search->frames[i].retry_priority
-                   < search->frames[selected].retry_priority) {
-          selected = i;
+      }
+      else {
+        for (uint32_t i = 0; i < search->frame_count; i++) {
+          if (search->frames[i].next_choice
+                  >= search->frames[i].choice_count) {
+            continue;
+          }
+          if (search->frames[i].retry_priority < 0.0) {
+            selected = i;
+            break;
+          }
+          if (selected == UINT32_MAX
+              || search->frames[i].retry_priority
+                     < search->frames[selected].retry_priority) {
+            selected = i;
+          }
         }
       }
       if (selected == UINT32_MAX) {
@@ -8900,9 +12555,11 @@ static inline bool jpg_reassembly_restore_retry(
 
     while (frame->next_choice < frame->choice_count
            && search->attempts < JPG_REASS_RETRY_LIMIT) {
-      JpgOOOBridgeChoice choice = frame->choices[frame->next_choice++];
+      if (jpg_reassembly_checkpoint_requested()) {
+        return false;
+      }
+      JpgOOOBridgeChoice choice = frame->choices[frame->next_choice];
 
-      search->attempts++;
       if (jpg_reassembly_debug_candidate(candidate)) {
         lock_fprintf(stderr,
                      "[jpgdbg] retry_try attempt=%" PRIu32
@@ -8910,16 +12567,22 @@ static inline bool jpg_reassembly_restore_retry(
                      " blocks=%" PRIu64 " moved=%" PRId64 "+%" PRIu64
                      " suffix=%" PRId64 "+%" PRIu64
                      " score=%.3f dc=%.0f\n",
-                     search->attempts, search->frame_count,
-                     frame->next_choice, frame->choice_count,
+                     search->attempts + 1, search->frame_count,
+                     frame->next_choice + 1, frame->choice_count,
                      frame->num_blocks, choice.moved_start, choice.run_len,
                      choice.suffix_start, choice.suffix_len,
                      jpg_reassembly_retry_choice_score(&choice),
                      choice.max_dc_discontinuity);
       }
       jpg_reassembly_restore_retry_frame(candidate, frame);
-      if (jpg_reassembly_apply_retry_choice(candidate, frame, &choice,
-                                            validates, validates_to)) {
+      const bool accepted = jpg_reassembly_apply_retry_choice(
+          candidate, frame, &choice, validates, validates_to);
+      if (!accepted && jpg_reassembly_checkpoint_requested()) {
+        return false;
+      }
+      frame->next_choice++;
+      search->attempts++;
+      if (accepted) {
         search->replay_started = true;
         jpg_reassembly_debug_dump("bridge_retry_accept", candidate,
                                   choice.moved_start, *validates_to);
@@ -8929,6 +12592,9 @@ static inline bool jpg_reassembly_restore_retry(
 
     jpg_reassembly_clear_retry_frame(frame);
     search->frame_count--;
+    if (latest_frame_only) {
+      return false;
+    }
   }
   return false;
 }
@@ -9617,17 +13283,20 @@ static inline bool jpg_reassembly_evaluate_baseline_scatter_block(
     uint64_t saved_num_blocks,
     uint64_t saved_length,
     int64_t moved_start,
+    bool measure_boundary,
     JpgOOOBridgeChoice *choice) {
   JpgReassemblyEntropyProbe entropy_probe;
   JpgBoundaryScore boundary;
   uint64_t materialized_length = 0;
+  uint64_t probe_blocks;
   char *materialized;
   bool baseline_rate_supported = false;
   bool entropy_available;
   double baseline_rate_deviation = 0.0;
+  double entropy_profile_deviation = 0.0;
 
   if (!candidate || !prefix_state || !prefix_state->valid || !choice
-      || prefix_state->is_progressive
+      || prefix_state->is_progressive || scalpel_state.blocksize == 0
       || !jpg_reassembly_bridge_candidate_plausible(moved_start, false)
       || jpg_reassembly_ooo_range_has_zero(moved_start, 1)) {
     return false;
@@ -9640,10 +13309,23 @@ static inline bool jpg_reassembly_evaluate_baseline_scatter_block(
         saved_num_blocks, saved_length, moved_start, 1, -1, 0, choice);
   }
 
+  probe_blocks = CEILDIV(JPG_REASS_BASELINE_SCATTER_PROBE_BYTES,
+                         scalpel_state.blocksize);
+  if (probe_blocks == 0) {
+    probe_blocks = 1;
+  }
+  while (probe_blocks > 1
+         && (!jpg_reassembly_ooo_range_available(
+                  candidate, moved_start, probe_blocks, -1, 0)
+             || jpg_reassembly_ooo_range_has_zero(
+                    moved_start, probe_blocks))) {
+    probe_blocks--;
+  }
+
   memset(&entropy_probe, 0, sizeof(entropy_probe));
   entropy_available = jpg_reassembly_probe_baseline_entropy(
       candidate, prefix_state, saved_num_blocks, saved_length,
-      moved_start, 1, -1, 0, &entropy_probe);
+      moved_start, probe_blocks, -1, 0, &entropy_probe);
   if (!entropy_available || !entropy_probe.supported || !entropy_probe.clean
       || !entropy_probe.reaches_probe_end) {
     if (jpg_reassembly_debug_candidate(candidate)) {
@@ -9682,20 +13364,63 @@ static inline bool jpg_reassembly_evaluate_baseline_scatter_block(
       baseline_rate_supported = true;
       baseline_rate_deviation =
           fabs(extension_rate - prefix_rate) / prefix_rate;
+      entropy_profile_deviation = baseline_rate_deviation;
+
+      if (prefix_state->huff_checkpoint.dc_samples > 0
+          && entropy_probe.mcu.dc_samples
+                 > prefix_state->huff_checkpoint.dc_samples
+          && entropy_probe.mcu.dc_abs_sum
+                 >= prefix_state->huff_checkpoint.dc_abs_sum) {
+        double prefix_dc_mean =
+            (double)prefix_state->huff_checkpoint.dc_abs_sum
+            / prefix_state->huff_checkpoint.dc_samples;
+        double extension_dc_mean =
+            (double)(entropy_probe.mcu.dc_abs_sum
+                     - prefix_state->huff_checkpoint.dc_abs_sum)
+            / (entropy_probe.mcu.dc_samples
+               - prefix_state->huff_checkpoint.dc_samples);
+
+        if (prefix_dc_mean > 0.0) {
+          entropy_profile_deviation +=
+              fabs(extension_dc_mean - prefix_dc_mean) / prefix_dc_mean;
+        }
+      }
+      if (prefix_state->huff_checkpoint.ac_samples > 0
+          && entropy_probe.mcu.ac_samples
+                 > prefix_state->huff_checkpoint.ac_samples
+          && entropy_probe.mcu.ac_abs_sum
+                 >= prefix_state->huff_checkpoint.ac_abs_sum) {
+        double prefix_ac_mean =
+            (double)prefix_state->huff_checkpoint.ac_abs_sum
+            / prefix_state->huff_checkpoint.ac_samples;
+        double extension_ac_mean =
+            (double)(entropy_probe.mcu.ac_abs_sum
+                     - prefix_state->huff_checkpoint.ac_abs_sum)
+            / (entropy_probe.mcu.ac_samples
+               - prefix_state->huff_checkpoint.ac_samples);
+
+        if (prefix_ac_mean > 0.0) {
+          entropy_profile_deviation +=
+              fabs(extension_ac_mean - prefix_ac_mean) / prefix_ac_mean;
+        }
+      }
     }
   }
 
-  jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
-                                       saved_length);
-  jpg_reassembly_ooo_append_range(candidate, moved_start, 1);
-  materialized = jpg_reassembly_materialize_candidate(candidate,
-                                                       &materialized_length);
-  boundary = jpg_boundary_score(materialized, saved_length,
-                                materialized_length);
-  jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
-                                       saved_length);
-  if (!boundary.valid) {
-    return false;
+  memset(&boundary, 0, sizeof(boundary));
+  if (measure_boundary) {
+    jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                         saved_length);
+    jpg_reassembly_ooo_append_range(candidate, moved_start, 1);
+    materialized = jpg_reassembly_materialize_candidate(candidate,
+                                                         &materialized_length);
+    boundary = jpg_boundary_score(materialized, saved_length,
+                                  materialized_length);
+    jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                         saved_length);
+    if (!boundary.valid) {
+      return false;
+    }
   }
 
   memset(choice, 0, sizeof(*choice));
@@ -9704,21 +13429,48 @@ static inline bool jpg_reassembly_evaluate_baseline_scatter_block(
   choice->huffman_support = true;
   choice->baseline_rate_supported = baseline_rate_supported;
   choice->dc_discontinuity_supported = entropy_probe.supported;
+  choice->entropy_profile_supported = baseline_rate_supported;
   choice->moved_start = moved_start;
   choice->run_len = 1;
   choice->suffix_start = -1;
   choice->baseline_rate_deviation = baseline_rate_deviation;
+  choice->entropy_profile_deviation = entropy_profile_deviation;
   choice->max_dc_discontinuity =
       entropy_probe.mcu.max_dc_discontinuity;
   choice->boundary = boundary;
   if (jpg_reassembly_debug_candidate(candidate)) {
     lock_fprintf(stderr,
                  "[jpgdbg] baseline_scatter run=%" PRId64
-                 "+1 rate=%d/%.6f norm=%.3f\n",
+                 "+1 rate=%d/%.6f profile=%.6f norm=%.3f\n",
                  moved_start, baseline_rate_supported ? 1 : 0,
-                 baseline_rate_deviation, boundary.normalized);
+                 baseline_rate_deviation, entropy_profile_deviation,
+                 boundary.normalized);
   }
   return true;
+}
+
+static inline bool jpg_reassembly_measure_baseline_scatter_boundary(
+    CarveInfo *candidate,
+    uint64_t saved_num_blocks,
+    uint64_t saved_length,
+    JpgOOOBridgeChoice *choice) {
+  uint64_t materialized_length = 0;
+  char *materialized;
+
+  if (!candidate || !candidate->b || !choice || !choice->found
+      || choice->moved_start < 0 || choice->run_len != 1) {
+    return false;
+  }
+  jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                       saved_length);
+  jpg_reassembly_ooo_append_range(candidate, choice->moved_start, 1);
+  materialized = jpg_reassembly_materialize_candidate(candidate,
+                                                       &materialized_length);
+  choice->boundary = jpg_boundary_score_scaled(
+      materialized, saved_length, materialized_length, 8, true);
+  jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
+                                       saved_length);
+  return choice->boundary.valid;
 }
 
 static inline bool jpg_reassembly_baseline_bridge_score_better(
@@ -9845,6 +13597,19 @@ static inline bool jpg_reassembly_baseline_scatter_better(
   if (trial_rate_consistent != best_rate_consistent) {
     return trial_rate_consistent;
   }
+  if (trial->dc_discontinuity_supported
+      && best->dc_discontinuity_supported) {
+    if (trial->max_dc_discontinuity
+            * JPG_REASS_BASELINE_DC_DISCONTINUITY_RATIO
+        < best->max_dc_discontinuity) {
+      return true;
+    }
+    if (best->max_dc_discontinuity
+            * JPG_REASS_BASELINE_DC_DISCONTINUITY_RATIO
+        < trial->max_dc_discontinuity) {
+      return false;
+    }
+  }
   return jpg_reassembly_baseline_bridge_better(trial, best);
 }
 
@@ -9900,8 +13665,8 @@ static inline bool jpg_reassembly_refine_baseline_bridge_run_length(
   uint32_t refined_choices = 0;
 
   if (!candidate || !prefix_state || !best || !best->found
-      || best->direct_validates || best->full_validates
-      || !best->huffman_support || best->suffix_len == 0
+      || best->direct_validates || !best->huffman_support
+      || best->suffix_len == 0
       || suffix_start < 0 || suffix_len == 0) {
     return false;
   }
@@ -9937,10 +13702,10 @@ static inline bool jpg_reassembly_refine_baseline_bridge_run_length(
     bridge_end = saved_length + run_len * scalpel_state.blocksize;
     ranking_trial = trial;
     ranking_trial.boundary = jpg_boundary_score_scaled(
-        materialized, saved_length, materialized_length, 2);
+        materialized, saved_length, materialized_length, 2, false);
     if (bridge_end < materialized_length) {
       ranking_trial.suffix_boundary = jpg_boundary_score_scaled(
-          materialized, bridge_end, materialized_length, 2);
+          materialized, bridge_end, materialized_length, 2, false);
     }
     jpg_reassembly_ooo_restore_candidate(candidate, saved_num_blocks,
                                          saved_length);
@@ -10050,10 +13815,10 @@ static inline void jpg_reassembly_shortlist_baseline_entry_only(
       break;
     }
   }
-  if (position >= JPG_REASS_BRIDGE_SHORTLIST_SIZE) {
+  if (position >= JPG_REASS_DEFAULT_SHORTLIST_SIZE) {
     return;
   }
-  if (shortlist->entry_only_count < JPG_REASS_BRIDGE_SHORTLIST_SIZE) {
+  if (shortlist->entry_only_count < JPG_REASS_DEFAULT_SHORTLIST_SIZE) {
     shortlist->entry_only_count++;
   }
   memmove(&shortlist->entry_only_choices[position + 1],
@@ -10094,10 +13859,10 @@ static inline void jpg_reassembly_shortlist_baseline_bridge(
       break;
     }
   }
-  if (position >= JPG_REASS_BRIDGE_SHORTLIST_SIZE) {
+  if (position >= JPG_REASS_DEFAULT_SHORTLIST_SIZE) {
     return;
   }
-  if (shortlist->count < JPG_REASS_BRIDGE_SHORTLIST_SIZE) {
+  if (shortlist->count < JPG_REASS_DEFAULT_SHORTLIST_SIZE) {
     shortlist->count++;
   }
   memmove(&shortlist->choices[position + 1],
@@ -10189,9 +13954,109 @@ static inline void jpg_reassembly_rank_baseline_entry(
   }
 }
 
-static inline void jpg_reassembly_rank_global_baseline_block(
+static inline void jpg_reassembly_insert_hidden_boundary_choice(
+    JPGHiddenBoundaryProgress *progress,
+    int64_t actual_block,
+    double score) {
+  uint32_t position;
+
+  if (!progress || actual_block < 0 || !isfinite(score)) {
+    return;
+  }
+  for (position = 0; position < progress->choice_count; position++) {
+    if (progress->choices[position].actual_block == actual_block) {
+      if (progress->choices[position].score <= score) {
+        return;
+      }
+      memmove(&progress->choices[position],
+              &progress->choices[position + 1],
+              (progress->choice_count - position - 1)
+                  * sizeof(progress->choices[0]));
+      progress->choice_count--;
+      break;
+    }
+  }
+  for (position = 0; position < progress->choice_count; position++) {
+    if (score < progress->choices[position].score
+        || (score == progress->choices[position].score
+            && actual_block
+                   < progress->choices[position].actual_block)) {
+      break;
+    }
+  }
+  if (position >= JPG_HIDDEN_BOUNDARY_CHOICES) {
+    return;
+  }
+  if (progress->choice_count < JPG_HIDDEN_BOUNDARY_CHOICES) {
+    progress->choice_count++;
+  }
+  memmove(&progress->choices[position + 1],
+          &progress->choices[position],
+          (progress->choice_count - position - 1)
+              * sizeof(progress->choices[0]));
+  progress->choices[position].actual_block = actual_block;
+  progress->choices[position].score = score;
+}
+
+static inline void jpg_reassembly_group_hidden_boundary_choices(
     CarveInfo *candidate,
-    const JPGCarveState *prefix_state,
+    JPGHiddenBoundaryProgress *progress) {
+  int64_t group_ends[JPG_HIDDEN_BOUNDARY_CHOICES];
+  double group_scores[JPG_HIDDEN_BOUNDARY_CHOICES];
+
+  if (!candidate || !progress || progress->choice_count < 2) {
+    return;
+  }
+  for (uint32_t index = 0; index < progress->choice_count; index++) {
+    int64_t next_header = -1;
+    int64_t apparent = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, progress->choices[index].actual_block);
+
+    if (apparent >= 0 && jpg_reassembly_next_header_apparent(
+            candidate, apparent + 1,
+            &next_header)) {
+      group_ends[index] = filemirror_actual_blocknumber(
+          scalpel_state.filemirror, next_header);
+    }
+    else {
+      group_ends[index] = progress->choices[index].actual_block;
+    }
+    group_scores[index] = progress->choices[index].score;
+  }
+  for (uint32_t left = 0; left < progress->choice_count; left++) {
+    for (uint32_t right = 0; right < progress->choice_count; right++) {
+      if (group_ends[left] == group_ends[right]
+          && progress->choices[right].score < group_scores[left]) {
+        group_scores[left] = progress->choices[right].score;
+      }
+    }
+  }
+  for (uint32_t index = 1; index < progress->choice_count; index++) {
+    JPGHiddenBoundaryChoice choice = progress->choices[index];
+    int64_t group_end = group_ends[index];
+    double group_score = group_scores[index];
+    uint32_t position = index;
+
+    while (position > 0
+           && (group_score < group_scores[position - 1]
+               || (group_score == group_scores[position - 1]
+                   && group_end == group_ends[position - 1]
+                   && choice.actual_block
+                          < progress->choices[position - 1].actual_block))) {
+      progress->choices[position] = progress->choices[position - 1];
+      group_ends[position] = group_ends[position - 1];
+      group_scores[position] = group_scores[position - 1];
+      position--;
+    }
+    progress->choices[position] = choice;
+    group_ends[position] = group_end;
+    group_scores[position] = group_score;
+  }
+}
+
+static inline bool jpg_reassembly_rank_global_baseline_block(
+    CarveInfo *candidate,
+    JPGCarveState *prefix_state,
     uint32_t fixed_prefix_blocks,
     uint64_t saved_num_blocks,
     uint64_t saved_length,
@@ -10199,47 +14064,307 @@ static inline void jpg_reassembly_rank_global_baseline_block(
     bool prefer_apparent_continuation,
     JpgOOOBridgeChoice *best) {
   uint64_t trials = 0;
+  bool hidden_boundary_search;
 
   if (!candidate || !prefix_state || !prefix_state->valid || !best) {
-    return;
+    return true;
+  }
+  hidden_boundary_search =
+      !prefer_apparent_continuation
+      && prefix_state->hidden_boundary_recovery;
+
+  if (hidden_boundary_search) {
+    JPGHiddenBoundaryProgress *progress =
+        &prefix_state->hidden_boundary_progress;
+
+    if (!progress->active
+        || progress->origin_blocks != saved_num_blocks
+        || progress->origin_length != saved_length) {
+      memset(progress, 0, sizeof(*progress));
+      progress->active = true;
+      progress->origin_blocks = saved_num_blocks;
+      progress->origin_length = saved_length;
+    }
+    if (!progress->baseline_scan_initialized) {
+      int64_t tail_apparent = -1;
+      int64_t scan_start = -1;
+
+      progress->baseline_scan_initialized = true;
+      if (saved_num_blocks > 0) {
+        tail_apparent = blockvector_get_apparent_blocknumber(
+            candidate->b, saved_num_blocks - 1);
+      }
+      if (tail_apparent >= 0 && tail_apparent < INT64_MAX) {
+        scan_start = tail_apparent + 1;
+      }
+      if (prefix_state->hidden_rejected_range_valid
+          && prefix_state->hidden_rejected_last_actual < INT64_MAX) {
+        int64_t successor = jpg_reassembly_apparent_lower_bound(
+            prefix_state->hidden_rejected_last_actual + 1);
+        if (successor > scan_start) {
+          scan_start = successor;
+        }
+      }
+      if (scan_start >= 0 && scan_start < last_apparent) {
+        progress->next_actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror, scan_start);
+        progress->scan_wrap_actual = progress->next_actual;
+      }
+      else {
+        progress->scan_wrapped = true;
+        progress->next_actual = 0;
+        progress->scan_wrap_actual = last_apparent > 0
+            ? filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                             last_apparent - 1) + 1 : 0;
+      }
+    }
+
+    if (progress->choices_ready
+        && progress->next_choice >= progress->choice_count) {
+      progress->choices_ready = false;
+      progress->choice_count = 0;
+      progress->next_choice = 0;
+      memset(progress->choices, 0, sizeof(progress->choices));
+    }
+
+    if (!progress->scan_complete) {
+      int64_t scan_limit = progress->scan_wrapped
+          ? jpg_reassembly_apparent_lower_bound(progress->scan_wrap_actual)
+          : last_apparent;
+      int64_t apparent = jpg_reassembly_apparent_lower_bound(
+          progress->next_actual);
+      while (!progress->scan_complete) {
+        int64_t actual;
+        JpgOOOBridgeChoice trial;
+        bool evaluated;
+
+        if (apparent >= scan_limit) {
+          if (!progress->scan_wrapped && progress->scan_wrap_actual > 0) {
+            progress->scan_wrapped = true;
+            progress->next_actual = 0;
+            apparent = 0;
+            scan_limit = jpg_reassembly_apparent_lower_bound(
+                progress->scan_wrap_actual);
+            progress->previous_compatible = false;
+            continue;
+          }
+          progress->scan_complete = true;
+          break;
+        }
+        if (jpg_reassembly_checkpoint_requested()) {
+          jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+          return false;
+        }
+        actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                               apparent);
+        if (actual != progress->next_actual) {
+          progress->previous_compatible = false;
+        }
+        progress->next_actual = actual;
+        progress->scan_batch_positions++;
+        if (!jpg_reassembly_ooo_apparent_available(candidate, apparent)) {
+          evaluated = false;
+        }
+        else if (prefix_state->hidden_rejected_range_valid
+                 && actual >= prefix_state->hidden_rejected_first_actual
+                 && actual <= prefix_state->hidden_rejected_last_actual) {
+          evaluated = false;
+        }
+        else if (jpg_reassembly_ooo_range_has_eoi(apparent, 1)) {
+          evaluated = false;
+        }
+        else {
+          double profile;
+
+          progress->trials++;
+          memset(&trial, 0, sizeof(trial));
+          evaluated = jpg_reassembly_evaluate_baseline_scatter_block(
+              candidate, prefix_state, fixed_prefix_blocks,
+              saved_num_blocks, saved_length, apparent, false, &trial);
+          if (evaluated) {
+            profile = trial.entropy_profile_supported
+                        ? trial.entropy_profile_deviation
+                        : DBL_MAX;
+            if (!progress->previous_compatible) {
+              jpg_reassembly_insert_hidden_boundary_choice(
+                  progress, actual, profile);
+            }
+            progress->previous_compatible = true;
+          }
+        }
+        if (!evaluated) {
+          progress->previous_compatible = false;
+        }
+        if (jpg_reassembly_checkpoint_requested()) {
+          jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+          return false;
+        }
+        progress->next_actual = actual + 1;
+        apparent++;
+        if (progress->scan_batch_positions
+              >= JPG_HIDDEN_BOUNDARY_SCAN_BATCH) {
+          progress->scan_batch_positions = 0;
+        }
+      }
+      if (progress->scan_complete && progress->choice_count > 0) {
+        jpg_reassembly_group_hidden_boundary_choices(candidate, progress);
+        progress->choices_ready = true;
+      }
+      jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+    }
+
+    if (progress->choices_ready) {
+      JpgOOOBridgeShortlist *shortlist = jpg_reassembly_bridge_shortlist;
+
+      if (shortlist) {
+        memset(shortlist, 0, sizeof(*shortlist));
+      }
+      memset(best, 0, sizeof(*best));
+      for (uint32_t index = progress->next_choice;
+           index < progress->choice_count; index++) {
+        JpgOOOBridgeChoice trial;
+        int64_t apparent = filemirror_apparent_blocknumber(
+            scalpel_state.filemirror, progress->choices[index].actual_block);
+
+        if (jpg_reassembly_checkpoint_requested()) {
+          jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+          return false;
+        }
+        if (apparent < 0
+            || !jpg_reassembly_ooo_apparent_available(candidate, apparent)) {
+          continue;
+        }
+        memset(&trial, 0, sizeof(trial));
+        if (!jpg_reassembly_evaluate_baseline_scatter_block(
+                candidate, prefix_state, fixed_prefix_blocks,
+                saved_num_blocks, saved_length,
+                apparent, true, &trial)) {
+          continue;
+        }
+        trial.hidden_boundary_candidate = true;
+        trial.hidden_boundary_rank = index;
+        trial.hidden_boundary_score = progress->choices[index].score;
+        if (!best->found) {
+          *best = trial;
+        }
+        if (shortlist
+            && shortlist->count < JPG_REASS_BRIDGE_SHORTLIST_SIZE) {
+          shortlist->choices[shortlist->count++] = trial;
+          shortlist->entry_only_choices[
+              shortlist->entry_only_count++] = trial;
+        }
+      }
+      if (!best->found) {
+        progress->next_choice = progress->choice_count;
+        jpg_put_decoder_state(candidate->carvehashkey, prefix_state);
+      }
+    }
+    return true;
   }
 
-  for (int64_t apparent = 0;
-       apparent < last_apparent && trials < JPG_REASS_OOO_MAX_TRIALS;
-       apparent++) {
-    JpgOOOBridgeChoice trial;
+  int64_t tail_apparent = saved_num_blocks > 0
+                              ? blockvector_get_apparent_blocknumber(
+                                    candidate->b, saved_num_blocks - 1)
+                              : -1;
+  int64_t local_first = tail_apparent - JPG_REASS_OOO_LOCAL_BACKSCAN_BLOCKS;
+  bool conclusive = false;
 
-    if (jpg_reassembly_checkpoint_requested()) {
-      break;
-    }
-    if (!jpg_reassembly_ooo_apparent_available(candidate, apparent)) {
-      continue;
-    }
-    trials++;
-    memset(&trial, 0, sizeof(trial));
-    bool evaluated = prefer_apparent_continuation
-        ? jpg_reassembly_evaluate_baseline_bridge(
-              candidate, prefix_state, true, fixed_prefix_blocks,
-              saved_num_blocks, saved_length, apparent, 1, -1, 0, &trial)
-        : jpg_reassembly_evaluate_baseline_scatter_block(
-              candidate, prefix_state, fixed_prefix_blocks,
-              saved_num_blocks, saved_length, apparent, &trial);
+  if (local_first < 0) {
+    local_first = 0;
+  }
 
-    if (evaluated) {
-      if (!prefer_apparent_continuation) {
-        trial.apparent_continuation = false;
+  // Try nearby preceding blocks first. A displaced run commonly sits close to
+  // the current physical run, while the global pass preserves broad coverage.
+  for (uint32_t phase = 0;
+       phase < 2 && !conclusive && !jpg_reassembly_checkpoint_requested();
+       phase++) {
+    int64_t apparent = phase == 0 ? tail_apparent - 1 : 0;
+    uint64_t trial_limit = phase == 0
+                               ? JPG_REASS_OOO_LOCAL_BACKSCAN_BLOCKS
+                               : JPG_REASS_OOO_MAX_TRIALS;
+
+    trials = 0;
+    while (trials < trial_limit
+           && (phase == 0 ? apparent >= local_first
+                          : apparent < last_apparent)) {
+      JpgOOOBridgeChoice trial;
+      int64_t trial_apparent = apparent;
+
+      if (phase == 0) {
+        apparent--;
       }
-      jpg_reassembly_shortlist_baseline_bridge(&trial);
-      if (prefer_apparent_continuation
-          ? jpg_reassembly_baseline_bridge_better(&trial, best)
-          : jpg_reassembly_baseline_scatter_better(&trial, best)) {
-        *best = trial;
+      else {
+        apparent++;
       }
-      if (jpg_reassembly_baseline_bridge_conclusive(best)) {
+
+      if (jpg_reassembly_checkpoint_requested()) {
         break;
       }
+      if (phase == 1 && trial_apparent >= local_first
+          && trial_apparent < tail_apparent) {
+        continue;
+      }
+      if (!jpg_reassembly_ooo_apparent_available(candidate,
+                                                  trial_apparent)) {
+        continue;
+      }
+      trials++;
+      memset(&trial, 0, sizeof(trial));
+      bool evaluated = prefer_apparent_continuation
+          ? jpg_reassembly_evaluate_baseline_bridge(
+                candidate, prefix_state, true, fixed_prefix_blocks,
+                saved_num_blocks, saved_length, trial_apparent, 1, -1, 0,
+                &trial)
+          : jpg_reassembly_evaluate_baseline_scatter_block(
+                candidate, prefix_state, fixed_prefix_blocks,
+                saved_num_blocks, saved_length, trial_apparent, true, &trial);
+
+      if (evaluated && !trial.full_validates && !trial.direct_validates
+          && trial.huffman_support && scalpel_state.blocksize > 0
+          && scalpel_state.blocksize <= JPG_REASS_SMALL_BLOCK_BRIDGE_BYTES) {
+        uint64_t exact_run_len =
+            CEILDIV(JPG_REASS_SMALL_BLOCK_BRIDGE_BYTES,
+                    scalpel_state.blocksize);
+
+        if (exact_run_len > JPG_REASS_OOO_MAX_RUN) {
+          exact_run_len = JPG_REASS_OOO_MAX_RUN;
+        }
+        if (exact_run_len > 0
+            && exact_run_len
+                   < (uint64_t)(last_apparent - trial_apparent)) {
+          JpgOOOBridgeChoice exact_trial;
+          int64_t suffix_start =
+              trial_apparent + (int64_t)exact_run_len;
+
+          memset(&exact_trial, 0, sizeof(exact_trial));
+          if (jpg_reassembly_evaluate_baseline_bridge(
+                  candidate, prefix_state, true, fixed_prefix_blocks,
+                  saved_num_blocks, saved_length, trial_apparent,
+                  exact_run_len, suffix_start, 0, &exact_trial)
+              && exact_trial.full_validates) {
+            trial = exact_trial;
+          }
+        }
+      }
+
+      if (evaluated) {
+        if (!prefer_apparent_continuation) {
+          trial.apparent_continuation = false;
+        }
+        jpg_reassembly_shortlist_baseline_bridge(&trial);
+        if (prefer_apparent_continuation
+            ? jpg_reassembly_baseline_bridge_better(&trial, best)
+            : jpg_reassembly_baseline_scatter_better(&trial, best)) {
+          *best = trial;
+        }
+        if (jpg_reassembly_baseline_bridge_conclusive(best)) {
+          conclusive = true;
+          break;
+        }
+      }
     }
   }
+  return !jpg_reassembly_checkpoint_requested();
 }
 
 static inline void jpg_reassembly_rank_nearby_baseline_bridge(
@@ -10495,10 +14620,10 @@ static inline void jpg_reassembly_shortlist_progressive_bridge(
       break;
     }
   }
-  if (position >= JPG_REASS_BRIDGE_SHORTLIST_SIZE) {
+  if (position >= JPG_REASS_DEFAULT_SHORTLIST_SIZE) {
     return;
   }
-  if (shortlist->count < JPG_REASS_BRIDGE_SHORTLIST_SIZE) {
+  if (shortlist->count < JPG_REASS_DEFAULT_SHORTLIST_SIZE) {
     shortlist->count++;
   }
   memmove(&shortlist->choices[position + 1],
@@ -10924,7 +15049,7 @@ static inline bool jpg_reassembly_try_confidence_anchor_bridge(
   *validates_to = trial_validates_to;
   candidate->best_validates_to = trial_validates_to;
   if (trial_state.valid) {
-    carve_put_state(candidate->carvehashkey, &trial_state);
+    jpg_put_decoder_state(candidate->carvehashkey, &trial_state);
   }
   blockvector_set_data_length(candidate->b, trial_validates_to + 1);
   resize_blockvector(candidate->b,
@@ -11431,6 +15556,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                                   uuid_string_t uuidp,
                                   uuid_string_t uuidc) {
   static const int64_t JPG_REASSEMBLY_FORWARD_SCAN_WINDOW = 128;
+  static const int64_t JPG_REASSEMBLY_NEARBY_SCAN_WINDOW = 4096;
   static const uint64_t JPG_REASSEMBLY_BOUNDARY_SLACK = 4;
   bool validates = false;
   uint64_t validates_to = 0;
@@ -11447,7 +15573,9 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
   JpgOOOBridgeShortlist *previous_bridge_shortlist =
       jpg_reassembly_bridge_shortlist;
   JPGReassemblyFallback fallback;
-  JpgReassemblyRetrySearch retry_search;
+  JpgReassemblyRetrySearch *retry_search;
+  JpgReassemblyRetrySearch *previous_retry_search = jpg_active_retry_search;
+  void *previous_retry_key = jpg_active_retry_key;
   bool progressive_scatter_followup = false;
   bool progressive_format = false;
   bool format_known = false;
@@ -11455,12 +15583,25 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
   bool progressive_seed_prepared = false;
   bool baseline_seed_prepared = false;
   bool baseline_seed_needs_search = false;
+  JPGForwardScanProgress forward_progress;
+
+  {
+    JPGCarveState saved;
+    (void)jpg_reassembly_load_saved_state(candidate, &saved);
+    forward_progress = saved.forward_scan_progress;
+  }
 
   memset(&materialization_cache, 0, sizeof(materialization_cache));
   memset(&boundary_preview_cache, 0, sizeof(boundary_preview_cache));
   memset(&bridge_shortlist, 0, sizeof(bridge_shortlist));
   memset(&fallback, 0, sizeof(fallback));
-  memset(&retry_search, 0, sizeof(retry_search));
+  // Each retry frame includes decoder state; keep the history off the worker stack.
+  retry_search = calloc(1, sizeof(*retry_search));
+  check_memory_allocation(retry_search, __LINE__, __FILE__,
+                          "jpg reassembly retry search");
+  jpg_load_retry_checkpoint(candidate, retry_search);
+  jpg_active_retry_search = retry_search;
+  jpg_active_retry_key = candidate->carvehashkey;
   jpg_reassembly_materialization_cache = &materialization_cache;
   jpg_boundary_preview_cache = &boundary_preview_cache;
   jpg_reassembly_bridge_shortlist = &bridge_shortlist;
@@ -11490,13 +15631,16 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
     bool have_prefix_state;
     JPGReassemblyForwardChoice best_choice;
     JpgOOOBridgeChoice best_bridge;
+    JpgOOOBridgeChoice bridge_to_commit;
     JpgOOOBridgeChoice best_baseline_entry;
     bool advanced = false;
+    bool backward_choice_found = false;
     bool global_baseline_search = false;
     bool global_progressive_search = false;
     bool baseline_scatter_active = false;
     bool baseline_scatter_ambiguous = false;
     bool baseline_bridge_ambiguous = false;
+    bool strong_baseline_entry = false;
     bool progressive_global_ambiguous = false;
     bool baseline_entry_verify = false;
     bool progressive_entry_verify = progressive_scatter_followup;
@@ -11519,8 +15663,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
     bool anchor_scan = scan_mode == 3;
 
     if (reassembly_check_max_size(work->id, candidate, uuidp, uuidc)) {
-      if (jpg_reassembly_restore_retry(candidate, &retry_search, &validates,
-                                       &validates_to)) {
+      if (jpg_reassembly_restore_retry(candidate, retry_search, &validates,
+                                       &validates_to, false)) {
         gallop = 0;
         progressive_scatter_followup = false;
         if (validates) {
@@ -11536,6 +15680,12 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           candidate->flavor = VALIDATED;
           goto done_write_candidate;
         }
+        continue;
+      }
+      if (jpg_reassembly_try_pending_hidden_rollback(
+              candidate, &validates, &validates_to)) {
+        gallop = 0;
+        progressive_scatter_followup = false;
         continue;
       }
       if (!scalpel_state.write_promising) {
@@ -11562,6 +15712,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
     if (!validates
         && validates_to + 1 < blockvector_get_data_length(candidate->b)) {
       JPGCarveState cold_state;
+      JpgWrongBlockResult current_wrongblock = jpg_wrongblock_result;
+      JpgWrongBlockResult cold_wrongblock;
       uint64_t cold_validates_to = 0;
       bool cold_validates;
 
@@ -11570,15 +15722,22 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           jpg_reassembly_validate_direct(candidate, &cold_state,
                                          &cold_validates_to,
                                          jpg_reassembly_get_fixed_prefix_blocks(candidate));
-      if (cold_validates || cold_validates_to > validates_to) {
+      cold_wrongblock = jpg_wrongblock_result;
+      if (jpg_reassembly_cold_validation_is_better(
+              cold_validates, cold_validates_to, &cold_wrongblock,
+              validates_to, &current_wrongblock)) {
         validates = cold_validates;
         validates_to = cold_validates_to;
+        jpg_wrongblock_result = cold_wrongblock;
         if (cold_state.valid) {
-          carve_put_state(candidate->carvehashkey, &cold_state);
+          jpg_put_decoder_state(candidate->carvehashkey, &cold_state);
         }
         jpg_reassembly_debug_dump(cold_validates ? "forward_current_cold_valid"
                                                  : "forward_current_cold",
                                   candidate, -1, validates_to);
+      }
+      else {
+        jpg_wrongblock_result = current_wrongblock;
       }
     }
     if (validates) {
@@ -11591,6 +15750,37 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
     }
 
     {
+      bool run_order_changed = false;
+      bool run_order_checkpoint = false;
+
+      if (jpg_reassembly_try_terminal_run_order_repair(
+              candidate, &validates, &validates_to,
+              jpg_reassembly_get_fixed_prefix_blocks(candidate),
+              true,
+              &run_order_changed,
+              &run_order_checkpoint)) {
+        candidate->flavor = PROMISING;
+        if (!scalpel_state.write_promising) {
+          destroy_candidate(&candidate);
+          goto done_do_not_write_candidate;
+        }
+        goto done_write_candidate;
+      }
+      if (run_order_changed) {
+        gallop = 0;
+        progressive_scatter_followup = false;
+        continue;
+      }
+      if (run_order_checkpoint
+          && jpg_reassembly_time_to_checkpoint(
+                 work->id, candidate, uuidp, uuidc, &fallback,
+                 &validates, &validates_to,
+                 &forward_progress)) {
+        goto done_do_not_write_candidate;
+      }
+    }
+
+    {
       uint64_t current_length = blockvector_get_data_length(candidate->b);
       uint64_t validated_length = validates_to + 1;
 
@@ -11598,7 +15788,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         uint64_t shortfall = current_length - validated_length;
 
         if (current_length % scalpel_state.blocksize == 0
-            && shortfall <= JPG_REASSEMBLY_BOUNDARY_SLACK) {
+            && shortfall <= JPG_REASSEMBLY_BOUNDARY_SLACK
+            && !jpg_wrongblock_result.detected) {
           validates_to = current_length - 1;
           validated_length = current_length;
         } else {
@@ -11611,13 +15802,22 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         }
       }
     }
+    jpg_reassembly_finish_mapped_tail(candidate, &validates, &validates_to);
+    if (validates) {
+      candidate->flavor = VALIDATED;
+      resize_blockvector(candidate->b,
+                         CEILDIV(blockvector_get_data_length(candidate->b),
+                                 scalpel_state.blocksize));
+      goto done_write_candidate;
+    }
     if (validates_to > candidate->best_validates_to) {
       candidate->best_validates_to = validates_to;
     }
 
     if (jpg_reassembly_time_to_checkpoint(work->id, candidate, uuidp, uuidc,
                                           &fallback, &validates,
-                                          &validates_to)) {
+                                          &validates_to,
+                                          &forward_progress)) {
       goto done_do_not_write_candidate;
     }
 
@@ -11667,8 +15867,14 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         if (format_known) {
           prefix_state.is_progressive = progressive_format;
         }
-        carve_put_state(candidate->carvehashkey, &prefix_state);
+        jpg_put_decoder_state(candidate->carvehashkey, &prefix_state);
       }
+    }
+    if (jpg_forward_source_matches(candidate, &forward_progress,
+                                    num_blocks, oldlength)) {
+      baseline_seed_prepared = forward_progress.baseline_seed_prepared;
+      progressive_seed_prepared = forward_progress.progressive_seed_prepared;
+      baseline_seed_needs_search = forward_progress.baseline_seed_needs_search;
     }
     if (format_known && progressive_format && !progressive_seed_prepared) {
       uint64_t seed_blocks = structural_prefix_blocks;
@@ -11700,7 +15906,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         prefix_state.is_progressive = true;
         prefix_state.reassembly_seed_checked = true;
         prefix_state.reassembly_seed_needs_search = false;
-        carve_put_state(candidate->carvehashkey, &prefix_state);
+        jpg_put_decoder_state(candidate->carvehashkey, &prefix_state);
       }
       progressive_seed_prepared = true;
       if (trimmed) {
@@ -11832,20 +16038,21 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
             && jpg_huffman_failure_is_hard(seed_probe.failure)) {
           uint64_t supported_body_blocks = 0;
 
-          // discard an inherited body only when both its entry seam and the
-          // entropy lookahead reject it; either signal alone can be benign.
-          if (seed_boundary.valid
-              && seed_boundary.normalized
-                     > JPG_REASS_BASELINE_BRIDGE_SCORE_LIMIT) {
-            retained_body_blocks = 0;
-          }
-          else if (seed_probe.frontier + 1 > seed_length) {
+          // Retain every complete body block supported by the entropy probe.
+          // The boundary score can reject the body only when the probe cannot
+          // establish any progress beyond the structural prefix.
+          if (seed_probe.frontier + 1 > seed_length) {
             supported_body_blocks =
                 (seed_probe.frontier + 1 - seed_length)
                 / scalpel_state.blocksize;
             if (supported_body_blocks < retained_body_blocks) {
               retained_body_blocks = supported_body_blocks;
             }
+          }
+          else if (seed_boundary.valid
+                   && seed_boundary.normalized
+                          > JPG_REASS_BASELINE_BRIDGE_SCORE_LIMIT) {
+            retained_body_blocks = 0;
           }
           seed_needs_search = true;
         }
@@ -11877,7 +16084,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         prefix_state.reassembly_seed_checked = true;
         prefix_state.reassembly_seed_needs_search = seed_needs_search;
         baseline_seed_needs_search = seed_needs_search;
-        carve_put_state(candidate->carvehashkey, &prefix_state);
+        jpg_put_decoder_state(candidate->carvehashkey, &prefix_state);
       }
       baseline_seed_prepared = true;
       if (inspected) {
@@ -11900,9 +16107,20 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         baseline_entry_verify = true;
       }
       if (!progressive_format) {
-        baseline_scatter_active =
-            jpg_reassembly_baseline_scatter_active(
-                candidate, structural_prefix_blocks);
+        if (prefix_state.hidden_boundary_recovery) {
+          JPGHiddenBoundaryProgress *progress =
+              &prefix_state.hidden_boundary_progress;
+
+          baseline_scatter_active =
+              !progress->active
+              || (num_blocks == progress->origin_blocks
+                  && oldlength == progress->origin_length);
+        }
+        else {
+          baseline_scatter_active =
+              jpg_reassembly_baseline_scatter_active(
+                  candidate, structural_prefix_blocks);
+        }
         if (baseline_seed_needs_search
             && num_blocks == structural_prefix_blocks) {
           baseline_scatter_active = true;
@@ -11922,6 +16140,72 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                      have_expected_restart ? 1 : 0, expected_restart,
                      prefix_state.huff_checkpoint.valid ? 1 : 0);
       }
+    }
+
+    if (!advanced && format_known && have_prefix_state
+        && !prefix_state.is_progressive
+        && prefix_state.hidden_boundary_recovery
+        && jpg_reassembly_try_hidden_rejected_successor(
+               candidate, &prefix_state, &validates, &validates_to,
+               jpg_reassembly_get_fixed_prefix_blocks(candidate),
+               num_blocks, oldlength)) {
+      if (validates) {
+        candidate->flavor = VALIDATED;
+        goto done_write_candidate;
+      }
+      advanced = true;
+    }
+    if (jpg_reassembly_checkpoint_requested()
+        && jpg_reassembly_time_to_checkpoint(
+               work->id, candidate, uuidp, uuidc, &fallback,
+               &validates, &validates_to,
+               &forward_progress)) {
+      goto done_do_not_write_candidate;
+    }
+    if (advanced) {
+      continue;
+    }
+
+    if (!advanced && format_known && have_prefix_state
+        && !prefix_state.is_progressive
+        && prefix_state.hidden_boundary_recovery
+        && jpg_reassembly_try_footer_tail(
+               candidate, &prefix_state, &validates, &validates_to,
+               jpg_reassembly_get_fixed_prefix_blocks(candidate),
+               num_blocks, oldlength)) {
+      candidate->flavor = VALIDATED;
+      goto done_write_candidate;
+    }
+    if (jpg_reassembly_checkpoint_requested()
+        && jpg_reassembly_time_to_checkpoint(
+               work->id, candidate, uuidp, uuidc, &fallback,
+               &validates, &validates_to,
+               &forward_progress)) {
+      goto done_do_not_write_candidate;
+    }
+
+    if (!advanced && format_known && have_prefix_state
+        && !prefix_state.is_progressive
+        && prefix_state.hidden_boundary_recovery
+        && jpg_reassembly_try_hidden_natural_run(
+               candidate, &prefix_state, &validates, &validates_to,
+               jpg_reassembly_get_fixed_prefix_blocks(candidate),
+               num_blocks, oldlength)) {
+      if (validates) {
+        candidate->flavor = VALIDATED;
+        goto done_write_candidate;
+      }
+      advanced = true;
+    }
+    if (jpg_reassembly_checkpoint_requested()
+        && jpg_reassembly_time_to_checkpoint(
+               work->id, candidate, uuidp, uuidc, &fallback,
+               &validates, &validates_to,
+               &forward_progress)) {
+      goto done_do_not_write_candidate;
+    }
+    if (advanced) {
+      continue;
     }
 
     accept_threshold = oldlength;
@@ -11944,34 +16228,134 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
     blockvector_free_choices(candidate->b, num_blocks);
 
     {
-      uint32_t scan_passes = confidence_order ? 4 : 1;
+      uint32_t scan_passes =
+          have_prefix_state && prefix_state.hidden_boundary_recovery
+              ? 0 : (confidence_order ? 7 : 1);
+      JPGReassemblyForwardChoice choice_before_backward;
       bool stop_forward_scan = false;
       bool contiguous_tail_probed = false;
+      uint32_t first_scan_pass = 0;
+      int64_t resume_actual = -1;
 
-      for (uint32_t scan_pass = 0;
+      memset(&choice_before_backward, 0, sizeof(choice_before_backward));
+      if (jpg_forward_progress_matches(candidate, &forward_progress,
+                                        num_blocks, oldlength, scan_mode)
+          && forward_progress.scan_pass <= scan_passes
+          && (forward_progress.pass_complete || forward_progress.next_actual >= 0)
+          && jpg_forward_restore_choice(&best_choice, &forward_progress.best)
+          && jpg_forward_restore_choice(&choice_before_backward,
+                                          &forward_progress.before_backward)) {
+        first_scan_pass = forward_progress.scan_pass;
+        backward_choice_found = forward_progress.backward_choice_found;
+        contiguous_tail_probed = forward_progress.contiguous_tail_probed;
+        natural_tail_start = forward_progress.natural_tail_actual >= 0
+            ? filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                               forward_progress.natural_tail_actual)
+            : -1;
+        if (forward_progress.pass_complete) {
+          if (first_scan_pass == 1 && backward_choice_found) {
+            best_choice = choice_before_backward;
+            backward_choice_found = false;
+          }
+          if (first_scan_pass < scan_passes) {
+            first_scan_pass++;
+          }
+        }
+        else {
+          resume_actual = forward_progress.next_actual;
+        }
+        if (jpg_reassembly_debug_candidate(candidate)) {
+          lock_fprintf(stderr,
+                       "[jpgdbg] forward_resume pass=%" PRIu32
+                       " next_actual=%" PRId64 " best_actual=%" PRId64 "\n",
+                       first_scan_pass, resume_actual,
+                       best_choice.found ? best_choice.actual : -1);
+        }
+      }
+      else {
+        memset(&best_choice, 0, sizeof(best_choice));
+        best_choice.apparent = best_choice.actual = -1;
+        memset(&choice_before_backward, 0, sizeof(choice_before_backward));
+      }
+      memset(&forward_progress, 0, sizeof(forward_progress));
+      forward_progress.source_blocks = num_blocks;
+      forward_progress.source_length = oldlength;
+      forward_progress.source_signature =
+          jpg_forward_source_signature(candidate, num_blocks);
+      forward_progress.scan_mode = scan_mode;
+      forward_progress.baseline_seed_prepared = baseline_seed_prepared;
+      forward_progress.progressive_seed_prepared = progressive_seed_prepared;
+      forward_progress.baseline_seed_needs_search = baseline_seed_needs_search;
+
+      for (uint32_t scan_pass = first_scan_pass;
            scan_pass < scan_passes && !stop_forward_scan;
            scan_pass++) {
-        int64_t scan_limit =
-            (wide_scan && (!confidence_order || scan_pass > 0))
-            ? last_apparent - 1
-            : tail_apparent + JPG_REASSEMBLY_FORWARD_SCAN_WINDOW;
+        bool backward_scan = confidence_order && scan_pass == 1;
+        int64_t scan_start = tail_apparent + 1;
+        int64_t scan_step = 1;
+        int64_t scan_limit = tail_apparent
+                             + JPG_REASSEMBLY_FORWARD_SCAN_WINDOW;
 
-        if (scan_limit >= last_apparent) {
+        if (backward_scan) {
+          int64_t backward_origin = first_apparent > 0
+                                        ? first_apparent
+                                        : tail_apparent;
+
+          if (scan_pass != first_scan_pass || resume_actual < 0) {
+            choice_before_backward = best_choice;
+          }
+          scan_start = backward_origin - 1;
+          scan_step = -1;
+          scan_limit =
+              backward_origin - JPG_REASS_OOO_PRIORITY_BACKSCAN_BLOCKS;
+          if (scan_limit < 0) {
+            scan_limit = 0;
+          }
+        }
+        else if (wide_scan && !confidence_order) {
+          scan_limit = last_apparent - 1;
+        }
+        else if (confidence_order
+                 && (scan_pass == 2 || scan_pass == 3)) {
+          scan_limit = tail_apparent
+                       + JPG_REASSEMBLY_NEARBY_SCAN_WINDOW;
+        }
+        else if (confidence_order && scan_pass > 3) {
           scan_limit = last_apparent - 1;
         }
 
-        for (int64_t apparent = tail_apparent + 1;
-             apparent <= scan_limit;
-             apparent++) {
+        if (!backward_scan && scan_limit >= last_apparent) {
+          scan_limit = last_apparent - 1;
+        }
+
+        if (scan_pass == first_scan_pass && resume_actual >= 0) {
+          scan_start = jpg_reassembly_apparent_lower_bound(resume_actual);
+          if (backward_scan
+              && (scan_start >= last_apparent
+                  || filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                                     scan_start) > resume_actual)) {
+            scan_start--;
+          }
+        }
+
+        for (int64_t apparent = scan_start;
+             backward_scan ? apparent >= scan_limit : apparent <= scan_limit;
+             apparent += scan_step) {
           int64_t actual;
           BlockValidationDecision blocktype;
 
           if (jpg_reassembly_checkpoint_requested()) {
+            jpg_forward_save_progress(
+                &forward_progress, scan_pass,
+                filemirror_actual_blocknumber(scalpel_state.filemirror, apparent),
+                natural_tail_start, contiguous_tail_probed, backward_choice_found,
+                &best_choice, &choice_before_backward);
             resize_blockvector(candidate->b, num_blocks);
             blockvector_set_data_length(candidate->b, oldlength);
             if (jpg_reassembly_time_to_checkpoint(
                     work->id, candidate, uuidp, uuidc, &fallback,
-                    &validates, &validates_to)) {
+                    &validates, &validates_to,
+                    &forward_progress)) {
               goto done_do_not_write_candidate;
             }
             resize_blockvector(candidate->b, num_blocks + 1);
@@ -11983,7 +16367,9 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
             fflush(stdout);
           }
 
-          if (first_apparent >= 0 && apparent < first_apparent) {
+          if (!backward_scan && first_apparent >= 0
+              && apparent < first_apparent
+              && tail_apparent >= first_apparent) {
             continue;
           }
           if (jpg_reassembly_apparent_in_blockvector_strict(candidate->b, apparent)) {
@@ -12000,29 +16386,71 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           blocktype = filemirror_get_blocktype(scalpel_state.filemirror,
                                                actual,
                                                candidate->needleidx);
-          if (blocktype == BLOCK_CONFIDENCE_INVALID) {
+          // A terminal sector can contain only the end of entropy data and EOI,
+          // which is not enough to classify the sector independently. Always
+          // test the physically adjacent continuation; the full JPEG validator
+          // still decides whether it can be committed.
+          if (blocktype == BLOCK_CONFIDENCE_INVALID
+              && apparent != tail_apparent + 1) {
             continue;
           }
 
           if (confidence_order && scan_pass > 0) {
-            if (apparent <= tail_apparent + JPG_REASSEMBLY_FORWARD_SCAN_WINDOW) {
+            if ((scan_pass == 2 || scan_pass == 3)
+                && apparent <= tail_apparent
+                               + JPG_REASSEMBLY_FORWARD_SCAN_WINDOW) {
               continue;
             }
-            if (scan_pass == 1) {
+            if (scan_pass == 2
+                && blocktype != BLOCK_CONFIDENCE_VALID) {
+              continue;
+            }
+            if (scan_pass > 3
+                && apparent <= tail_apparent
+                               + JPG_REASSEMBLY_NEARBY_SCAN_WINDOW) {
+              continue;
+            }
+            if (scan_pass == 4) {
               if (blocktype != BLOCK_CONFIDENCE_VALID) {
                 continue;
               }
             }
-            else if (scan_pass == 2) {
+            else if (scan_pass == 5) {
               if (blocktype < 80 || blocktype == BLOCK_CONFIDENCE_VALID) {
                 continue;
               }
             }
-            else if (blocktype >= 80) {
+            else if (scan_pass == 6 && blocktype >= 80) {
               continue;
             }
           }
 
+          if (confidence_order && (backward_scan || scan_pass == 2)
+              && have_prefix_state && !prefix_state.is_progressive
+              && prefix_state.huff_checkpoint.valid) {
+            JpgReassemblyEntropyProbe entropy_probe;
+            const bool probe_available =
+                jpg_reassembly_probe_baseline_entropy(
+                    candidate, &prefix_state, num_blocks, oldlength,
+                    apparent, 1, -1, 0, &entropy_probe);
+
+            resize_blockvector(candidate->b, num_blocks + 1);
+            blockvector_set_apparent_blocknumber(candidate->b, num_blocks,
+                                                 -1);
+            blockvector_free_choices(candidate->b, num_blocks);
+            if (probe_available && entropy_probe.supported
+                && (!entropy_probe.clean
+                    || !entropy_probe.reaches_probe_end)
+                && jpg_huffman_failure_is_hard(entropy_probe.failure)
+                && entropy_probe.frontier < accept_threshold) {
+              continue;
+            }
+          }
+
+          jpg_forward_save_progress(
+              &forward_progress, scan_pass, actual, natural_tail_start,
+              contiguous_tail_probed, backward_choice_found,
+              &best_choice, &choice_before_backward);
           blockvector_set_apparent_blocknumber(candidate->b, num_blocks,
                                                apparent);
           (void)inflate_blockvector_single_block(candidate->b, num_blocks);
@@ -12037,6 +16465,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           bool trial_actual_is_zero;
           bool trial_effectively_reaches_end;
           bool trial_has_followon_support;
+          bool trial_wrongblock;
           bool trial_restart_not_due = false;
           bool trial_have_boundary = false;
           bool trial_is_natural_tail = false;
@@ -12052,17 +16481,28 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
             memset(&trial_state, 0, sizeof(trial_state));
           }
 
+          const uint32_t trial_fixed_prefix =
+              jpg_reassembly_get_fixed_prefix_blocks(candidate);
+          const bool trial_may_resume =
+              trial_state.valid && trial_state.checkpoint_pos > 0
+              && !jpg_reassembly_requires_cold_validation(
+                     candidate, trial_fixed_prefix);
           trial_validates =
               jpg_reassembly_validate_direct(candidate, &trial_state,
                                              &trial_validates_to,
-                                             jpg_reassembly_get_fixed_prefix_blocks(candidate));
+                                             trial_fixed_prefix);
           validates = trial_validates;
           validates_to = trial_validates_to;
           jpg_reassembly_debug_dump(validates ? "forward_trial_valid"
                                               : "forward_trial",
                                     candidate, apparent, validates_to);
-          if (!validates && validates_to + 1 <= accept_threshold) {
+          // A trial already decoded from scratch has no independent cold
+          // fallback to try. Retain that fallback for resumable decoder state.
+          if (!validates && trial_may_resume
+              && validates_to + 1 <= accept_threshold) {
             JPGCarveState cold_state;
+            JpgWrongBlockResult current_wrongblock = jpg_wrongblock_result;
+            JpgWrongBlockResult cold_wrongblock;
             uint64_t cold_validates_to = 0;
             bool cold_validates;
 
@@ -12071,13 +16511,20 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                 jpg_reassembly_validate_direct(candidate, &cold_state,
                                                &cold_validates_to,
                                                jpg_reassembly_get_fixed_prefix_blocks(candidate));
-            if (cold_validates || cold_validates_to > validates_to) {
+            cold_wrongblock = jpg_wrongblock_result;
+            if (jpg_reassembly_cold_validation_is_better(
+                    cold_validates, cold_validates_to, &cold_wrongblock,
+                    validates_to, &current_wrongblock)) {
               validates = cold_validates;
               validates_to = cold_validates_to;
               memcpy(&trial_state, &cold_state, sizeof(trial_state));
+              jpg_wrongblock_result = cold_wrongblock;
               jpg_reassembly_debug_dump(cold_validates ? "forward_cold_valid"
                                                        : "forward_cold_accept",
                                         candidate, apparent, validates_to);
+            }
+            else {
+              jpg_wrongblock_result = current_wrongblock;
             }
           }
 
@@ -12085,10 +16532,12 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           trial_reaches_end = validates_to >= trial_end;
           trial_shortfall = trial_reaches_end ? 0 : trial_end - validates_to;
           trial_near_end = trial_shortfall <= JPG_REASSEMBLY_BOUNDARY_SLACK;
+          trial_wrongblock = jpg_wrongblock_result.detected;
           trial_actual_is_zero =
               filemirror_actual_block_is_zero(scalpel_state.filemirror, actual);
           trial_effectively_reaches_end =
-              trial_reaches_end || (trial_near_end && !trial_actual_is_zero);
+              trial_reaches_end
+              || (trial_near_end && !trial_actual_is_zero && !trial_wrongblock);
           trial_is_immediate = apparent == tail_apparent + 1;
           trial_score_validates_to = validates_to;
           if (!validates && validates_to + 1 > accept_threshold) {
@@ -12124,14 +16573,27 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                 blockvector_get_data_length(candidate->b));
             trial_have_boundary = trial_boundary.valid;
           }
-          // a complete validation through the next known footer is conclusive
-          // and keeps ordinary gap recovery out of the OOO search.
-          if (!validates && !contiguous_tail_probed
-              && trial_is_natural_tail
-              && !(scalpel_state.blocksize
-                       <= JPG_REASS_SMALL_BLOCK_BRIDGE_BYTES
-                   && actual > tail_actual + 1)) {
-            contiguous_tail_probed = true;
+          // Try a complete decode through the next known footer for the
+          // physical continuation and strongly ranked remote continuations.
+          const bool try_ranked_tail =
+              confidence_order && trial_has_followon_support
+              && ((scan_pass == 0 && !trial_is_immediate)
+                  || (scan_pass == 2
+                      && blocktype == BLOCK_CONFIDENCE_VALID));
+          const bool try_complete_tail =
+              trial_is_natural_tail
+              || try_ranked_tail;
+          if (!validates && try_complete_tail
+              && (!trial_is_natural_tail || !contiguous_tail_probed)
+              && (try_ranked_tail || !trial_is_natural_tail
+                  || !(scalpel_state.blocksize
+                           <= JPG_REASS_SMALL_BLOCK_BRIDGE_BYTES
+                       && actual > tail_actual + 1))) {
+            bool polluted_prefix = false;
+
+            if (trial_is_natural_tail) {
+              contiguous_tail_probed = true;
+            }
             deflate_blockvector_single_block(candidate->b, num_blocks, oldlength);
             blockvector_set_apparent_blocknumber(candidate->b, num_blocks, -1);
             resize_blockvector(candidate->b, num_blocks);
@@ -12140,6 +16602,21 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                     candidate, &validates, &validates_to,
                     jpg_reassembly_get_fixed_prefix_blocks(candidate),
                     num_blocks, oldlength, apparent)) {
+              candidate->flavor = VALIDATED;
+              goto done_write_candidate;
+            }
+            polluted_prefix =
+                oldlength > 0 && validates_to < oldlength - 1
+                && jpg_wrongblock_result.detected
+                && jpg_wrongblock_result.method
+                && strcmp(jpg_wrongblock_result.method,
+                          "huffman_trailing_data") == 0;
+            if (trial_is_natural_tail && polluted_prefix
+                && num_blocks > structural_prefix_blocks
+                && jpg_reassembly_try_suffix_rollback_tail_validation(
+                       candidate, &validates, &validates_to,
+                       structural_prefix_blocks, num_blocks, oldlength,
+                       apparent)) {
               advanced = true;
               stop_forward_scan = true;
               break;
@@ -12165,23 +16642,51 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
               || (trial_effectively_reaches_end
                   && (trial_is_immediate || trial_has_followon_support
                       || (trial_is_natural_tail && trial_have_boundary)))) {
+            bool better_direct_progress =
+                validates_to > best_choice.direct_validates_to;
+            bool equal_direct_progress =
+                validates_to == best_choice.direct_validates_to;
+            bool comparable_continuity =
+                trial_is_immediate == best_choice.is_immediate;
+            bool better_continuity =
+                equal_direct_progress && trial_is_immediate
+                && !best_choice.is_immediate;
+            bool comparable_followon =
+                trial_has_followon_support
+                == best_choice.has_followon_support;
+            bool better_followon =
+                equal_direct_progress && comparable_continuity
+                && ((trial_has_followon_support
+                     && !best_choice.has_followon_support)
+                    || (comparable_followon
+                        && trial_score_validates_to
+                               > best_choice.score_validates_to));
+            bool equal_followon_progress =
+                comparable_followon
+                && trial_score_validates_to
+                       == best_choice.score_validates_to;
+            bool better_boundary =
+                equal_direct_progress && comparable_continuity
+                && equal_followon_progress
+                && trial_have_boundary
+                && (!best_choice.have_boundary
+                    || trial_boundary.normalized
+                           < best_choice.boundary.normalized
+                    || (trial_boundary.normalized
+                            == best_choice.boundary.normalized
+                        && trial_boundary.seam_mad
+                               < best_choice.boundary.seam_mad));
             bool replace_best =
                 !best_choice.found
                 || validates
-                || (trial_have_boundary
-                    && (!best_choice.have_boundary
-                        || trial_boundary.normalized
-                               < best_choice.boundary.normalized
-                        || (trial_boundary.normalized
-                                == best_choice.boundary.normalized
-                            && trial_boundary.seam_mad
-                                   < best_choice.boundary.seam_mad)))
-                || (!trial_have_boundary && !best_choice.have_boundary
-                    && (trial_score_validates_to
-                            > best_choice.score_validates_to
-                        || (trial_score_validates_to
-                                == best_choice.score_validates_to
-                            && apparent < best_choice.apparent)));
+                || better_direct_progress
+                || better_continuity
+                || better_followon
+                || better_boundary
+                || (equal_direct_progress && comparable_continuity
+                    && equal_followon_progress
+                    && trial_have_boundary == best_choice.have_boundary
+                    && apparent < best_choice.apparent);
 
             if (replace_best) {
               best_choice.found = true;
@@ -12195,6 +16700,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
               best_choice.actual = actual;
               best_choice.commit_validates_to =
                   trial_effectively_reaches_end ? trial_end : validates_to;
+              best_choice.direct_validates_to = validates_to;
               best_choice.score_validates_to = trial_score_validates_to;
               best_choice.have_boundary = trial_have_boundary;
               if (trial_have_boundary) {
@@ -12208,6 +16714,9 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
               } else {
                 best_choice.have_state = false;
               }
+              if (backward_scan && trial_has_followon_support) {
+                backward_choice_found = true;
+              }
               if (validates || trial_is_immediate) {
                 jpg_reassembly_debug_dump("forward_best_valid", candidate,
                                           apparent, validates_to);
@@ -12220,6 +16729,45 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           deflate_blockvector_single_block(candidate->b, num_blocks, oldlength);
           blockvector_set_apparent_blocknumber(candidate->b, num_blocks, -1);
 
+          if (backward_scan && trial_has_followon_support
+              && format_known && have_prefix_state
+              && !prefix_state.is_progressive) {
+            int64_t preheader_footer = -1;
+            bool range_has_eoi = jpg_reassembly_next_footer_apparent(
+                candidate, apparent, first_apparent, &preheader_footer);
+
+            resize_blockvector(candidate->b, num_blocks);
+            blockvector_set_data_length(candidate->b, oldlength);
+            if (range_has_eoi && first_apparent > apparent
+                && jpg_reassembly_try_ooo_candidate_run(
+                       candidate, &prefix_state, true,
+                       &validates, &validates_to,
+                       jpg_reassembly_get_fixed_prefix_blocks(candidate),
+                       num_blocks, oldlength, apparent,
+                       (uint64_t)(first_apparent - apparent),
+                       -1, 0, true, true, true, NULL)) {
+              candidate->flavor = VALIDATED;
+              goto done_write_candidate;
+            }
+            if (!range_has_eoi
+                && jpg_reassembly_try_preheader_two_run_validation(
+                    candidate, &prefix_state, &validates, &validates_to,
+                    jpg_reassembly_get_fixed_prefix_blocks(candidate),
+                    num_blocks, oldlength, apparent)) {
+              candidate->flavor = VALIDATED;
+              blockvector_set_data_length(candidate->b, validates_to + 1);
+              resize_blockvector(
+                  candidate->b,
+                  CEILDIV(blockvector_get_data_length(candidate->b),
+                          scalpel_state.blocksize));
+              goto done_write_candidate;
+            }
+            resize_blockvector(candidate->b, num_blocks + 1);
+            blockvector_set_apparent_blocknumber(candidate->b, num_blocks,
+                                                 -1);
+            blockvector_free_choices(candidate->b, num_blocks);
+          }
+
           if (reassembly_check_kill_queue(work, &candidate, uuidp, uuidc)) {
             goto done_do_not_write_candidate;
           }
@@ -12228,18 +16776,31 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
             blockvector_set_data_length(candidate->b, oldlength);
             if (jpg_reassembly_time_to_checkpoint(
                     work->id, candidate, uuidp, uuidc, &fallback,
-                    &validates, &validates_to)) {
+                    &validates, &validates_to,
+                    &forward_progress)) {
               goto done_do_not_write_candidate;
             }
             resize_blockvector(candidate->b, num_blocks + 1);
             blockvector_set_apparent_blocknumber(candidate->b, num_blocks, -1);
             blockvector_free_choices(candidate->b, num_blocks);
           }
-          if (trial_is_natural_tail) {
-            stop_forward_scan = true;
+          if (trial_is_natural_tail && !confidence_order) {
             break;
           }
         }
+
+        if (backward_scan && backward_choice_found) {
+          best_choice = choice_before_backward;
+          backward_choice_found = false;
+        }
+      }
+      jpg_forward_save_progress(
+          &forward_progress, scan_passes, -1, natural_tail_start,
+          contiguous_tail_probed, backward_choice_found,
+          &best_choice, &choice_before_backward);
+      forward_progress.pass_complete = true;
+      if (advanced) {
+        forward_progress.active = false;
       }
     }
 
@@ -12356,7 +16917,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       if (jpg_reassembly_checkpoint_requested()
           && jpg_reassembly_time_to_checkpoint(
                  work->id, candidate, uuidp, uuidc, &fallback,
-                 &validates, &validates_to)) {
+                 &validates, &validates_to,
+                 &forward_progress)) {
         goto done_do_not_write_candidate;
       }
     }
@@ -12659,6 +17221,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
               }
             }
           }
+          // A baseline bridge that needs the known suffix can have multiple
+          // complete solutions, so compare it with the unanchored candidates.
           anchored_bridge_complete =
               raw_anchor_best.found && raw_anchor_runner_up.found
               && raw_anchor_best.progressive_entropy_supported
@@ -12737,8 +17301,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
               prefix_state.is_progressive
                   ? jpg_reassembly_progressive_bridge_conclusive(
                         &best_bridge)
-                  : jpg_reassembly_baseline_bridge_conclusive(
-                        &best_bridge);
+                  : best_bridge.direct_validates;
 
           if (!anchored_bridge_complete) {
             for (int64_t moved_start = 0;
@@ -12806,16 +17369,54 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         if (!prefix_state.is_progressive && best_bridge.found
             && scalpel_state.blocksize
                    < JPG_REASS_BASELINE_SEED_PROBE_BYTES) {
-          (void)jpg_reassembly_refine_baseline_bridge_run_length(
-              candidate, &prefix_state, have_prefix_state,
-              fixed_prefix_blocks, num_blocks, oldlength,
-              natural_tail_start, suffix_len, &best_bridge);
+          int64_t refined_starts[JPG_REASS_BRIDGE_SHORTLIST_SIZE + 1];
+          uint32_t refined_start_count = 0;
+          JpgOOOBridgeChoice refined_bridge = best_bridge;
+
+          refined_starts[refined_start_count++] =
+              refined_bridge.moved_start;
+          if (jpg_reassembly_refine_baseline_bridge_run_length(
+                  candidate, &prefix_state, have_prefix_state,
+                  fixed_prefix_blocks, num_blocks, oldlength,
+                  natural_tail_start, suffix_len, &refined_bridge)
+              && jpg_reassembly_baseline_bridge_better(
+                     &refined_bridge, &best_bridge)) {
+            best_bridge = refined_bridge;
+          }
+          // Refine the other strong entry seams before accepting a complete
+          // suffix-dependent bridge with a shorter displaced run.
+          for (uint32_t rank = 0;
+               rank < bridge_shortlist.entry_only_count; rank++) {
+            bool already_refined = false;
+
+            refined_bridge = bridge_shortlist.entry_only_choices[rank];
+            for (uint32_t i = 0; i < refined_start_count; i++) {
+              if (refined_starts[i] == refined_bridge.moved_start) {
+                already_refined = true;
+                break;
+              }
+            }
+            if (already_refined) {
+              continue;
+            }
+            refined_starts[refined_start_count++] =
+                refined_bridge.moved_start;
+            if (jpg_reassembly_refine_baseline_bridge_run_length(
+                    candidate, &prefix_state, have_prefix_state,
+                    fixed_prefix_blocks, num_blocks, oldlength,
+                    natural_tail_start, suffix_len, &refined_bridge)
+                && jpg_reassembly_baseline_bridge_better(
+                       &refined_bridge, &best_bridge)) {
+              best_bridge = refined_bridge;
+            }
+          }
         }
       }
       if (jpg_reassembly_checkpoint_requested()
           && jpg_reassembly_time_to_checkpoint(
                  work->id, candidate, uuidp, uuidc, &fallback,
-                 &validates, &validates_to)) {
+                 &validates, &validates_to,
+                 &forward_progress)) {
         goto done_do_not_write_candidate;
       }
     }
@@ -12858,7 +17459,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       if (jpg_reassembly_checkpoint_requested()
           && jpg_reassembly_time_to_checkpoint(
                  work->id, candidate, uuidp, uuidc, &fallback,
-                 &validates, &validates_to)) {
+                 &validates, &validates_to,
+                 &forward_progress)) {
         goto done_do_not_write_candidate;
       }
     }
@@ -12902,7 +17504,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
         if (jpg_reassembly_checkpoint_requested()
             && jpg_reassembly_time_to_checkpoint(
                    work->id, candidate, uuidp, uuidc, &fallback,
-                   &validates, &validates_to)) {
+                   &validates, &validates_to,
+                   &forward_progress)) {
           goto done_do_not_write_candidate;
         }
       }
@@ -12944,7 +17547,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       if (jpg_reassembly_checkpoint_requested()
           && jpg_reassembly_time_to_checkpoint(
                  work->id, candidate, uuidp, uuidc, &fallback,
-                 &validates, &validates_to)) {
+                 &validates, &validates_to,
+                 &forward_progress)) {
         goto done_do_not_write_candidate;
       }
     }
@@ -12966,17 +17570,35 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
              sizeof(best_bridge.suffix_boundary));
     }
 
+    strong_baseline_entry =
+        !advanced && format_known && have_prefix_state
+        && !prefix_state.is_progressive && best_choice.found
+        && best_choice.have_boundary && tail_actual >= 0
+        && tail_actual < INT64_MAX
+        && best_choice.actual > tail_actual + 1
+        && best_baseline_entry.found
+        && best_baseline_entry.moved_start != best_choice.apparent
+        && best_baseline_entry.huffman_available
+        && best_baseline_entry.huffman_support
+        && best_baseline_entry.baseline_rate_supported
+        && best_baseline_entry.boundary.valid
+        && best_baseline_entry.boundary.normalized
+               < best_choice.boundary.normalized
+                     * JPG_REASS_BASELINE_FORWARD_BRIDGE_RATIO;
+
     if (!advanced && format_known && have_prefix_state
         && !prefix_state.is_progressive
         && !baseline_scatter_active
-        && num_blocks
-               <= (uint64_t)jpg_reassembly_get_fixed_prefix_blocks(candidate)
-                    + 1
+        && (num_blocks
+                <= (uint64_t)jpg_reassembly_get_fixed_prefix_blocks(candidate)
+                     + 1
+            || strong_baseline_entry)
         && best_baseline_entry.found
         && best_baseline_entry.huffman_support
-        && best_baseline_entry.baseline_rate_supported
-        && best_baseline_entry.baseline_rate_deviation
-               < JPG_REASS_BASELINE_RATE_LIMIT
+        && (strong_baseline_entry
+            || (best_baseline_entry.baseline_rate_supported
+                && best_baseline_entry.baseline_rate_deviation
+                       < JPG_REASS_BASELINE_RATE_LIMIT))
         && (!best_bridge.found
             || (!best_bridge.full_validates
                 && !best_bridge.direct_validates
@@ -13004,6 +17626,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
     if (!advanced && !strong_forward_continuation
         && format_known && !global_baseline_search
         && have_prefix_state && !prefix_state.is_progressive
+        && (!prefix_state.hidden_boundary_recovery
+            || baseline_scatter_active)
         && (baseline_scatter_active
             || ((baseline_entry_verify
                  || (!best_choice.found
@@ -13022,7 +17646,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           jpg_reassembly_get_fixed_prefix_blocks(candidate),
           num_blocks, oldlength, last_apparent,
           !baseline_scatter_active, &best_bridge);
-      if (baseline_scatter_active && best_bridge.found) {
+      if (baseline_scatter_active && best_bridge.found
+          && !prefix_state.hidden_boundary_recovery) {
         (void)jpg_reassembly_refine_baseline_scatter_lookahead(
             candidate, &prefix_state,
             jpg_reassembly_get_fixed_prefix_blocks(candidate),
@@ -13040,7 +17665,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       if (jpg_reassembly_checkpoint_requested()
           && jpg_reassembly_time_to_checkpoint(
                  work->id, candidate, uuidp, uuidc, &fallback,
-                 &validates, &validates_to)) {
+                 &validates, &validates_to,
+                 &forward_progress)) {
         goto done_do_not_write_candidate;
       }
     }
@@ -13194,28 +17820,63 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                         && best_bridge.huffman_support
                         && best_bridge.baseline_rate_supported
                         && best_bridge.baseline_rate_deviation
-                               < JPG_REASS_BASELINE_RATE_LIMIT)
+                               < JPG_REASS_BASELINE_RATE_LIMIT
+                        && (!best_choice.have_boundary
+                            || jpg_reassembly_baseline_bridge_beats_forward(
+                                   &best_bridge, &best_choice)))
+                    || (strong_baseline_entry && global_baseline_search
+                        && best_bridge.huffman_support)
                     || ((!best_choice.has_followon_support
                          || best_bridge.huffman_support)
                         && jpg_reassembly_baseline_bridge_beats_forward(
                                &best_bridge, &best_choice)))));
+    bridge_to_commit = best_bridge;
+    if (bridge_to_commit.hidden_boundary_candidate
+        && prefix_state.hidden_boundary_progress.active) {
+      JPGHiddenBoundaryProgress *progress =
+          &prefix_state.hidden_boundary_progress;
+
+      while (progress->next_choice < progress->choice_count
+             && progress->choices[progress->next_choice].actual_block
+                    != filemirror_actual_blocknumber(
+                        scalpel_state.filemirror, bridge_to_commit.moved_start)) {
+        progress->next_choice++;
+      }
+      if (progress->next_choice < progress->choice_count) {
+        progress->next_choice++;
+      }
+      jpg_put_decoder_state(candidate->carvehashkey, &prefix_state);
+    }
+    if (prefer_bridge && have_prefix_state && !prefix_state.is_progressive
+        && !best_bridge.full_validates && !best_bridge.direct_validates
+        && best_bridge.suffix_len > 0) {
+      // The entry seam establishes the displaced run. Its return suffix is a
+      // separate hypothesis that remains available through the retry frame.
+      bridge_to_commit.full_validates = false;
+      bridge_to_commit.suffix_start = -1;
+      bridge_to_commit.suffix_len = 0;
+      memset(&bridge_to_commit.suffix_boundary, 0,
+             sizeof(bridge_to_commit.suffix_boundary));
+    }
     if (!advanced && format_known && have_prefix_state && best_bridge.found
-        && !baseline_scatter_active && !global_baseline_search
-        && !global_progressive_search
-        && (jpg_reassembly_has_physical_gap(candidate)
+        && ((!baseline_scatter_active && !global_baseline_search
+             && !global_progressive_search)
+            || best_bridge.hidden_boundary_candidate)
+        && (best_bridge.hidden_boundary_candidate
+            || jpg_reassembly_has_physical_gap(candidate)
             || (best_choice.found
                 && best_choice.actual > tail_actual + 1))) {
       resize_blockvector(candidate->b, num_blocks);
       blockvector_set_data_length(candidate->b, oldlength);
       jpg_reassembly_save_retry_frame(
           candidate, &prefix_state, have_prefix_state, &best_choice,
-          &best_bridge, prefer_bridge ? &best_bridge : NULL,
-          &bridge_shortlist, &retry_search);
+          &best_bridge, prefer_bridge ? &bridge_to_commit : NULL,
+          &bridge_shortlist, retry_search);
     }
     if (!advanced
-        && jpg_reassembly_retry_alternative_preferred(&retry_search)
-        && jpg_reassembly_restore_retry(candidate, &retry_search,
-                                        &validates, &validates_to)) {
+        && jpg_reassembly_retry_alternative_preferred(retry_search)
+        && jpg_reassembly_restore_retry(candidate, retry_search,
+                                        &validates, &validates_to, true)) {
       gallop = 0;
       progressive_scatter_followup = false;
       if (validates) {
@@ -13244,29 +17905,32 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                                      &fallback);
         saved_fallback = fallback.pending;
       }
-      if ((best_bridge.full_validates && best_bridge.direct_validates
+      if ((bridge_to_commit.full_validates
+           && bridge_to_commit.direct_validates
            && jpg_reassembly_try_ooo_candidate_run(
                   candidate, &prefix_state, have_prefix_state,
                   &validates, &validates_to,
                   jpg_reassembly_get_fixed_prefix_blocks(candidate),
                   num_blocks, oldlength,
-                  best_bridge.moved_start, best_bridge.run_len, 0, 0,
+                  bridge_to_commit.moved_start, bridge_to_commit.run_len, 0, 0,
                   true, true, true, NULL))
-          || (best_bridge.full_validates && !best_bridge.direct_validates
+          || (bridge_to_commit.full_validates
+              && !bridge_to_commit.direct_validates
            && jpg_reassembly_try_bridge_tail_validation(
                   candidate, &prefix_state, have_prefix_state,
                   &validates, &validates_to,
                   jpg_reassembly_get_fixed_prefix_blocks(candidate),
-                  num_blocks, oldlength, best_bridge.moved_start,
-                  best_bridge.run_len, best_bridge.suffix_start, true, NULL))
-          || (!best_bridge.full_validates
+                  num_blocks, oldlength, bridge_to_commit.moved_start,
+                  bridge_to_commit.run_len, bridge_to_commit.suffix_start,
+                  true, NULL))
+          || (!bridge_to_commit.full_validates
               && jpg_reassembly_try_ooo_candidate_run(
                   candidate, &prefix_state, have_prefix_state,
                   &validates, &validates_to,
                   jpg_reassembly_get_fixed_prefix_blocks(candidate),
                   num_blocks, oldlength,
-                  best_bridge.moved_start, best_bridge.run_len,
-                  best_bridge.suffix_start, best_bridge.suffix_len,
+                  bridge_to_commit.moved_start, bridge_to_commit.run_len,
+                  bridge_to_commit.suffix_start, bridge_to_commit.suffix_len,
                   false, true, true, NULL))) {
         advanced = true;
       }
@@ -13308,7 +17972,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       validates = best_choice.validates;
       validates_to = best_choice.commit_validates_to;
       if (best_choice.have_state) {
-        carve_put_state(candidate->carvehashkey, &best_choice.state);
+        jpg_put_decoder_state(candidate->carvehashkey, &best_choice.state);
       }
       if (validates) {
         candidate->flavor = VALIDATED;
@@ -13333,7 +17997,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       if (best_choice.reaches_trial_end) {
         uint64_t before_blocks = blockvector_get_num_blocks(candidate->b);
         uint64_t before_length = blockvector_get_data_length(candidate->b);
-        void *saved_state = carve_get_state(candidate->carvehashkey);
+        void *saved_state = jpg_get_decoder_state(candidate->carvehashkey);
         bool gallop_checkpoint;
         bool gallop_progress;
 
@@ -13345,16 +18009,16 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
             blockvector_get_num_blocks(candidate->b) != before_blocks
             || blockvector_get_data_length(candidate->b) != before_length;
         if (!gallop_progress && saved_state) {
-          carve_put_state(candidate->carvehashkey, saved_state);
+          jpg_put_decoder_state(candidate->carvehashkey, saved_state);
         }
         if (saved_state) {
-          scalpel_state.search_specs[candidate->needleidx].FREECARVESTATEFUNC(
-              &saved_state);
+          free(saved_state);
         }
         if (gallop_checkpoint
             && jpg_reassembly_time_to_checkpoint(
                    work->id, candidate, uuidp, uuidc, &fallback,
-                   &validates, &validates_to)) {
+                   &validates, &validates_to,
+                   &forward_progress)) {
           goto done_do_not_write_candidate;
         }
         if (validates) {
@@ -13380,7 +18044,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
 
     if (jpg_reassembly_time_to_checkpoint(work->id, candidate, uuidp, uuidc,
                                           &fallback, &validates,
-                                          &validates_to)) {
+                                          &validates_to,
+                                          &forward_progress)) {
       goto done_do_not_write_candidate;
     }
 
@@ -13408,7 +18073,7 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
           while (!validates) {
             uint64_t before_blocks = blockvector_get_num_blocks(candidate->b);
             uint64_t before_length = blockvector_get_data_length(candidate->b);
-            void *saved_state = carve_get_state(candidate->carvehashkey);
+            void *saved_state = jpg_get_decoder_state(candidate->carvehashkey);
             bool gallop_checkpoint =
                 jpg_reassembly_gallop(candidate, &validates_to, &validates,
                                       &anchor_gallop, uuidp, uuidc);
@@ -13417,15 +18082,16 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
                 || blockvector_get_data_length(candidate->b) != before_length;
 
             if (!gallop_progress && saved_state) {
-              carve_put_state(candidate->carvehashkey, saved_state);
+              jpg_put_decoder_state(candidate->carvehashkey, saved_state);
             }
             if (saved_state) {
-              scalpel_state.search_specs[candidate->needleidx].FREECARVESTATEFUNC(&saved_state);
+              free(saved_state);
             }
             if (gallop_checkpoint
                 && jpg_reassembly_time_to_checkpoint(
                        work->id, candidate, uuidp, uuidc, &fallback,
-                       &validates, &validates_to)) {
+                       &validates, &validates_to,
+                       &forward_progress)) {
               goto done_do_not_write_candidate;
             }
             if (validates) {
@@ -13450,7 +18116,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
             }
             if (jpg_reassembly_time_to_checkpoint(
                     work->id, candidate, uuidp, uuidc, &fallback,
-                    &validates, &validates_to)) {
+                    &validates, &validates_to,
+                    &forward_progress)) {
               goto done_do_not_write_candidate;
             }
           }
@@ -13460,7 +18127,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       if (anchor_checkpoint
           && jpg_reassembly_time_to_checkpoint(
                  work->id, candidate, uuidp, uuidc, &fallback,
-                 &validates, &validates_to)) {
+                 &validates, &validates_to,
+                 &forward_progress)) {
         goto done_do_not_write_candidate;
       }
     }
@@ -13494,7 +18162,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       if (ooo_checkpoint
           && jpg_reassembly_time_to_checkpoint(
                  work->id, candidate, uuidp, uuidc, &fallback,
-                 &validates, &validates_to)) {
+                 &validates, &validates_to,
+                 &forward_progress)) {
         goto done_do_not_write_candidate;
       }
     }
@@ -13503,8 +18172,8 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       continue;
     }
 
-    if (jpg_reassembly_restore_retry(candidate, &retry_search, &validates,
-                                     &validates_to)) {
+    if (jpg_reassembly_restore_retry(candidate, retry_search, &validates,
+                                     &validates_to, false)) {
       gallop = 0;
       progressive_scatter_followup = false;
       if (validates) {
@@ -13524,6 +18193,80 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
       continue;
     }
 
+    {
+      bool run_order_changed = false;
+      bool run_order_checkpoint = false;
+
+      if (jpg_reassembly_try_terminal_run_order_repair(
+              candidate, &validates, &validates_to,
+              jpg_reassembly_get_fixed_prefix_blocks(candidate),
+              true, &run_order_changed, &run_order_checkpoint)) {
+        candidate->flavor = PROMISING;
+        if (!scalpel_state.write_promising) {
+          destroy_candidate(&candidate);
+          goto done_do_not_write_candidate;
+        }
+        goto done_write_candidate;
+      }
+      if (run_order_changed) {
+        gallop = 0;
+        progressive_scatter_followup = false;
+        continue;
+      }
+      if (run_order_checkpoint
+          && jpg_reassembly_time_to_checkpoint(
+                 work->id, candidate, uuidp, uuidc, &fallback,
+                 &validates, &validates_to,
+                 &forward_progress)) {
+        goto done_do_not_write_candidate;
+      }
+    }
+
+    if (format_known && have_prefix_state
+        && !prefix_state.is_progressive
+        && jpg_reassembly_try_preheader_tail_validation(
+               candidate, &prefix_state, &validates, &validates_to,
+               jpg_reassembly_get_fixed_prefix_blocks(candidate),
+               num_blocks, oldlength, 0)) {
+      candidate->flavor = VALIDATED;
+      blockvector_set_data_length(candidate->b, validates_to + 1);
+      resize_blockvector(candidate->b,
+                         CEILDIV(blockvector_get_data_length(candidate->b),
+                                 scalpel_state.blocksize));
+      goto done_write_candidate;
+    }
+    if (jpg_reassembly_checkpoint_requested()
+        && jpg_reassembly_time_to_checkpoint(
+               work->id, candidate, uuidp, uuidc, &fallback,
+               &validates, &validates_to,
+               &forward_progress)) {
+      goto done_do_not_write_candidate;
+    }
+
+    if (format_known && have_prefix_state
+        && !prefix_state.is_progressive
+        && jpg_reassembly_try_footer_tail(
+               candidate, &prefix_state, &validates, &validates_to,
+               jpg_reassembly_get_fixed_prefix_blocks(candidate),
+               num_blocks, oldlength)) {
+      candidate->flavor = VALIDATED;
+      goto done_write_candidate;
+    }
+    if (jpg_reassembly_checkpoint_requested()
+        && jpg_reassembly_time_to_checkpoint(
+               work->id, candidate, uuidp, uuidc, &fallback,
+               &validates, &validates_to,
+               &forward_progress)) {
+      goto done_do_not_write_candidate;
+    }
+
+    if (jpg_reassembly_try_pending_hidden_rollback(
+            candidate, &validates, &validates_to)) {
+      gallop = 0;
+      progressive_scatter_followup = false;
+      continue;
+    }
+
     jpg_reassembly_debug_dump("forward_no_progress", candidate, -1,
                               validates_to);
     break;
@@ -13535,6 +18278,14 @@ static inline void jpg_reassembly(ThreadWork *work, CarveInfo **c,
   }
 
 done_write_candidate:
+  if (candidate && candidate->flavor == VALIDATED
+      && jpg_reassembly_has_ambiguous_join_order(candidate)) {
+    candidate->flavor = PROMISING;
+    if (!scalpel_state.write_promising) {
+      destroy_candidate(&candidate);
+      goto done_do_not_write_candidate;
+    }
+  }
   if (jpg_reassembly_debug_candidate(candidate)) {
     lock_fprintf(stderr,
                  "[jpgdbg] done_write local=%p caller=%p caller_blocks=%" PRIu64
@@ -13550,7 +18301,10 @@ done_write_candidate:
 done_do_not_write_candidate:
 done:
   jpg_reassembly_clear_fallback(&fallback);
-  jpg_reassembly_clear_retry_search(&retry_search);
+  jpg_reassembly_clear_retry_search(retry_search);
+  free(retry_search);
+  jpg_active_retry_search = previous_retry_search;
+  jpg_active_retry_key = previous_retry_key;
   jpg_boundary_preview_cache_invalidate();
   jpg_boundary_preview_cache = previous_boundary_preview_cache;
   jpg_reassembly_bridge_shortlist = previous_bridge_shortlist;

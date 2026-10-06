@@ -13,9 +13,15 @@ blockmap_filename
 
 .SH DESCRIPTION
 .PP
-\fBcrblockmap\fR creates a new, empty blockmap associated with a specific image file and blocksize. It performs block deduplication and zero-block detection during creation.
+\fBcrblockmap\fR creates a blockmap for an image file and block size,
+initially with no explicitly covered blocks. It records duplicate and zero
+blocks during creation. The image must be nonempty and is not modified.
 .PP
 If a carve window is specified via \fB-j\fR and \fB-k\fR, deduplication and zero block detection occur only within that window. Blocks outside the window are implicitly considered covered by scalpel3.
+.PP
+Block numbers start at zero and both window endpoints are inclusive. The
+start must not exceed the end, and both must lie within the image. A final
+short block counts as one block. Options must precede the filenames.
 
 .SH OPTIONS
 .PP
@@ -29,7 +35,9 @@ End of the active carve window (default is the last block of the image).
 
 .TP
 .BI -q " clustersize"
-Block / cluster size in bytes. Must be >= 512 and a multiple of 512. Default is 512.
+Block / cluster size in bytes. Must be a multiple of 512 from 512 through
+4294966784. Default is 512. For use with scalpel3 or fragmentator, choose a
+block size no larger than their limit of 1073741824 bytes.
 
 .TP
 .I img_filename
@@ -38,6 +46,9 @@ The source disk image.
 .TP
 .I blockmap_filename
 The filename for the new blockmap. \fBcrblockmap\fR will not overwrite an existing file.
+
+.SH EXIT STATUS
+Returns zero on success and nonzero on error.
 
 .SH SEE ALSO
 .BR scalpel3 (1),

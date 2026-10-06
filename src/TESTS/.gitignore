@@ -1,0 +1,12 @@
+/dfrws-2006-challenge.raw
+/dfrws-2007-challenge.img
+/dfrws-data/
+/dfrws-results/
+__pycache__/
+/test.img*
+/file.abc
+/file2.abc
+/file.123
+/file2.123
+/test.csv
+/test.sqlite
