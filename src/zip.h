@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -114,6 +118,11 @@
 #define ZIP_APK_V31_BLOCK_ID                    UINT32_C(0x1b93ad61)
 #define ZIP_APK_CHUNK_SIZE                      (UINT64_C(1024) * 1024)
 #define ZIP_APK_FAST_RUN_LIMIT                  UINT64_C(2)
+#define ZIP_CARVE_STATE_MAGIC                   UINT64_C(0x5a49505343414e31)
+#define ZIP_CARVE_STATE_VERSION                 UINT64_C(2)
+#define ZIP_SCAN_VALID                         UINT64_C(1)
+#define ZIP_SCAN_ENTRY_VALID                   UINT64_C(2)
+#define ZIP_SCAN_STRUCTURE                     UINT64_C(4)
 
 typedef struct ZipEntry {
   const uint8_t *name;
@@ -310,7 +319,9 @@ typedef enum ZipRepairPhase {
   ZIP_REPAIR_PHASE_STORED_GAP_OOO = 7,
   ZIP_REPAIR_PHASE_STAGED_GAP = 8,
   ZIP_REPAIR_PHASE_ZERO_INSERTIONS = 9,
-  ZIP_REPAIR_PHASE_ENCRYPTED_ROTATION = 10
+  ZIP_REPAIR_PHASE_ENCRYPTED_ROTATION = 10,
+  ZIP_REPAIR_PHASE_DELAYED_ADJACENT = 11,
+  ZIP_REPAIR_PHASE_ENCRYPTED_VALIDATE = 12
 } ZipRepairPhase;
 
 // Cursor state for exact repair loops that may span a checkpoint. The phase
@@ -334,6 +345,70 @@ typedef struct ZipRepairResume {
   int64_t best_confidence_gain;
   uint8_t phase;
 } ZipRepairResume;
+
+// Completed partial improvements are retained even when another source scores
+// better. A checkpoint may make that source unavailable without invalidating
+// the other trials against the unchanged candidate.
+typedef struct ZipScanOutcome {
+  uint64_t source;
+  uint64_t run_length;
+  uint64_t failure;
+  uint64_t entry;
+  uint64_t output;
+  uint64_t flags;
+} ZipScanOutcome;
+
+typedef struct ZipNormalScanState {
+  uint64_t signature;
+  uint64_t image_blocks;
+  uint64_t plan_signature;
+  uint64_t pending_source;
+  uint64_t selected_source;
+  uint64_t selected_run;
+  uint64_t outcome_count;
+  roaring64_bitmap_t *completed;
+  roaring64_bitmap_t *pruned;
+  ZipScanOutcome *outcomes;
+  uint64_t outcome_capacity;
+} ZipNormalScanState;
+
+typedef struct ZipGapProbe {
+  uint64_t destination;
+  uint64_t failure;
+  uint64_t output;
+  int64_t source;
+  int64_t swap;
+  int64_t confidence;
+  uint64_t flags;
+} ZipGapProbe;
+
+// Retain earlier decoder results needed to rank a delayed-error plateau.
+typedef struct ZipDelayedScanState {
+  uint64_t signature;
+  uint64_t next_delay;
+  uint64_t finished;
+  uint64_t exact;
+  ZipRepairResume best;
+  ZipGapProbe probes[ZIP_DEFLATE_GAP_PROBE_COUNT];
+} ZipDelayedScanState;
+
+// Validation of the ranked encrypted layouts can yield independently of the
+// earlier confidence scan. Only decoder scratch is rebuilt after restore.
+typedef struct ZipEncryptedScanState {
+  uint64_t signature;
+  uint64_t best_split;
+  int64_t best_score;
+  uint64_t best_header_gain;
+  uint64_t hypothesis_count;
+  uint64_t next_hypothesis;
+  uint64_t valid_count;
+  uint64_t hypothesis_splits[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT];
+  int64_t hypothesis_scores[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT];
+  uint64_t valid_splits[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT];
+  int64_t valid_sources[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT];
+  int64_t valid_swaps[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT];
+  int64_t valid_scores[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT];
+} ZipEncryptedScanState;
 
 typedef struct ZipCarveState {
   uint64_t archive_size;
@@ -394,11 +469,32 @@ typedef struct ZipCarveState {
   bool apk_digest_fast_complete;
   bool enclosed_by_cfbf;
   ZipRepairResume repair_resume;
+  ZipNormalScanState *normal_scan;
+  ZipDelayedScanState *delayed_scan;
+  ZipEncryptedScanState *encrypted_scan;
   ZipStateEntry entries[];
 } ZipCarveState;
 
 static _Atomic uint64_t zip_reassembly_memory_reserved = 0;
 static _Atomic uint64_t zip_reassembly_memory_budget_cached = 0;
+
+static inline void zip_normal_scan_clear(ZipCarveState *state);
+static inline bool zip_auxiliary_states_valid(const ZipCarveState *state);
+static inline uint64_t zip_normal_scan_signature(
+    CarveInfo *candidate, const ZipCarveState *state,
+    const uint8_t *baseline, uint64_t output, uint64_t run_last);
+static inline ZipNormalScanState *zip_normal_scan_prepare(
+    ZipCarveState *state, uint64_t signature, uint64_t image_blocks);
+static inline void zip_normal_scan_complete_source(ZipNormalScanState *scan);
+static inline void zip_normal_scan_record(
+    ZipNormalScanState *scan, uint64_t source, uint64_t run_length,
+    uint64_t failure, uint64_t entry, uint64_t output, uint64_t flags);
+static inline bool zip_normal_scan_select(
+    CarveInfo *candidate, ZipCarveState *state, ZipMappedBlockIndex *index,
+    uint64_t baseline_output, ZipScanOutcome *best, int64_t *swap_slot);
+static inline bool zip_normal_scan_valid(const ZipNormalScanState *scan);
+static inline bool zip_normal_scan_codec(
+    ZipNormalScanState **scan, FILE *fp, StateSerialization mode);
 
 static inline uint16_t zip_read_le16(const uint8_t *data);
 static inline uint32_t zip_read_le32(const uint8_t *data);
@@ -673,6 +769,61 @@ static inline ZipCarveState *zip_state_from_layout(const ZipLayout *layout,
                                                    bool track_gap_hypotheses);
 static inline uint8_t *zip_state_gap_tried(ZipCarveState *state);
 static inline bool zip_state_enable_gap_tracking(ZipCarveState **state);
+static inline bool zip_auxiliary_states_valid(const ZipCarveState *state) {
+  if (!state || scalpel_state.blocksize == 0
+      || state->repair_resume.phase > ZIP_REPAIR_PHASE_ENCRYPTED_VALIDATE) {
+    return false;
+  }
+  const uint64_t blocks = state->archive_size / scalpel_state.blocksize
+      + (state->archive_size % scalpel_state.blocksize != 0);
+  const ZipDelayedScanState *delayed = state->delayed_scan;
+  if (delayed) {
+    if (delayed->next_delay > blocks || delayed->finished > 1
+        || delayed->exact > 1 || delayed->best.best_destination > blocks
+        || delayed->best.best_run_length > blocks
+        || delayed->best.best_run_length
+               > blocks - delayed->best.best_destination
+        || (delayed->exact && !delayed->finished)) {
+      return false;
+    }
+    for (size_t i = 0; i < ZIP_DEFLATE_GAP_PROBE_COUNT; i++) {
+      const ZipGapProbe *probe = &delayed->probes[i];
+      if (probe->flags > 7 || (!(probe->flags & 1) && probe->flags != 0)
+          || ((probe->flags & 1)
+              && (probe->destination >= blocks || probe->source < 0))) {
+        return false;
+      }
+    }
+  }
+  const ZipEncryptedScanState *encrypted = state->encrypted_scan;
+  if (state->repair_resume.phase == ZIP_REPAIR_PHASE_ENCRYPTED_VALIDATE
+      && (!encrypted || encrypted->hypothesis_count == 0)) {
+    return false;
+  }
+  if (encrypted) {
+    if (encrypted->hypothesis_count > ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT
+        || encrypted->next_hypothesis > encrypted->hypothesis_count
+        || encrypted->valid_count > encrypted->next_hypothesis
+        || encrypted->best_split >= blocks) {
+      return false;
+    }
+    for (size_t i = 0; i < encrypted->hypothesis_count; i++) {
+      if (encrypted->hypothesis_splits[i] == 0
+          || encrypted->hypothesis_splits[i] >= blocks) {
+        return false;
+      }
+    }
+    for (size_t i = 0; i < encrypted->valid_count; i++) {
+      if (encrypted->valid_splits[i] == 0
+          || encrypted->valid_splits[i] >= blocks
+          || encrypted->valid_sources[i] < 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 static inline bool zip_serialize_carve_state(void **state,
                                              FILE *fp,
                                              StateSerialization mode);
@@ -4999,6 +5150,258 @@ static inline void zip_set_partial(uint64_t failure_offset,
                       : failing_block * (uint64_t)blocksize - 1;
 }
 
+// The normal scan owns its decoder-independent progress. Scratch inflater and
+// block-index data are rebuilt, but completed source trials are not repeated.
+static inline void zip_normal_scan_clear(ZipCarveState *state) {
+  if (!state || !state->normal_scan) {
+    return;
+  }
+  ZipNormalScanState *scan = state->normal_scan;
+  roaring64_bitmap_free(scan->completed);
+  roaring64_bitmap_free(scan->pruned);
+  free(scan->outcomes);
+  free(scan);
+  state->normal_scan = NULL;
+}
+
+static inline uint64_t zip_normal_scan_signature(
+    CarveInfo *candidate, const ZipCarveState *state,
+    const uint8_t *baseline, uint64_t output, uint64_t run_last) {
+  uint64_t hash = XXH3_64bits(baseline, (size_t)state->archive_size);
+  const uint64_t fields[] = {
+    scalpel_state.blocksize, filemirror_filesize(scalpel_state.filemirror),
+    blockvector_get_data_length(candidate->b),
+    blockvector_get_num_blocks(candidate->b), state->archive_size,
+    state->observed_archive_size, state->central_offset, state->eocd_offset,
+    state->failure_offset, state->failure_entry, output,
+    state->destination_slot, state->run_length, run_last,
+    state->structure_pending, state->apk_digest_fast_active,
+    state->preferred_run_active, state->broad_scan,
+    state->structure_retry_active, state->entry_count
+  };
+  for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
+    hash = (hash ^ fields[index]) * UINT64_C(1099511628211);
+  }
+  for (uint64_t slot = 0; slot < blockvector_get_num_blocks(candidate->b);
+       slot++) {
+    hash = (hash ^ (uint64_t)blockvector_get_actual_blocknumber(candidate->b,
+                                                              slot))
+        * UINT64_C(1099511628211);
+  }
+  for (uint64_t index = 0; index < state->entry_count; index++) {
+    const ZipStateEntry *entry = &state->entries[index];
+    const uint64_t metadata[] = {
+      entry->local_offset, entry->observed_local_offset, entry->compressed_size,
+      entry->uncompressed_size, entry->data_offset, entry->range_end,
+      entry->crc32, entry->name_crc32, entry->flags, entry->method,
+      entry->encrypted, entry->geometry_known
+    };
+    for (size_t field = 0; field < sizeof(metadata) / sizeof(metadata[0]);
+         field++) {
+      hash = (hash ^ metadata[field]) * UINT64_C(1099511628211);
+    }
+  }
+  return hash;
+}
+
+static inline ZipNormalScanState *zip_normal_scan_prepare(
+    ZipCarveState *state, uint64_t signature, uint64_t image_blocks) {
+  if (state->normal_scan
+      && (state->normal_scan->signature != signature
+          || state->normal_scan->image_blocks != image_blocks)) {
+    zip_normal_scan_clear(state);
+  }
+  if (!state->normal_scan) {
+    state->normal_scan = (ZipNormalScanState *)calloc(1,
+                                                   sizeof(*state->normal_scan));
+    check_memory_allocation(state->normal_scan, __LINE__, __FILE__,
+                            "ZIP normal scan");
+    state->normal_scan->signature = signature;
+    state->normal_scan->image_blocks = image_blocks;
+    state->normal_scan->pending_source = UINT64_MAX;
+    state->normal_scan->selected_source = UINT64_MAX;
+    state->normal_scan->completed = roaring64_bitmap_create();
+    state->normal_scan->pruned = roaring64_bitmap_create();
+    check_memory_allocation(state->normal_scan->completed, __LINE__, __FILE__,
+                            "ZIP completed sources");
+    check_memory_allocation(state->normal_scan->pruned, __LINE__, __FILE__,
+                            "ZIP score-pruned sources");
+    // Legacy states have no accumulator or physical owner for a nested normal
+    // trial. Reconstruct this scope once rather than attach it to a new source.
+    if (state->repair_resume.phase == ZIP_REPAIR_PHASE_STORED_PAIR
+        || state->repair_resume.phase == ZIP_REPAIR_PHASE_STORED_ADJACENT) {
+      zip_reassembly_reset_repair_resume(state);
+    }
+    state->scan_rank = 0;
+  }
+  return state->normal_scan;
+}
+
+static inline void zip_normal_scan_complete_source(ZipNormalScanState *scan) {
+  if (scan->pending_source != UINT64_MAX) {
+    roaring64_bitmap_add(scan->completed, scan->pending_source);
+    scan->pending_source = UINT64_MAX;
+  }
+}
+
+static inline void zip_normal_scan_record(
+    ZipNormalScanState *scan, uint64_t source, uint64_t run_length,
+    uint64_t failure, uint64_t entry, uint64_t output, uint64_t flags) {
+  if (scan->outcome_count == scan->outcome_capacity) {
+    uint64_t capacity = scan->outcome_capacity > 0
+        ? scan->outcome_capacity * 2 : 16;
+    if (capacity < scan->outcome_capacity
+        || capacity > SIZE_MAX / sizeof(*scan->outcomes)) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "ZIP outcome capacity",
+                   __LINE__, __FILE__);
+    }
+    scan->outcomes = (ZipScanOutcome *)realloc(
+        scan->outcomes, (size_t)capacity * sizeof(*scan->outcomes));
+    check_memory_allocation(scan->outcomes, __LINE__, __FILE__,
+                            "ZIP completed outcomes");
+    scan->outcome_capacity = capacity;
+  }
+  scan->outcomes[scan->outcome_count++] = (ZipScanOutcome){
+    source, run_length, failure, entry, output, flags
+  };
+}
+
+// Select only currently usable outcomes. If the old winner disappeared, retry
+// only sources whose evaluation was pruned by that winner's score.
+static inline bool zip_normal_scan_select(
+    CarveInfo *candidate, ZipCarveState *state, ZipMappedBlockIndex *index,
+    uint64_t baseline_output, ZipScanOutcome *best, int64_t *swap_slot) {
+  ZipNormalScanState *scan = state->normal_scan;
+  *best = (ZipScanOutcome){UINT64_MAX, state->run_length,
+      state->failure_offset, state->failure_entry, baseline_output, 0};
+  bool old_available = scan->selected_source == UINT64_MAX;
+  for (uint64_t number = 0; number < scan->outcome_count; number++) {
+    const ZipScanOutcome *outcome = &scan->outcomes[number];
+    int64_t swap = ZIP_SWAP_SLOT_UNMAPPED;
+    if (!zip_reassembly_source_run_viable_indexed(
+            candidate, state->destination_slot, outcome->run_length,
+            (int64_t)outcome->source, &swap, index)) {
+      continue;
+    }
+    if (outcome->source == scan->selected_source
+        && outcome->run_length == scan->selected_run) {
+      old_available = true;
+    }
+    if (outcome->flags != 0 || outcome->output > best->output
+        || (outcome->output == best->output && outcome->failure > best->failure)) {
+      *best = *outcome;
+      *swap_slot = swap;
+      if (outcome->flags != 0) {
+        break;
+      }
+    }
+  }
+  bool reconsider = !old_available && !roaring64_bitmap_is_empty(scan->pruned);
+  if (reconsider) {
+    roaring64_bitmap_andnot_inplace(scan->completed, scan->pruned);
+    roaring64_bitmap_clear(scan->pruned);
+    state->scan_rank = 0;
+  }
+  scan->selected_source = best->source;
+  scan->selected_run = best->run_length;
+  return reconsider;
+}
+
+static inline bool zip_normal_scan_valid(const ZipNormalScanState *scan) {
+  if (!scan || scan->image_blocks == 0 || scan->image_blocks > INT64_MAX
+      || (scan->pending_source != UINT64_MAX
+          && scan->pending_source >= scan->image_blocks)
+      || (scan->selected_source != UINT64_MAX
+          && (scan->selected_source >= scan->image_blocks
+              || scan->selected_run == 0
+              || scan->selected_run > scan->image_blocks - scan->selected_source))
+      || scan->outcome_count > scan->image_blocks
+      || scan->outcome_count > scan->outcome_capacity
+      || (scan->outcome_count > 0 && !scan->outcomes)
+      || !scan->completed || !scan->pruned
+      || !roaring64_bitmap_internal_validate(scan->completed, NULL)
+      || !roaring64_bitmap_internal_validate(scan->pruned, NULL)
+      || (!roaring64_bitmap_is_empty(scan->completed)
+          && roaring64_bitmap_maximum(scan->completed) >= scan->image_blocks)
+      || (!roaring64_bitmap_is_empty(scan->pruned)
+          && roaring64_bitmap_maximum(scan->pruned) >= scan->image_blocks)) {
+    return false;
+  }
+  for (uint64_t number = 0; number < scan->outcome_count; number++) {
+    const ZipScanOutcome *outcome = &scan->outcomes[number];
+    if (outcome->source >= scan->image_blocks || outcome->run_length == 0
+        || outcome->run_length > scan->image_blocks - outcome->source
+        || outcome->flags > (ZIP_SCAN_VALID | ZIP_SCAN_ENTRY_VALID
+                              | ZIP_SCAN_STRUCTURE)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static inline bool zip_normal_scan_codec(
+    ZipNormalScanState **scan, FILE *fp, StateSerialization mode) {
+  const size_t header_size = offsetof(ZipNormalScanState, completed);
+  if (mode == DESERIALIZE) {
+    *scan = (ZipNormalScanState *)calloc(1, sizeof(**scan));
+    check_memory_allocation(*scan, __LINE__, __FILE__, "ZIP scan restore");
+  }
+  if ((mode == SERIALIZE && !zip_normal_scan_valid(*scan))
+      || (mode == SERIALIZE ? fwrite(*scan, header_size, 1, fp)
+                              : fread(*scan, header_size, 1, fp)) != 1
+      || (*scan)->image_blocks == 0 || (*scan)->image_blocks > INT64_MAX
+      || (*scan)->outcome_count > (*scan)->image_blocks
+      || (*scan)->outcome_count > SIZE_MAX / sizeof(ZipScanOutcome)) {
+    return false;
+  }
+  roaring64_bitmap_t **bitmaps[] = {&(*scan)->completed, &(*scan)->pruned};
+  for (size_t which = 0; which < 2; which++) {
+    uint64_t bytes = mode == SERIALIZE
+        ? roaring64_bitmap_portable_size_in_bytes(*bitmaps[which]) : 0;
+    if ((mode == SERIALIZE ? fwrite(&bytes, sizeof(bytes), 1, fp)
+                            : fread(&bytes, sizeof(bytes), 1, fp)) != 1
+        || bytes == 0 || bytes > SIZE_MAX
+        || (bytes > 4096 && (bytes - 4096) / 16 > (*scan)->image_blocks)) {
+      return false;
+    }
+    char *buffer = (char *)malloc((size_t)bytes);
+    check_memory_allocation(buffer, __LINE__, __FILE__, "ZIP scan bitmap");
+    bool ok;
+    if (mode == SERIALIZE) {
+      ok = roaring64_bitmap_portable_serialize(*bitmaps[which], buffer) == bytes
+          && fwrite(buffer, 1, (size_t)bytes, fp) == bytes;
+    }
+    else {
+      ok = fread(buffer, 1, (size_t)bytes, fp) == bytes;
+      if (ok) {
+        *bitmaps[which] = roaring64_bitmap_portable_deserialize_safe(
+            buffer, (size_t)bytes);
+        ok = *bitmaps[which] != NULL;
+      }
+    }
+    free(buffer);
+    if (!ok) {
+      return false;
+    }
+  }
+  if (mode == DESERIALIZE && (*scan)->outcome_count > 0) {
+    (*scan)->outcomes = (ZipScanOutcome *)malloc(
+        (size_t)(*scan)->outcome_count * sizeof(ZipScanOutcome));
+    check_memory_allocation((*scan)->outcomes, __LINE__, __FILE__,
+                            "ZIP scan outcomes restore");
+    (*scan)->outcome_capacity = (*scan)->outcome_count;
+  }
+  if ((*scan)->outcome_count > 0
+      && (mode == SERIALIZE
+          ? fwrite((*scan)->outcomes, sizeof(ZipScanOutcome),
+                   (size_t)(*scan)->outcome_count, fp)
+          : fread((*scan)->outcomes, sizeof(ZipScanOutcome),
+                  (size_t)(*scan)->outcome_count, fp)) != (*scan)->outcome_count) {
+    return false;
+  }
+  return zip_normal_scan_valid(*scan);
+}
+
 static inline bool zip_state_size(uint64_t entry_count,
                                   uint64_t gap_tried_bytes,
                                   size_t *size) {
@@ -5133,14 +5536,22 @@ static inline bool zip_serialize_carve_state(void **state,
                                              StateSerialization mode) {
 
   ZipCarveState **zip_state = (ZipCarveState **)state;
-  const size_t header_size = offsetof(ZipCarveState, entries);
+  const size_t header_size = offsetof(ZipCarveState, normal_scan);
 
   if (!zip_state || !fp) {
     return false;
   }
 
   if (mode == SERIALIZE) {
-    if (!*zip_state
+    uint64_t flags = *zip_state
+        ? ((*zip_state)->normal_scan ? 1 : 0)
+            | ((*zip_state)->delayed_scan ? 2 : 0)
+            | ((*zip_state)->encrypted_scan ? 4 : 0) : 0;
+    uint64_t envelope[] = {0, ZIP_CARVE_STATE_MAGIC, ZIP_CARVE_STATE_VERSION,
+                            header_size, flags};
+    if (!*zip_state || (*zip_state)->archive_size == 0
+        || !zip_auxiliary_states_valid(*zip_state)
+        || fwrite(envelope, sizeof(envelope), 1, fp) != 1
         || fwrite(*zip_state, header_size, 1, fp) != 1
         || ((*zip_state)->entry_count > 0
             && fwrite((*zip_state)->entries, sizeof(ZipStateEntry),
@@ -5149,7 +5560,15 @@ static inline bool zip_serialize_carve_state(void **state,
         || ((*zip_state)->gap_tried_bytes > 0
             && fwrite(zip_state_gap_tried(*zip_state), 1,
                       (size_t)(*zip_state)->gap_tried_bytes, fp)
-                   != (size_t)(*zip_state)->gap_tried_bytes)) {
+                   != (size_t)(*zip_state)->gap_tried_bytes)
+        || ((*zip_state)->normal_scan
+            && !zip_normal_scan_codec(&(*zip_state)->normal_scan, fp, mode))
+        || ((*zip_state)->delayed_scan
+            && fwrite((*zip_state)->delayed_scan,
+                      sizeof(*(*zip_state)->delayed_scan), 1, fp) != 1)
+        || ((*zip_state)->encrypted_scan
+            && fwrite((*zip_state)->encrypted_scan,
+                      sizeof(*(*zip_state)->encrypted_scan), 1, fp) != 1)) {
       perror("zip carve state serialization");
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
@@ -5159,9 +5578,33 @@ static inline bool zip_serialize_carve_state(void **state,
   ZipCarveState header;
 
   memset(&header, 0, sizeof(header));
-  if (fread(&header, header_size, 1, fp) != 1) {
+  uint64_t first = 0;
+  uint64_t envelope[4] = {0};
+  bool has_normal_scan = false;
+  if (fread(&first, sizeof(first), 1, fp) != 1) {
     perror("zip carve state deserialization");
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  if (first == 0) {
+    if (fread(envelope, sizeof(envelope), 1, fp) != 1
+        || envelope[0] != ZIP_CARVE_STATE_MAGIC
+        || envelope[1] == 0 || envelope[1] > ZIP_CARVE_STATE_VERSION
+        || envelope[2] != header_size
+        || envelope[3] > (envelope[1] == 1 ? 1 : 7)
+        || fread(&header, header_size, 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid ZIP state envelope",
+                   __LINE__, __FILE__);
+    }
+    has_normal_scan = (envelope[3] & 1) != 0;
+  }
+  else {
+    // Original records begin with archive_size and have no version marker.
+    header.archive_size = first;
+    if (fread((uint8_t *)&header + sizeof(first),
+              header_size - sizeof(first), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "truncated legacy ZIP state",
+                   __LINE__, __FILE__);
+    }
   }
 
   size_t state_size = 0;
@@ -5170,14 +5613,16 @@ static inline bool zip_serialize_carve_state(void **state,
       ? CEILDIV(header.archive_size, scalpel_state.blocksize) : 0;
   const uint64_t maximum_gap_bytes = CEILDIV(archive_blocks, UINT64_C(8));
 
-  if (header.gap_tried_bytes > maximum_gap_bytes
+  if (header.archive_size == 0 || header.archive_size > SIZE_MAX
+      || header.entry_count > header.archive_size / ZIP_LOCAL_HEADER_SIZE
+      || header.gap_tried_bytes > maximum_gap_bytes
       || !zip_state_size(header.entry_count, header.gap_tried_bytes,
                          &state_size)) {
     handle_error(SCALPEL_ERROR_CHECKPOINT,
                  "invalid ZIP carve state size", __LINE__, __FILE__);
   }
 
-  *zip_state = (ZipCarveState *)malloc(state_size);
+  *zip_state = (ZipCarveState *)calloc(1, state_size);
   check_memory_allocation(*zip_state, __LINE__, __FILE__, "ZipCarveState");
   memcpy(*zip_state, &header, header_size);
   if (header.entry_count > 0
@@ -5194,6 +5639,46 @@ static inline bool zip_serialize_carve_state(void **state,
     perror("zip carve state gap history deserialization");
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
+  if (has_normal_scan
+      && !zip_normal_scan_codec(&(*zip_state)->normal_scan, fp, mode)) {
+    zip_free_carve_state(state);
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid ZIP normal scan",
+                 __LINE__, __FILE__);
+  }
+  if ((envelope[3] & 2) != 0) {
+    (*zip_state)->delayed_scan = (ZipDelayedScanState *)calloc(
+        1, sizeof(*(*zip_state)->delayed_scan));
+    check_memory_allocation((*zip_state)->delayed_scan, __LINE__, __FILE__,
+                            "ZIP delayed scan restore");
+    if (fread((*zip_state)->delayed_scan,
+              sizeof(*(*zip_state)->delayed_scan), 1, fp) != 1) {
+      zip_free_carve_state(state);
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "truncated ZIP delayed scan",
+                   __LINE__, __FILE__);
+    }
+  }
+  if ((envelope[3] & 4) != 0) {
+    (*zip_state)->encrypted_scan = (ZipEncryptedScanState *)calloc(
+        1, sizeof(*(*zip_state)->encrypted_scan));
+    check_memory_allocation((*zip_state)->encrypted_scan, __LINE__, __FILE__,
+                            "ZIP encrypted scan restore");
+    if (fread((*zip_state)->encrypted_scan,
+              sizeof(*(*zip_state)->encrypted_scan), 1, fp) != 1) {
+      zip_free_carve_state(state);
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "truncated ZIP encrypted scan",
+                   __LINE__, __FILE__);
+    }
+  }
+  if (!zip_auxiliary_states_valid(*zip_state)) {
+    zip_free_carve_state(state);
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid ZIP repair scan",
+                 __LINE__, __FILE__);
+  }
+  // Older records stored a mutable footer-list index, not a physical offset.
+  if (envelope[1] < 2
+      && (*zip_state)->repair_resume.phase == ZIP_REPAIR_PHASE_ZSTD_ANCHORED) {
+    zip_reassembly_reset_repair_resume(*zip_state);
+  }
   return true;
 }
 
@@ -5202,7 +5687,7 @@ static inline void *zip_clone_carve_state(const void *srcstate) {
   const ZipCarveState *source = (const ZipCarveState *)srcstate;
   size_t state_size = 0;
 
-  if (!source
+  if (!source || !zip_auxiliary_states_valid(source)
       || !zip_state_size(source->entry_count, source->gap_tried_bytes,
                          &state_size)) {
     return NULL;
@@ -5213,6 +5698,50 @@ static inline void *zip_clone_carve_state(const void *srcstate) {
   check_memory_allocation(destination, __LINE__, __FILE__,
                           "ZipCarveState clone");
   memcpy(destination, source, state_size);
+  destination->normal_scan = NULL;
+  destination->delayed_scan = NULL;
+  destination->encrypted_scan = NULL;
+  if (source->normal_scan) {
+    const ZipNormalScanState *original = source->normal_scan;
+    if (!zip_normal_scan_valid(original)) {
+      free(destination);
+      return NULL;
+    }
+    ZipNormalScanState *copy = (ZipNormalScanState *)malloc(sizeof(*copy));
+    check_memory_allocation(copy, __LINE__, __FILE__, "ZIP scan clone");
+    *copy = *original;
+    copy->completed = roaring64_bitmap_copy(original->completed);
+    copy->pruned = roaring64_bitmap_copy(original->pruned);
+    check_memory_allocation(copy->completed, __LINE__, __FILE__,
+                            "ZIP completed sources clone");
+    check_memory_allocation(copy->pruned, __LINE__, __FILE__,
+                            "ZIP score-pruned sources clone");
+    copy->outcomes = NULL;
+    copy->outcome_capacity = copy->outcome_count;
+    if (copy->outcome_count > 0) {
+      copy->outcomes = (ZipScanOutcome *)malloc(
+          (size_t)copy->outcome_count * sizeof(*copy->outcomes));
+      check_memory_allocation(copy->outcomes, __LINE__, __FILE__,
+                              "ZIP completed outcomes clone");
+      memcpy(copy->outcomes, original->outcomes,
+             (size_t)copy->outcome_count * sizeof(*copy->outcomes));
+    }
+    destination->normal_scan = copy;
+  }
+  if (source->delayed_scan) {
+    destination->delayed_scan = (ZipDelayedScanState *)malloc(
+        sizeof(*destination->delayed_scan));
+    check_memory_allocation(destination->delayed_scan, __LINE__, __FILE__,
+                            "ZIP delayed scan clone");
+    *destination->delayed_scan = *source->delayed_scan;
+  }
+  if (source->encrypted_scan) {
+    destination->encrypted_scan = (ZipEncryptedScanState *)malloc(
+        sizeof(*destination->encrypted_scan));
+    check_memory_allocation(destination->encrypted_scan, __LINE__, __FILE__,
+                            "ZIP encrypted scan clone");
+    *destination->encrypted_scan = *source->encrypted_scan;
+  }
   return destination;
 }
 
@@ -5220,6 +5749,11 @@ static inline void zip_free_carve_state(void **state) {
 
   if (!state) {
     return;
+  }
+  zip_normal_scan_clear((ZipCarveState *)*state);
+  if (*state) {
+    free(((ZipCarveState *)*state)->delayed_scan);
+    free(((ZipCarveState *)*state)->encrypted_scan);
   }
   free(*state);
   *state = NULL;
@@ -9208,7 +9742,31 @@ zip_reassembly_repair_adjacent_displaced_run(
   memset(&mapped_blocks, 0, sizeof(mapped_blocks));
   (void)zip_mapped_block_index_initialize(&first_candidate, &mapped_blocks);
 
-  for (uint64_t source_rank = 0; source_rank < scan_limit; source_rank++) {
+  uint64_t view = XXH3_64bits(first_data, (size_t)buffer_size);
+  view = (view ^ image_blocks) * UINT64_C(1099511628211);
+  view = (view ^ scalpel_state.blocksize) * UINT64_C(1099511628211);
+  for (uint64_t slot = 0; slot < total_blocks; slot++) {
+    view = (view ^ (uint64_t)blockvector_get_actual_blocknumber(first_repair,
+                                                               slot))
+        * UINT64_C(1099511628211);
+  }
+  const bool resume = state->repair_resume.phase
+          == ZIP_REPAIR_PHASE_DELAYED_ADJACENT
+      && state->repair_resume.source == (uint64_t)first_source
+      && state->repair_resume.run_length == first_length
+      && state->repair_resume.second_destination == first_destination
+      && state->repair_resume.second_run_length == displaced_length
+      && state->repair_resume.footer_index == view
+      && state->repair_resume.source_rank <= scan_limit;
+  uint64_t source_rank = resume ? state->repair_resume.source_rank : 0;
+  state->repair_resume.phase = ZIP_REPAIR_PHASE_DELAYED_ADJACENT;
+  state->repair_resume.source = (uint64_t)first_source;
+  state->repair_resume.run_length = first_length;
+  state->repair_resume.second_destination = first_destination;
+  state->repair_resume.second_run_length = displaced_length;
+  state->repair_resume.footer_index = view;
+
+  for (; source_rank < scan_limit; source_rank++) {
     if ((source_rank & UINT64_C(0xff)) == 0) {
       if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
         zip_mapped_block_index_clear(&mapped_blocks);
@@ -9218,7 +9776,8 @@ zip_reassembly_repair_adjacent_displaced_run(
       }
       if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                memory_order_acquire)) {
-        zip_reassembly_reset_repair_resume(state);
+        // Keep the caller's delay/best tuple and this trial's own source cursor.
+        state->repair_resume.source_rank = source_rank;
         carve_put_state((*candidate)->carvehashkey, state);
         if (reassembly_time_to_checkpoint(work->id, *candidate,
                                           uuidp, uuidc)) {
@@ -9322,6 +9881,8 @@ zip_reassembly_repair_adjacent_displaced_run(
   zip_mapped_block_index_clear(&mapped_blocks);
   free(second_trial);
   free_blockvector(&first_repair);
+  state->repair_resume.phase = ZIP_REPAIR_PHASE_DELAYED;
+  state->repair_resume.source_rank = 0;
   return ZIP_GAP_REPAIR_NONE;
 }
 
@@ -9927,26 +10488,38 @@ static inline ZipGapRepairResult zip_reassembly_repair_zstd_anchored_gap(
   const uint8_t *repair_baseline = baseline;
   SearchSpec *spec = &scalpel_state.search_specs[(*candidate)->needleidx];
   uint64_t selected_footer_index = UINT64_MAX;
-  const uint64_t footer_start = resume
-      ? state->repair_resume.footer_index : 0;
+  uint64_t footer_start = 0;
+  if (resume) {
+    uint64_t last = spec->offsets.numfooters;
+    while (footer_start < last) {
+      uint64_t middle = footer_start + (last - footer_start) / 2;
+      if (spec->offsets.footers[middle] < state->repair_resume.footer_index) {
+        footer_start = middle + 1;
+      }
+      else {
+        last = middle;
+      }
+    }
+  }
 
   for (uint64_t footer_index = footer_start;
        footer_index < spec->offsets.numfooters; footer_index++) {
+    const uint64_t footer = spec->offsets.footers[footer_index];
     if ((footer_index & UINT64_C(0xff)) == 0
         && atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                 memory_order_acquire)) {
       state->repair_resume.phase = ZIP_REPAIR_PHASE_ZSTD_ANCHORED;
-      state->repair_resume.footer_index = footer_index;
-      state->repair_resume.destination = destination;
-      state->repair_resume.source = 0;
+      if (!resume || footer != state->repair_resume.footer_index) {
+        state->repair_resume.footer_index = footer;
+        state->repair_resume.destination = destination;
+        state->repair_resume.source = 0;
+      }
       carve_put_state((*candidate)->carvehashkey, state);
       if (reassembly_time_to_checkpoint(work->id, *candidate,
                                         uuidp, uuidc)) {
         return ZIP_GAP_REPAIR_STOPPED;
       }
     }
-    const uint64_t footer = spec->offsets.footers[footer_index];
-
     if (footer < state->eocd_offset) {
       continue;
     }
@@ -10031,6 +10604,8 @@ static inline ZipGapRepairResult zip_reassembly_repair_zstd_anchored_gap(
     return ZIP_GAP_REPAIR_NONE;
   }
 
+  resume = resume && spec->offsets.footers[selected_footer_index]
+      == state->repair_resume.footer_index;
   if (resume) {
     destination = state->repair_resume.destination;
     if (destination < entry_first || destination >= total_blocks) {
@@ -10067,7 +10642,8 @@ static inline ZipGapRepairResult zip_reassembly_repair_zstd_anchored_gap(
       const uint64_t source_last = image_blocks - run_length;
 
       const uint64_t source_start = resume
-          && selected_footer_index == state->repair_resume.footer_index
+          && spec->offsets.footers[selected_footer_index]
+                 == state->repair_resume.footer_index
           && destination == state->repair_resume.destination
           && state->repair_resume.source >= source_first
           && state->repair_resume.source <= source_last
@@ -10082,7 +10658,8 @@ static inline ZipGapRepairResult zip_reassembly_repair_zstd_anchored_gap(
           if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                    memory_order_acquire)) {
             state->repair_resume.phase = ZIP_REPAIR_PHASE_ZSTD_ANCHORED;
-            state->repair_resume.footer_index = selected_footer_index;
+            state->repair_resume.footer_index =
+                spec->offsets.footers[selected_footer_index];
             state->repair_resume.destination = destination;
             state->repair_resume.source = source;
             carve_put_state((*candidate)->carvehashkey, state);
@@ -10821,6 +11398,7 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
                                         scalpel_state.blocksize);
   const bool directly_verifiable = zip_method_directly_verifiable(
       entry->method);
+  bool two_runs_exhausted = false;
 
   if (state->repair_resume.phase == ZIP_REPAIR_PHASE_NONE
       || state->repair_resume.phase
@@ -10896,6 +11474,7 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
     if (two_run_result != ZIP_GAP_REPAIR_NONE) {
       return two_run_result;
     }
+    two_runs_exhausted = true;
   }
 
   uint64_t failure_block = state->failure_offset
@@ -11008,10 +11587,63 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
   // surviving worker advances to the next strongest hypothesis.
   //
 
-  bool resume = state->repair_resume.phase == ZIP_REPAIR_PHASE_DELAYED;
+  bool resume = state->repair_resume.phase == ZIP_REPAIR_PHASE_DELAYED
+      || state->repair_resume.phase == ZIP_REPAIR_PHASE_DELAYED_ADJACENT;
 
   if (state->repair_resume.phase != ZIP_REPAIR_PHASE_NONE && !resume) {
     zip_reassembly_reset_repair_resume(state);
+  }
+
+  uint64_t delayed_view = zip_normal_scan_signature(
+      *candidate, state, baseline, entry->local_offset, failure_block);
+  delayed_view ^= state->gap_hypothesis_isolated;
+  if (state->gap_tried_bytes > 0) {
+    delayed_view ^= XXH3_64bits(zip_state_gap_tried(state),
+                               (size_t)state->gap_tried_bytes);
+  }
+  bool delayed_usable = state->delayed_scan
+      && state->delayed_scan->signature == delayed_view;
+  if (delayed_usable && (resume || state->delayed_scan->finished)) {
+    const ZipRepairResume *saved = state->delayed_scan->finished
+        ? &state->delayed_scan->best : &state->repair_resume;
+    int64_t swap = ZIP_SWAP_SLOT_UNMAPPED;
+    if (saved->best_source >= 0
+        && !zip_reassembly_source_run_viable(
+               *candidate, saved->best_destination, saved->best_run_length,
+               saved->best_source, &swap)) {
+      delayed_usable = false;
+    }
+    for (size_t i = 0; delayed_usable && i < ZIP_DEFLATE_GAP_PROBE_COUNT;
+         i++) {
+      const ZipGapProbe *probe = &state->delayed_scan->probes[i];
+      if ((probe->flags & 1)
+          && !zip_reassembly_source_run_viable(
+                 *candidate, probe->destination,
+                 total_blocks - probe->destination, probe->source, &swap)) {
+        delayed_usable = false;
+      }
+    }
+  }
+  if (!delayed_usable) {
+    free(state->delayed_scan);
+    state->delayed_scan = (ZipDelayedScanState *)calloc(
+        1, sizeof(*state->delayed_scan));
+    check_memory_allocation(state->delayed_scan, __LINE__, __FILE__,
+                            "ZIP delayed scan");
+    state->delayed_scan->signature = delayed_view;
+    state->delayed_scan->best.best_source = -1;
+    state->delayed_scan->best.best_confidence_gain = INT64_MIN;
+    // Missing or unavailable prior observations cannot rank the remaining
+    // suffix fairly. Rebuild only this physical-gap scope.
+    if (resume && !state->gap_hypothesis_isolated) {
+      zip_reassembly_reset_repair_resume(state);
+      resume = false;
+    }
+  }
+  ZipDelayedScanState *delayed = state->delayed_scan;
+  if (delayed->finished) {
+    state->repair_resume = delayed->best;
+    resume = true;
   }
 
   uint64_t best_destination = resume
@@ -11034,8 +11666,8 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
       ? state->repair_resume.best_swap_slot : ZIP_SWAP_SLOT_UNMAPPED;
   int64_t best_confidence_gain = resume
       ? state->repair_resume.best_confidence_gain : INT64_MIN;
-  const uint64_t delay_start = resume
-      ? state->repair_resume.destination : 0;
+  const uint64_t delay_start = delayed->finished ? failure_block - entry_first + 1
+      : resume ? state->repair_resume.destination : 0;
   const uint64_t maximum_delay = failure_block - entry_first;
   const uint64_t delay_end = resume && state->gap_hypothesis_isolated
       ? state->repair_resume.first_destination : maximum_delay;
@@ -11043,16 +11675,8 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
       state->archive_size);
   uint8_t *gap_tried = zip_state_gap_tried(state);
   ZipMappedBlockIndex mapped_blocks;
-  bool exact_layout_found = false;
-  bool gap_probe_present[ZIP_DEFLATE_GAP_PROBE_COUNT] = {false};
-  bool gap_probe_selectable[ZIP_DEFLATE_GAP_PROBE_COUNT] = {false};
-  bool gap_probe_archive_valid[ZIP_DEFLATE_GAP_PROBE_COUNT] = {false};
-  uint64_t gap_probe_destination[ZIP_DEFLATE_GAP_PROBE_COUNT] = {0};
-  uint64_t gap_probe_failure[ZIP_DEFLATE_GAP_PROBE_COUNT] = {0};
-  uint64_t gap_probe_output[ZIP_DEFLATE_GAP_PROBE_COUNT] = {0};
-  int64_t gap_probe_source[ZIP_DEFLATE_GAP_PROBE_COUNT] = {0};
-  int64_t gap_probe_swap[ZIP_DEFLATE_GAP_PROBE_COUNT] = {0};
-  int64_t gap_probe_confidence[ZIP_DEFLATE_GAP_PROBE_COUNT] = {0};
+  bool exact_layout_found = delayed->exact != 0;
+  ZipGapProbe *gap_probes = delayed->probes;
 
   memset(&mapped_blocks, 0, sizeof(mapped_blocks));
   (void)zip_mapped_block_index_initialize(*candidate, &mapped_blocks);
@@ -11071,7 +11695,9 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
       return ZIP_GAP_REPAIR_STOPPED;
     }
     if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
-      state->repair_resume.phase = ZIP_REPAIR_PHASE_DELAYED;
+      if (state->repair_resume.phase != ZIP_REPAIR_PHASE_DELAYED_ADJACENT) {
+        state->repair_resume.phase = ZIP_REPAIR_PHASE_DELAYED;
+      }
       state->repair_resume.destination = delay;
       state->repair_resume.best_destination = best_destination;
       state->repair_resume.best_run_length = best_suffix_length;
@@ -11080,6 +11706,8 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
       state->repair_resume.best_source = best_source;
       state->repair_resume.best_swap_slot = best_swap_slot;
       state->repair_resume.best_confidence_gain = best_confidence_gain;
+      delayed->best = state->repair_resume;
+      delayed->next_delay = delay;
       carve_put_state((*candidate)->carvehashkey, state);
       if (reassembly_time_to_checkpoint(work->id, *candidate,
                                         uuidp, uuidc)) {
@@ -11222,6 +11850,14 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
     else if (entry->method == ZIP_METHOD_BZIP2
              || entry->method == ZIP_METHOD_ZSTD
              || entry->method == ZIP_METHOD_XZ) {
+      state->repair_resume.destination = delay;
+      state->repair_resume.best_destination = best_destination;
+      state->repair_resume.best_run_length = best_suffix_length;
+      state->repair_resume.best_failure = best_failure;
+      state->repair_resume.best_output = best_output;
+      state->repair_resume.best_source = best_source;
+      state->repair_resume.best_swap_slot = best_swap_slot;
+      state->repair_resume.best_confidence_gain = best_confidence_gain;
       const ZipGapRepairResult adjacent_result =
           zip_reassembly_repair_adjacent_displaced_run(
               work, candidate, state, entry, trial, buffer_size,
@@ -11238,15 +11874,14 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
         && delay < ZIP_DEFLATE_GAP_PROBE_COUNT) {
       const size_t probe_index = (size_t)delay;
 
-      gap_probe_present[probe_index] = true;
-      gap_probe_selectable[probe_index] = !delay_previously_tried;
-      gap_probe_archive_valid[probe_index] = archive_valid;
-      gap_probe_destination[probe_index] = destination;
-      gap_probe_failure[probe_index] = probe_failure;
-      gap_probe_output[probe_index] = probe_output;
-      gap_probe_source[probe_index] = source_actual;
-      gap_probe_swap[probe_index] = swap_slot;
-      gap_probe_confidence[probe_index] = probe_confidence_gain;
+      gap_probes[probe_index].flags = 1
+          | (!delay_previously_tried ? 2 : 0) | (archive_valid ? 4 : 0);
+      gap_probes[probe_index].destination = destination;
+      gap_probes[probe_index].failure = probe_failure;
+      gap_probes[probe_index].output = probe_output;
+      gap_probes[probe_index].source = source_actual;
+      gap_probes[probe_index].swap = swap_slot;
+      gap_probes[probe_index].confidence = probe_confidence_gain;
     }
 
     // A decoder can report identical terminal progress for several adjacent
@@ -11327,12 +11962,12 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
 
     for (uint64_t index = 0;
          index < ZIP_DEFLATE_GAP_PROBE_COUNT; index++) {
-      if (gap_probe_present[index]
+      if ((gap_probes[index].flags & 1)
           && (run_length == 0
-              || gap_probe_failure[index] == run_failure)) {
+              || gap_probes[index].failure == run_failure)) {
         if (run_length == 0) {
           run_start = index;
-          run_failure = gap_probe_failure[index];
+          run_failure = gap_probes[index].failure;
         }
         run_length++;
       }
@@ -11342,10 +11977,10 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
           longest_end = index - 1;
           longest_length = run_length;
         }
-        if (gap_probe_present[index]) {
+        if (gap_probes[index].flags & 1) {
           run_start = index;
           run_length = 1;
-          run_failure = gap_probe_failure[index];
+          run_failure = gap_probes[index].failure;
         }
         else {
           run_length = 0;
@@ -11394,7 +12029,7 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
         }
       }
       if (!duplicate && probe_index < ZIP_DEFLATE_GAP_PROBE_COUNT
-          && gap_probe_selectable[probe_index]) {
+          && (gap_probes[probe_index].flags & 2)) {
         selected_probe = probe_index;
         break;
       }
@@ -11403,14 +12038,14 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
     if (selected_probe != UINT64_MAX) {
       const size_t probe_index = (size_t)selected_probe;
 
-      best_destination = gap_probe_destination[probe_index];
+      best_destination = gap_probes[probe_index].destination;
       best_suffix_length = total_blocks - best_destination;
-      best_failure = gap_probe_failure[probe_index];
-      best_output = gap_probe_output[probe_index];
-      best_source = gap_probe_source[probe_index];
-      best_swap_slot = gap_probe_swap[probe_index];
-      best_confidence_gain = gap_probe_confidence[probe_index];
-      exact_layout_found = gap_probe_archive_valid[probe_index];
+      best_failure = gap_probes[probe_index].failure;
+      best_output = gap_probes[probe_index].output;
+      best_source = gap_probes[probe_index].source;
+      best_swap_slot = gap_probes[probe_index].swap;
+      best_confidence_gain = gap_probes[probe_index].confidence;
+      exact_layout_found = (gap_probes[probe_index].flags & 4) != 0;
       if (scalpel_state.mode_verbose) {
         lock_fprintf(stdout,
                      "ZIP physical-gap plateau priority: delay=%" PRIu64
@@ -11424,7 +12059,17 @@ static inline ZipGapRepairResult zip_reassembly_repair_delayed_gap(
   // exhaustive two-run solver. Normal reassembly searches the remaining
   // displacement, then restores this gap hypothesis if needed.
   //
-  if (!exact_layout_found
+  delayed->finished = 1;
+  delayed->exact = exact_layout_found;
+  delayed->best = state->repair_resume;
+  delayed->best.best_destination = best_destination;
+  delayed->best.best_run_length = best_suffix_length;
+  delayed->best.best_failure = best_failure;
+  delayed->best.best_output = best_output;
+  delayed->best.best_source = best_source;
+  delayed->best.best_swap_slot = best_swap_slot;
+  delayed->best.best_confidence_gain = best_confidence_gain;
+  if (!exact_layout_found && !two_runs_exhausted
       && (best_source < 0 || !state->gap_base_initialized
           || entry->method == ZIP_METHOD_BZIP2)) {
     zip_mapped_block_index_clear(&mapped_blocks);
@@ -11626,12 +12271,34 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
     return ZIP_GAP_REPAIR_NONE;
   }
 
-  const bool resuming = state->repair_resume.phase
-                        == ZIP_REPAIR_PHASE_ENCRYPTED_ROTATION;
+  const uint8_t *rotation_baseline = (const uint8_t *)
+      blockvector_get_data_pointer((*candidate)->b);
+  const uint64_t rotation_view = zip_normal_scan_signature(
+      *candidate, state, rotation_baseline, 0, total_blocks);
+  bool resuming = state->repair_resume.phase
+      == ZIP_REPAIR_PHASE_ENCRYPTED_ROTATION;
+  bool validating = state->repair_resume.phase
+      == ZIP_REPAIR_PHASE_ENCRYPTED_VALIDATE;
 
-  if (state->repair_resume.phase != ZIP_REPAIR_PHASE_NONE && !resuming) {
+  if (state->repair_resume.phase != ZIP_REPAIR_PHASE_NONE
+      && !resuming && !validating) {
     return ZIP_GAP_REPAIR_NONE;
   }
+  if (!state->encrypted_scan
+      || state->encrypted_scan->signature != rotation_view) {
+    bool old_scan = state->encrypted_scan != NULL;
+    free(state->encrypted_scan);
+    state->encrypted_scan = (ZipEncryptedScanState *)calloc(
+        1, sizeof(*state->encrypted_scan));
+    check_memory_allocation(state->encrypted_scan, __LINE__, __FILE__,
+                            "ZIP encrypted scan");
+    state->encrypted_scan->signature = rotation_view;
+    if (validating || old_scan) {
+      zip_reassembly_reset_repair_resume(state);
+      resuming = validating = false;
+    }
+  }
+  ZipEncryptedScanState *encrypted = state->encrypted_scan;
 
   uint64_t resume_entry = resuming ? state->repair_resume.footer_index : 0;
   uint64_t resume_split = resuming ? state->repair_resume.destination : 0;
@@ -11641,9 +12308,14 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
       ? state->repair_resume.best_confidence_gain : INT64_MIN;
   uint64_t best_header_gain = resuming
       ? state->repair_resume.best_failure : 0;
+  if (validating) {
+    best_split = encrypted->best_split;
+    best_score = encrypted->best_score;
+    best_header_gain = encrypted->best_header_gain;
+  }
   bool saw_classifier_evidence = best_split > 0;
 
-  for (uint64_t entry_index = resume_entry;
+  for (uint64_t entry_index = validating ? state->entry_count : resume_entry;
        entry_index < state->entry_count; entry_index++) {
     const ZipStateEntry *entry = &state->entries[entry_index];
 
@@ -11664,11 +12336,6 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
     if (first_split > last_split) {
       continue;
     }
-    if (resuming && entry_index == resume_entry
-        && resume_split >= first_split && resume_split <= last_split) {
-      first_split = resume_split;
-    }
-
     uint64_t confidence_window = ZIP_ENCRYPTED_ROTATION_WINDOW_BLOCKS;
     const uint64_t split_count = last_split - first_split + 1;
 
@@ -11677,6 +12344,11 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
     }
     if (confidence_window < 4) {
       continue;
+    }
+    // The score's window belongs to the full member, not its untested suffix.
+    if (resuming && entry_index == resume_entry
+        && resume_split >= first_split && resume_split <= last_split) {
+      first_split = resume_split;
     }
 
     bool windows_initialized = false;
@@ -11803,9 +12475,10 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
   // neighborhood at several scales, retaining a bounded set of the strongest
   // structurally valid interpretations because encrypted bytes cannot resolve
   // the remaining ambiguity without a key.
-  uint64_t hypothesis_splits[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT] = {0};
-  int64_t hypothesis_scores[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT] = {0};
-  uint32_t hypothesis_count = 0;
+  uint64_t *hypothesis_splits = encrypted->hypothesis_splits;
+  int64_t *hypothesis_scores = encrypted->hypothesis_scores;
+  uint32_t hypothesis_count = validating
+      ? (uint32_t)encrypted->hypothesis_count : 0;
   uint64_t refine_first = best_split > ZIP_ENCRYPTED_ROTATION_REFINE_BLOCKS
                               ? best_split - ZIP_ENCRYPTED_ROTATION_REFINE_BLOCKS
                               : 1;
@@ -11814,7 +12487,8 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
   if (refine_last < best_split || refine_last >= total_blocks) {
     refine_last = total_blocks - 1;
   }
-  for (uint64_t split = refine_first; split <= refine_last; split++) {
+  for (uint64_t split = validating ? refine_last + 1 : refine_first;
+       split <= refine_last; split++) {
     if ((uint64_t)header_actual > UINT64_MAX - split) {
       continue;
     }
@@ -11882,13 +12556,21 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
     hypothesis_scores[0] = best_score;
     hypothesis_count = 1;
   }
+  encrypted->best_split = best_split;
+  encrypted->best_score = best_score;
+  encrypted->best_header_gain = best_header_gain;
+  encrypted->hypothesis_count = hypothesis_count;
+  if (!validating) {
+    encrypted->next_hypothesis = 0;
+    encrypted->valid_count = 0;
+  }
 
   ZipMappedBlockIndex mapped_blocks;
-  uint64_t valid_splits[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT] = {0};
-  int64_t valid_sources[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT] = {0};
-  int64_t valid_swaps[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT] = {0};
-  int64_t valid_scores[ZIP_ENCRYPTED_ROTATION_HYPOTHESIS_LIMIT] = {0};
-  uint32_t valid_count = 0;
+  uint64_t *valid_splits = encrypted->valid_splits;
+  int64_t *valid_sources = encrypted->valid_sources;
+  int64_t *valid_swaps = encrypted->valid_swaps;
+  int64_t *valid_scores = encrypted->valid_scores;
+  uint32_t valid_count = (uint32_t)encrypted->valid_count;
 
   memset(&mapped_blocks, 0, sizeof(mapped_blocks));
   (void)zip_mapped_block_index_initialize(*candidate, &mapped_blocks);
@@ -11900,13 +12582,17 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
 
   check_memory_allocation(trial, __LINE__, __FILE__,
                           "encrypted ZIP rotation trial");
-  for (uint32_t index = 0; index < hypothesis_count; index++) {
+  for (uint32_t index = (uint32_t)encrypted->next_hypothesis;
+       index < hypothesis_count; index++) {
+    encrypted->next_hypothesis = index;
+    encrypted->valid_count = valid_count;
     if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
       free(trial);
       zip_mapped_block_index_clear(&mapped_blocks);
       return ZIP_GAP_REPAIR_STOPPED;
     }
     if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+      state->repair_resume.phase = ZIP_REPAIR_PHASE_ENCRYPTED_VALIDATE;
       carve_put_state((*candidate)->carvehashkey, state);
       if (reassembly_time_to_checkpoint(work->id, *candidate,
                                         uuidp, uuidc)) {
@@ -11969,6 +12655,24 @@ static inline ZipGapRepairResult zip_reassembly_repair_encrypted_rotation(
   free(trial);
   zip_mapped_block_index_clear(&mapped_blocks);
 
+  // A retained interpretation must still be usable after other candidates
+  // claim blocks. Recheck availability, not already completed decoding.
+  uint32_t available_count = 0;
+  for (uint32_t index = 0; index < valid_count; index++) {
+    int64_t swap = ZIP_SWAP_SLOT_UNMAPPED;
+    if (zip_reassembly_source_run_viable(*candidate, valid_splits[index],
+            total_blocks - valid_splits[index], valid_sources[index], &swap)) {
+      valid_splits[available_count] = valid_splits[index];
+      valid_sources[available_count] = valid_sources[index];
+      valid_swaps[available_count] = swap;
+      valid_scores[available_count] = valid_scores[index];
+      available_count++;
+    }
+  }
+  valid_count = available_count;
+  encrypted->next_hypothesis = hypothesis_count;
+  encrypted->valid_count = valid_count;
+  zip_reassembly_reset_repair_resume(state);
   if (valid_count == 0) {
     return ZIP_GAP_REPAIR_NONE;
   }
@@ -12890,6 +13594,10 @@ static inline void zip_reassembly(ThreadWork *work,
         > image_blocks - expected_actual - 1
             ? expected_actual : image_blocks - expected_actual - 1;
     const uint64_t scan_limit = maximum_distance * 2 + 1;
+    ZipNormalScanState *normal_scan = zip_normal_scan_prepare(state,
+        zip_normal_scan_signature(*candidate, state, baseline,
+                                  current_output_progress, run_last),
+        image_blocks);
     int64_t best_source = -1;
     int64_t best_swap_slot = ZIP_SWAP_SLOT_UNMAPPED;
     uint64_t best_run_length = state->run_length;
@@ -12980,6 +13688,21 @@ static inline void zip_reassembly(ThreadWork *work,
     memset(&mapped_blocks, 0, sizeof(mapped_blocks));
     (void)zip_mapped_block_index_initialize(*candidate, &mapped_blocks);
 
+    ZipScanOutcome retained_best;
+    (void)zip_normal_scan_select(*candidate, state, &mapped_blocks,
+                                 current_output_progress, &retained_best,
+                                 &best_swap_slot);
+    if (retained_best.source != UINT64_MAX) {
+      best_source = (int64_t)retained_best.source;
+      best_run_length = retained_best.run_length;
+      best_failure = retained_best.failure;
+      best_entry = retained_best.entry;
+      best_output_progress = retained_best.output;
+      best_valid = (retained_best.flags & ZIP_SCAN_VALID) != 0;
+      best_entry_valid = (retained_best.flags & ZIP_SCAN_ENTRY_VALID) != 0;
+      best_structure_progress = (retained_best.flags & ZIP_SCAN_STRUCTURE) != 0;
+    }
+
     // A physically displaced run is normally absent from the current
     // candidate and has no active reservations. Prefer unmapped and
     // unreserved sources, then stronger file type evidence. Confidence only
@@ -12991,6 +13714,7 @@ static inline void zip_reassembly(ThreadWork *work,
     const uint64_t source_confidence_samples = state->run_length
         < ZIP_SOURCE_CONFIDENCE_SAMPLE_BLOCKS
             ? state->run_length : ZIP_SOURCE_CONFIDENCE_SAMPLE_BLOCKS;
+    uint64_t plan_signature = expected_actual;
 
     for (uint64_t actual = 0; actual < image_blocks; actual++) {
       if (state->run_length > image_blocks - actual) {
@@ -13002,6 +13726,8 @@ static inline void zip_reassembly(ThreadWork *work,
           source_confidence_samples);
 
       source_bucket_present[source_bucket] = true;
+      plan_signature = (plan_signature ^ source_bucket)
+          * UINT64_C(1099511628211);
     }
     for (uint8_t mapped = 0; mapped <= 1; mapped++) {
       for (uint8_t reserved = 0; reserved <= 1; reserved++) {
@@ -13029,11 +13755,14 @@ static inline void zip_reassembly(ThreadWork *work,
     // retain complete source coverage.
     //
     const bool source_bucketed = source_bucket_count > 0 && scan_limit
-        <= (uint64_t)INT64_MAX / source_bucket_count;
+        <= (uint64_t)INT64_MAX / (source_bucket_count + 1);
     const uint64_t bucket_scan_count = source_bucket_count == 0
         ? 0 : source_bucketed
             ? scan_limit * source_bucket_count : scan_limit;
-    const uint64_t scan_count = bucket_scan_count;
+    // A final unbucketed pass catches sources that moved to an earlier bucket
+    // while other candidates changed reservations. Completed trials are skipped.
+    const uint64_t scan_count = bucket_scan_count
+        + (source_bucketed ? scan_limit : 0);
 
     if (state->scan_rank < 0
         || (uint64_t)state->scan_rank >= scan_count) {
@@ -13043,10 +13772,21 @@ static inline void zip_reassembly(ThreadWork *work,
         ? XXH3_64bits((*candidate)->clone_binuuid, sizeof(uuid_t))
               % scan_limit
         : 0;
+    plan_signature = (plan_signature ^ clone_source_start)
+        * UINT64_C(1099511628211);
+    plan_signature = (plan_signature ^ ((*candidate)->clone
+        ? (uint64_t)state->scan_shares + 1 : 0)) * UINT64_C(1099511628211);
+    if (normal_scan->plan_signature != plan_signature) {
+      normal_scan->plan_signature = plan_signature;
+      state->scan_rank = 0;
+    }
     bool anchored_repair_solved = false;
+    bool pending_first = normal_scan->pending_source != UINT64_MAX;
 
     for (uint64_t rank = (uint64_t)state->scan_rank;
-         rank < scan_count; rank++) {
+         pending_first || rank < scan_count;
+         zip_normal_scan_complete_source(normal_scan),
+         pending_first ? (pending_first = false) : (rank++, false)) {
       if ((rank & UINT64_C(0xff)) == 0) {
         if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
           zip_mapped_block_index_clear(&mapped_blocks);
@@ -13077,12 +13817,13 @@ static inline void zip_reassembly(ThreadWork *work,
         }
       }
 
-      uint64_t source_phase = source_bucketed
+      const bool reconcile = source_bucketed && rank >= bucket_scan_count;
+      uint64_t source_phase = source_bucketed && !reconcile
           ? rank / scan_limit : 0;
 
       // Helpers retain complete source coverage, but rotate the bucket order
       // so idle threads immediately explore different evidence classes.
-      if (source_bucketed && (*candidate)->clone) {
+      if (source_bucketed && !reconcile && (*candidate)->clone) {
         const uint64_t phase_offset =
             ((uint64_t)state->scan_shares + 1) % source_bucket_count;
 
@@ -13100,7 +13841,10 @@ static inline void zip_reassembly(ThreadWork *work,
       }
       uint64_t source_block = expected_actual;
 
-      if (source_rank > 0) {
+      if (pending_first) {
+        source_block = normal_scan->pending_source;
+      }
+      else if (source_rank > 0) {
         const uint64_t distance = (source_rank + 1) / 2;
 
         if ((source_rank & UINT64_C(1)) != 0) {
@@ -13119,7 +13863,10 @@ static inline void zip_reassembly(ThreadWork *work,
 
       const int64_t source_actual = (int64_t)source_block;
 
-      if (source_bucketed) {
+      if (roaring64_bitmap_contains(normal_scan->completed, source_block)) {
+        continue;
+      }
+      if (source_bucketed && !reconcile && !pending_first) {
         if (state->run_length > image_blocks - source_block) {
           continue;
         }
@@ -13132,6 +13879,8 @@ static inline void zip_reassembly(ThreadWork *work,
           continue;
         }
       }
+      normal_scan->pending_source = source_block;
+      state->scan_rank = (int64_t)rank;
 
       // Share immediately before expensive source validation. The prior
       // helper has time to leave the promising queue while this thread probes
@@ -13265,6 +14014,11 @@ static inline void zip_reassembly(ThreadWork *work,
             best_structure_progress = tail_progress
                                       && !tail_valid
                                       && !tail_entry_valid;
+            zip_normal_scan_record(normal_scan, source_block, tail_length,
+                best_failure, best_entry, best_output_progress,
+                (best_valid ? ZIP_SCAN_VALID : 0)
+                | (best_entry_valid ? ZIP_SCAN_ENTRY_VALID : 0)
+                | (best_structure_progress ? ZIP_SCAN_STRUCTURE : 0));
             break;
           }
         }
@@ -13306,6 +14060,7 @@ zip_reassembly_skip_tail_trial:
           source_actual, &trial_swap_slot, &mapped_blocks);
 
       if (!source_viable) {
+        normal_scan->pending_source = UINT64_MAX;
         continue;
       }
 
@@ -13382,6 +14137,11 @@ zip_reassembly_skip_tail_trial:
             && deflate_probe_output <= best_output_progress
             && (deflate_probe_output < best_output_progress
                 || deflate_probe_failure <= best_failure)) {
+        if (deflate_probe_output > current_output_progress
+            || (deflate_probe_output == current_output_progress
+                && deflate_probe_failure > state->failure_offset)) {
+          roaring64_bitmap_add(normal_scan->pruned, source_block);
+        }
         continue;
       }
 
@@ -13532,6 +14292,18 @@ zip_reassembly_skip_tail_trial:
         best_valid = trial_valid;
         best_entry_valid = entry_valid;
       }
+      if (trial_valid || entry_valid
+          || (entry && (entry->method == ZIP_METHOD_DEFLATE
+                        || entry->method == ZIP_METHOD_DEFLATE64
+                        || entry->method == ZIP_METHOD_LZMA)
+              && (trial_output_progress > current_output_progress
+                  || (trial_output_progress == current_output_progress
+                      && trial_failure > state->failure_offset)))) {
+        zip_normal_scan_record(normal_scan, source_block, trial_run_length,
+            trial_failure, trial_entry, trial_output_progress,
+            (trial_valid ? ZIP_SCAN_VALID : 0)
+            | (entry_valid ? ZIP_SCAN_ENTRY_VALID : 0));
+      }
       if (!trial_valid && !entry_valid && entry
           && (entry->method == ZIP_METHOD_DEFLATE
               || entry->method == ZIP_METHOD_DEFLATE64
@@ -13549,6 +14321,10 @@ zip_reassembly_skip_tail_trial:
         best_entry_valid = false;
         best_structure_progress = false;
       }
+      if (best_source >= 0) {
+        normal_scan->selected_source = (uint64_t)best_source;
+        normal_scan->selected_run = best_run_length;
+      }
 
       if (trial_valid || entry_valid) {
         break;
@@ -13556,11 +14332,30 @@ zip_reassembly_skip_tail_trial:
 
     }
 
+    bool retry_pruned = false;
+    if (!anchored_repair_solved) {
+      retry_pruned = zip_normal_scan_select(*candidate, state, &mapped_blocks,
+          current_output_progress, &retained_best, &best_swap_slot);
+      best_source = retained_best.source == UINT64_MAX
+          ? -1 : (int64_t)retained_best.source;
+      best_run_length = retained_best.run_length;
+      best_failure = retained_best.failure;
+      best_entry = retained_best.entry;
+      best_output_progress = retained_best.output;
+      best_valid = (retained_best.flags & ZIP_SCAN_VALID) != 0;
+      best_entry_valid = (retained_best.flags & ZIP_SCAN_ENTRY_VALID) != 0;
+      best_structure_progress = (retained_best.flags & ZIP_SCAN_STRUCTURE) != 0;
+    }
     zip_mapped_block_index_clear(&mapped_blocks);
     zip_deflate_prefix_clear(&deflate_prefix);
     zip_apk_digest_context_clear(&apk_digest_context);
     state->scan_rank = 0;
+    if (retry_pruned) {
+      carve_put_state((*candidate)->carvehashkey, state);
+      continue;
+    }
     if (anchored_repair_solved) {
+      zip_normal_scan_clear(state);
       blockvector_set_data_length((*candidate)->b, state->archive_size);
       state->destination_slot = 0;
       state->run_length = 1;
@@ -13571,6 +14366,7 @@ zip_reassembly_skip_tail_trial:
       continue;
     }
     if (best_source >= 0) {
+      zip_normal_scan_clear(state);
       const uint64_t committed_destination = state->destination_slot;
 
       zip_reassembly_commit_source_run(*candidate,
@@ -13715,6 +14511,7 @@ zip_reassembly_skip_tail_trial:
     }
 
 zip_reassembly_advance_search:
+    zip_normal_scan_clear(state);
     state->scan_rank = 0;
     if (state->preferred_run_active) {
       // The physical shift gives the strongest displaced-run length. If that
@@ -13843,6 +14640,7 @@ zip_reassembly_advance_search:
     }
 
 zip_reassembly_exhausted:
+    zip_normal_scan_clear(state);
     if (state->apk_digest_fast_active) {
       state->apk_digest_fast_active = false;
       state->apk_digest_fast_complete = true;

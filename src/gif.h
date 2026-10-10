@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -499,6 +503,14 @@ static inline bool gif_reassembly_normalize_candidate(int id,
     int64_t ab = blockvector_get_apparent_blocknumber(candidate->b, i);
     int64_t act = blockvector_get_actual_blocknumber(candidate->b, i);
     if (ab < 0 || act < 0) {
+      // A restored scan keeps its exclusions in an empty slot after the
+      // committed prefix. It is search state, not a hole in the file data.
+      if (candidate->no_initial_block_extension && bs > 0
+          && ab < 0 && act < 0 && i + 1 == nb
+          && blockvector_get_data_length(candidate->b) > 0
+          && i == CEILDIV(blockvector_get_data_length(candidate->b), bs)) {
+        break;
+      }
       if (i == 0) {
         return false;
       }

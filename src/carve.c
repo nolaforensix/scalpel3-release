@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -4510,8 +4514,10 @@ static int modico_cpu_batch_size(uint32_t blocksize) {
   }
 
   lock_fprintf(stdout,
-               "[gpu_batch:modico] backend=cpu blocksize=%u batch=%d "
-               "(max=%d)\n",
+               "MoDiCo CPU batch planning:\n"
+               "  Block size:               %u bytes\n"
+               "  Batch size:               %d\n"
+               "  Maximum batch size:       %d\n",
                blocksize, batch, max_batch);
   return batch;
 }
@@ -4569,8 +4575,8 @@ static int modico_session_batch_size(mc_session_t *sess,
       batch = 1;
     }
     lock_fprintf(stdout,
-                 "[gpu_batch:modico-coreml] backend=coreml batch=%d "
-                 "(static session batch)\n",
+                 "MoDiCo CoreML batch planning:\n"
+                 "  Batch size:               %d (static session batch)\n",
                  batch);
     return batch;
   }
@@ -4608,8 +4614,13 @@ static int modico_session_batch_size(mc_session_t *sess,
       }
 
       lock_fprintf(stdout,
-                   "[gpu_batch:modico-gpu%d] backend=%s blocksize=%u "
-                   "batch=%d (native histograms, max=%d)\n",
+                   "MoDiCo GPU batch planning:\n"
+                   "  CUDA device:              %d\n"
+                   "  Inference backend:        %s\n"
+                   "  Block size:               %u bytes\n"
+                   "  Batch size:               %d\n"
+                   "  Maximum batch size:       %d\n"
+                   "  Native histograms:        yes\n",
                    mc_cuda_device_id(sess), mc_inference_backend(sess),
                    blocksize, batch, max_batch);
       return batch;
@@ -4857,7 +4868,7 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
 
   int first_n = batch_n / 2;
   int second_n = batch_n - first_n;
-  lock_fprintf(stderr, "MoDiCo: retrying memory-limited batch=%d as %d + %d.\n",
+  lock_fprintf(stdout, "MoDiCo is retrying memory-limited batch %d as %d + %d.\n",
                batch_n, first_n, second_n);
 
   uint64_t first = 0;
@@ -5270,25 +5281,31 @@ static void modico_populate_blocktypes(void) {
 
   frame_message("MODICO BLOCK CLASSIFICATION STARTING");
   if (mc_uses_cuda(sess) && session_count > 1) {
-    lock_fprintf(stdout, "MoDiCo execution provider: cuda devices=");
+    char devices[ONNX_MAX_GPU_DEVICES * 16 + 1] = {0};
+    size_t used = 0;
     for (int i = 0; i < session_count; i++) {
-      lock_fprintf(stdout, "%s%d", i ? "," : "",
-                   mc_cuda_device_id(sessions[i]));
+      used += (size_t)snprintf(devices + used, sizeof(devices) - used,
+                               "%s%d", i ? ", " : "",
+                               mc_cuda_device_id(sessions[i]));
     }
-    lock_fprintf(stdout, ", inference backend=%s",
+    lock_fprintf(stdout,
+                 "MoDiCo execution provider: cuda.\n"
+                 "  CUDA devices:             %s\n"
+                 "  Inference backend:        %s\n",
+                 devices, mc_inference_backend(sess));
+  }
+  else if (mc_uses_cuda(sess)) {
+    lock_fprintf(stdout,
+                 "MoDiCo execution provider: %s.\n"
+                 "  CUDA device:              %d\n"
+                 "  Inference backend:        %s\n",
+                 mc_execution_provider(sess), mc_cuda_device_id(sess),
                  mc_inference_backend(sess));
   }
   else {
-    lock_fprintf(stdout, "MoDiCo execution provider: %s",
+    lock_fprintf(stdout, "MoDiCo execution provider: %s.\n",
                  mc_execution_provider(sess));
-    if (mc_uses_cuda(sess)) {
-      lock_fprintf(stdout, " device=%d", mc_cuda_device_id(sess));
-    }
-    if (mc_uses_tensorrt(sess)) {
-      lock_fprintf(stdout, ", inference backend=tensorrt");
-    }
   }
-  lock_fprintf(stdout, ".\n");
 
   // Time the classification (populate) pass so it can be subtracted from the
   // total to isolate reassembly time in A/B comparisons.
@@ -7324,8 +7341,13 @@ static int add_or_alternatives(PatternList *pl, uint32_t *idx, const char *patte
 
       populate_pattern_entry(pl, *idx, parsed, parsed_len, has_wildcards, mask, spec_idx, is_header);
 
-      lock_fprintf(stdout, "  -> Added OR alternative idx=%u for spec=%u (len=%zu, first_byte=0x%02x)\n", *idx, spec_idx,
-                   parsed_len, (unsigned char)parsed[0]);
+      if (scalpel_state.mode_verbose) {
+        lock_fprintf(stdout,
+                     "  %-18s  %-6s: alternative %u, spec %u, %zu bytes, first byte 0x%02x\n",
+                     scalpel_state.search_specs[spec_idx].FILETYPE,
+                     is_header ? "header" : "footer", *idx, spec_idx,
+                     parsed_len, (unsigned char)parsed[0]);
+      }
 
       (*idx)++;
       num_added++;
@@ -7345,8 +7367,14 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
   for (uint32_t direction = 0; direction < 2; direction++) {
     bool headers = direction == 0;
 
-    lock_fprintf(stdout, "\nBuilding %s pattern list...\n",
-                 headers ? "HEADER" : "FOOTER");
+    if (scalpel_state.mode_verbose) {
+      lock_fprintf(stdout,
+                   "\n%s pattern definitions:\n"
+                   "  %-18s  %4s  %5s  %-5s  %s\n"
+                   "  ------------------  ----  -----  -----  --------\n",
+                   headers ? "Header" : "Footer",
+                   "File type", "Spec", "Bytes", "Regex", "Callback");
+    }
 
     for (uint32_t i = 0; i < num_specs; i++) {
       if (specs[i].MASTER) {
@@ -7358,19 +7386,26 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
       bool has_func = headers ? (specs[i].HEADERFUNC != NULL) : (specs[i].FOOTERFUNC != NULL);
       bool is_regex = headers ? specs[i].begin_is_RE : specs[i].end_is_RE;
 
-      lock_fprintf(stdout, "  %s: len=%zu regex=%d func=%d\n",
-                   specs[i].FILETYPE, pattern_len, is_regex, has_func);
+      if (scalpel_state.mode_verbose) {
+        lock_fprintf(stdout, "  %-18s  %4u  %5zu  %-5s  %s\n",
+                     specs[i].FILETYPE, i, pattern_len,
+                     is_regex ? "yes" : "no", has_func ? "yes" : "no");
+      }
 
-      if (pattern_len > 0 && pattern_len < 20) {
+      if (scalpel_state.mode_verbose && pattern_len > 0 && pattern_len < 20) {
+        char pattern_text[20 * 5 + 1];
+        size_t used = 0;
         for (size_t j = 0; j < pattern_len; j++) {
           if (pattern[j] >= 32 && pattern[j] <= 126) {
-            lock_fprintf(stdout, "'%c' ", pattern[j]);
+            used += (size_t)snprintf(pattern_text + used, sizeof(pattern_text) - used,
+                                     "'%c' ", pattern[j]);
           }
           else {
-            lock_fprintf(stdout, "0x%02x ", (unsigned char)pattern[j]);
+            used += (size_t)snprintf(pattern_text + used, sizeof(pattern_text) - used,
+                                     "0x%02x ", (unsigned char)pattern[j]);
           }
         }
-        lock_fprintf(stdout, "\n");
+        lock_fprintf(stdout, "    Pattern: %s\n", pattern_text);
       }
 
       if (! pattern_len || has_func) {
@@ -7407,12 +7442,14 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
           }
           if (all_simple) {
             pattern_count += num_alts;
-            lock_fprintf(stdout,
-                         "    -> OR pattern: %d alternatives (simple)\n",
-                         num_alts);
+            if (scalpel_state.mode_verbose) {
+              lock_fprintf(stdout,
+                           "    Alternatives: %d simple alternatives (SIMD eligible)\n",
+                           num_alts);
+            }
           }
-          else {
-            lock_fprintf(stdout, "    -> OR pattern: complex, using PCRE2\n");
+          else if (scalpel_state.mode_verbose) {
+            lock_fprintf(stdout, "    Alternatives: complex; using PCRE2\n");
           }
         }
         else {
@@ -7449,6 +7486,9 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
 
   uint32_t idx = 0;
 
+  if (scalpel_state.mode_verbose) {
+    lock_fprintf(stdout, "\nSIMD pattern alternatives:\n");
+  }
   for (uint32_t direction = 0; direction < 2; direction++) {
     bool headers = direction == 0;
 
@@ -7479,8 +7519,10 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
           int num_added =
               add_or_alternatives(pl, &idx, pattern, pattern_len, i, headers);
 
-          if (num_added < 0) {
-            lock_fprintf(stdout, "  -> OR pattern too complex, skipping\n");
+          if (num_added < 0 && scalpel_state.mode_verbose) {
+            lock_fprintf(stdout,
+                         "  %-18s  %-6s: complex alternatives; using PCRE2, not SIMD\n",
+                         specs[i].FILETYPE, headers ? "header" : "footer");
           }
         }
         else {
@@ -7518,9 +7560,9 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
             if (scalpel_state.mode_verbose) {
               lock_fprintf(
                   stdout,
-                  "  -> Added regex pattern idx=%u for %s "
-                  "(first_byte=0x%02x)\n",
-                  idx, specs[i].FILETYPE, (unsigned char)parsed[0]);
+                  "  %-18s  %-6s: regex pattern %u, first byte 0x%02x\n",
+                  specs[i].FILETYPE, headers ? "header" : "footer",
+                  idx, (unsigned char)parsed[0]);
             }
             idx++;
           }
@@ -7542,10 +7584,9 @@ static PatternList *build_pattern_list(SearchSpec *specs, uint32_t num_specs) {
 
         if (scalpel_state.mode_verbose) {
           lock_fprintf(stdout,
-                       "  -> Added string pattern idx=%u for %s "
-                       "(first_byte=0x%02x, has_wc=%d)\n",
-                       idx, specs[i].FILETYPE, (unsigned char)pattern[0],
-                       has_wc);
+                       "  %-18s  %-6s: string pattern %u, first byte 0x%02x, wildcards %s\n",
+                       specs[i].FILETYPE, headers ? "header" : "footer",
+                       idx, (unsigned char)pattern[0], has_wc ? "yes" : "no");
         }
         idx++;
       }
@@ -7821,7 +7862,7 @@ static void init_optimized_pattern_search(void) {
   simple_pattern_list =
       build_pattern_list(scalpel_state.search_specs, scalpel_state.num_specs);
 
-  if (simple_pattern_list) {
+  if (simple_pattern_list && scalpel_state.mode_verbose) {
     lock_fprintf(stdout,
                  "Built optimized search for %u simple header/footer patterns "
                  "(SIMD-accelerated)\n",
@@ -7865,7 +7906,6 @@ static void init_optimized_pattern_search(void) {
               && ! pattern_in_simd_list(simple_pattern_list, i, true))) {
         thread_search_patterns[idx].spec_idx = i;
         thread_search_patterns[idx].is_header = true;
-        lock_fprintf(stdout, "  %s header: thread-based search\n", spec->FILETYPE);
         idx++;
       }
 
@@ -7874,16 +7914,44 @@ static void init_optimized_pattern_search(void) {
               && ! pattern_in_simd_list(simple_pattern_list, i, false))) {
         thread_search_patterns[idx].spec_idx = i;
         thread_search_patterns[idx].is_header = false;
-        lock_fprintf(stdout, "  %s footer: thread-based search\n", spec->FILETYPE);
         idx++;
       }
     }
     num_thread_search_patterns = thread_count;
   }
 
-  lock_fprintf(stdout, "Pattern categorization: %u SIMD, %u thread-based\n",
+  if (scalpel_state.mode_verbose) {
+    lock_fprintf(stdout,
+                 "\nHeader/footer search methods:\n"
+                 "  %-18s  %-6s  %s\n"
+                 "  ------------------  ------  ------------------------\n",
+                 "File type", "Marker", "Search method");
+    for (uint32_t i = 0; i < scalpel_state.num_specs; i++) {
+      SearchSpec *spec = &scalpel_state.search_specs[i];
+      if (spec->MASTER) {
+        continue;
+      }
+      for (uint32_t direction = 0; direction < 2; direction++) {
+        bool header = direction == 0;
+        bool callback = header ? spec->HEADERFUNC != NULL : spec->FOOTERFUNC != NULL;
+        bool configured = callback || (header ? spec->HEADER[0] : spec->FOOTER[0]);
+        if (! configured) {
+          continue;
+        }
+        const char *method = callback ? "thread-based callback"
+            : pattern_in_simd_list(simple_pattern_list, i, header) ? "SIMD pattern search"
+            : "thread-based pattern search";
+        lock_fprintf(stdout, "  %-18s  %-6s  %s\n", spec->FILETYPE,
+                     header ? "header" : "footer", method);
+      }
+    }
+  }
+  lock_fprintf(stdout, "\nPattern categorization: %u SIMD, %u thread-based\n",
                simple_pattern_list ? simple_pattern_list->num_patterns : 0,
                num_thread_search_patterns);
+  if (! scalpel_state.mode_verbose) {
+    lock_fprintf(stdout, "Use -v for detailed header/footer patterns and search methods.\n");
+  }
 }
 
 

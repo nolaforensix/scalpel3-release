@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -35,6 +39,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "modico_classmap.h"
+#include "scalpel_output.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -216,7 +221,7 @@ int *modico_classmap_build(const char *classmap_path,
     size_t len = 0;
     char *buf = slurp(classmap_path, &len);
     if (!buf) {
-        fprintf(stderr, "[modico] classmap: cannot read %s\n", classmap_path);
+        lock_fprintf(stderr, "MoDiCo: classmap: cannot read %s\n", classmap_path);
         return NULL;
     }
 
@@ -231,12 +236,12 @@ int *modico_classmap_build(const char *classmap_path,
 
     if (rc != 0 || names.n == 0) {
         if (rc == MODICO_CLASSMAP_NAME_TOO_LONG) {
-            fprintf(stderr,
-                    "[modico] classmap: JSON class name exceeds %d bytes in %s\n",
+            lock_fprintf(stderr,
+                    "MoDiCo: classmap: JSON class name exceeds %d bytes in %s\n",
                     MODICO_JSON_CLASS_NAME_MAX, classmap_path);
         }
         else {
-            fprintf(stderr, "[modico] classmap: failed to parse %s (%d names)\n",
+            lock_fprintf(stderr, "MoDiCo: classmap: failed to parse %s (%d names)\n",
                     classmap_path, names.n);
         }
         namelist_free(&names);

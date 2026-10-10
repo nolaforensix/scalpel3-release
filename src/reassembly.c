@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -24,11 +28,8 @@
 // Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
-// scalpel3 is a complete rewrite of the open source scalpel, which was originally developed by
-// Golden G. Richard III in 2005 and then enhanced by both Vico Marziale and Golden G. Richard until
-// ~2013. Earlier versions of scalpel had their roots in Foremost 0.69. The emphasis of scalpel3 is
-// on *practical* solutions to solving file fragmentation for selected file types and making this
-// process as fast as possible on modern hardware.
+// The emphasis of scalpel3 is on *practical* solutions to solving file fragmentation for selected
+// file types and making this process as fast as possible on modern hardware.
 //
 // IMPORTANT: scalpel3 internals differ significantly from earlier versions of scalpel and the
 // configuration for scalpel3 is NOT compatible with earlier versions.

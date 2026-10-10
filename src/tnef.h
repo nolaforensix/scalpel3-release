@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -100,7 +104,8 @@ typedef struct TnefBlockChecksum {
   bool readable;
 } TnefBlockChecksum;
 
-#define TNEF_SEARCH_MAGIC UINT32_C(0x544e4631)
+#define TNEF_SEARCH_MAGIC_V1 UINT32_C(0x544e4631)
+#define TNEF_SEARCH_MAGIC UINT32_C(0x544e4632)
 typedef enum {
   TNEF_SEARCH_DIRECT, TNEF_SEARCH_INDEX, TNEF_SEARCH_GAP, TNEF_SEARCH_DISPLACED
 } TnefSearchPhase;
@@ -124,6 +129,9 @@ typedef struct {
   TnefSearchProgress progress;
   int64_t *best_actual;
   TnefBlockChecksum *index;
+  TnefParseSummary pending;
+  uint64_t prefix_blocks;
+  XXH128_hash_t prefix;
 } TnefCarveState;
 
 static inline bool tnef_serialize_carve_state(void **state, FILE *fp, StateSerialization mode);
@@ -131,6 +139,7 @@ static inline void *tnef_clone_carve_state(const void *state);
 static inline void tnef_free_carve_state(void **state);
 static inline size_t tnef_sizeof_carve_state(const void *state);
 static inline void tnef_print_carve_state(const void *state);
+static inline XXH128_hash_t tnef_search_prefix(CarveInfo *candidate, uint64_t blocks);
 static inline bool tnef_search_poll(ThreadWork *work, CarveInfo **candidate,
     uuid_string_t uuidp, uuid_string_t uuidc, TnefCarveState *state,
     const int64_t *best_mapping);
@@ -443,14 +452,64 @@ static inline void tnef_candidate_validate(CarveInfo *candidate,
                                            uint64_t *validates_to,
                                            bool *promising) {
 
-  (void)validates_to;
+  if (!candidate || !candidate->b || !validates || !validates_to || !promising) {
+    return;
+  }
 
-  if (!candidate || !candidate->b || !validates || !promising
-      || !*validates) {
+  if (!*validates) {
+    // The backend may retain only the verified prefix. Preserve the next
+    // attribute's description before its header is removed by that trim.
+    TnefParseSummary summary;
+    const uint64_t length = blockvector_get_data_length(candidate->b);
+    const uint64_t blocksize = scalpel_state.blocksize;
+    if (*promising && blocksize && tnef_parse(
+            (const uint8_t *)blockvector_get_data_pointer(candidate->b),
+            length, &summary) != TNEF_PARSE_INVALID
+        && summary.verified_end && summary.pending_attribute_end
+        && summary.pending_attribute_end <= UINT64_MAX - TNEF_ATTRIBUTE_OVERHEAD) {
+      const uint64_t keep = CEILDIV(summary.verified_end, blocksize);
+      if (keep <= length / blocksize && keep <= blockvector_get_num_blocks(candidate->b)) {
+        TnefCarveState *saved = carve_get_state(candidate->carvehashkey);
+        const XXH128_hash_t prefix = tnef_search_prefix(candidate, keep);
+        if (!saved || saved->prefix_blocks != keep
+            || !XXH128_isEqual(saved->prefix, prefix)
+            || memcmp(&saved->pending, &summary, sizeof(summary)) != 0) {
+          tnef_free_carve_state((void **)&saved);
+          saved = calloc(1, sizeof(*saved));
+          check_memory_allocation(saved, __LINE__, __FILE__, "TNEF pending attribute");
+          saved->progress.magic = TNEF_SEARCH_MAGIC;
+          saved->progress.block_count = CEILDIV(
+              summary.pending_attribute_end + TNEF_ATTRIBUTE_OVERHEAD, blocksize);
+          saved->progress.image_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+          saved->pending = summary;
+          saved->prefix_blocks = keep;
+          saved->prefix = prefix;
+          carve_put_state(candidate->carvehashkey, saved);
+        }
+        tnef_free_carve_state((void **)&saved);
+        // Keep the block containing verified bytes through the backend's
+        // whole-block trim. The parser's verified_end remains the byte limit.
+        *validates_to = keep * blocksize - 1;
+      }
+    }
     return;
   }
 
   const uint64_t block_count = blockvector_get_num_blocks(candidate->b);
+
+  TnefCarveState *saved = carve_get_state(candidate->carvehashkey);
+  if (saved) {
+    const bool pending = saved->pending.pending_attribute_end > blockvector_get_data_length(candidate->b);
+    const bool same_prefix = saved->prefix_blocks == block_count
+        && XXH128_isEqual(saved->prefix, tnef_search_prefix(candidate, block_count));
+    const bool legacy_pending = !saved->prefix_blocks && saved->progress.block_count > block_count;
+    tnef_free_carve_state((void **)&saved);
+    if ((pending && same_prefix) || legacy_pending) {
+      *validates = false;
+      *promising = true;
+      return;
+    }
+  }
 
   if (block_count < 2) {
     return;
@@ -514,6 +573,43 @@ static inline bool tnef_reassembly_poll(ThreadWork *work,
     return true;
   }
   return false;
+}
+
+// Pending attribute metadata depends on the retained prefix, not on changes
+// elsewhere in the image that require the source scan to be restarted.
+static inline XXH128_hash_t tnef_search_prefix(CarveInfo *candidate, uint64_t blocks) {
+  XXH3_state_t hash;
+  XXH3_128bits_reset(&hash);
+  const uint64_t length = blocks * (uint64_t)scalpel_state.blocksize;
+  const uint64_t geometry[] = {blocks, length, scalpel_state.blocksize};
+  XXH3_128bits_update(&hash, geometry, sizeof(geometry));
+  const uint64_t image_bytes = filemirror_filesize(scalpel_state.filemirror);
+  const uint64_t image_blocks = CEILDIV(image_bytes, (uint64_t)scalpel_state.blocksize);
+  static const uint8_t zeros[256] = {0};
+  for (uint64_t slot = 0; slot < blocks; slot++) {
+    const int64_t actual = blockvector_get_actual_blocknumber(candidate->b, slot);
+    XXH3_128bits_update(&hash, &actual, sizeof(actual));
+    uint64_t available = 0;
+    const char *data = actual >= 0 && (uint64_t)actual < image_blocks
+        ? filemirror_actual_block_data_pointer(scalpel_state.filemirror, actual, &available) : NULL;
+    if (!data) {
+      available = 0;
+    }
+    if (available > scalpel_state.blocksize) {
+      available = scalpel_state.blocksize;
+    }
+    XXH3_128bits_update(&hash, &available, sizeof(available));
+    if (available) {
+      XXH3_128bits_update(&hash, data, (size_t)available);
+    }
+    uint64_t padding = scalpel_state.blocksize - available;
+    while (padding) {
+      const size_t chunk = padding < sizeof(zeros) ? (size_t)padding : sizeof(zeros);
+      XXH3_128bits_update(&hash, zeros, chunk);
+      padding -= chunk;
+    }
+  }
+  return XXH3_128bits_digest(&hash);
 }
 
 // Persist only when yielding. Scratch bytes can be reconstructed; ranked
@@ -1401,6 +1497,9 @@ static inline TnefRecoveryResult tnef_reassembly_repair_attribute(
     state->progress.block_count = block_count;
     state->progress.image_blocks = image_blocks;
   }
+  state->pending = *current_summary;
+  state->prefix_blocks = committed_blocks;
+  state->prefix = tnef_search_prefix(*candidate, committed_blocks);
   TnefSearchProgress *progress = &state->progress;
   TnefRecoveryScore *best = &progress->best;
   const bool resume_gap = progress->phase == TNEF_SEARCH_GAP;
@@ -1650,9 +1749,29 @@ static inline void tnef_reassembly(ThreadWork *work,
     blockvector_set_data_length(blockvector, blocks * (uint64_t)scalpel_state.blocksize);
     inflate_blockvector(blockvector);
     TnefParseSummary current_summary;
-    const TnefParseResult current_result = tnef_parse(
+    TnefParseResult current_result = tnef_parse(
         (const uint8_t *)blockvector_get_data_pointer(blockvector),
         blockvector_get_data_length(blockvector), &current_summary);
+
+    // Trimming to a verified boundary can remove the next attribute's header.
+    // Its absence after a checkpoint is not evidence that the stream ended.
+    TnefCarveState *saved = carve_get_state((*candidate)->carvehashkey);
+    if (saved) {
+      const bool pending = saved->pending.pending_attribute_end > current_summary.verified_end;
+      if (pending && saved->prefix_blocks == blocks
+          && saved->pending.verified_end == current_summary.verified_end
+          && XXH128_isEqual(saved->prefix, tnef_search_prefix(*candidate, blocks))) {
+        current_summary = saved->pending;
+        current_result = TNEF_PARSE_TRUNCATED;
+      }
+      else if (current_result == TNEF_PARSE_COMPLETE
+          && (pending || (!saved->prefix_blocks && saved->progress.block_count > blocks))) {
+        // Older checkpoints omitted the pending header. Keep their prefix as
+        // partial rather than claiming that a forgotten search was complete.
+        current_result = TNEF_PARSE_TRUNCATED;
+      }
+      tnef_free_carve_state((void **)&saved);
+    }
 
     if (current_result == TNEF_PARSE_COMPLETE) {
       blockvector_set_data_length(blockvector, current_summary.verified_end);
@@ -1726,13 +1845,19 @@ static inline bool tnef_serialize_carve_state(void **state, FILE *fp, StateSeria
   }
   if (mode == SERIALIZE) {
     const TnefCarveState *saved = *state;
-    const TnefSearchProgress *p = &saved->progress;
+    TnefSearchProgress header = saved->progress;
+    header.magic = TNEF_SEARCH_MAGIC;
+    const TnefSearchProgress *p = &header;
     return fwrite(p, sizeof(*p), 1, fp) == 1
         && (!p->best.found || fwrite(saved->best_actual, sizeof(int64_t), (size_t)p->block_count, fp) == p->block_count)
-        && (!p->index_count || fwrite(saved->index, sizeof(TnefBlockChecksum), (size_t)p->index_count, fp) == p->index_count);
+        && (!p->index_count || fwrite(saved->index, sizeof(TnefBlockChecksum), (size_t)p->index_count, fp) == p->index_count)
+        && fwrite(&saved->pending, sizeof(saved->pending), 1, fp) == 1
+        && fwrite(&saved->prefix_blocks, sizeof(saved->prefix_blocks), 1, fp) == 1
+        && fwrite(&saved->prefix, sizeof(saved->prefix), 1, fp) == 1;
   }
   TnefSearchProgress p;
-  if (fread(&p, sizeof(p), 1, fp) != 1 || p.magic != TNEF_SEARCH_MAGIC
+  if (fread(&p, sizeof(p), 1, fp) != 1
+      || (p.magic != TNEF_SEARCH_MAGIC && p.magic != TNEF_SEARCH_MAGIC_V1)
       || p.phase > TNEF_SEARCH_DISPLACED || !p.block_count
       || p.block_count > SIZE_MAX / sizeof(int64_t)
       || p.image_blocks > SIZE_MAX / sizeof(TnefBlockChecksum)
@@ -1777,6 +1902,36 @@ static inline bool tnef_serialize_carve_state(void **state, FILE *fp, StateSeria
       return false;
     }
   }
+  if (p.magic == TNEF_SEARCH_MAGIC) {
+    if (fread(&saved->pending, sizeof(saved->pending), 1, fp) != 1
+        || fread(&saved->prefix_blocks, sizeof(saved->prefix_blocks), 1, fp) != 1
+        || fread(&saved->prefix, sizeof(saved->prefix), 1, fp) != 1
+        || saved->prefix_blocks > p.block_count) {
+      tnef_free_carve_state((void **)&saved);
+      return false;
+    }
+    const TnefParseSummary *pending = &saved->pending;
+    const TnefParseSummary empty = {0};
+    if (!saved->prefix_blocks
+        && (memcmp(pending, &empty, sizeof(empty)) != 0
+            || saved->prefix.low64 || saved->prefix.high64)) {
+      tnef_free_carve_state((void **)&saved);
+      return false;
+    }
+    if (saved->prefix_blocks
+        && (pending->pending_attribute_start != pending->verified_end
+            || pending->pending_attribute_start > UINT64_MAX - TNEF_ATTRIBUTE_OVERHEAD
+            || pending->pending_payload_offset != pending->pending_attribute_start + TNEF_ATTRIBUTE_HEADER_SIZE
+            || pending->pending_payload_length == 0
+            || pending->pending_payload_length > UINT32_MAX
+            || pending->pending_payload_length > UINT64_MAX - pending->pending_payload_offset - TNEF_ATTRIBUTE_CHECKSUM_SIZE
+            || pending->pending_attribute_end != pending->pending_payload_offset
+                + pending->pending_payload_length + TNEF_ATTRIBUTE_CHECKSUM_SIZE)) {
+      tnef_free_carve_state((void **)&saved);
+      return false;
+    }
+  }
+  saved->progress.magic = TNEF_SEARCH_MAGIC;
   *state = saved;
   return true;
 }

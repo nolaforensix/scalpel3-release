@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -2349,7 +2353,15 @@ static inline uint64_t jpg_huffman_validate(JpgValidationContext *ctx,
             return last_mcu_start_pos > 0 ? last_mcu_start_pos : bs.byte_pos;
           }
           dc_diff = (dc_extra < (1 << (dc_sym - 1))) ? dc_extra - (1 << dc_sym) + 1 : dc_extra;
-          comp_dc_predictor[sc->comp_idx] += dc_diff;
+          const int64_t predicted = (int64_t)comp_dc_predictor[sc->comp_idx] + dc_diff;
+          // Invalid entropy must not overflow the saved coefficient predictor.
+          if (predicted < INT32_MIN || predicted > INT32_MAX) {
+            if (failure) {
+              *failure = JPG_HUFFMAN_FAILURE_ENTROPY_CODE;
+            }
+            return last_mcu_start_pos > 0 ? last_mcu_start_pos : bs.byte_pos;
+          }
+          comp_dc_predictor[sc->comp_idx] = (int32_t)predicted;
         }
 
         int32_t abs_dc_diff = (dc_diff < 0) ? -dc_diff : dc_diff;

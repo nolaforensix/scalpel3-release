@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -8591,18 +8595,24 @@ static inline bool exe_extract_authenticode_digest(
   const EVP_MD *method = algorithm_object
                              ? EVP_get_digestbynid(OBJ_obj2nid(algorithm_object))
                              : NULL;
-  if (!method || !digest_string || digest_string->length <= 0
-      || digest_string->length != EVP_MD_get_size(method)) {
+  const int extracted_length = digest_string
+                                   ? ASN1_STRING_length(digest_string) : 0;
+  const unsigned char *digest_data = digest_string
+                                        ? ASN1_STRING_get0_data(digest_string)
+                                        : NULL;
+  if (!method || !digest_data || extracted_length <= 0
+      || extracted_length > EVP_MAX_MD_SIZE
+      || extracted_length != EVP_MD_get_size(method)) {
     X509_SIG_free(digest_info);
     PKCS7_free(pkcs7);
     return false;
   }
 
   static _Thread_local uint8_t extracted[EVP_MAX_MD_SIZE];
-  memcpy(extracted, digest_string->data, (size_t)digest_string->length);
+  memcpy(extracted, digest_data, (size_t)extracted_length);
   *digest_method = method;
   *digest = extracted;
-  *digest_length = (uint32_t)digest_string->length;
+  *digest_length = (uint32_t)extracted_length;
   X509_SIG_free(digest_info);
   PKCS7_free(pkcs7);
   return true;

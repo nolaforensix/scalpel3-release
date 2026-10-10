@@ -184,6 +184,8 @@ the recovery checkpoint.
 Treat blocks in the image before the specified block number as covered.
 This option in conjunction with -k allows execution of scalpel3 against a window of blocks in the input file.
 Block numbers start at zero; the specified block is included in the window.
+When omitted, the start block is inherited from the blockmap. An explicit
+\fB-j 0\fR overrides a saved nonzero start block.
 
 .TP
 .BI -k " #"
@@ -191,6 +193,8 @@ Treat blocks in the image after the specified block number as covered.  This opt
 conjunction with -j allows execution of scalpel3 against a window of blocks in the input file.
 The specified block is included in the window. Both endpoints must be in
 the image, with the start no greater than the end.
+When omitted, the end block is inherited from the blockmap. Only explicitly
+supplied bounds override the saved window.
 
 .TP
 .B -L
@@ -376,6 +380,8 @@ by scalpel3.  Please see this source file for more information.
 Set this to the base scalpel3 directory so runtime resources, including AI
 models, can be located.  It does not select the executable: checkpoint
 compatibility uses the hash of the scalpel3 binary that is actually running.
+Use the repository root, not its \fIsrc\fR directory. An invalid root is
+reported as a configuration error before carving begins.
 This variable is not required for the informational \fB-h\fR, \fB-L\fR, and
 \fB-V\fR options.
 .TP
@@ -386,6 +392,8 @@ Other block validators are unaffected.
 .B SCALPEL3_MODICO_DIR
 Override the model directory, normally
 \fI${SCALPEL3_HOME}/src/exe_vision/unix\fR.
+An unreadable or nonexistent directory is an error, not an indication that
+the selected block size lacks a model.
 .TP
 .B SCALPEL3_MODICO_CLASSMAP
 Override the class-name mapping file, normally \fIclass_names.json\fR in

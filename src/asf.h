@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -53,7 +57,7 @@
 #define ASF_MAXIMUM_HEADER_OBJECTS UINT32_C(1048576)
 #define ASF_PAYLOAD_CONFIDENCE_MAX 99
 #define ASF_CARVE_STATE_MAGIC UINT32_C(0x41534653)
-#define ASF_CARVE_STATE_VERSION 9U
+#define ASF_CARVE_STATE_VERSION 10U
 #define ASF_REPAIR_ANCHOR_PACKETS 3U
 #define ASF_REPAIR_POLL_INTERVAL UINT64_C(256)
 #define ASF_REPAIR_PREFERRED_HYPOTHESES 8U
@@ -123,6 +127,23 @@ typedef struct AsfLayout {
   bool broadcast;
 } AsfLayout;
 
+typedef enum AsfRefinePhase {
+  ASF_REFINE_NONE,
+  ASF_REFINE_PREFIX,
+  ASF_REFINE_SCORES
+} AsfRefinePhase;
+
+typedef struct AsfRefineState {
+  uint64_t view;
+  uint64_t next_slot;
+  uint64_t maximum_shift;
+  uint64_t next_shift;
+  int64_t cumulative_gain;
+  int64_t best_gain;
+  uint64_t best_shift;
+  uint32_t phase;
+} AsfRefineState;
+
 typedef struct AsfCarveState {
   uint32_t magic;
   uint32_t version;
@@ -155,6 +176,7 @@ typedef struct AsfCarveState {
   uint32_t preferred_count;
   uint32_t preferred_index;
   uint32_t preferred_modes[ASF_REPAIR_PREFERRED_HYPOTHESES];
+  AsfRefineState refinement;
 } AsfCarveState;
 
 typedef struct AsfAnchorScore {
@@ -272,10 +294,17 @@ static inline BlockValidationDecision asf_reassembly_confidence(
 static inline bool asf_reassembly_apparent_in_prefix(
     BlockVector *blockvector, int64_t apparent,
     uint64_t prefix_blocks);
+static inline uint64_t asf_reassembly_refinement_view(
+    BlockVector *blockvector, const AsfCarveState *state,
+    int32_t asf_index, int32_t wmv_index, uint64_t image_blocks);
+static inline bool asf_reassembly_refinement_valid(
+    const AsfRefineState *refinement, uint64_t target,
+    uint64_t maximum_shift);
 static inline bool asf_reassembly_refine_opaque_boundary(
     ThreadWork *work, CarveInfo **candidate, AsfCarveState *state,
     int32_t asf_index, int32_t wmv_index, uint64_t image_blocks,
-    uuid_string_t uuidp, uuid_string_t uuidc);
+    uuid_string_t uuidp, uuid_string_t uuidc, BlockVector **original,
+    uint64_t original_validates_to);
 static inline bool asf_reassembly_copy_packet(
     CarveInfo *candidate, const uint8_t *prefix, uint64_t prefix_length,
     uint64_t target_offset, int64_t source_actual, uint64_t source_blocks,
@@ -293,6 +322,12 @@ static inline bool asf_reassembly_better_anchor(
 static inline bool asf_reassembly_checkpoint(
     ThreadWork *work, CarveInfo **candidate, AsfCarveState *state,
     uuid_string_t uuidp, uuid_string_t uuidc);
+static inline void asf_reassembly_rollback_trial(CarveInfo *candidate,
+    BlockVector **original, uint64_t original_validates_to);
+static inline bool asf_reassembly_checkpoint_trial(
+    ThreadWork *work, CarveInfo **candidate, AsfCarveState *state,
+    uuid_string_t uuidp, uuid_string_t uuidc, BlockVector **original,
+    uint64_t original_validates_to);
 static inline bool asf_reassembly_extend_prefix(CarveInfo *candidate,
                                                 uint64_t target_slot,
                                                 uint64_t image_blocks);
@@ -955,7 +990,8 @@ static inline uint32_t asf_block_validate(
 
 static inline bool asf_carve_state_valid(const AsfCarveState *state) {
   return state && state->magic == ASF_CARVE_STATE_MAGIC
-      && state->version == ASF_CARVE_STATE_VERSION;
+      && state->version == ASF_CARVE_STATE_VERSION
+      && state->refinement.phase <= ASF_REFINE_SCORES;
 }
 
 static inline bool asf_serialize_carve_state(void **state, FILE *fp,
@@ -969,10 +1005,26 @@ static inline bool asf_serialize_carve_state(void **state, FILE *fp,
     check_memory_allocation(*asf_state, __LINE__, __FILE__,
                             "AsfCarveState");
   }
-  if ((mode == SERIALIZE && !asf_carve_state_valid(*asf_state))
-      || (mode == SERIALIZE
-          ? fwrite(*asf_state, sizeof(**asf_state), 1, fp)
-          : fread(*asf_state, sizeof(**asf_state), 1, fp)) != 1) {
+  bool valid = false;
+  if (mode == SERIALIZE) {
+    valid = asf_carve_state_valid(*asf_state)
+        && fwrite(*asf_state, sizeof(**asf_state), 1, fp) == 1;
+  }
+  else {
+    const size_t prefix_size = offsetof(AsfCarveState, signature);
+    valid = fread(*asf_state, prefix_size, 1, fp) == 1
+        && (*asf_state)->magic == ASF_CARVE_STATE_MAGIC
+        && ((*asf_state)->version == 9U
+            || (*asf_state)->version == ASF_CARVE_STATE_VERSION);
+    if (valid) {
+      size_t record_size = (*asf_state)->version == 9U
+          ? offsetof(AsfCarveState, refinement) : sizeof(**asf_state);
+      valid = fread((uint8_t *)*asf_state + prefix_size,
+                    record_size - prefix_size, 1, fp) == 1;
+      (*asf_state)->version = ASF_CARVE_STATE_VERSION;
+    }
+  }
+  if (!valid) {
     if (mode == DESERIALIZE) {
       free(*asf_state);
       *asf_state = NULL;
@@ -1092,6 +1144,7 @@ static inline void asf_reassembly_clear_best(AsfCarveState *state) {
   state->best_time_pairs = 0;
   state->best_prefix_zeros = 0;
   state->matches = 0;
+  memset(&state->refinement, 0, sizeof(state->refinement));
 }
 
 static inline void asf_reassembly_add_preferred(
@@ -1229,12 +1282,80 @@ static inline bool asf_reassembly_apparent_in_prefix(
   return false;
 }
 
+// Bind the saved refinement to its prefix and the evidence it actually uses.
+// Apparent renumbering, reservations and unrelated image blocks do not matter.
+static inline uint64_t asf_reassembly_refinement_view(
+    BlockVector *blockvector, const AsfCarveState *state,
+    int32_t asf_index, int32_t wmv_index, uint64_t image_blocks) {
+  uint64_t view = UINT64_C(1469598103934665603);
+  const uint64_t scope[] = {state->first_target_slot,
+      state->best_target_slot, (uint64_t)state->best_actual, image_blocks,
+      scalpel_state.blocksize, (uint64_t)asf_index, (uint64_t)wmv_index,
+      state->refinement.phase};
+  for (size_t index = 0; index < sizeof(scope) / sizeof(scope[0]); index++) {
+    view = (view ^ scope[index]) * UINT64_C(1099511628211);
+  }
+  for (uint64_t slot = 0; slot < state->best_target_slot; slot++) {
+    int64_t actual = blockvector_get_actual_blocknumber(blockvector, slot);
+    view = (view ^ (uint64_t)actual) * UINT64_C(1099511628211);
+  }
+  if (state->refinement.phase == ASF_REFINE_SCORES) {
+    for (uint64_t shift = 1; shift <= state->refinement.maximum_shift;
+         shift++) {
+      int64_t source = state->best_actual - (int64_t)shift;
+      int64_t retained = blockvector_get_actual_blocknumber(
+          blockvector, state->best_target_slot - shift);
+      bool available = source >= 0 && (uint64_t)source < image_blocks
+          && !filemirror_actual_block_covered(scalpel_state.filemirror, source)
+          && filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                               source) >= 0;
+      uint64_t scores = (uint64_t)asf_reassembly_confidence(
+          source, asf_index, wmv_index)
+          | ((uint64_t)asf_reassembly_confidence(
+              retained, asf_index, wmv_index) << 8)
+          | ((uint64_t)available << 16);
+      view = (view ^ scores) * UINT64_C(1099511628211);
+    }
+  }
+  return view;
+}
+
+// Check saved work before using its cursors or accumulating another score.
+static inline bool asf_reassembly_refinement_valid(
+    const AsfRefineState *refinement, uint64_t target,
+    uint64_t maximum_shift) {
+  if (refinement->phase == ASF_REFINE_NONE
+      || refinement->phase > ASF_REFINE_SCORES
+      || refinement->maximum_shift > maximum_shift
+      || refinement->maximum_shift > INT64_MAX / BLOCK_CONFIDENCE_VALID
+      || refinement->next_slot > target
+      || refinement->next_shift == 0
+      || refinement->next_shift > refinement->maximum_shift + 1) {
+    return false;
+  }
+  if (refinement->phase == ASF_REFINE_PREFIX) {
+    return refinement->next_shift == 1
+        && refinement->cumulative_gain == 0 && refinement->best_gain == 0
+        && refinement->best_shift == 0;
+  }
+  const uint64_t processed = refinement->next_shift - 1;
+  const int64_t score_bound = (int64_t)processed * BLOCK_CONFIDENCE_VALID;
+  return (refinement->maximum_shift == 0 || refinement->next_slot == target)
+      && refinement->best_shift <= processed
+      && refinement->best_gain >= 0 && refinement->best_gain <= score_bound
+      && refinement->cumulative_gain >= -score_bound
+      && refinement->cumulative_gain <= refinement->best_gain
+      && ((refinement->best_shift == 0) == (refinement->best_gain == 0));
+}
+
 static inline bool asf_reassembly_refine_opaque_boundary(
     ThreadWork *work, CarveInfo **candidate, AsfCarveState *state,
     int32_t asf_index, int32_t wmv_index, uint64_t image_blocks,
-    uuid_string_t uuidp, uuid_string_t uuidc) {
+    uuid_string_t uuidp, uuid_string_t uuidc, BlockVector **original,
+    uint64_t original_validates_to) {
   if (!work || !candidate || !*candidate || !(*candidate)->b || !state
       || state->best_actual < 0
+      || (uint64_t)state->best_actual >= image_blocks
       || state->best_target_slot <= state->first_target_slot
       || wmv_index < 0) {
     return false;
@@ -1250,15 +1371,39 @@ static inline bool asf_reassembly_refine_opaque_boundary(
   if ((uint64_t)state->best_actual < maximum_shift) {
     maximum_shift = (uint64_t)state->best_actual;
   }
+  if (maximum_shift > INT64_MAX / BLOCK_CONFIDENCE_VALID) {
+    memset(&state->refinement, 0, sizeof(state->refinement));
+    return false;
+  }
 
   int64_t first_source = state->best_actual - (int64_t)maximum_shift;
-  for (uint64_t slot = 0;
-       slot < state->best_target_slot && maximum_shift > 0; slot++) {
+  AsfRefineState *refinement = &state->refinement;
+  if (refinement->phase != ASF_REFINE_NONE
+      && (!asf_reassembly_refinement_valid(
+              refinement, state->best_target_slot, maximum_shift)
+          || refinement->view != asf_reassembly_refinement_view(
+              (*candidate)->b, state, asf_index, wmv_index, image_blocks))) {
+    memset(refinement, 0, sizeof(*refinement));
+  }
+  if (refinement->phase == ASF_REFINE_NONE) {
+    memset(refinement, 0, sizeof(*refinement));
+    refinement->phase = ASF_REFINE_PREFIX;
+    refinement->maximum_shift = maximum_shift;
+    refinement->next_shift = 1;
+    refinement->view = asf_reassembly_refinement_view(
+        (*candidate)->b, state, asf_index, wmv_index, image_blocks);
+  }
+  while (refinement->phase == ASF_REFINE_PREFIX
+         && refinement->next_slot < state->best_target_slot
+         && refinement->maximum_shift > 0) {
+    uint64_t slot = refinement->next_slot;
     if (slot > 0 && slot % ASF_REPAIR_POLL_INTERVAL == 0
-        && asf_reassembly_checkpoint(
-            work, candidate, state, uuidp, uuidc)) {
+        && asf_reassembly_checkpoint_trial(
+            work, candidate, state, uuidp, uuidc, original,
+            original_validates_to)) {
       return true;
     }
+    refinement->next_slot++;
     int64_t actual = blockvector_get_actual_blocknumber((*candidate)->b,
                                                         slot);
     if (actual < first_source || actual >= state->best_actual) {
@@ -1266,18 +1411,21 @@ static inline bool asf_reassembly_refine_opaque_boundary(
     }
     uint64_t shift = (uint64_t)(state->best_actual - actual);
     uint64_t replacement_slot = state->best_target_slot - shift;
-    if (shift <= maximum_shift && slot < replacement_slot) {
-      maximum_shift = shift - 1;
+    if (shift <= refinement->maximum_shift && slot < replacement_slot) {
+      refinement->maximum_shift = shift - 1;
     }
+  }
+  if (refinement->phase == ASF_REFINE_PREFIX) {
+    refinement->phase = ASF_REFINE_SCORES;
+    refinement->view = asf_reassembly_refinement_view(
+        (*candidate)->b, state, asf_index, wmv_index, image_blocks);
   }
 
   // Moving the target and source backward together preserves every packet byte
   // already checked by the anchor. Choose only the opaque prefix extension for
   // which classifier evidence improves on the blocks it replaces.
-  int64_t cumulative_gain = 0;
-  int64_t best_gain = 0;
-  uint64_t best_shift = 0;
-  for (uint64_t shift = 1; shift <= maximum_shift; shift++) {
+  while (refinement->next_shift <= refinement->maximum_shift) {
+    uint64_t shift = refinement->next_shift;
     uint64_t target_slot = state->best_target_slot - shift;
     int64_t source_actual = state->best_actual - (int64_t)shift;
     int64_t retained_actual = blockvector_get_actual_blocknumber(
@@ -1299,25 +1447,28 @@ static inline bool asf_reassembly_refine_opaque_boundary(
         source_actual, asf_index, wmv_index);
     BlockValidationDecision retained_confidence = asf_reassembly_confidence(
         retained_actual, asf_index, wmv_index);
-    cumulative_gain += (int64_t)source_confidence
+    refinement->cumulative_gain += (int64_t)source_confidence
         - (int64_t)retained_confidence;
-    if (cumulative_gain > best_gain) {
-      best_gain = cumulative_gain;
-      best_shift = shift;
+    if (refinement->cumulative_gain > refinement->best_gain) {
+      refinement->best_gain = refinement->cumulative_gain;
+      refinement->best_shift = shift;
     }
+    refinement->next_shift = shift + 1;
     if (shift % ASF_REPAIR_POLL_INTERVAL == 0
-        && asf_reassembly_checkpoint(
-            work, candidate, state, uuidp, uuidc)) {
+        && asf_reassembly_checkpoint_trial(
+            work, candidate, state, uuidp, uuidc, original,
+            original_validates_to)) {
       return true;
     }
   }
 
-  if (best_shift > 0) {
-    state->best_target_slot -= best_shift;
-    state->best_actual -= (int64_t)best_shift;
+  if (refinement->best_shift > 0) {
+    state->best_target_slot -= refinement->best_shift;
+    state->best_actual -= (int64_t)refinement->best_shift;
     state->best_confidence = (uint32_t)asf_reassembly_confidence(
         state->best_actual, asf_index, wmv_index);
   }
+  memset(refinement, 0, sizeof(*refinement));
   return false;
 }
 
@@ -1595,6 +1746,45 @@ static inline bool asf_reassembly_checkpoint(
       return true;
     }
   }
+  return false;
+}
+
+// A speculative preferred trial owns a separate vector; rejecting it must
+// restore both the original mapping and its validated-prefix bookkeeping.
+static inline void asf_reassembly_rollback_trial(CarveInfo *candidate,
+    BlockVector **original, uint64_t original_validates_to) {
+  if (candidate && original && *original) {
+    free_blockvector(&candidate->b);
+    candidate->b = *original;
+    *original = NULL;
+    candidate->best_validates_to = original_validates_to;
+  }
+}
+
+// Queue the durable parent. The preferred-search descriptor recreates its
+// temporary trial after restore; a declined checkpoint leaves the trial live.
+static inline bool asf_reassembly_checkpoint_trial(
+    ThreadWork *work, CarveInfo **candidate, AsfCarveState *state,
+    uuid_string_t uuidp, uuid_string_t uuidc, BlockVector **original,
+    uint64_t original_validates_to) {
+  if (!original || !*original) {
+    return asf_reassembly_checkpoint(work, candidate, state, uuidp, uuidc);
+  }
+  if (!candidate || !*candidate) {
+    free_blockvector(original);
+    return true;
+  }
+  BlockVector *trial = (*candidate)->b;
+  const uint64_t trial_validates_to = (*candidate)->best_validates_to;
+  (*candidate)->b = *original;
+  (*candidate)->best_validates_to = original_validates_to;
+  if (asf_reassembly_checkpoint(work, candidate, state, uuidp, uuidc)) {
+    *original = NULL;
+    free_blockvector(&trial);
+    return true;
+  }
+  (*candidate)->b = trial;
+  (*candidate)->best_validates_to = trial_validates_to;
   return false;
 }
 
@@ -2234,6 +2424,7 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
     }
 
     BlockVector *preferred_original = NULL;
+    uint64_t original_validates_to = (*candidate)->best_validates_to;
     while (*candidate
            && ((asf_reassembly_preferred_active(state)
                 && state->target_slot
@@ -2258,6 +2449,7 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
         BlockVector *trial = NULL;
         clone_blockvector(blockvector, &trial, true);
         preferred_original = blockvector;
+        original_validates_to = (*candidate)->best_validates_to;
         (*candidate)->b = trial;
         blockvector = trial;
         blocks = blockvector_get_num_blocks(blockvector);
@@ -2270,11 +2462,8 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
       else if (!hole_splice_scan && target_slot > blocks) {
         if (!asf_reassembly_extend_prefix(*candidate, target_slot,
                                           image_blocks)) {
-          if (preferred_original) {
-            free_blockvector(&(*candidate)->b);
-            (*candidate)->b = preferred_original;
-            preferred_original = NULL;
-          }
+          asf_reassembly_rollback_trial(*candidate, &preferred_original,
+                                         original_validates_to);
           if (!asf_reassembly_advance_target(state)) {
             break;
           }
@@ -2290,8 +2479,10 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
       if (prefix_length > blockvector_get_data_length(blockvector)) {
         prefix_length = blockvector_get_data_length(blockvector);
       }
-      (*candidate)->best_validates_to = prefix_length > 0
-          ? prefix_length - 1 : 0;
+      if (!hole_splice_scan) {
+        (*candidate)->best_validates_to = prefix_length > 0
+            ? prefix_length - 1 : 0;
+      }
       AsfLayout prefix_layout;
       AsfParseResult prefix_result = asf_parse_file(
           (const uint8_t *)blockvector_get_data_pointer(blockvector),
@@ -2302,11 +2493,8 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
           || !prefix_layout.packet_geometry_fixed
           || prefix_layout.packet_size == 0
           || prefix_layout.packets_parsed >= prefix_layout.packet_count) {
-        if (preferred_original) {
-          free_blockvector(&(*candidate)->b);
-          (*candidate)->b = preferred_original;
-          preferred_original = NULL;
-        }
+        asf_reassembly_rollback_trial(*candidate, &preferred_original,
+                                       original_validates_to);
         if (!asf_reassembly_advance_target(state)) {
           break;
         }
@@ -2360,6 +2548,49 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
             }
             scan_end = source + 1;
           }
+        }
+      }
+      // Checkpoint pruning can make a saved winner unusable. Its score must
+      // not suppress still-available alternatives from earlier in this scan.
+      if (state->best_actual >= 0) {
+        int64_t best_apparent = (uint64_t)state->best_actual < image_blocks
+            ? filemirror_apparent_blocknumber(
+                scalpel_state.filemirror, state->best_actual) : -1;
+        bool available = (uint64_t)state->best_actual < image_blocks
+            && !filemirror_actual_block_covered(
+                scalpel_state.filemirror, state->best_actual)
+            && best_apparent >= 0
+            && !(hole_splice_scan
+                ? asf_reassembly_apparent_in_prefix(
+                    blockvector, best_apparent, target_slot)
+                : apparent_block_in_blockvector(blockvector, best_apparent));
+        if (available && contiguous_prefix_scan) {
+          available = !filemirror_actual_block_is_zero(
+              scalpel_state.filemirror, state->best_actual);
+        }
+        else if (available) {
+          AsfAnchorScore score;
+          available = asf_reassembly_score_anchor(
+              *candidate, &prefix_layout, target_slot, state->best_actual,
+              hole_splice_scan
+                  ? state->preferred_end_slots[state->preferred_index] - target_slot
+                  : UINT64_MAX,
+              hole_splice_scan
+                  ? state->preferred_suffix_actuals[state->preferred_index] : -1,
+              prefix_length, packet, image_blocks, &score)
+              && score.packets == state->best_anchor_packets
+              && score.time_cost == state->best_time_cost
+              && score.object_cost == state->best_object_cost
+              && score.sequence_cost == state->best_sequence_cost
+              && score.object_pairs == state->best_object_pairs
+              && score.sequence_pairs == state->best_sequence_pairs
+              && score.time_pairs == state->best_time_pairs;
+        }
+        if (!available) {
+          asf_reassembly_clear_best(state);
+          state->next_actual = preferred_trial && !hole_splice_scan
+              ? (uint64_t)state->preferred_source_actuals[state->preferred_index]
+              : 0;
         }
       }
       for (uint64_t actual_index = state->next_actual;
@@ -2469,8 +2700,9 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
         }
 
         if (state->next_actual % ASF_REPAIR_POLL_INTERVAL == 0
-            && asf_reassembly_checkpoint(
-                work, candidate, state, uuidp, uuidc)) {
+            && asf_reassembly_checkpoint_trial(
+                work, candidate, state, uuidp, uuidc, &preferred_original,
+                original_validates_to)) {
           free(packet);
           asf_free_carve_state((void **)&state);
           return;
@@ -2478,9 +2710,8 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
       }
       free(packet);
       if (state->best_actual < 0 && preferred_original) {
-        free_blockvector(&(*candidate)->b);
-        (*candidate)->b = preferred_original;
-        preferred_original = NULL;
+        asf_reassembly_rollback_trial(*candidate, &preferred_original,
+                                       original_validates_to);
       }
       if (state->best_actual >= 0
           || !asf_reassembly_advance_target(state)) {
@@ -2500,7 +2731,7 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
     if (!hole_splice && layout.saw_windows_media_video
         && asf_reassembly_refine_opaque_boundary(
             work, candidate, state, asf_index, wmv_index, image_blocks,
-            uuidp, uuidc)) {
+            uuidp, uuidc, &preferred_original, original_validates_to)) {
       asf_free_carve_state((void **)&state);
       return;
     }
@@ -2513,6 +2744,7 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
       BlockVector *trial = NULL;
       clone_blockvector(blockvector, &trial, true);
       preferred_original = blockvector;
+      original_validates_to = (*candidate)->best_validates_to;
       (*candidate)->b = trial;
       blockvector = trial;
       blocks = blockvector_get_num_blocks(blockvector);
@@ -2524,6 +2756,8 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
     else if (!hole_splice && target_slot > blocks
              && !asf_reassembly_extend_prefix(*candidate, target_slot,
                                               image_blocks)) {
+      asf_reassembly_rollback_trial(*candidate, &preferred_original,
+                                     original_validates_to);
       break;
     }
 
@@ -2543,9 +2777,8 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
         || !prefix_layout.data_object_valid
         || !prefix_layout.packet_geometry_fixed) {
       if (preferred_hypothesis) {
-        free_blockvector(&(*candidate)->b);
-        (*candidate)->b = preferred_original;
-        preferred_original = NULL;
+        asf_reassembly_rollback_trial(*candidate, &preferred_original,
+                                       original_validates_to);
         state->scan_active = 1;
         if (asf_reassembly_advance_target(state)) {
           continue;
@@ -2588,9 +2821,8 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
               image_blocks, contiguous_prefix);
     if (!applied) {
       if (preferred_hypothesis) {
-        free_blockvector(&(*candidate)->b);
-        (*candidate)->b = preferred_original;
-        preferred_original = NULL;
+        asf_reassembly_rollback_trial(*candidate, &preferred_original,
+                                       original_validates_to);
         state->scan_active = 1;
         if (asf_reassembly_advance_target(state)) {
           continue;
@@ -2612,9 +2844,8 @@ static inline void asf_reassembly(ThreadWork *work, CarveInfo **candidate,
       resize_blockvector((*candidate)->b, target_slot);
       inflate_blockvector((*candidate)->b);
       if (preferred_hypothesis) {
-        free_blockvector(&(*candidate)->b);
-        (*candidate)->b = preferred_original;
-        preferred_original = NULL;
+        asf_reassembly_rollback_trial(*candidate, &preferred_original,
+                                       original_validates_to);
         state->scan_active = 1;
         if (asf_reassembly_advance_target(state)) {
           continue;

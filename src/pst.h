@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -68,7 +72,7 @@
 #define PST_MAXIMUM_FILE_SIZE                UINT64_C(1099511627776)
 #define PST_BLOCK_CONFIDENCE                 95
 #define PST_STATE_MAGIC                      UINT32_C(0x50535452)
-#define PST_STATE_VERSION                    UINT32_C(5)
+#define PST_STATE_VERSION                    UINT32_C(6)
 #define PST_REASSEMBLY_POLL_INTERVAL         UINT64_C(64)
 #define PST_REASSEMBLY_FAST_SHIFT_LIMIT      UINT64_C(64)
 #define PST_REASSEMBLY_HYPOTHESIS_LIMIT      UINT32_C(16)
@@ -270,6 +274,7 @@ typedef struct PstCarveState {
   PstRepairSearch searches[PST_SEARCH_CONTEXTS];
   PstFreeGapSearch free_gaps;
   PstContinuitySearch continuity;
+  roaring64_bitmap_t *checkpoint_covered;
 } PstCarveState;
 
 static uint32_t pst_crc32_table[256];
@@ -374,6 +379,11 @@ static inline bool pst_reassembly_anchor_mapping(
     BlockVector *blockvector, PstVariant variant, int64_t *mapping,
     uint64_t first_slot, uint64_t blocks, int64_t actual, bool permute);
 static inline XXH128_hash_t pst_reassembly_view_hash(CarveInfo *candidate);
+static inline roaring64_bitmap_t *pst_reassembly_covered_blocks(void);
+static inline bool pst_reassembly_run_available(CarveInfo *candidate,
+    int64_t actual, uint64_t blocks);
+static inline bool pst_serialize_coverage(PstCarveState *state, FILE *fp,
+    StateSerialization mode);
 static inline void pst_reassembly_resume_searches(
     CarveInfo *candidate, PstCarveState *state);
 static inline bool pst_reassembly_poll(ThreadWork *work,
@@ -2046,8 +2056,8 @@ static inline void pst_reassembly_restore_best(
   }
 }
 
-// Physical mappings survive apparent renumbering. A changed coverage set
-// changes which substitutions are legal and requires fresh search evidence.
+// Physical mappings survive apparent renumbering. Coverage is compared
+// separately so unrelated removals do not discard completed search trials.
 static inline XXH128_hash_t pst_reassembly_view_hash(CarveInfo *candidate) {
   XXH3_state_t hash;
   XXH3_128bits_reset(&hash);
@@ -2067,32 +2077,114 @@ static inline XXH128_hash_t pst_reassembly_view_hash(CarveInfo *candidate) {
     XXH3_128bits_update(&hash, mapping, (size_t)count * sizeof(mapping[0]));
     first += count;
   }
-  const uint64_t image_blocks = CEILDIV(metadata[2], metadata[3]);
-  uint8_t covered[256];
-  for (uint64_t first = 0; first < image_blocks;) {
-    uint64_t count = image_blocks - first;
-    if (count > sizeof(covered)) {
-      count = sizeof(covered);
-    }
-    for (uint64_t i = 0; i < count; i++) {
-      covered[i] = filemirror_actual_block_covered(
-          scalpel_state.filemirror, (int64_t)(first + i)) ? 1 : 0;
-    }
-    XXH3_128bits_update(&hash, covered, (size_t)count);
-    first += count;
-  }
   return XXH3_128bits_digest(&hash);
+}
+
+// Retain the old unavailable set compactly to distinguish domain expansion
+// from removal of choices that cannot improve an earlier negative trial.
+static inline roaring64_bitmap_t *pst_reassembly_covered_blocks(void) {
+  roaring64_bitmap_t *covered = roaring64_bitmap_create();
+  check_memory_allocation(covered, __LINE__, __FILE__, "PST coverage snapshot");
+  const uint64_t blocks = CEILDIV(filemirror_filesize(scalpel_state.filemirror),
+                                  scalpel_state.blocksize);
+  for (uint64_t actual = 0; actual < blocks; actual++) {
+    if (filemirror_actual_block_covered(scalpel_state.filemirror, (int64_t)actual)) {
+      roaring64_bitmap_add(covered, actual);
+    }
+  }
+  roaring64_bitmap_run_optimize(covered);
+  return covered;
+}
+
+// A retained trial may use its own committed blocks, but cannot acquire
+// another candidate's newly covered data after a checkpoint.
+static inline bool pst_reassembly_run_available(CarveInfo *candidate,
+    int64_t actual, uint64_t blocks) {
+  const uint64_t image_blocks = CEILDIV(
+      filemirror_filesize(scalpel_state.filemirror), scalpel_state.blocksize);
+  if (actual < 0 || blocks == 0 || (uint64_t)actual >= image_blocks
+      || blocks > image_blocks - (uint64_t)actual
+      || blocks - 1 > (uint64_t)(INT64_MAX - actual)) {
+    return false;
+  }
+  for (uint64_t i = 0; i < blocks; i++) {
+    const int64_t source = actual + (int64_t)i;
+    if ((filemirror_actual_block_covered(scalpel_state.filemirror, source)
+         && pst_reassembly_find_actual_slot(candidate->b, source) < 0)
+        || (filemirror_apparent_blocknumber(scalpel_state.filemirror, source) < 0
+            && !filemirror_actual_block_is_zero(scalpel_state.filemirror, source))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 static inline void pst_reassembly_resume_searches(
     CarveInfo *candidate, PstCarveState *state) {
   if (state->checkpoint_saved) {
     const XXH128_hash_t view = pst_reassembly_view_hash(candidate);
-    if (!XXH128_isEqual(view, state->checkpoint_view)) {
+    roaring64_bitmap_t *covered = pst_reassembly_covered_blocks();
+    if (!XXH128_isEqual(view, state->checkpoint_view)
+        || !state->checkpoint_covered
+        || !roaring64_bitmap_is_subset(state->checkpoint_covered, covered)) {
+      // A changed base or newly available sources can enable formerly skipped
+      // trials. Old checkpoints lack this distinction and retain the old reset.
       memset(state->searches, 0, sizeof(state->searches));
       memset(&state->free_gaps, 0, sizeof(state->free_gaps));
       pst_continuity_clear(&state->continuity);
     }
+    else if (!roaring64_bitmap_equals(state->checkpoint_covered, covered)) {
+      for (uint32_t i = 0; i < PST_SEARCH_CONTEXTS; i++) {
+        PstRepairSearch *search = &state->searches[i];
+        if (!search->initialized) {
+          continue;
+        }
+        const uint64_t first_blocks = search->best_prefix_blocks != 0
+            ? search->best_prefix_blocks : search->best_blocks;
+        bool invalid = search->ambiguous || search->amap_identity_ambiguous;
+        if (search->best_actual >= 0) {
+          invalid = invalid || !pst_reassembly_run_available(
+              candidate, search->best_actual, first_blocks);
+        }
+        if (search->best_prefix_blocks != 0) {
+          invalid = invalid || !pst_reassembly_run_available(candidate,
+              search->best_tail_actual, search->best_blocks - first_blocks);
+        }
+        if (search->first_amap_actual >= 0) {
+          invalid = invalid || !pst_reassembly_run_available(
+              candidate, search->first_amap_actual, 1);
+        }
+        if (invalid) {
+          // Lost winners or unresolved ambiguity require new evidence only
+          // for this context, not for all other completed searches.
+          memset(search, 0, sizeof(*search));
+        }
+      }
+      PstFreeGapSearch *free_gaps = &state->free_gaps;
+      if (free_gaps->initialized && free_gaps->phase == 1
+          && free_gaps->width != 0 && free_gaps->next_slot > 0
+          && free_gaps->next_slot < blockvector_get_num_blocks(candidate->b)) {
+        const int64_t previous = blockvector_get_actual_blocknumber(
+            candidate->b, free_gaps->next_slot - 1);
+        if (previous == INT64_MAX || !pst_reassembly_run_available(
+                candidate, previous + 1, free_gaps->width)) {
+          // Further extensions of this prefix are no longer legal. Keep the
+          // publication budget and continue with the next possible boundary.
+          free_gaps->next_slot++;
+          free_gaps->width = 0;
+        }
+      }
+      for (uint64_t i = 0; i < state->continuity.count; i++) {
+        const PstContinuityRun *run = &state->continuity.runs[i];
+        if (!pst_reassembly_run_available(candidate, run->actual, run->blocks)) {
+          pst_continuity_clear(&state->continuity);
+          break;
+        }
+      }
+    }
+    roaring64_bitmap_free(covered);
+    roaring64_bitmap_free(state->checkpoint_covered);
+    state->checkpoint_covered = NULL;
     state->checkpoint_saved = false;
   }
 }
@@ -2113,12 +2205,16 @@ static inline bool pst_reassembly_poll(ThreadWork *work,
   }
   if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
     state->checkpoint_view = pst_reassembly_view_hash(*candidate);
+    roaring64_bitmap_free(state->checkpoint_covered);
+    state->checkpoint_covered = pst_reassembly_covered_blocks();
     state->checkpoint_saved = true;
     carve_put_state((*candidate)->carvehashkey, state);
     if (reassembly_time_to_checkpoint(work->id, *candidate, uuidp, uuidc)) {
       return true;
     }
     state->checkpoint_saved = false;
+    roaring64_bitmap_free(state->checkpoint_covered);
+    state->checkpoint_covered = NULL;
   }
   return false;
 }
@@ -4994,6 +5090,50 @@ static inline void pst_reassembly(ThreadWork *work,
   pst_free_carve_state((void **)&state);
 }
 
+// Store the compact physical coverage snapshot separately from pointer fields.
+static inline bool pst_serialize_coverage(PstCarveState *state, FILE *fp,
+    StateSerialization mode) {
+  uint64_t size = 0;
+  if (mode == SERIALIZE && state->checkpoint_covered) {
+    size = roaring64_bitmap_portable_size_in_bytes(state->checkpoint_covered);
+  }
+  if ((mode == SERIALIZE ? fwrite(&size, sizeof(size), 1, fp)
+                        : fread(&size, sizeof(size), 1, fp)) != 1) {
+    return false;
+  }
+  if (size == 0) {
+    return true;
+  }
+  const uint64_t blocks = CEILDIV(filemirror_filesize(scalpel_state.filemirror),
+                                  scalpel_state.blocksize);
+  // Even singleton containers need much less than this bound. Do not allocate
+  // a checkpoint-supplied arbitrary length before inspecting the bitmap.
+  if (size > SIZE_MAX || blocks > (UINT64_MAX - 1024) / 32
+      || size > blocks * 32 + 1024) {
+    return false;
+  }
+  char *bytes = (char *)malloc((size_t)size);
+  check_memory_allocation(bytes, __LINE__, __FILE__, "PST coverage checkpoint");
+  bool valid;
+  if (mode == SERIALIZE) {
+    valid = roaring64_bitmap_portable_serialize(state->checkpoint_covered, bytes) == size
+        && fwrite(bytes, (size_t)size, 1, fp) == 1;
+  }
+  else {
+    valid = fread(bytes, (size_t)size, 1, fp) == 1;
+    if (valid) {
+      state->checkpoint_covered = roaring64_bitmap_portable_deserialize_safe(
+          bytes, (size_t)size);
+      valid = state->checkpoint_covered
+          && roaring64_bitmap_internal_validate(state->checkpoint_covered, NULL)
+          && (roaring64_bitmap_is_empty(state->checkpoint_covered)
+              || roaring64_bitmap_maximum(state->checkpoint_covered) < blocks);
+    }
+  }
+  free(bytes);
+  return valid;
+}
+
 static inline bool pst_serialize_carve_state(void **state, FILE *fp,
                                              StateSerialization mode) {
   if (!state || !fp) {
@@ -5008,12 +5148,14 @@ static inline bool pst_serialize_carve_state(void **state, FILE *fp,
     PstCarveState header = **typed;
     header.continuity.runs = NULL;
     header.continuity.capacity = header.continuity.count;
+    header.checkpoint_covered = NULL;
     if (fwrite(&header, sizeof(header), 1, fp) != 1
         || (header.continuity.count != 0
             && fwrite((*typed)->continuity.runs,
                       sizeof(*header.continuity.runs),
                       (size_t)header.continuity.count, fp)
-                   != header.continuity.count)) {
+                   != header.continuity.count)
+        || !pst_serialize_coverage(*typed, fp, mode)) {
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
     return true;
@@ -5024,11 +5166,23 @@ static inline bool pst_serialize_carve_state(void **state, FILE *fp,
     check_memory_allocation(*typed, __LINE__, __FILE__,
                             "PST carve state");
   }
-  const size_t count = fread(*typed, sizeof(**typed), 1, fp);
-
-  if (count != 1) {
+  const size_t prefix = offsetof(PstCarveState, profile);
+  if (fread(*typed, prefix, 1, fp) != 1) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
+  if ((*typed)->magic != PST_STATE_MAGIC
+      || ((*typed)->version != PST_STATE_VERSION && (*typed)->version != 5)) {
+    pst_free_carve_state(state);
+    return false;
+  }
+  const bool legacy = (*typed)->version == 5;
+  const size_t record = legacy ? offsetof(PstCarveState, checkpoint_covered)
+                               : sizeof(**typed);
+  if (fread((uint8_t *)*typed + prefix, record - prefix, 1, fp) != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  (*typed)->version = PST_STATE_VERSION;
+  (*typed)->checkpoint_covered = NULL;
   if (mode == DESERIALIZE) {
     PstContinuitySearch *continuity = &(*typed)->continuity;
     continuity->runs = NULL;
@@ -5098,6 +5252,10 @@ static inline bool pst_serialize_carve_state(void **state, FILE *fp,
         previous_end = run->first_slot + run->blocks;
       }
     }
+    if (!legacy && !pst_serialize_coverage(*typed, fp, mode)) {
+      pst_free_carve_state(state);
+      return false;
+    }
   }
   return true;
 }
@@ -5111,6 +5269,13 @@ static inline void *pst_clone_carve_state(const void *srcstate) {
   check_memory_allocation(clone, __LINE__, __FILE__,
                           "PST carve state clone");
   memcpy(clone, srcstate, sizeof(*clone));
+  clone->checkpoint_covered = NULL;
+  if (((const PstCarveState *)srcstate)->checkpoint_covered) {
+    clone->checkpoint_covered = roaring64_bitmap_copy(
+        ((const PstCarveState *)srcstate)->checkpoint_covered);
+    check_memory_allocation(clone->checkpoint_covered, __LINE__, __FILE__,
+                            "PST coverage clone");
+  }
   clone->continuity.runs = NULL;
   clone->continuity.capacity = clone->continuity.count;
   if (clone->continuity.count != 0) {
@@ -5128,6 +5293,7 @@ static inline void *pst_clone_carve_state(const void *srcstate) {
 static inline void pst_free_carve_state(void **state) {
   if (state && *state) {
     pst_continuity_clear(&((PstCarveState *)*state)->continuity);
+    roaring64_bitmap_free(((PstCarveState *)*state)->checkpoint_covered);
     free(*state);
     *state = NULL;
   }

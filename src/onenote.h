@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -61,7 +65,7 @@
 #define ONENOTE_REASSEMBLY_SEAM_BUFFER 640u
 #define ONENOTE_REASSEMBLY_EXHAUSTIVE_GAP_BLOCKS 16u
 #define ONENOTE_CARVE_STATE_MAGIC UINT32_C(0x4f4e5333)
-#define ONENOTE_CARVE_STATE_VERSION UINT32_C(1)
+#define ONENOTE_CARVE_STATE_VERSION UINT32_C(8)
 
 typedef enum OneNoteKind {
   ONENOTE_KIND_NONE = 0,
@@ -187,6 +191,7 @@ typedef struct OneNoteRevisionState {
   uint64_t structural_references;
   uint64_t trial_start;
   uint64_t trial_end;
+  uint64_t searched_end;
   bool trial_active;
   bool no_memory;
 } OneNoteRevisionState;
@@ -209,9 +214,43 @@ typedef struct OneNoteRecoveryScore {
 } OneNoteRecoveryScore;
 
 typedef enum OneNoteSearchPhase {
+  ONENOTE_SEARCH_NONE = 0,
   ONENOTE_SEARCH_INTERIOR_SPANS = 1,
   ONENOTE_SEARCH_INTERIOR_SPANS_COMPLETE
 } OneNoteSearchPhase;
+
+typedef struct OneNoteAlignment {
+  int64_t actual;
+  uint64_t slot;
+} OneNoteAlignment;
+
+typedef enum OneNoteRepairPhase {
+  ONENOTE_REPAIR_NONE = 0,
+  ONENOTE_REPAIR_RUNS,
+  ONENOTE_REPAIR_SUFFIXES,
+  ONENOTE_REPAIR_ZERO_GAP,
+  ONENOTE_REPAIR_ZERO_ISLAND,
+  ONENOTE_REPAIR_PACKAGE_GAP,
+  ONENOTE_REPAIR_PACKAGE_TAIL,
+  ONENOTE_REPAIR_BOUNDARIES,
+  ONENOTE_REPAIR_ZIP_SOURCES,
+  ONENOTE_REPAIR_ZIP_EXTENSION,
+  ONENOTE_REPAIR_ALIGNMENTS,
+  ONENOTE_REPAIR_ANCHOR
+} OneNoteRepairPhase;
+
+typedef struct OneNoteRepairSearch {
+  uint32_t phase;
+  uint32_t pass;
+  uint64_t run_length;
+  uint64_t run_start;
+  uint64_t next_source;
+  uint64_t searched_end;
+  uint64_t view;
+  OneNoteRecoveryScore best;
+  OneNoteRecoveryScore weak;
+  OneNoteRecoveryScore local_best;
+} OneNoteRepairSearch;
 
 typedef struct OneNoteCarveState {
   uint32_t magic;
@@ -224,6 +263,14 @@ typedef struct OneNoteCarveState {
   uint64_t span_start;
   uint64_t run_start;
   uint64_t run_end;
+  uint64_t overlapping_suffix_blocks;
+  uint64_t reservations;
+  uint64_t alignment_count;
+  uint32_t progress_valid;
+  uint32_t exact_run_boundaries;
+  uint64_t span_view;
+  OneNoteRepairSearch repair;
+  OneNoteAlignment *alignments;
 } OneNoteCarveState;
 
 static inline uint32_t onenote_read_le32(const uint8_t *data);
@@ -392,6 +439,71 @@ static inline size_t onenote_sizeof_carve_state(const void *state);
 static inline void onenote_print_carve_state(const void *state);
 static inline uint64_t onenote_reassembly_mapping_hash(
     const int64_t *mapping, uint64_t block_count);
+static inline void onenote_reassembly_remember_alignment(
+    OneNoteCarveState *state, int64_t actual, uint64_t slot);
+static inline OneNoteCarveState *onenote_reassembly_progress_state(
+    CarveInfo *candidate, const int64_t *mapping, uint64_t block_count,
+    uint64_t data_length);
+static inline void onenote_reassembly_restore_progress(
+    CarveInfo *candidate, const int64_t *mapping, uint64_t block_count,
+    uint64_t data_length, OneNoteRecoveryScore *current,
+    int64_t **displacements, uint64_t *count, uint64_t *capacity);
+static inline void onenote_reassembly_commit_progress(
+    CarveInfo *candidate, const int64_t *mapping, uint64_t block_count,
+    uint64_t data_length, const OneNoteRecoveryScore *current,
+    const OneNoteRecoveryScore *placement, bool new_alignment);
+static inline uint64_t onenote_reassembly_span_view(
+    const int64_t *mapping, uint64_t block_count);
+static inline bool onenote_reassembly_score_valid(
+    const OneNoteRecoveryScore *score, uint64_t block_count);
+static inline uint64_t onenote_reassembly_search_view(uint64_t end);
+static inline uint64_t onenote_reassembly_search_scope(
+    const OneNoteCarveState *state, const OneNoteRepairSearch *search);
+static inline OneNoteRepairSearch onenote_reassembly_load_search(
+    CarveInfo *candidate);
+static inline bool onenote_reassembly_search_poll(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, OneNoteRepairSearch *search,
+    const OneNoteRevisionState *workspace);
+static inline bool onenote_reassembly_search_zero(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start_slot, uint64_t failure_end_slot,
+    const OneNoteRecoveryScore *current, OneNoteRecoveryScore *best,
+    OneNoteRevisionState *workspace, OneNoteRepairSearch *search);
+static inline bool onenote_reassembly_search_zip(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start_slot, uint64_t failure_end_slot,
+    const OneNoteRecoveryScore *current, OneNoteRecoveryScore *best,
+    OneNoteRevisionState *workspace, OneNoteRepairSearch *search);
+static inline bool onenote_reassembly_search_boundaries(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, const OneNoteRecoveryScore *current,
+    OneNoteRecoveryScore *best, const int64_t *displacements,
+    uint64_t displacement_count, OneNoteRevisionState *workspace,
+    OneNoteRepairSearch *search);
+static inline bool onenote_reassembly_search_alignments(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start_slot, uint64_t failure_end_slot,
+    uint64_t failure_slot, const OneNoteRecoveryScore *current,
+    OneNoteRecoveryScore *best, const int64_t *displacements,
+    uint64_t displacement_count, OneNoteRevisionState *workspace,
+    OneNoteRepairSearch *search);
+static inline bool onenote_reassembly_search_runs(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start, uint64_t failure_end,
+    uint64_t failure_slot, const OneNoteRecoveryScore *current,
+    OneNoteRecoveryScore *best, OneNoteRecoveryScore *weak,
+    OneNoteRevisionState *workspace, OneNoteRepairSearch *search);
 static inline bool onenote_reassembly_poll(ThreadWork *work,
                                            CarveInfo **candidate,
                                            uuid_string_t uuidp,
@@ -2684,14 +2796,109 @@ static inline void onenote_candidate_validate(CarveInfo *candidate,
   *promising = true;
 }
 
+static inline bool onenote_reassembly_score_valid(
+    const OneNoteRecoveryScore *score, uint64_t block_count) {
+
+  const bool *flags[] = {&score->summary.no_memory, &score->complete,
+                        &score->found, &score->zip_output_comparable,
+                        &score->exact_run_boundaries};
+
+  for (size_t index = 0; index < sizeof(flags) / sizeof(flags[0]); index++) {
+    unsigned char value;
+
+    memcpy(&value, flags[index], sizeof(value));
+    if (value > 1) {
+      return false;
+    }
+  }
+  return !score->found
+         || (score->source >= 0 && score->run_start > 0
+             && score->run_start < block_count && score->run_length > 0
+             && score->run_length <= block_count - score->run_start);
+}
+
 static inline bool onenote_carve_state_valid(
     const OneNoteCarveState *state) {
 
   if (!state || state->magic != ONENOTE_CARVE_STATE_MAGIC
       || state->version != ONENOTE_CARVE_STATE_VERSION
-      || state->phase < ONENOTE_SEARCH_INTERIOR_SPANS
       || state->phase > ONENOTE_SEARCH_INTERIOR_SPANS_COMPLETE
-      || state->block_count < 3 || state->data_length == 0) {
+      || state->reserved != 0 || state->block_count == 0
+      || state->data_length == 0 || state->progress_valid > 1
+      || state->exact_run_boundaries > 1
+      || state->overlapping_suffix_blocks > state->block_count
+      || state->alignment_count > SIZE_MAX / sizeof(*state->alignments)
+      || (state->alignment_count != 0 && !state->alignments)
+      || (state->progress_valid == 0
+          && (state->alignment_count != 0 || state->exact_run_boundaries
+              || state->overlapping_suffix_blocks != 0))) {
+    return false;
+  }
+  for (uint64_t index = 0; index < state->alignment_count; index++) {
+    if (state->alignments[index].actual < 0
+        || state->alignments[index].slot >= state->block_count) {
+      return false;
+    }
+  }
+  const OneNoteRepairSearch *search = &state->repair;
+
+  if (!onenote_reassembly_score_valid(&search->best, state->block_count)
+      || !onenote_reassembly_score_valid(&search->weak, state->block_count)
+      || !onenote_reassembly_score_valid(&search->local_best, state->block_count)
+      || search->phase > ONENOTE_REPAIR_ANCHOR
+      || (search->phase != ONENOTE_REPAIR_NONE
+          && (!state->progress_valid || search->pass > 1
+              || search->run_start == 0
+              || search->run_start > state->block_count
+              || (search->phase != ONENOTE_REPAIR_ZERO_GAP
+                  && search->phase != ONENOTE_REPAIR_PACKAGE_GAP
+                  && search->phase != ONENOTE_REPAIR_BOUNDARIES
+                  && search->phase != ONENOTE_REPAIR_ZIP_EXTENSION
+                  && (search->run_start == state->block_count
+                      || search->run_length == 0
+                      || search->run_length
+                             > state->block_count - search->run_start))
+              || (search->phase == ONENOTE_REPAIR_ZIP_EXTENSION
+                  && (search->run_start == state->block_count
+                      || search->run_length < 2
+                      || search->run_length > state->block_count - search->run_start + 1
+                      || !search->local_best.found
+                      || !search->local_best.zip_output_comparable))
+              || (search->phase == ONENOTE_REPAIR_BOUNDARIES
+                  && (search->run_start == state->block_count
+                      || search->run_length == 0
+                      || (search->pass == 0
+                          && search->run_length >= search->run_start)
+                      || (search->pass == 1
+                          && search->run_length > state->block_count - search->run_start)
+                      || search->next_source > state->alignment_count + 1))
+              || search->searched_end == 0 || search->searched_end > INT64_MAX
+              || ((search->phase == ONENOTE_REPAIR_ZIP_SOURCES
+                   || search->phase == ONENOTE_REPAIR_ZIP_EXTENSION)
+                  && search->local_best.found
+                  && ((uint64_t)search->local_best.source >= search->searched_end
+                      || search->local_best.run_start != search->run_start
+                      || (search->phase == ONENOTE_REPAIR_ZIP_EXTENSION
+                          && search->local_best.run_length != search->run_length - 1)))
+              || ((search->phase == ONENOTE_REPAIR_RUNS
+                   || search->phase == ONENOTE_REPAIR_ZERO_ISLAND
+                   || search->phase == ONENOTE_REPAIR_ZIP_SOURCES)
+                  && search->next_source > search->searched_end)
+              || (search->phase == ONENOTE_REPAIR_ALIGNMENTS
+                  && search->next_source > state->alignment_count + 1)
+              || (search->phase == ONENOTE_REPAIR_ANCHOR
+                  && (search->next_source > 2 || !search->best.found))
+              || (search->phase == ONENOTE_REPAIR_SUFFIXES
+                  && search->next_source > search->run_length)
+              || (search->phase == ONENOTE_REPAIR_PACKAGE_TAIL
+                  && search->next_source
+                         < state->block_count - search->run_length)))) {
+    return false;
+  }
+  if (state->phase == ONENOTE_SEARCH_NONE) {
+    return state->progress_valid != 0;
+  }
+  if (state->block_count < 3) {
     return false;
   }
   if (state->phase == ONENOTE_SEARCH_INTERIOR_SPANS_COMPLETE) {
@@ -2715,21 +2922,58 @@ static inline bool onenote_serialize_carve_state(
   }
   if (mode == SERIALIZE) {
     if (!onenote_carve_state_valid(*onenote_state)
-        || fwrite(*onenote_state, sizeof(**onenote_state), 1, fp) != 1) {
+        || fwrite(*onenote_state,
+                  offsetof(OneNoteCarveState, alignments), 1, fp) != 1
+        || ((*onenote_state)->alignment_count != 0
+            && fwrite((*onenote_state)->alignments,
+                      sizeof(*(*onenote_state)->alignments),
+                      (size_t)(*onenote_state)->alignment_count, fp)
+                   != (*onenote_state)->alignment_count)) {
       handle_error(SCALPEL_ERROR_CHECKPOINT,
                    "invalid OneNote carve state", __LINE__, __FILE__);
     }
     return true;
   }
 
-  OneNoteCarveState *restored = malloc(sizeof(*restored));
+  OneNoteCarveState *restored = calloc(1, sizeof(*restored));
   check_memory_allocation(restored, __LINE__, __FILE__,
                           "OneNote carve state");
-  if (fread(restored, sizeof(*restored), 1, fp) != 1
-      || !onenote_carve_state_valid(restored)) {
-    free(restored);
+  const size_t legacy_size = offsetof(OneNoteCarveState,
+                                      overlapping_suffix_blocks);
+  const size_t extra_size = offsetof(OneNoteCarveState, alignments)
+                           - offsetof(OneNoteCarveState, repair);
+  const size_t v2_size = offsetof(OneNoteCarveState, repair) - legacy_size;
+  bool valid = fread(restored, legacy_size, 1, fp) == 1
+               && restored->magic == ONENOTE_CARVE_STATE_MAGIC
+               && (restored->version == 1 || restored->version == 2
+                   || restored->version == 3 || restored->version == 4
+                   || restored->version == 5 || restored->version == 6
+                   || restored->version == 7
+                   || restored->version == ONENOTE_CARVE_STATE_VERSION);
+
+  if (valid && restored->version >= 2) {
+    valid = fread((uint8_t *)restored + legacy_size, v2_size, 1, fp) == 1
+            && restored->alignment_count
+                   <= SIZE_MAX / sizeof(*restored->alignments);
+    if (valid && restored->version >= 3) {
+      valid = fread(&restored->repair, extra_size, 1, fp) == 1;
+    }
+    if (valid && restored->alignment_count != 0) {
+      restored->alignments = malloc((size_t)restored->alignment_count
+                                    * sizeof(*restored->alignments));
+      check_memory_allocation(restored->alignments, __LINE__, __FILE__,
+                              "OneNote saved alignments");
+      valid = fread(restored->alignments, sizeof(*restored->alignments),
+                    (size_t)restored->alignment_count, fp)
+              == restored->alignment_count;
+    }
+  }
+  restored->version = ONENOTE_CARVE_STATE_VERSION;
+  if (!valid || !onenote_carve_state_valid(restored)) {
+    onenote_free_carve_state((void **)&restored);
     handle_error(SCALPEL_ERROR_CHECKPOINT,
                  "invalid OneNote carve state", __LINE__, __FILE__);
+    return false;
   }
   *onenote_state = restored;
   return true;
@@ -2746,12 +2990,24 @@ static inline void *onenote_clone_carve_state(const void *srcstate) {
   check_memory_allocation(clone, __LINE__, __FILE__,
                           "OneNote carve state clone");
   memcpy(clone, source, sizeof(*clone));
+  clone->alignments = NULL;
+  if (source->alignment_count != 0) {
+    clone->alignments = malloc((size_t)source->alignment_count
+                              * sizeof(*clone->alignments));
+    check_memory_allocation(clone->alignments, __LINE__, __FILE__,
+                            "OneNote alignment clone");
+    memcpy(clone->alignments, source->alignments,
+           (size_t)source->alignment_count * sizeof(*clone->alignments));
+  }
   return clone;
 }
 
 static inline void onenote_free_carve_state(void **state) {
 
   if (state) {
+    if (*state) {
+      free(((OneNoteCarveState *)*state)->alignments);
+    }
     free(*state);
     *state = NULL;
   }
@@ -2760,7 +3016,7 @@ static inline void onenote_free_carve_state(void **state) {
 static inline size_t onenote_sizeof_carve_state(const void *state) {
 
   (void)state;
-  return sizeof(OneNoteCarveState);
+  return 0;
 }
 
 static inline void onenote_print_carve_state(const void *state) {
@@ -2804,6 +3060,216 @@ static inline uint64_t onenote_reassembly_mapping_hash(
   return hash;
 }
 
+// Keep a physical witness for each learned alignment. Apparent positions can
+// change when a checkpoint removes blocks recovered by another candidate.
+//
+static inline void onenote_reassembly_remember_alignment(
+    OneNoteCarveState *state, int64_t actual, uint64_t slot) {
+
+  if (!state || actual < 0 || slot >= state->block_count) {
+    return;
+  }
+  if (state->alignment_count >= SIZE_MAX / sizeof(*state->alignments)) {
+    handle_error(SCALPEL_GENERAL_ABORT, "OneNote alignment table overflow",
+                 __LINE__, __FILE__);
+    return;
+  }
+  OneNoteAlignment *alignments = realloc(
+      state->alignments,
+      (size_t)(state->alignment_count + 1) * sizeof(*alignments));
+  check_memory_allocation(alignments, __LINE__, __FILE__,
+                          "OneNote saved alignments");
+  state->alignments = alignments;
+  state->alignments[state->alignment_count++] =
+      (OneNoteAlignment){.actual = actual, .slot = slot};
+}
+
+// Load progress only for the same committed physical mapping and extent.
+//
+static inline OneNoteCarveState *onenote_reassembly_progress_state(
+    CarveInfo *candidate, const int64_t *mapping, uint64_t block_count,
+    uint64_t data_length) {
+
+  OneNoteCarveState *state = (OneNoteCarveState *)carve_get_state(
+      candidate->carvehashkey);
+  const uint64_t hash = onenote_reassembly_mapping_hash(mapping, block_count);
+
+  if (!onenote_carve_state_valid(state)
+      || state->block_count != block_count || state->data_length != data_length
+      || state->mapping_hash != hash) {
+    onenote_free_carve_state((void **)&state);
+    state = calloc(1, sizeof(*state));
+    check_memory_allocation(state, __LINE__, __FILE__,
+                            "OneNote committed progress");
+    state->magic = ONENOTE_CARVE_STATE_MAGIC;
+    state->version = ONENOTE_CARVE_STATE_VERSION;
+    state->block_count = block_count;
+    state->data_length = data_length;
+    state->mapping_hash = hash;
+  }
+  return state;
+}
+
+// Restore decisions made while committing the current mapping. Parser scratch
+// is rebuilt independently; these learned alignments and guards are not scratch.
+//
+static inline void onenote_reassembly_restore_progress(
+    CarveInfo *candidate, const int64_t *mapping, uint64_t block_count,
+    uint64_t data_length, OneNoteRecoveryScore *current,
+    int64_t **displacements, uint64_t *count, uint64_t *capacity) {
+
+  OneNoteCarveState *state = onenote_reassembly_progress_state(
+      candidate, mapping, block_count, data_length);
+  if (state->progress_valid) {
+    current->overlapping_suffix_blocks = state->overlapping_suffix_blocks;
+    current->exact_run_boundaries = state->exact_run_boundaries != 0;
+    current->reservations = state->reservations;
+  }
+  else {
+    state->progress_valid = 1;
+    state->reservations = current->reservations;
+    onenote_reassembly_remember_alignment(
+        state, filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                             mapping[0]), 0);
+  }
+
+  for (uint64_t index = 0; index < state->alignment_count; index++) {
+    const OneNoteAlignment *alignment = &state->alignments[index];
+    const int64_t apparent = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, alignment->actual);
+
+    if (apparent < 0 || alignment->slot > INT64_MAX
+        || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                          alignment->actual)) {
+      continue;
+    }
+    const int64_t displacement = apparent - (int64_t)alignment->slot;
+    bool known = false;
+
+    for (uint64_t prior = 0; prior < *count; prior++) {
+      if ((*displacements)[prior] == displacement) {
+        known = true;
+        break;
+      }
+    }
+    if (known) {
+      continue;
+    }
+    if (*count == *capacity) {
+      if (*capacity > SIZE_MAX / sizeof(**displacements) / 2) {
+        handle_error(SCALPEL_GENERAL_ABORT, "OneNote displacement table overflow",
+                     __LINE__, __FILE__);
+        break;
+      }
+      *capacity *= 2;
+      *displacements = realloc(*displacements,
+                                (size_t)*capacity * sizeof(**displacements));
+      check_memory_allocation(*displacements, __LINE__, __FILE__,
+                              "OneNote restored displacements");
+    }
+    (*displacements)[(*count)++] = displacement;
+  }
+  onenote_store_carve_state(candidate, state);
+  onenote_free_carve_state((void **)&state);
+}
+
+// Saving a new committed mapping invalidates only the boundary search for the
+// previous mapping. Preserve every learned alignment, including older ones.
+//
+static inline void onenote_reassembly_commit_progress(
+    CarveInfo *candidate, const int64_t *mapping, uint64_t block_count,
+    uint64_t data_length, const OneNoteRecoveryScore *current,
+    const OneNoteRecoveryScore *placement, bool new_alignment) {
+
+  OneNoteCarveState *state = (OneNoteCarveState *)carve_get_state(
+      candidate->carvehashkey);
+
+  if (!onenote_carve_state_valid(state)) {
+    onenote_free_carve_state((void **)&state);
+    state = calloc(1, sizeof(*state));
+    check_memory_allocation(state, __LINE__, __FILE__,
+                            "OneNote committed progress");
+    state->magic = ONENOTE_CARVE_STATE_MAGIC;
+    state->version = ONENOTE_CARVE_STATE_VERSION;
+    state->block_count = block_count;
+    onenote_reassembly_remember_alignment(
+        state, filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                             mapping[0]), 0);
+  }
+  state->block_count = block_count;
+  state->data_length = data_length;
+  state->mapping_hash = onenote_reassembly_mapping_hash(mapping, block_count);
+  state->phase = ONENOTE_SEARCH_NONE;
+  state->span_start = state->run_start = state->run_end = state->span_view = 0;
+  state->progress_valid = 1;
+  state->overlapping_suffix_blocks = current->overlapping_suffix_blocks;
+  state->exact_run_boundaries = current->exact_run_boundaries ? 1 : 0;
+  state->reservations = current->reservations;
+  memset(&state->repair, 0, sizeof(state->repair));
+  if (new_alignment) {
+    onenote_reassembly_remember_alignment(
+        state, filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                             placement->source),
+        placement->run_start);
+  }
+  onenote_store_carve_state(candidate, state);
+  onenote_free_carve_state((void **)&state);
+}
+
+// The span cursor depends on the blocks reachable through its two apparent
+// alignments, not on unrelated coverage elsewhere in the image.
+//
+static inline uint64_t onenote_reassembly_span_view(
+    const int64_t *mapping, uint64_t block_count) {
+
+  uint64_t hash = UINT64_C(1469598103934665603);
+  const uint64_t image_blocks = filemirror_apparent_blocks(
+      scalpel_state.filemirror);
+
+  for (uint64_t start = 1; start + 1 < block_count;) {
+    const int64_t inner = mapping[start] - (int64_t)start;
+    uint64_t end = start + 1;
+
+    while (end < block_count && mapping[end] - (int64_t)end == inner) {
+      end++;
+    }
+    if (end == block_count) {
+      break;
+    }
+    const int64_t outer = mapping[start - 1] - (int64_t)(start - 1);
+
+    if (outer == mapping[end] - (int64_t)end && outer != inner) {
+      hash = (hash ^ start) * UINT64_C(1099511628211);
+      hash = (hash ^ end) * UINT64_C(1099511628211);
+      for (uint32_t side = 0; side < 2; side++) {
+        const int64_t displacement = side ? inner : outer;
+
+        for (uint64_t slot = 1; slot < block_count; slot++) {
+          int64_t actual = -1;
+
+          if (displacement >= -(int64_t)slot
+              && displacement <= INT64_MAX - (int64_t)slot) {
+            const int64_t apparent = displacement + (int64_t)slot;
+
+            if ((uint64_t)apparent < image_blocks) {
+              actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                                     apparent);
+            }
+          }
+          hash = (hash ^ (uint64_t)actual) * UINT64_C(1099511628211);
+          const bool covered = actual >= 0
+              && filemirror_actual_block_covered(scalpel_state.filemirror,
+                                                 actual);
+
+          hash = (hash ^ (uint64_t)covered) * UINT64_C(1099511628211);
+        }
+      }
+    }
+    start = end;
+  }
+  return hash;
+}
+
 // Honor kill-queue and checkpoint requests without imposing voluntary yields.
 //
 static inline bool onenote_reassembly_poll(ThreadWork *work,
@@ -2820,6 +3286,89 @@ static inline bool onenote_reassembly_poll(ThreadWork *work,
     return true;
   }
   return false;
+}
+
+// These searches enumerate apparent runs. Retain their cursor only while the
+// tested source prefix still names the same available physical blocks.
+//
+static inline uint64_t onenote_reassembly_search_view(uint64_t end) {
+
+  uint64_t hash = UINT64_C(1469598103934665603);
+  const uint64_t blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  const uint64_t count = end < blocks ? end : blocks;
+
+  for (uint64_t index = 0; index < count; index++) {
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, (int64_t)index);
+    const bool covered = actual < 0
+        || filemirror_actual_block_covered(scalpel_state.filemirror, actual);
+
+    hash = (hash ^ (uint64_t)actual) * UINT64_C(1099511628211);
+    hash = (hash ^ (uint64_t)covered) * UINT64_C(1099511628211);
+  }
+  return (hash ^ count) * UINT64_C(1099511628211);
+}
+
+// Boundary refinements also depend on the learned alignment list. A removed
+// witness can change its filtered indices even outside the scanned source prefix.
+//
+static inline uint64_t onenote_reassembly_search_scope(
+    const OneNoteCarveState *state, const OneNoteRepairSearch *search) {
+
+  uint64_t hash = onenote_reassembly_search_view(search->searched_end);
+
+  if (search->phase == ONENOTE_REPAIR_BOUNDARIES
+      || search->phase == ONENOTE_REPAIR_ALIGNMENTS) {
+    for (uint64_t index = 0; index < state->alignment_count; index++) {
+      const OneNoteAlignment *alignment = &state->alignments[index];
+      const int64_t apparent = filemirror_apparent_blocknumber(
+          scalpel_state.filemirror, alignment->actual);
+      const bool covered = filemirror_actual_block_covered(
+          scalpel_state.filemirror, alignment->actual);
+
+      hash = (hash ^ (uint64_t)apparent) * UINT64_C(1099511628211);
+      hash = (hash ^ (uint64_t)covered) * UINT64_C(1099511628211);
+    }
+  }
+  return hash;
+}
+
+static inline OneNoteRepairSearch onenote_reassembly_load_search(
+    CarveInfo *candidate) {
+
+  OneNoteRepairSearch search = {0};
+  OneNoteCarveState *state = (OneNoteCarveState *)carve_get_state(
+      candidate->carvehashkey);
+
+  if (onenote_carve_state_valid(state)
+      && state->repair.phase != ONENOTE_REPAIR_NONE
+      && state->repair.view
+             == onenote_reassembly_search_scope(state, &state->repair)) {
+    search = state->repair;
+  }
+  onenote_free_carve_state((void **)&state);
+  return search;
+}
+
+static inline bool onenote_reassembly_search_poll(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, OneNoteRepairSearch *search,
+    const OneNoteRevisionState *workspace) {
+
+  if (candidate && *candidate
+      && atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+    OneNoteCarveState *state = (OneNoteCarveState *)carve_get_state(
+        (*candidate)->carvehashkey);
+
+    if (onenote_carve_state_valid(state)) {
+      search->searched_end = workspace->searched_end;
+      search->view = onenote_reassembly_search_scope(state, search);
+      state->repair = *search;
+      onenote_store_carve_state(*candidate, state);
+    }
+    onenote_free_carve_state((void **)&state);
+  }
+  return onenote_reassembly_poll(work, candidate, uuidp, uuidc);
 }
 
 // Copy one apparent image block into a zero-padded destination block.
@@ -3169,6 +3718,10 @@ static inline bool onenote_reassembly_try_run(
       || source < 0 || (uint64_t)source > image_blocks
       || run_length > image_blocks - (uint64_t)source) {
     return false;
+  }
+
+  if (workspace && workspace->searched_end < (uint64_t)source + run_length) {
+    workspace->searched_end = (uint64_t)source + run_length;
   }
 
   bool changed = false;
@@ -3662,6 +4215,12 @@ static inline bool onenote_reassembly_preserve_interior_spans(
     state->block_count = block_count;
     state->data_length = data_length;
     state->mapping_hash = mapping_hash;
+  }
+  const uint64_t span_view = onenote_reassembly_span_view(mapping, block_count);
+
+  if (state->phase == ONENOTE_SEARCH_NONE || state->span_view != span_view) {
+    state->phase = ONENOTE_SEARCH_INTERIOR_SPANS;
+    state->span_view = span_view;
     state->span_start = 1;
     state->run_start = 1;
     state->run_end = 2;
@@ -3929,6 +4488,932 @@ static inline bool onenote_reassembly_preserve_interior_spans(
   return false;
 }
 
+// Keep zero-gap and displaced zero-island trials across a checkpoint.
+//
+static inline bool onenote_reassembly_search_zero(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start_slot, uint64_t failure_end_slot,
+    const OneNoteRecoveryScore *current, OneNoteRecoveryScore *best,
+    OneNoteRevisionState *workspace, OneNoteRepairSearch *search) {
+
+  const uint64_t image_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  const uint64_t blocksize = scalpel_state.blocksize;
+  uint64_t attempts = 0;
+  bool resume_island = search->phase == ONENOTE_REPAIR_ZERO_ISLAND;
+
+  // A physical gap commonly appears as one or more mapped zero blocks
+  // followed by the displaced suffix. Test that complete suffix directly;
+  // strict parser progress is still required before it can be committed.
+  // Valid allocated zero ranges remain untouched when this hypothesis does
+  // not improve the parse, and the general search below remains available.
+  if ((search->phase == ONENOTE_REPAIR_NONE
+       || search->phase == ONENOTE_REPAIR_ZERO_GAP)
+      && !current->complete && block_count > 1) {
+    for (uint64_t gap_start = search->phase == ONENOTE_REPAIR_ZERO_GAP
+                                 ? search->run_start : 1;
+         gap_start < block_count && *candidate && !best->complete;
+         gap_start++) {
+      const int64_t gap_actual = filemirror_actual_blocknumber(
+          scalpel_state.filemirror, mapping[gap_start]);
+
+      if (gap_actual < 0
+          || !filemirror_actual_block_is_zero(
+                 scalpel_state.filemirror, gap_actual)) {
+        continue;
+      }
+
+      uint64_t zero_blocks = 1;
+
+      while (zero_blocks < block_count - gap_start) {
+        const int64_t actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror,
+            mapping[gap_start + zero_blocks]);
+
+        if (actual < 0
+            || !filemirror_actual_block_is_zero(
+                   scalpel_state.filemirror, actual)) {
+          break;
+        }
+        zero_blocks++;
+      }
+
+      const uint64_t run_length = block_count - gap_start;
+
+      if (mapping[gap_start] >= 0
+          && zero_blocks <= (uint64_t)(INT64_MAX - mapping[gap_start])) {
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+          const uint64_t apparent =
+              (uint64_t)mapping[gap_start + offset];
+
+          used[apparent >> 3]
+              &= (uint8_t)~(1u << (apparent & 7u));
+        }
+
+        OneNoteRecoveryScore gap_best = {0};
+
+        onenote_reassembly_try_run(
+            trial_data, mapping, used, block_count, data_length, kind,
+            gap_start, run_length,
+            mapping[gap_start] + (int64_t)zero_blocks,
+            current, &gap_best, true, NULL, workspace, true);
+        if (onenote_reassembly_score_better(&gap_best, best)) {
+          *best = gap_best;
+        }
+
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+          const uint64_t apparent =
+              (uint64_t)mapping[gap_start + offset];
+
+          used[apparent >> 3]
+              |= (uint8_t)(1u << (apparent & 7u));
+        }
+      }
+
+      attempts++;
+      *search = (OneNoteRepairSearch){
+        .phase = ONENOTE_REPAIR_ZERO_GAP,
+        .run_start = gap_start + zero_blocks, .best = *best
+      };
+      if (onenote_reassembly_search_poll(
+              work, candidate, uuidp, uuidc, search, workspace)) {
+        return true;
+      }
+      gap_start += zero_blocks - 1;
+    }
+    memset(search, 0, sizeof(*search));
+  }
+
+  // An out-of-order run commonly leaves a fixed-size zero island at its
+  // logical position. Test islands near the parser's failure range first,
+  // then the remaining islands before expanding the general search. Parser
+  // failures can surface well after the displaced run that caused them.
+  // Strict format evidence remains the acceptance criterion.
+  if ((search->phase == ONENOTE_REPAIR_NONE
+       || search->phase == ONENOTE_REPAIR_ZERO_ISLAND)
+      && !current->complete && !best->complete
+      && failure_start_slot > 0
+      && failure_start_slot <= failure_end_slot) {
+    for (uint32_t zero_pass = resume_island ? search->pass : 0;
+         zero_pass < 2 && *candidate && !best->complete; zero_pass++) {
+      for (uint64_t zero_start = resume_island ? search->run_start : 1;
+           zero_start < block_count && *candidate && !best->complete;
+           zero_start++) {
+        const int64_t zero_actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror, mapping[zero_start]);
+
+        if (zero_actual < 0
+            || !filemirror_actual_block_is_zero(
+                   scalpel_state.filemirror, zero_actual)) {
+          continue;
+        }
+
+        uint64_t zero_blocks = 1;
+
+        while (zero_blocks < block_count - zero_start) {
+          const int64_t actual = filemirror_actual_blocknumber(
+              scalpel_state.filemirror,
+              mapping[zero_start + zero_blocks]);
+
+          if (actual < 0
+              || !filemirror_actual_block_is_zero(
+                     scalpel_state.filemirror, actual)) {
+            break;
+          }
+          zero_blocks++;
+        }
+        const uint64_t zero_end = zero_start + zero_blocks - 1;
+
+        const bool intersects_failure = zero_end >= failure_start_slot
+                                        && zero_start <= failure_end_slot;
+
+        if ((zero_pass == 0) != intersects_failure) {
+          zero_start += zero_blocks - 1;
+          continue;
+        }
+
+        bool contiguous_target = true;
+        const uint64_t target_start = (uint64_t)mapping[zero_start];
+
+        for (uint64_t offset = 1; offset < zero_blocks; offset++) {
+          if (mapping[zero_start + offset]
+              != mapping[zero_start] + (int64_t)offset) {
+            contiguous_target = false;
+            break;
+          }
+        }
+        if (!contiguous_target) {
+          zero_start += zero_blocks - 1;
+          continue;
+        }
+        const uint64_t target_end = target_start + zero_blocks;
+
+        for (uint64_t offset = 0; offset < zero_blocks; offset++) {
+          const uint64_t apparent =
+              (uint64_t)mapping[zero_start + offset];
+
+          used[apparent >> 3]
+              &= (uint8_t)~(1u << (apparent & 7u));
+        }
+
+        OneNoteRecoveryScore zero_best = resume_island
+            ? search->local_best : (OneNoteRecoveryScore){0};
+        OneNoteRecoveryScore zero_weak = resume_island
+            ? search->weak : (OneNoteRecoveryScore){0};
+        const uint64_t final_source = image_blocks - zero_blocks;
+
+        for (uint64_t source = resume_island ? search->next_source : 0;
+             source <= final_source && *candidate && !zero_best.complete;
+             source++) {
+          // A displaced run has a distinct physical source. Overlapping
+          // suffix shifts are evaluated by the zero-gap path above.
+          if (source < target_end
+              && source + zero_blocks > target_start) {
+            continue;
+          }
+          onenote_reassembly_probe_run(
+              trial_data, mapping, used, block_count, data_length, kind,
+              zero_start, zero_blocks, (int64_t)source, current,
+              &zero_best, &zero_weak, false, workspace);
+
+          attempts++;
+          if ((attempts & UINT64_C(0xff)) == 0) {
+            *search = (OneNoteRepairSearch){
+              .phase = ONENOTE_REPAIR_ZERO_ISLAND, .pass = zero_pass,
+              .run_start = zero_start, .run_length = zero_blocks,
+              .next_source = source + 1, .best = *best,
+              .weak = zero_weak, .local_best = zero_best
+            };
+            if (onenote_reassembly_search_poll(
+                    work, candidate, uuidp, uuidc, search, workspace)) {
+              return true;
+            }
+          }
+        }
+
+        resume_island = false;
+        bool restored = true;
+
+        for (uint64_t offset = 0; offset < zero_blocks; offset++) {
+          if (!onenote_reassembly_copy_block(
+                  trial_data + (zero_start + offset) * blocksize,
+                  mapping[zero_start + offset])) {
+            restored = false;
+            break;
+          }
+        }
+        for (uint64_t offset = 0; offset < zero_blocks; offset++) {
+          const uint64_t apparent =
+              (uint64_t)mapping[zero_start + offset];
+
+          used[apparent >> 3]
+              |= (uint8_t)(1u << (apparent & 7u));
+        }
+        if (!restored) {
+          destroy_candidate(candidate);
+          return true;
+        }
+        if (zero_best.complete) {
+          zero_best.exact_run_boundaries = true;
+        }
+        if (onenote_reassembly_score_better(&zero_best, best)) {
+          *best = zero_best;
+        }
+        zero_start += zero_blocks - 1;
+      }
+    }
+    memset(search, 0, sizeof(*search));
+  }
+
+  return false;
+}
+
+// Resume embedded ZIP source ranking and extension without repeating completed
+// decompression trials. Preferred sources remain tentative until full validation.
+//
+static inline bool onenote_reassembly_search_zip(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start_slot, uint64_t failure_end_slot,
+    const OneNoteRecoveryScore *current, OneNoteRecoveryScore *best,
+    OneNoteRevisionState *workspace, OneNoteRepairSearch *search) {
+
+  const uint64_t image_blocks = filemirror_apparent_blocks(
+      scalpel_state.filemirror);
+  const uint64_t blocksize = scalpel_state.blocksize;
+  bool resume_sources = search->phase == ONENOTE_REPAIR_ZIP_SOURCES;
+  bool resume_extension = search->phase == ONENOTE_REPAIR_ZIP_EXTENSION;
+  uint64_t attempts = 0;
+
+  if ((search->phase != ONENOTE_REPAIR_NONE
+       && !resume_sources && !resume_extension)
+      || current->complete || !current->zip_output_comparable
+      || failure_start_slot == 0 || failure_start_slot > failure_end_slot) {
+    return false;
+  }
+  const uint64_t priority_count = failure_end_slot - failure_start_slot + 1;
+
+  if (priority_count > SIZE_MAX / sizeof(OneNoteTargetPriority)) {
+    return false;
+  }
+  OneNoteTargetPriority *priorities = malloc(
+      (size_t)priority_count * sizeof(*priorities));
+  check_memory_allocation(priorities, __LINE__, __FILE__,
+                          "OneNote ZIP target priorities");
+
+  for (uint64_t index = 0; index < priority_count; index++) {
+    const uint64_t slot = failure_start_slot + index;
+
+    priorities[index].slot = slot;
+    priorities[index].uniformity = onenote_reassembly_uniformity(
+        trial_data + slot * blocksize, blocksize);
+  }
+  for (uint64_t index = 1; index < priority_count; index++) {
+    const OneNoteTargetPriority value = priorities[index];
+    uint64_t destination = index;
+
+    while (destination > 0
+           && (value.uniformity < priorities[destination - 1].uniformity
+               || (value.uniformity == priorities[destination - 1].uniformity
+                   && value.slot < priorities[destination - 1].slot))) {
+      priorities[destination] = priorities[destination - 1];
+      destination--;
+    }
+    priorities[destination] = value;
+  }
+
+  uint64_t first_priority = 0;
+
+  if (resume_sources || resume_extension) {
+    while (first_priority < priority_count
+           && priorities[first_priority].slot != search->run_start) {
+      first_priority++;
+    }
+    if (first_priority == priority_count) {
+      first_priority = 0;
+      resume_sources = false;
+      resume_extension = false;
+      memset(search, 0, sizeof(*search));
+    }
+  }
+
+  for (uint64_t priority = first_priority;
+       priority < priority_count && *candidate && !best->complete;
+       priority++) {
+    const uint64_t run_start = priorities[priority].slot;
+    const uint64_t old_apparent = (uint64_t)mapping[run_start];
+
+    used[old_apparent >> 3] &= (uint8_t)~(1u << (old_apparent & 7u));
+
+    OneNoteRecoveryScore preferred = resume_sources || resume_extension
+                                        ? search->local_best
+                                        : (OneNoteRecoveryScore){0};
+    uint64_t preferred_source = preferred.found
+                                   ? (uint64_t)preferred.source : 0;
+
+    if (!resume_extension) {
+      for (uint64_t source = resume_sources ? search->next_source : 0;
+           source < image_blocks && *candidate && !best->complete; source++) {
+        OneNoteRecoveryScore source_best = {0};
+        OneNoteRecoveryScore observed = {0};
+
+        const bool advanced = onenote_reassembly_try_run(
+            trial_data, mapping, used, block_count, data_length, kind,
+            run_start, 1, (int64_t)source, current, &source_best,
+            true, &observed, workspace, true);
+
+        if (advanced && observed.complete) {
+          *best = observed;
+          break;
+        }
+        if (advanced && observed.zip_output_comparable
+            && observed.zip_output_distance < current->zip_output_distance) {
+          if (!preferred.found
+              || observed.zip_output_distance < preferred.zip_output_distance
+              || (observed.zip_output_distance == preferred.zip_output_distance
+                  && onenote_reassembly_score_better(&observed, &preferred))) {
+            preferred = observed;
+            preferred_source = source;
+          }
+        }
+
+        attempts++;
+        if ((attempts & UINT64_C(0xff)) == 0) {
+          *search = (OneNoteRepairSearch){
+            .phase = ONENOTE_REPAIR_ZIP_SOURCES,
+            .run_start = run_start, .run_length = 1,
+            .next_source = source + 1, .best = *best,
+            .local_best = preferred
+          };
+          if (onenote_reassembly_search_poll(
+                  work, candidate, uuidp, uuidc, search, workspace)) {
+            used[old_apparent >> 3] |= (uint8_t)(1u << (old_apparent & 7u));
+            free(priorities);
+            return true;
+          }
+        }
+      }
+    }
+    if (!best->complete && preferred.found) {
+      uint64_t prior_distance = preferred.zip_output_distance;
+      uint64_t maximum_length = failure_end_slot - run_start + 1;
+
+      if (maximum_length > block_count - run_start) {
+        maximum_length = block_count - run_start;
+      }
+      if (maximum_length > image_blocks - preferred_source) {
+        maximum_length = image_blocks - preferred_source;
+      }
+
+      const uint64_t first_length = resume_extension ? search->run_length : 2;
+      uint64_t cleared = first_length - 1;
+
+      for (uint64_t offset = 1; offset < cleared; offset++) {
+        const uint64_t apparent = (uint64_t)mapping[run_start + offset];
+
+        used[apparent >> 3] &= (uint8_t)~(1u << (apparent & 7u));
+      }
+      for (uint64_t run_length = first_length;
+           run_length <= maximum_length && *candidate; run_length++) {
+        const uint64_t slot = run_start + run_length - 1;
+        const uint64_t apparent = (uint64_t)mapping[slot];
+
+        used[apparent >> 3] &= (uint8_t)~(1u << (apparent & 7u));
+        cleared = run_length;
+
+        OneNoteRecoveryScore extended_best = {0};
+        OneNoteRecoveryScore extended = {0};
+        const bool extension_advanced = onenote_reassembly_try_run(
+            trial_data, mapping, used, block_count, data_length, kind,
+            run_start, run_length, (int64_t)preferred_source,
+            current, &extended_best, true, &extended, workspace, true);
+
+        if (extension_advanced && extended.complete) {
+          *best = extended;
+          break;
+        }
+        if (!extension_advanced || !extended.zip_output_comparable
+            || extended.zip_output_distance >= prior_distance) {
+          break;
+        }
+        prior_distance = extended.zip_output_distance;
+        *search = (OneNoteRepairSearch){
+          .phase = ONENOTE_REPAIR_ZIP_EXTENSION,
+          .run_start = run_start, .run_length = run_length + 1,
+          .best = *best, .local_best = extended
+        };
+        if (onenote_reassembly_search_poll(
+                work, candidate, uuidp, uuidc, search, workspace)) {
+          for (uint64_t offset = 0; offset < cleared; offset++) {
+            const uint64_t restored = (uint64_t)mapping[run_start + offset];
+
+            used[restored >> 3] |= (uint8_t)(1u << (restored & 7u));
+          }
+          free(priorities);
+          return true;
+        }
+      }
+
+      for (uint64_t offset = 1; offset < cleared; offset++) {
+        const uint64_t apparent = (uint64_t)mapping[run_start + offset];
+
+        used[apparent >> 3] |= (uint8_t)(1u << (apparent & 7u));
+      }
+    }
+
+    used[old_apparent >> 3] |= (uint8_t)(1u << (old_apparent & 7u));
+    resume_sources = false;
+    resume_extension = false;
+    memset(search, 0, sizeof(*search));
+  }
+  free(priorities);
+  return false;
+}
+
+// Continue boundary alternatives after earlier complete placements.
+//
+static inline bool onenote_reassembly_search_boundaries(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, const OneNoteRecoveryScore *current,
+    OneNoteRecoveryScore *best, const int64_t *displacements,
+    uint64_t displacement_count, OneNoteRevisionState *workspace,
+    OneNoteRepairSearch *search) {
+
+  uint64_t attempts = 0;
+  bool resuming = search->phase == ONENOTE_REPAIR_BOUNDARIES;
+
+  // Once the format is complete, only refine boundaries between physical
+  // alignments that previously advanced the parser. This can recover opaque
+  // edge blocks without admitting unrelated source regions merely because
+  // they happen to improve a byte-continuity heuristic.
+  if ((search->phase == ONENOTE_REPAIR_NONE
+       || search->phase == ONENOTE_REPAIR_BOUNDARIES) && current->complete) {
+    if (!resuming && onenote_reassembly_preserve_interior_spans(
+            work, candidate, uuidp, uuidc, trial_data, mapping, used,
+            block_count, data_length, kind, current,
+            workspace)) {
+      return true;
+    }
+    for (uint64_t boundary = resuming ? search->run_start : 1;
+         boundary < block_count && *candidate; boundary++) {
+      if (mapping[boundary] == mapping[boundary - 1] + 1) {
+        continue;
+      }
+
+      for (uint32_t side = resuming ? search->pass : 0; side < 2; side++) {
+        const uint64_t maximum_length = side == 0
+                                            ? boundary - 1
+                                            : block_count - boundary;
+
+        for (uint64_t run_length = resuming ? search->run_length : 1;
+             run_length <= maximum_length && *candidate; run_length++) {
+          const uint64_t run_start = side == 0
+                                         ? boundary - run_length
+                                         : boundary;
+
+          for (uint64_t offset = 0; offset < run_length; offset++) {
+            const uint64_t apparent =
+                (uint64_t)mapping[run_start + offset];
+
+            used[apparent >> 3]
+                &= (uint8_t)~(1u << (apparent & 7u));
+          }
+
+          if (run_start <= INT64_MAX) {
+            const int64_t logical_start = (int64_t)run_start;
+
+            for (uint64_t index = resuming ? search->next_source : 0;
+                 index < displacement_count && *candidate; index++) {
+              if (displacements[index]
+                  <= INT64_MAX - logical_start) {
+                OneNoteRecoveryScore observed = {0};
+
+                onenote_reassembly_try_run(
+                    trial_data, mapping, used, block_count, data_length,
+                    kind, run_start, run_length,
+                    displacements[index] + logical_start, current, best,
+                    true, &observed, workspace, true);
+                if (observed.complete
+                    && (observed.content_seam_cost
+                            == current->content_seam_cost)
+                    && scalpel_state.write_promising) {
+                  onenote_reassembly_preserve_run(
+                      candidate, mapping, block_count, data_length,
+                      &observed);
+                }
+              }
+              attempts++;
+              if ((attempts & UINT64_C(0xff)) == 0) {
+                *search = (OneNoteRepairSearch){
+                  .phase = ONENOTE_REPAIR_BOUNDARIES, .pass = side,
+                  .run_start = boundary, .run_length = run_length,
+                  .next_source = index + 1, .best = *best
+                };
+                if (onenote_reassembly_search_poll(
+                        work, candidate, uuidp, uuidc, search, workspace)) {
+                  return true;
+                }
+              }
+            }
+          }
+          resuming = false;
+
+          for (uint64_t offset = 0; offset < run_length; offset++) {
+            const uint64_t apparent =
+                (uint64_t)mapping[run_start + offset];
+
+            used[apparent >> 3]
+                |= (uint8_t)(1u << (apparent & 7u));
+          }
+        }
+      }
+    }
+    memset(search, 0, sizeof(*search));
+  }
+
+  return false;
+}
+
+// Retain alignment trials and the tentative anchor while testing longer runs.
+// Each completed trial is saved only if a checkpoint actually requests a yield.
+//
+static inline bool onenote_reassembly_search_alignments(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start_slot, uint64_t failure_end_slot,
+    uint64_t failure_slot, const OneNoteRecoveryScore *current,
+    OneNoteRecoveryScore *best, const int64_t *displacements,
+    uint64_t displacement_count, OneNoteRevisionState *workspace,
+    OneNoteRepairSearch *search) {
+
+  uint64_t attempts = 0;
+
+  if ((search->phase == ONENOTE_REPAIR_NONE
+       || search->phase == ONENOTE_REPAIR_ALIGNMENTS)
+      && !current->complete
+      && (!best->complete || search->phase == ONENOTE_REPAIR_ALIGNMENTS)
+      && failure_slot > 0 && failure_slot <= INT64_MAX) {
+    const int64_t logical_slot = (int64_t)failure_slot;
+
+    for (uint64_t index = search->phase == ONENOTE_REPAIR_ALIGNMENTS
+                              ? search->next_source : 0;
+         index < displacement_count && *candidate; index++) {
+      if (displacements[index] >= -logical_slot
+          && displacements[index] <= INT64_MAX - logical_slot) {
+        onenote_reassembly_try_alignment(
+            trial_data, mapping, used, block_count, data_length, kind,
+            failure_start_slot, failure_end_slot, failure_slot,
+            displacements[index] + logical_slot, current, best,
+            NULL, workspace, true);
+      }
+      *search = (OneNoteRepairSearch){
+        .phase = ONENOTE_REPAIR_ALIGNMENTS, .run_start = failure_slot,
+        .run_length = 1, .next_source = index + 1, .best = *best
+      };
+      if (onenote_reassembly_search_poll(
+              work, candidate, uuidp, uuidc, search, workspace)) {
+        return true;
+      }
+    }
+    memset(search, 0, sizeof(*search));
+  }
+
+  bool resuming = search->phase == ONENOTE_REPAIR_ANCHOR;
+
+  if ((search->phase == ONENOTE_REPAIR_NONE || resuming)
+      && best->found && !current->complete
+      && !onenote_reassembly_evidence_progress(current, best)) {
+    const OneNoteRecoveryScore anchor = *best;
+    OneNoteRecoveryScore expanded = resuming
+        ? search->local_best : (OneNoteRecoveryScore){0};
+    bool evidence_found = expanded.found;
+
+    for (uint64_t run_length = resuming ? search->run_length : 2;
+         run_length < block_count && *candidate && !evidence_found;
+         run_length++) {
+      uint64_t first_start = failure_start_slot >= run_length - 1
+                                 ? failure_start_slot - run_length + 1 : 1;
+      uint64_t final_start = failure_end_slot;
+      const uint64_t maximum_start = block_count - run_length;
+
+      if (first_start == 0) {
+        first_start = 1;
+      }
+      if (final_start > maximum_start) {
+        final_start = maximum_start;
+      }
+      if (first_start > final_start) {
+        continue;
+      }
+
+      for (uint64_t run_start = resuming ? search->run_start : first_start;
+           run_start <= final_start && *candidate && !evidence_found;
+           run_start++) {
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+          const uint64_t apparent = (uint64_t)mapping[run_start + offset];
+
+          used[apparent >> 3] &= (uint8_t)~(1u << (apparent & 7u));
+        }
+
+        int64_t sources[2] = {anchor.source, -1};
+
+        if (failure_slot >= run_start
+            && failure_slot - run_start <= INT64_MAX
+            && anchor.source >= (int64_t)(failure_slot - run_start)) {
+          sources[1] = anchor.source - (int64_t)(failure_slot - run_start);
+        }
+        for (uint32_t source_index = resuming ? (uint32_t)search->next_source : 0;
+             source_index < 2 && *candidate && !evidence_found;
+             source_index++) {
+          if (sources[source_index] < 0
+              || (source_index == 1 && sources[1] == sources[0])) {
+            continue;
+          }
+
+          OneNoteRecoveryScore observed = {0};
+          OneNoteRecoveryScore source_best = {0};
+
+          onenote_reassembly_try_run(
+              trial_data, mapping, used, block_count, data_length, kind,
+              run_start, run_length, sources[source_index], current,
+              &source_best, true, &observed, workspace, false);
+          if (onenote_reassembly_evidence_progress(current, &observed)) {
+            OneNoteRecoveryScore confirmed = {0};
+            OneNoteRecoveryScore confirmed_best = {0};
+
+            onenote_reassembly_try_run(
+                trial_data, mapping, used, block_count, data_length, kind,
+                run_start, run_length, sources[source_index], current,
+                &confirmed_best, true, &confirmed, workspace, true);
+            if (onenote_reassembly_evidence_progress(current, &confirmed)
+                && onenote_reassembly_score_better(&confirmed, &expanded)) {
+              expanded = confirmed;
+              evidence_found = true;
+            }
+          }
+          attempts++;
+          if ((attempts & UINT64_C(0xff)) == 0) {
+            *search = (OneNoteRepairSearch){
+              .phase = ONENOTE_REPAIR_ANCHOR, .run_start = run_start,
+              .run_length = run_length, .next_source = source_index + 1,
+              .best = anchor, .local_best = expanded
+            };
+            if (onenote_reassembly_search_poll(
+                    work, candidate, uuidp, uuidc, search, workspace)) {
+              for (uint64_t offset = 0; offset < run_length; offset++) {
+                const uint64_t apparent = (uint64_t)mapping[run_start + offset];
+
+                used[apparent >> 3] |= (uint8_t)(1u << (apparent & 7u));
+              }
+              return true;
+            }
+          }
+        }
+        resuming = false;
+
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+          const uint64_t apparent = (uint64_t)mapping[run_start + offset];
+
+          used[apparent >> 3] |= (uint8_t)(1u << (apparent & 7u));
+        }
+      }
+    }
+
+    if (evidence_found) {
+      *best = expanded;
+    }
+    else {
+      memset(best, 0, sizeof(*best));
+    }
+    memset(search, 0, sizeof(*search));
+  }
+  return false;
+}
+
+// Resume exhaustive run and small-suffix scans with their earlier best trials.
+// Temporary bytes and the used bitmap are rebuilt on entry; only the caller
+// commits a repair to the candidate.
+//
+static inline bool onenote_reassembly_search_runs(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint8_t *trial_data, const int64_t *mapping,
+    uint8_t *used, uint64_t block_count, uint64_t data_length,
+    OneNoteKind kind, uint64_t failure_start, uint64_t failure_end,
+    uint64_t failure_slot, const OneNoteRecoveryScore *current,
+    OneNoteRecoveryScore *best, OneNoteRecoveryScore *weak,
+    OneNoteRevisionState *workspace, OneNoteRepairSearch *search) {
+
+  const uint64_t image_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  const uint64_t blocksize = scalpel_state.blocksize;
+  uint64_t attempts = 0;
+  bool resume_runs = search->phase == ONENOTE_REPAIR_RUNS;
+  bool resume_suffix = search->phase == ONENOTE_REPAIR_SUFFIXES;
+
+  for (uint32_t pass = resume_runs ? search->pass : 0;
+       !resume_suffix && !current->complete && pass < 2 && !best->found; pass++) {
+    if (pass == 0 && failure_slot == 0) {
+      continue;
+    }
+    if (pass == 1 && best->found) {
+      break;
+    }
+    for (uint64_t run_length = resume_runs ? search->run_length : 1;
+         run_length < block_count && !best->found; run_length++) {
+      uint64_t first_start = 1;
+      uint64_t final_start = block_count - run_length;
+
+      if (pass == 0) {
+        first_start = failure_start >= run_length - 1
+                          ? failure_start - run_length + 1 : 1;
+        if (first_start == 0) {
+          first_start = 1;
+        }
+        final_start = failure_end < final_start
+                          ? failure_end : final_start;
+        if (first_start > final_start) {
+          continue;
+        }
+      }
+
+      OneNoteRecoveryScore length_best = resume_runs
+          ? search->local_best : (OneNoteRecoveryScore){0};
+
+      for (uint64_t run_start = resume_runs ? search->run_start : first_start;
+           run_start <= final_start && *candidate; run_start++) {
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+          const uint64_t apparent = (uint64_t)mapping[run_start + offset];
+
+          used[apparent >> 3]
+              &= (uint8_t)~(1u << (apparent & 7u));
+        }
+
+        int64_t preferred[2] = {-1, -1};
+
+        preferred[0] = mapping[run_start - 1] + 1;
+        if (run_start + run_length < block_count) {
+          preferred[1] = mapping[run_start + run_length]
+                         - (int64_t)run_length;
+        }
+        for (uint32_t index = 0; !resume_runs && index < 2; index++) {
+          if (preferred[index] >= 0
+              && (index == 0 || preferred[index] != preferred[0])) {
+            onenote_reassembly_probe_run(
+                trial_data, mapping, used, block_count, data_length, kind,
+                run_start, run_length, preferred[index], current,
+                &length_best, weak, false, workspace);
+          }
+        }
+
+        const uint64_t final_source = image_blocks - run_length;
+
+        for (uint64_t source = resume_runs ? search->next_source : 0;
+             source <= final_source && *candidate; source++) {
+          if ((int64_t)source != preferred[0]
+              && (int64_t)source != preferred[1]) {
+            onenote_reassembly_probe_run(
+                trial_data, mapping, used, block_count, data_length, kind,
+                run_start, run_length, (int64_t)source, current,
+                &length_best, weak, false, workspace);
+          }
+          attempts++;
+          if ((attempts & UINT64_C(0xff)) == 0) {
+            *search = (OneNoteRepairSearch){
+              .phase = ONENOTE_REPAIR_RUNS, .pass = pass,
+              .run_length = run_length, .run_start = run_start,
+              .next_source = source + 1, .best = *best, .weak = *weak,
+              .local_best = length_best
+            };
+            if (onenote_reassembly_search_poll(
+                    work, candidate, uuidp, uuidc, search, workspace)) {
+              return true;
+            }
+          }
+        }
+
+        resume_runs = false;
+
+        bool restored = true;
+
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+          if (!onenote_reassembly_copy_block(
+                  trial_data + (run_start + offset) * blocksize,
+                  mapping[run_start + offset])) {
+            restored = false;
+            break;
+          }
+        }
+        if (!restored) {
+          destroy_candidate(candidate);
+          return true;
+        }
+
+        for (uint64_t offset = 0; offset < run_length; offset++) {
+          const uint64_t apparent = (uint64_t)mapping[run_start + offset];
+
+          used[apparent >> 3]
+              |= (uint8_t)(1u << (apparent & 7u));
+        }
+      }
+      if (onenote_reassembly_score_better(&length_best, best)) {
+        *best = length_best;
+      }
+    }
+  }
+
+  // Exhaustively test forward shifts from every suffix boundary in small
+  // candidates. A gap can otherwise remain invisible when another displaced
+  // run determines the failure cursor. Larger candidates retain the
+  // parser-directed search without paying for repeated full-file parses.
+  if (!current->complete && !best->complete && block_count > 2
+      && block_count <= ONENOTE_REASSEMBLY_EXHAUSTIVE_GAP_BLOCKS) {
+    OneNoteRecoveryScore suffix_best = resume_suffix
+        ? search->local_best : (OneNoteRecoveryScore){0};
+
+    for (uint64_t run_start = resume_suffix ? search->run_start : 1;
+         run_start < block_count && *candidate
+         && !suffix_best.complete; run_start++) {
+      const uint64_t run_length = block_count - run_start;
+
+      for (uint64_t offset = 0; offset < run_length; offset++) {
+        const uint64_t apparent =
+            (uint64_t)mapping[run_start + offset];
+
+        used[apparent >> 3]
+            &= (uint8_t)~(1u << (apparent & 7u));
+      }
+
+      const int64_t previous = mapping[run_start - 1];
+
+      if (previous >= 0 && previous < INT64_MAX) {
+        const uint64_t expected_source = (uint64_t)previous + 1;
+
+        for (uint64_t shift = resume_suffix ? search->next_source : 1;
+             shift < run_length && *candidate
+             && !suffix_best.complete; shift++) {
+          if (expected_source > (uint64_t)INT64_MAX - shift) {
+            break;
+          }
+          onenote_reassembly_probe_run(
+              trial_data, mapping, used, block_count, data_length, kind,
+              run_start, run_length,
+              (int64_t)(expected_source + shift), current,
+              &suffix_best, weak, false, workspace);
+
+          attempts++;
+          if ((attempts & UINT64_C(0xff)) == 0) {
+            *search = (OneNoteRepairSearch){
+              .phase = ONENOTE_REPAIR_SUFFIXES,
+              .run_length = run_length, .run_start = run_start,
+              .next_source = shift + 1, .best = *best, .weak = *weak,
+              .local_best = suffix_best
+            };
+            if (onenote_reassembly_search_poll(
+                    work, candidate, uuidp, uuidc, search, workspace)) {
+              return true;
+            }
+          }
+        }
+      }
+
+      resume_suffix = false;
+
+      bool restored = true;
+
+      for (uint64_t offset = 0; offset < run_length; offset++) {
+        if (!onenote_reassembly_copy_block(
+                trial_data + (run_start + offset) * blocksize,
+                mapping[run_start + offset])) {
+          restored = false;
+          break;
+        }
+      }
+      for (uint64_t offset = 0; offset < run_length; offset++) {
+        const uint64_t apparent =
+            (uint64_t)mapping[run_start + offset];
+
+        used[apparent >> 3]
+            |= (uint8_t)(1u << (apparent & 7u));
+      }
+      if (!restored) {
+        destroy_candidate(candidate);
+        return true;
+      }
+    }
+    if (onenote_reassembly_score_better(&suffix_best, best)) {
+      *best = suffix_best;
+    }
+  }
+
+
+  memset(search, 0, sizeof(*search));
+  return false;
+}
+
 // Package stores are sequential FSSHTTPB streams. A physical zero-block gap
 // can therefore be repaired by removing the zero island, shifting the mapped
 // suffix left, and continuing the same physical run until its authenticated
@@ -4005,7 +5490,33 @@ static inline void onenote_package_reassembly(
     return;
   }
 
-  uint64_t trial_capacity = block_count;
+  OneNoteCarveState *state = onenote_reassembly_progress_state(
+      *candidate, mapping, block_count, current_length);
+  state->progress_valid = 1;
+  onenote_store_carve_state(*candidate, state);
+  onenote_free_carve_state((void **)&state);
+  OneNoteRepairSearch search = onenote_reassembly_load_search(*candidate);
+  OneNoteRevisionState workspace = {.searched_end = search.searched_end};
+  const uint64_t max_file_blocks = 1
+      + (UINT64_C(4294967296) - 1) / blocksize;
+  const uint64_t capacity_limit = image_blocks < max_file_blocks
+      ? image_blocks : max_file_blocks;
+
+  if ((search.phase != ONENOTE_REPAIR_PACKAGE_GAP
+       && search.phase != ONENOTE_REPAIR_PACKAGE_TAIL)
+      || search.next_source > capacity_limit
+      || search.next_source > SIZE_MAX / sizeof(int64_t)
+      || search.next_source > SIZE_MAX / blocksize) {
+    memset(&search, 0, sizeof(search));
+  }
+  for (uint64_t slot = 0; slot < block_count; slot++) {
+    if (workspace.searched_end < (uint64_t)mapping[slot] + 1) {
+      workspace.searched_end = (uint64_t)mapping[slot] + 1;
+    }
+  }
+  bool resume_tail = search.phase == ONENOTE_REPAIR_PACKAGE_TAIL;
+  uint64_t trial_capacity = resume_tail && search.next_source > block_count
+      ? search.next_source : block_count;
   int64_t *trial_mapping = malloc(
       (size_t)trial_capacity * sizeof(*trial_mapping));
   check_memory_allocation(trial_mapping, __LINE__, __FILE__,
@@ -4013,13 +5524,10 @@ static inline void onenote_package_reassembly(
   uint8_t *trial_data = malloc((size_t)trial_capacity * blocksize);
   check_memory_allocation(trial_data, __LINE__, __FILE__,
                           "OneNote package trial data");
-  const uint64_t max_file_blocks = 1
-      + (UINT64_C(4294967296) - 1) / blocksize;
-  const uint64_t capacity_limit = image_blocks < max_file_blocks
-      ? image_blocks : max_file_blocks;
   bool recovered = false;
 
-  for (uint64_t gap_start = 1;
+  for (uint64_t gap_start = search.phase == ONENOTE_REPAIR_NONE
+                                 ? 1 : search.run_start;
        gap_start < block_count && *candidate && !recovered;
        gap_start++) {
     const int64_t gap_actual = filemirror_actual_blocknumber(
@@ -4051,11 +5559,28 @@ static inline void onenote_package_reassembly(
     const uint64_t trial_blocks = block_count - zero_blocks;
     bool copied = true;
 
-    for (uint64_t slot = 0; slot < trial_blocks; slot++) {
-      const uint64_t source_slot = slot < gap_start
-                                       ? slot : slot + zero_blocks;
+    if (resume_tail && search.run_length != zero_blocks) {
+      resume_tail = false;
+    }
+    const uint64_t restored_blocks = resume_tail
+        ? search.next_source : trial_blocks;
 
-      trial_mapping[slot] = mapping[source_slot];
+    for (uint64_t slot = 0; slot < restored_blocks; slot++) {
+      if (slot < trial_blocks) {
+        const uint64_t source_slot = slot < gap_start
+            ? slot : slot + zero_blocks;
+
+        trial_mapping[slot] = mapping[source_slot];
+      }
+      else {
+        const uint64_t delta = slot - trial_blocks + 1;
+
+        if (delta > (uint64_t)(INT64_MAX - mapping[block_count - 1])) {
+          copied = false;
+          break;
+        }
+        trial_mapping[slot] = mapping[block_count - 1] + (int64_t)delta;
+      }
       if (!onenote_reassembly_copy_block(
               trial_data + slot * blocksize, trial_mapping[slot])) {
         copied = false;
@@ -4064,15 +5589,18 @@ static inline void onenote_package_reassembly(
     }
 
     OneNoteSummary trial_summary = {0};
-    uint64_t materialized_blocks = trial_blocks;
+    uint64_t materialized_blocks = restored_blocks;
 
-    if (copied) {
+    if (copied && !resume_tail) {
       recovered = onenote_parse(
           trial_data, materialized_blocks * blocksize, kind, &trial_summary);
     }
 
-    int64_t next_apparent = mapping[block_count - 1] == INT64_MAX
-        ? -1 : mapping[block_count - 1] + 1;
+    const uint64_t next_delta = materialized_blocks - trial_blocks + 1;
+    int64_t next_apparent = next_delta
+            > (uint64_t)(INT64_MAX - mapping[block_count - 1])
+        ? -1 : mapping[block_count - 1] + (int64_t)next_delta;
+    resume_tail = false;
 
     while (copied && !recovered && next_apparent >= 0
            && (uint64_t)next_apparent < image_blocks
@@ -4125,8 +5653,16 @@ static inline void onenote_package_reassembly(
             kind, &trial_summary);
       }
 
+      if (workspace.searched_end < (uint64_t)next_apparent + 1) {
+        workspace.searched_end = (uint64_t)next_apparent + 1;
+      }
+      search = (OneNoteRepairSearch){
+        .phase = ONENOTE_REPAIR_PACKAGE_TAIL, .run_start = gap_start,
+        .run_length = zero_blocks, .next_source = materialized_blocks
+      };
       if (!recovered
-          && onenote_reassembly_poll(work, candidate, uuidp, uuidc)) {
+          && onenote_reassembly_search_poll(
+                 work, candidate, uuidp, uuidc, &search, &workspace)) {
         free(trial_data);
         free(trial_mapping);
         free(mapping);
@@ -4153,7 +5689,12 @@ static inline void onenote_package_reassembly(
       break;
     }
 
-    if (onenote_reassembly_poll(work, candidate, uuidp, uuidc)) {
+    search = (OneNoteRepairSearch){
+      .phase = ONENOTE_REPAIR_PACKAGE_GAP,
+      .run_start = gap_start + zero_blocks
+    };
+    if (onenote_reassembly_search_poll(
+            work, candidate, uuidp, uuidc, &search, &workspace)) {
       free(trial_data);
       free(trial_mapping);
       free(mapping);
@@ -4342,9 +5883,21 @@ static inline void onenote_reassembly(ThreadWork *work,
   check_memory_allocation(displacements, __LINE__, __FILE__,
                           "OneNote source displacements");
   displacements[0] = first_apparent;
+  onenote_reassembly_restore_progress(
+      *candidate, mapping, block_count, data_length, &current,
+      &displacements, &displacement_count, &displacement_capacity);
+  OneNoteRepairSearch search = onenote_reassembly_load_search(*candidate);
+  parser_workspace.searched_end = search.searched_end;
 
   while (*candidate && !current.summary.no_memory) {
-    OneNoteRecoveryScore best = {0};
+    OneNoteRecoveryScore best = search.best;
+
+    for (uint64_t slot = 0; slot < block_count; slot++) {
+      if (mapping[slot] >= 0
+          && parser_workspace.searched_end < (uint64_t)mapping[slot] + 1) {
+        parser_workspace.searched_end = (uint64_t)mapping[slot] + 1;
+      }
+    }
     uint64_t failure_slot = current.summary.failure_offset / blocksize;
     uint64_t failure_start_slot = current.summary.failure_start / blocksize;
     uint64_t failure_end_slot = current.summary.failure_end / blocksize;
@@ -4361,801 +5914,72 @@ static inline void onenote_reassembly(ThreadWork *work,
       failure_end_slot = block_count - 1;
     }
 
-    uint64_t attempts = 0;
-    // A physical gap commonly appears as one or more mapped zero blocks
-    // followed by the displaced suffix. Test that complete suffix directly;
-    // strict parser progress is still required before it can be committed.
-    // Valid allocated zero ranges remain untouched when this hypothesis does
-    // not improve the parse, and the general search below remains available.
-    if (!current.complete && block_count > 1) {
-      for (uint64_t gap_start = 1;
-           gap_start < block_count && *candidate && !best.complete;
-           gap_start++) {
-        const int64_t gap_actual = filemirror_actual_blocknumber(
-            scalpel_state.filemirror, mapping[gap_start]);
-
-        if (gap_actual < 0
-            || !filemirror_actual_block_is_zero(
-                   scalpel_state.filemirror, gap_actual)) {
-          continue;
-        }
-
-        uint64_t zero_blocks = 1;
-
-        while (zero_blocks < block_count - gap_start) {
-          const int64_t actual = filemirror_actual_blocknumber(
-              scalpel_state.filemirror,
-              mapping[gap_start + zero_blocks]);
-
-          if (actual < 0
-              || !filemirror_actual_block_is_zero(
-                     scalpel_state.filemirror, actual)) {
-            break;
-          }
-          zero_blocks++;
-        }
-
-        const uint64_t run_length = block_count - gap_start;
-
-        if (mapping[gap_start] >= 0
-            && zero_blocks <= (uint64_t)(INT64_MAX - mapping[gap_start])) {
-          for (uint64_t offset = 0; offset < run_length; offset++) {
-            const uint64_t apparent =
-                (uint64_t)mapping[gap_start + offset];
-
-            used[apparent >> 3]
-                &= (uint8_t)~(1u << (apparent & 7u));
-          }
-
-          OneNoteRecoveryScore gap_best = {0};
-
-          onenote_reassembly_try_run(
-              trial_data, mapping, used, block_count, data_length, kind,
-              gap_start, run_length,
-              mapping[gap_start] + (int64_t)zero_blocks,
-              &current, &gap_best, true, NULL, &parser_workspace, true);
-          if (onenote_reassembly_score_better(&gap_best, &best)) {
-            best = gap_best;
-          }
-
-          for (uint64_t offset = 0; offset < run_length; offset++) {
-            const uint64_t apparent =
-                (uint64_t)mapping[gap_start + offset];
-
-            used[apparent >> 3]
-                |= (uint8_t)(1u << (apparent & 7u));
-          }
-        }
-
-        attempts++;
-        if (onenote_reassembly_poll(work, candidate, uuidp, uuidc)) {
-          onenote_revision_state_release(&parser_workspace);
-          free(displacements);
-          free(trial_data);
-          free(used);
-          free(mapping);
-          return;
-        }
-        gap_start += zero_blocks - 1;
-      }
+    if (onenote_reassembly_search_zero(
+            work, candidate, uuidp, uuidc, trial_data, mapping, used,
+            block_count, data_length, kind, failure_start_slot,
+            failure_end_slot, &current, &best, &parser_workspace, &search)) {
+      onenote_revision_state_release(&parser_workspace);
+      free(displacements);
+      free(trial_data);
+      free(used);
+      free(mapping);
+      return;
     }
 
-    // An out-of-order run commonly leaves a fixed-size zero island at its
-    // logical position. Test islands near the parser's failure range first,
-    // then the remaining islands before expanding the general search. Parser
-    // failures can surface well after the displaced run that caused them.
-    // Strict format evidence remains the acceptance criterion.
-    if (!current.complete && !best.complete
-        && failure_start_slot > 0
-        && failure_start_slot <= failure_end_slot) {
-      for (uint32_t zero_pass = 0;
-           zero_pass < 2 && *candidate && !best.complete; zero_pass++) {
-        for (uint64_t zero_start = 1;
-             zero_start < block_count && *candidate && !best.complete;
-             zero_start++) {
-          const int64_t zero_actual = filemirror_actual_blocknumber(
-              scalpel_state.filemirror, mapping[zero_start]);
-
-          if (zero_actual < 0
-              || !filemirror_actual_block_is_zero(
-                     scalpel_state.filemirror, zero_actual)) {
-            continue;
-          }
-
-          uint64_t zero_blocks = 1;
-
-          while (zero_blocks < block_count - zero_start) {
-            const int64_t actual = filemirror_actual_blocknumber(
-                scalpel_state.filemirror,
-                mapping[zero_start + zero_blocks]);
-
-            if (actual < 0
-                || !filemirror_actual_block_is_zero(
-                       scalpel_state.filemirror, actual)) {
-              break;
-            }
-            zero_blocks++;
-          }
-          const uint64_t zero_end = zero_start + zero_blocks - 1;
-
-          const bool intersects_failure = zero_end >= failure_start_slot
-                                          && zero_start <= failure_end_slot;
-
-          if ((zero_pass == 0) != intersects_failure) {
-            zero_start += zero_blocks - 1;
-            continue;
-          }
-
-          bool contiguous_target = true;
-          const uint64_t target_start = (uint64_t)mapping[zero_start];
-
-          for (uint64_t offset = 1; offset < zero_blocks; offset++) {
-            if (mapping[zero_start + offset]
-                != mapping[zero_start] + (int64_t)offset) {
-              contiguous_target = false;
-              break;
-            }
-          }
-          if (!contiguous_target) {
-            zero_start += zero_blocks - 1;
-            continue;
-          }
-          const uint64_t target_end = target_start + zero_blocks;
-
-          for (uint64_t offset = 0; offset < zero_blocks; offset++) {
-            const uint64_t apparent =
-                (uint64_t)mapping[zero_start + offset];
-
-            used[apparent >> 3]
-                &= (uint8_t)~(1u << (apparent & 7u));
-          }
-
-          OneNoteRecoveryScore zero_best = {0};
-          OneNoteRecoveryScore zero_weak = {0};
-          const uint64_t final_source = image_blocks - zero_blocks;
-
-          for (uint64_t source = 0;
-               source <= final_source && *candidate && !zero_best.complete;
-               source++) {
-            // A displaced run has a distinct physical source. Overlapping
-            // suffix shifts are evaluated by the zero-gap path above.
-            if (source < target_end
-                && source + zero_blocks > target_start) {
-              continue;
-            }
-            onenote_reassembly_probe_run(
-                trial_data, mapping, used, block_count, data_length, kind,
-                zero_start, zero_blocks, (int64_t)source, &current,
-                &zero_best, &zero_weak, false, &parser_workspace);
-
-            attempts++;
-            if ((attempts & UINT64_C(0xff)) == 0
-                && onenote_reassembly_poll(
-                       work, candidate, uuidp, uuidc)) {
-              onenote_revision_state_release(&parser_workspace);
-              free(displacements);
-              free(trial_data);
-              free(used);
-              free(mapping);
-              return;
-            }
-          }
-
-          bool restored = true;
-
-          for (uint64_t offset = 0; offset < zero_blocks; offset++) {
-            if (!onenote_reassembly_copy_block(
-                    trial_data + (zero_start + offset) * blocksize,
-                    mapping[zero_start + offset])) {
-              restored = false;
-              break;
-            }
-          }
-          for (uint64_t offset = 0; offset < zero_blocks; offset++) {
-            const uint64_t apparent =
-                (uint64_t)mapping[zero_start + offset];
-
-            used[apparent >> 3]
-                |= (uint8_t)(1u << (apparent & 7u));
-          }
-          if (!restored) {
-            onenote_revision_state_release(&parser_workspace);
-            free(displacements);
-            free(trial_data);
-            free(used);
-            free(mapping);
-            destroy_candidate(candidate);
-            return;
-          }
-          if (zero_best.complete) {
-            zero_best.exact_run_boundaries = true;
-          }
-          if (onenote_reassembly_score_better(&zero_best, &best)) {
-            best = zero_best;
-          }
-          zero_start += zero_blocks - 1;
-        }
-      }
-    }
-
-    // A damaged embedded DEFLATE member can remain syntactically valid and
-    // reveal corruption only through its stored output length and CRC. Search
-    // statistically uniform destination blocks first, then extend any source
-    // alignment whose decoded length moves toward the stored value. Only a
-    // complete parent and child validation leaves this fast path.
-    //
-    if (!current.complete && current.zip_output_comparable
-        && failure_start_slot > 0
-        && failure_start_slot <= failure_end_slot) {
-      const uint64_t priority_count = failure_end_slot
-                                      - failure_start_slot + 1;
-
-      if (priority_count <= SIZE_MAX / sizeof(OneNoteTargetPriority)) {
-        OneNoteTargetPriority *priorities = malloc(
-            (size_t)priority_count * sizeof(*priorities));
-        check_memory_allocation(priorities, __LINE__, __FILE__,
-                                "OneNote ZIP target priorities");
-
-        for (uint64_t index = 0; index < priority_count; index++) {
-          const uint64_t slot = failure_start_slot + index;
-
-          priorities[index].slot = slot;
-          priorities[index].uniformity = onenote_reassembly_uniformity(
-              trial_data + slot * blocksize, blocksize);
-        }
-        for (uint64_t index = 1; index < priority_count; index++) {
-          const OneNoteTargetPriority value = priorities[index];
-          uint64_t destination = index;
-
-          while (destination > 0
-                 && (value.uniformity
-                         < priorities[destination - 1].uniformity
-                     || (value.uniformity
-                             == priorities[destination - 1].uniformity
-                         && value.slot
-                                < priorities[destination - 1].slot))) {
-            priorities[destination] = priorities[destination - 1];
-            destination--;
-          }
-          priorities[destination] = value;
-        }
-
-        for (uint64_t priority = 0;
-             priority < priority_count && *candidate && !best.complete;
-             priority++) {
-          const uint64_t run_start = priorities[priority].slot;
-          const uint64_t old_apparent = (uint64_t)mapping[run_start];
-
-          used[old_apparent >> 3]
-              &= (uint8_t)~(1u << (old_apparent & 7u));
-
-          OneNoteRecoveryScore preferred = {0};
-          uint64_t preferred_source = 0;
-
-          for (uint64_t source = 0;
-               source < image_blocks && *candidate && !best.complete;
-               source++) {
-            OneNoteRecoveryScore source_best = {0};
-            OneNoteRecoveryScore observed = {0};
-
-            const bool advanced = onenote_reassembly_try_run(
-                trial_data, mapping, used, block_count, data_length, kind,
-                run_start, 1, (int64_t)source, &current, &source_best,
-                true, &observed, &parser_workspace, true);
-
-            if (advanced && observed.complete) {
-              best = observed;
-              break;
-            }
-            if (advanced && observed.zip_output_comparable
-                && observed.zip_output_distance
-                       < current.zip_output_distance) {
-              if (!preferred.found
-                  || observed.zip_output_distance
-                         < preferred.zip_output_distance
-                  || (observed.zip_output_distance
-                          == preferred.zip_output_distance
-                      && onenote_reassembly_score_better(
-                             &observed, &preferred))) {
-                preferred = observed;
-                preferred_source = source;
-              }
-            }
-
-            attempts++;
-            if ((attempts & UINT64_C(0xff)) == 0
-                && onenote_reassembly_poll(
-                       work, candidate, uuidp, uuidc)) {
-              used[old_apparent >> 3]
-                  |= (uint8_t)(1u << (old_apparent & 7u));
-              free(priorities);
-              onenote_revision_state_release(&parser_workspace);
-              free(displacements);
-              free(trial_data);
-              free(used);
-              free(mapping);
-              return;
-            }
-          }
-
-          if (!best.complete && preferred.found) {
-            uint64_t prior_distance = preferred.zip_output_distance;
-            uint64_t maximum_length = failure_end_slot - run_start + 1;
-
-            if (maximum_length > block_count - run_start) {
-              maximum_length = block_count - run_start;
-            }
-            if (maximum_length > image_blocks - preferred_source) {
-              maximum_length = image_blocks - preferred_source;
-            }
-
-            uint64_t cleared = 1;
-
-            for (uint64_t run_length = 2;
-                 run_length <= maximum_length && *candidate;
-                 run_length++) {
-              const uint64_t slot = run_start + run_length - 1;
-              const uint64_t apparent = (uint64_t)mapping[slot];
-
-              used[apparent >> 3]
-                  &= (uint8_t)~(1u << (apparent & 7u));
-              cleared = run_length;
-
-              OneNoteRecoveryScore extended_best = {0};
-              OneNoteRecoveryScore extended = {0};
-              const bool extension_advanced = onenote_reassembly_try_run(
-                  trial_data, mapping, used, block_count, data_length,
-                  kind, run_start, run_length, (int64_t)preferred_source,
-                  &current, &extended_best, true, &extended,
-                  &parser_workspace, true);
-
-              if (extension_advanced && extended.complete) {
-                best = extended;
-                break;
-              }
-              if (!extension_advanced
-                  || !extended.zip_output_comparable
-                  || extended.zip_output_distance >= prior_distance) {
-                break;
-              }
-              prior_distance = extended.zip_output_distance;
-            }
-
-            for (uint64_t offset = 1; offset < cleared; offset++) {
-              const uint64_t apparent =
-                  (uint64_t)mapping[run_start + offset];
-
-              used[apparent >> 3]
-                  |= (uint8_t)(1u << (apparent & 7u));
-            }
-          }
-
-          used[old_apparent >> 3]
-              |= (uint8_t)(1u << (old_apparent & 7u));
-        }
-        free(priorities);
-      }
+    if (onenote_reassembly_search_zip(
+            work, candidate, uuidp, uuidc, trial_data, mapping, used,
+            block_count, data_length, kind, failure_start_slot,
+            failure_end_slot, &current, &best, &parser_workspace, &search)) {
+      onenote_revision_state_release(&parser_workspace);
+      free(displacements);
+      free(trial_data);
+      free(used);
+      free(mapping);
+      return;
     }
 
     if (current.complete && current.exact_run_boundaries) {
       break;
     }
 
-    // Once the format is complete, only refine boundaries between physical
-    // alignments that previously advanced the parser. This can recover opaque
-    // edge blocks without admitting unrelated source regions merely because
-    // they happen to improve a byte-continuity heuristic.
-    if (current.complete) {
-      if (onenote_reassembly_preserve_interior_spans(
-              work, candidate, uuidp, uuidc, trial_data, mapping, used,
-              block_count, data_length, kind, &current,
-              &parser_workspace)) {
-        onenote_revision_state_release(&parser_workspace);
-        free(displacements);
-        free(trial_data);
-        free(used);
-        free(mapping);
-        return;
-      }
-      for (uint64_t boundary = 1;
-           boundary < block_count && *candidate; boundary++) {
-        if (mapping[boundary] == mapping[boundary - 1] + 1) {
-          continue;
-        }
-
-        for (uint32_t side = 0; side < 2; side++) {
-          const uint64_t maximum_length = side == 0
-                                              ? boundary - 1
-                                              : block_count - boundary;
-
-          for (uint64_t run_length = 1;
-               run_length <= maximum_length && *candidate; run_length++) {
-            const uint64_t run_start = side == 0
-                                           ? boundary - run_length
-                                           : boundary;
-
-            for (uint64_t offset = 0; offset < run_length; offset++) {
-              const uint64_t apparent =
-                  (uint64_t)mapping[run_start + offset];
-
-              used[apparent >> 3]
-                  &= (uint8_t)~(1u << (apparent & 7u));
-            }
-
-            if (run_start <= INT64_MAX) {
-              const int64_t logical_start = (int64_t)run_start;
-
-              for (uint64_t index = 0;
-                   index < displacement_count && *candidate; index++) {
-                if (displacements[index]
-                    <= INT64_MAX - logical_start) {
-                  OneNoteRecoveryScore observed = {0};
-
-                  onenote_reassembly_try_run(
-                      trial_data, mapping, used, block_count, data_length,
-                      kind, run_start, run_length,
-                      displacements[index] + logical_start, &current, &best,
-                      true, &observed, &parser_workspace, true);
-                  if (observed.complete
-                      && (observed.content_seam_cost
-                              == current.content_seam_cost)
-                      && scalpel_state.write_promising) {
-                    onenote_reassembly_preserve_run(
-                        candidate, mapping, block_count, data_length,
-                        &observed);
-                  }
-                }
-                attempts++;
-                if ((attempts & UINT64_C(0xff)) == 0
-                    && onenote_reassembly_poll(
-                           work, candidate, uuidp, uuidc)) {
-                  onenote_revision_state_release(&parser_workspace);
-                  free(displacements);
-                  free(trial_data);
-                  free(used);
-                  free(mapping);
-                  return;
-                }
-              }
-            }
-
-            for (uint64_t offset = 0; offset < run_length; offset++) {
-              const uint64_t apparent =
-                  (uint64_t)mapping[run_start + offset];
-
-              used[apparent >> 3]
-                  |= (uint8_t)(1u << (apparent & 7u));
-            }
-          }
-        }
-      }
+    if (onenote_reassembly_search_boundaries(
+            work, candidate, uuidp, uuidc, trial_data, mapping, used,
+            block_count, data_length, kind, &current, &best, displacements,
+            displacement_count, &parser_workspace, &search)) {
+      onenote_revision_state_release(&parser_workspace);
+      free(displacements);
+      free(trial_data);
+      free(used);
+      free(mapping);
+      return;
     }
 
-    // A parser failure usually identifies one logical block inside a displaced
-    // physical run. Try previously proven source alignments first. New source
-    // alignments are discovered by the format-evidence search below; scheduler
-    // metadata is used only to break ties between equally validated trials.
-    if (!current.complete && !best.complete && failure_slot > 0) {
-      if (failure_slot <= INT64_MAX) {
-        const int64_t logical_slot = (int64_t)failure_slot;
-
-        for (uint64_t index = 0;
-             index < displacement_count && *candidate; index++) {
-          if (displacements[index] >= -logical_slot
-              && displacements[index] <= INT64_MAX - logical_slot) {
-            onenote_reassembly_try_alignment(
-                trial_data, mapping, used, block_count, data_length, kind,
-                failure_start_slot, failure_end_slot, failure_slot,
-                displacements[index] + logical_slot, &current, &best,
-                NULL, &parser_workspace, true);
-          }
-        }
-      }
-
-    }
-    // A parser cursor can move past a corrupt block for many unrelated byte
-    // values. Before committing such a weak single-block result, treat its
-    // physical source as an anchor and test progressively larger contiguous
-    // runs intersecting the reported failure. This recovers displaced runs
-    // without searching every image block again for every possible length.
-    //
-    if (best.found && !current.complete
-        && !onenote_reassembly_evidence_progress(&current, &best)) {
-      const OneNoteRecoveryScore anchor = best;
-      OneNoteRecoveryScore expanded = {0};
-      bool evidence_found = false;
-
-      for (uint64_t run_length = 2;
-           run_length < block_count && *candidate && !evidence_found;
-           run_length++) {
-        uint64_t first_start = failure_start_slot >= run_length - 1
-                                   ? failure_start_slot - run_length + 1 : 1;
-        uint64_t final_start = failure_end_slot;
-        const uint64_t maximum_start = block_count - run_length;
-
-        if (first_start == 0) {
-          first_start = 1;
-        }
-        if (final_start > maximum_start) {
-          final_start = maximum_start;
-        }
-        if (first_start > final_start) {
-          continue;
-        }
-
-        for (uint64_t run_start = first_start;
-             run_start <= final_start && *candidate && !evidence_found;
-             run_start++) {
-          for (uint64_t offset = 0; offset < run_length; offset++) {
-            const uint64_t apparent = (uint64_t)mapping[run_start + offset];
-
-            used[apparent >> 3]
-                &= (uint8_t)~(1u << (apparent & 7u));
-          }
-
-          int64_t sources[2] = {anchor.source, -1};
-
-          if (failure_slot >= run_start
-              && failure_slot - run_start <= INT64_MAX
-              && anchor.source >= (int64_t)(failure_slot - run_start)) {
-            sources[1] = anchor.source
-                         - (int64_t)(failure_slot - run_start);
-          }
-
-          for (uint32_t source_index = 0;
-               source_index < 2 && *candidate && !evidence_found;
-               source_index++) {
-            if (sources[source_index] < 0
-                || (source_index == 1 && sources[1] == sources[0])) {
-              continue;
-            }
-
-            OneNoteRecoveryScore observed = {0};
-            OneNoteRecoveryScore source_best = {0};
-
-            onenote_reassembly_try_run(
-                trial_data, mapping, used, block_count, data_length, kind,
-                run_start, run_length, sources[source_index], &current,
-                &source_best, true, &observed, &parser_workspace, false);
-            if (onenote_reassembly_evidence_progress(&current, &observed)) {
-              OneNoteRecoveryScore confirmed = {0};
-              OneNoteRecoveryScore confirmed_best = {0};
-
-              onenote_reassembly_try_run(
-                  trial_data, mapping, used, block_count, data_length, kind,
-                  run_start, run_length, sources[source_index], &current,
-                  &confirmed_best, true, &confirmed, &parser_workspace, true);
-              if (onenote_reassembly_evidence_progress(&current, &confirmed)
-                  && onenote_reassembly_score_better(
-                         &confirmed, &expanded)) {
-                expanded = confirmed;
-                evidence_found = true;
-              }
-            }
-            attempts++;
-            if ((attempts & UINT64_C(0xff)) == 0
-                && onenote_reassembly_poll(
-                       work, candidate, uuidp, uuidc)) {
-              onenote_revision_state_release(&parser_workspace);
-              free(displacements);
-              free(trial_data);
-              free(used);
-              free(mapping);
-              return;
-            }
-          }
-
-          for (uint64_t offset = 0; offset < run_length; offset++) {
-            const uint64_t apparent = (uint64_t)mapping[run_start + offset];
-
-            used[apparent >> 3]
-                |= (uint8_t)(1u << (apparent & 7u));
-          }
-        }
-      }
-      if (evidence_found) {
-        best = expanded;
-      }
-      else {
-        memset(&best, 0, sizeof(best));
-      }
+    if (onenote_reassembly_search_alignments(
+            work, candidate, uuidp, uuidc, trial_data, mapping, used,
+            block_count, data_length, kind, failure_start_slot,
+            failure_end_slot, failure_slot, &current, &best, displacements,
+            displacement_count, &parser_workspace, &search)) {
+      onenote_revision_state_release(&parser_workspace);
+      free(displacements);
+      free(trial_data);
+      free(used);
+      free(mapping);
+      return;
     }
 
-    OneNoteRecoveryScore weak = {0};
+    OneNoteRecoveryScore weak = search.weak;
 
-    for (uint32_t pass = 0;
-         !current.complete && pass < 2 && !best.found; pass++) {
-      if (pass == 0 && failure_slot == 0) {
-        continue;
-      }
-      if (pass == 1 && best.found) {
-        break;
-      }
-      for (uint64_t run_length = 1;
-           run_length < block_count && !best.found; run_length++) {
-        uint64_t first_start = 1;
-        uint64_t final_start = block_count - run_length;
-
-        if (pass == 0) {
-          first_start = failure_start_slot >= run_length - 1
-                            ? failure_start_slot - run_length + 1 : 1;
-          if (first_start == 0) {
-            first_start = 1;
-          }
-          final_start = failure_end_slot < final_start
-                            ? failure_end_slot : final_start;
-          if (first_start > final_start) {
-            continue;
-          }
-        }
-
-        OneNoteRecoveryScore best_for_length = {0};
-
-        for (uint64_t run_start = first_start;
-             run_start <= final_start && *candidate; run_start++) {
-          for (uint64_t offset = 0; offset < run_length; offset++) {
-            const uint64_t apparent = (uint64_t)mapping[run_start + offset];
-
-            used[apparent >> 3]
-                &= (uint8_t)~(1u << (apparent & 7u));
-          }
-
-          int64_t preferred[2] = {-1, -1};
-
-          preferred[0] = mapping[run_start - 1] + 1;
-          if (run_start + run_length < block_count) {
-            preferred[1] = mapping[run_start + run_length]
-                           - (int64_t)run_length;
-          }
-          for (uint32_t index = 0; index < 2; index++) {
-            if (preferred[index] >= 0
-                && (index == 0 || preferred[index] != preferred[0])) {
-              onenote_reassembly_probe_run(
-                  trial_data, mapping, used, block_count, data_length, kind,
-                  run_start, run_length, preferred[index], &current,
-                  &best_for_length, &weak, false, &parser_workspace);
-            }
-          }
-
-          const uint64_t final_source = image_blocks - run_length;
-
-          for (uint64_t source = 0;
-               source <= final_source && *candidate; source++) {
-            if ((int64_t)source != preferred[0]
-                && (int64_t)source != preferred[1]) {
-              onenote_reassembly_probe_run(
-                  trial_data, mapping, used, block_count, data_length, kind,
-                  run_start, run_length, (int64_t)source, &current,
-                  &best_for_length, &weak, false, &parser_workspace);
-            }
-            attempts++;
-            if ((attempts & UINT64_C(0xff)) == 0
-                && onenote_reassembly_poll(
-                       work, candidate, uuidp, uuidc)) {
-              onenote_revision_state_release(&parser_workspace);
-              free(displacements);
-              free(trial_data);
-              free(used);
-              free(mapping);
-              return;
-            }
-          }
-
-          bool restored = true;
-
-          for (uint64_t offset = 0; offset < run_length; offset++) {
-            if (!onenote_reassembly_copy_block(
-                    trial_data + (run_start + offset) * blocksize,
-                    mapping[run_start + offset])) {
-              restored = false;
-              break;
-            }
-          }
-          if (!restored) {
-            onenote_revision_state_release(&parser_workspace);
-            free(displacements);
-            free(trial_data);
-            free(used);
-            free(mapping);
-            destroy_candidate(candidate);
-            return;
-          }
-
-          for (uint64_t offset = 0; offset < run_length; offset++) {
-            const uint64_t apparent = (uint64_t)mapping[run_start + offset];
-
-            used[apparent >> 3]
-                |= (uint8_t)(1u << (apparent & 7u));
-          }
-        }
-        if (onenote_reassembly_score_better(&best_for_length, &best)) {
-          best = best_for_length;
-        }
-      }
-    }
-
-    // Exhaustively test forward shifts from every suffix boundary in small
-    // candidates. A gap can otherwise remain invisible when another displaced
-    // run determines the failure cursor. Larger candidates retain the
-    // parser-directed search without paying for repeated full-file parses.
-    if (!current.complete && !best.complete && block_count > 2
-        && block_count <= ONENOTE_REASSEMBLY_EXHAUSTIVE_GAP_BLOCKS) {
-      OneNoteRecoveryScore suffix_best = {0};
-
-      for (uint64_t run_start = 1;
-           run_start < block_count && *candidate
-           && !suffix_best.complete; run_start++) {
-        const uint64_t run_length = block_count - run_start;
-
-        for (uint64_t offset = 0; offset < run_length; offset++) {
-          const uint64_t apparent =
-              (uint64_t)mapping[run_start + offset];
-
-          used[apparent >> 3]
-              &= (uint8_t)~(1u << (apparent & 7u));
-        }
-
-        const int64_t previous = mapping[run_start - 1];
-
-        if (previous >= 0 && previous < INT64_MAX) {
-          const uint64_t expected_source = (uint64_t)previous + 1;
-
-          for (uint64_t shift = 1;
-               shift < run_length && *candidate
-               && !suffix_best.complete; shift++) {
-            if (expected_source > (uint64_t)INT64_MAX - shift) {
-              break;
-            }
-            onenote_reassembly_probe_run(
-                trial_data, mapping, used, block_count, data_length, kind,
-                run_start, run_length,
-                (int64_t)(expected_source + shift), &current,
-                &suffix_best, &weak, false, &parser_workspace);
-
-            attempts++;
-            if ((attempts & UINT64_C(0xff)) == 0
-                && onenote_reassembly_poll(
-                       work, candidate, uuidp, uuidc)) {
-              onenote_revision_state_release(&parser_workspace);
-              free(displacements);
-              free(trial_data);
-              free(used);
-              free(mapping);
-              return;
-            }
-          }
-        }
-
-        bool restored = true;
-
-        for (uint64_t offset = 0; offset < run_length; offset++) {
-          if (!onenote_reassembly_copy_block(
-                  trial_data + (run_start + offset) * blocksize,
-                  mapping[run_start + offset])) {
-            restored = false;
-            break;
-          }
-        }
-        for (uint64_t offset = 0; offset < run_length; offset++) {
-          const uint64_t apparent =
-              (uint64_t)mapping[run_start + offset];
-
-          used[apparent >> 3]
-              |= (uint8_t)(1u << (apparent & 7u));
-        }
-        if (!restored) {
-          onenote_revision_state_release(&parser_workspace);
-          free(displacements);
-          free(trial_data);
-          free(used);
-          free(mapping);
-          destroy_candidate(candidate);
-          return;
-        }
-      }
-      if (onenote_reassembly_score_better(&suffix_best, &best)) {
-        best = suffix_best;
-      }
+    if (onenote_reassembly_search_runs(
+            work, candidate, uuidp, uuidc, trial_data, mapping, used,
+            block_count, data_length, kind, failure_start_slot,
+            failure_end_slot, failure_slot, &current, &best, &weak,
+            &parser_workspace, &search)) {
+      onenote_revision_state_release(&parser_workspace);
+      free(displacements);
+      free(trial_data);
+      free(used);
+      free(mapping);
+      return;
     }
 
     if (!best.found && weak.found && *candidate) {
@@ -5192,6 +6016,8 @@ static inline void onenote_reassembly(ThreadWork *work,
     if (!best.found || !*candidate) {
       break;
     }
+    bool new_alignment = false;
+
     if (best.run_start <= INT64_MAX) {
       const int64_t displacement = best.source - (int64_t)best.run_start;
       bool known = false;
@@ -5226,6 +6052,7 @@ static inline void onenote_reassembly(ThreadWork *work,
           displacement_capacity = new_capacity;
         }
         displacements[displacement_count++] = displacement;
+        new_alignment = true;
       }
     }
     onenote_reassembly_apply_run(*candidate, mapping, used, trial_data,
@@ -5250,6 +6077,11 @@ static inline void onenote_reassembly(ThreadWork *work,
         parser_workspace.zip_probe.baseline_output_comparable;
     current.zip_output_distance =
         parser_workspace.zip_probe.baseline_output_distance;
+
+    onenote_reassembly_commit_progress(
+        *candidate, mapping, block_count, data_length, &current, &best,
+        new_alignment);
+    parser_workspace.searched_end = 0;
 
     // Preserve each structurally complete reconstruction before optional
     // boundary refinement because opaque ranges can leave several defensible

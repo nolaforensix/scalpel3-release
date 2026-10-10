@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2021-2026 Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 // See LICENSE.md for licensing and commercial licensing contact information.
 
 // Small installation check, compiled against the selected C/C++ ONNX Runtime.
@@ -17,12 +21,24 @@
 #include "onnxruntime_cxx_api.h"
 #include "onnx_providers.h"
 #include "onnx_cuda_options.h"
+#include "scalpel_output.h"
 
 static std::string varint(uint64_t value);
 static std::string integer(uint32_t field, uint64_t value);
 static std::string message(uint32_t field, const std::string &value);
 static std::string tensor(const char *name, std::initializer_list<uint64_t> dims);
 static std::string model();
+
+// The installation probe does not link the carving backend. Provide its output
+// helper locally so the shared GPU planner still emits one locked message.
+void lock_fprintf(FILE *stream, const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  flockfile(stream);
+  vfprintf(stream, format, args);
+  funlockfile(stream);
+  va_end(args);
+}
 
 // Encode this tiny ONNX graph directly, without requiring Python ONNX/protobuf packages.
 static std::string varint(uint64_t value) {
@@ -68,7 +84,7 @@ static std::string model() {
 
 int main(int argc, char **argv) {
   if (argc != 2) {
-    std::fprintf(stderr, "Usage: onnx_install_probe cpu|cuda:DEVICE|inspect\n");
+    lock_fprintf(stderr, "Usage: onnx_install_probe cpu|cuda:DEVICE|inspect\n");
     return 2;
   }
   try {
@@ -78,7 +94,7 @@ int main(int argc, char **argv) {
     if (! api || ! dladdr(reinterpret_cast<void *>(api->GetVersionString), &library)) {
       throw std::runtime_error("Cannot identify the loaded ONNX Runtime library");
     }
-    std::printf("ORT_VERSION=%s\nORT_LIBRARY=%s\n", api->GetVersionString(),
+    lock_fprintf(stdout, "ORT_VERSION=%s\nORT_LIBRARY=%s\n", api->GetVersionString(),
                 library.dli_fname);
     if (! std::strcmp(argv[1], "inspect")) {
       return 0;
@@ -132,12 +148,12 @@ int main(int argc, char **argv) {
         }
       }
     }
-    std::printf("PROVIDER=%s\nRUNTIME=%s\nINFERENCE=PASS\n", provider,
+    lock_fprintf(stdout, "PROVIDER=%s\nRUNTIME=%s\nINFERENCE=PASS\n", provider,
                 onnx_cuda_runtime_description());
     return 0;
   }
   catch (const std::exception &error) {
-    std::fprintf(stderr, "ONNX installation check failed: %s\n", error.what());
+    lock_fprintf(stderr, "ONNX installation check failed: %s\n", error.what());
     return 1;
   }
 }

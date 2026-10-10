@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -191,6 +195,7 @@ typedef struct PNGBlockState {
 #define PNG_CRC_HASH_BUCKETS 65536
 #define PNG_GAP_WINDOW_BUCKETS 262144
 #define PNG_GAP_INDEX_MAX_M 8
+#define PNG_GAP_MAX_MATCHES 32
 #define PNG_MARKER_BUCKETS 65536
 
 typedef struct PNGGapWindowEntry {
@@ -204,6 +209,7 @@ typedef struct PNGGapWindowTable {
   PNGGapWindowEntry *pool;
   uint32_t count;
   uint32_t M;
+  uint64_t universe_hash;
 } PNGGapWindowTable;
 
 typedef struct PNGCrcEntry {
@@ -2097,6 +2103,19 @@ static inline void png_m2_resume_reset(PNGM2ResumeState *state) {
     state->best_suffix_actual = -1;
 }
 
+typedef struct PNGGapMatchState {
+    uint64_t universe_hash;
+    bool indexed;
+    bool best_found;
+    bool best_validated;
+    uint32_t best_locality;
+    uint64_t best_validates_to;
+    uint64_t best_advance_to;
+    int64_t best_start_actual;
+    int64_t best_suffix_actual;
+    uint32_t batch_matches;
+} PNGGapMatchState;
+
 typedef struct PNGCarveState {
     bool valid;
     uint64_t prefix_hash;         /* XXH3 of data[0..checkpoint_curpos) */
@@ -2262,7 +2281,7 @@ typedef struct PNGCarveState {
                                      * 4 M3 split-run, 5 suffix-run */
     uint8_t  solver_pair_idx;       /* M3 split-run pair index */
     uint16_t solver_phase_pad;
-    uint64_t solver_m4_universe_hash;
+    uint64_t solver_m4_universe_hash; /* active M=3/M=4 search fingerprint */
     uint64_t solver_table_epoch;    /* apparent-block mapping epoch */
     PNGM2ResumeState m2_resume;
 
@@ -2342,6 +2361,9 @@ typedef struct PNGCarveState {
 
     /* pngcheck locals */
     PNGCheckpointLocals loc;
+    /* Append new scalar state here to retain the preceding checkpoint layout. */
+    PNGGapMatchState gap_match;
+    uint64_t retry_crc_pos;       /* exhausted tentative prefix retried here */
 } PNGCarveState;
 
 typedef struct PNGReassemblyPrivateState {
@@ -2393,6 +2415,8 @@ typedef struct PNGReassemblyPrivateState {
   long     exhausted_wait_checkpoint_nsec;
   uint64_t safe_partial_blocks;
   uint64_t safe_partial_length;
+  PNGGapMatchState gap_match;
+  uint64_t retry_crc_pos;
 } PNGReassemblyPrivateState;
 
 static inline void png_solver_resume_reset(PNGCarveState *local) {
@@ -2571,6 +2595,7 @@ static inline void png_gap_resume_reset(PNGCarveState *local) {
   local->gap_fast_start = 0;
   local->gap_fast_suffix_nb = 0;
   local->gap_fast_crc_pos = 0;
+  memset(&local->gap_match, 0, sizeof(local->gap_match));
 }
 
 static inline void png_d1_resume_reset(PNGCarveState *local) {
@@ -2658,6 +2683,8 @@ static inline void png_reassembly_private_save(
       src->exhausted_wait_checkpoint_nsec;
   dst->safe_partial_blocks = src->safe_partial_blocks;
   dst->safe_partial_length = src->safe_partial_length;
+  dst->gap_match = src->gap_match;
+  dst->retry_crc_pos = src->retry_crc_pos;
 }
 
 static inline void png_reassembly_private_restore(
@@ -2721,6 +2748,8 @@ static inline void png_reassembly_private_restore(
       src->exhausted_wait_checkpoint_nsec;
   dst->safe_partial_blocks = src->safe_partial_blocks;
   dst->safe_partial_length = src->safe_partial_length;
+  dst->gap_match = src->gap_match;
+  dst->retry_crc_pos = src->retry_crc_pos;
 }
 
 // the following structure and functions are used to replace fgetc(),
@@ -3324,11 +3353,7 @@ static inline void png_free_carve_state(void **state) {
 
 static inline bool png_serialize_carve_state(void **state, FILE *fp, StateSerialization mode) {
     PNGCarveState **sp = (PNGCarveState **)state;
-
-    size_t (*fb)(void *ptr, size_t size, size_t nitems, FILE *stream) =
-        mode == SERIALIZE ?
-        (size_t (*)(void *, size_t, size_t, FILE *))fwrite :
-        (size_t (*)(void *, size_t, size_t, FILE *))fread;
+    static const unsigned char magic[8] = {'P', 'N', 'G', 'C', 'S', '0', '0', '3'};
 
     if (mode == DESERIALIZE) {
         *sp = (PNGCarveState *)calloc(1, sizeof(PNGCarveState));
@@ -3357,12 +3382,47 @@ static inline bool png_serialize_carve_state(void **state, FILE *fp, StateSerial
         tmp.zstrm_leftover = NULL;
         tmp.zstrm_leftover_count = 0;
         tmp.solver_ctx = NULL;
-        if (fb(&tmp, sizeof(tmp), 1, fp) != 1) {
+        const uint64_t bytes = sizeof(tmp);
+        if (fwrite(magic, sizeof(magic), 1, fp) != 1
+            || fwrite(&bytes, sizeof(bytes), 1, fp) != 1
+            || fwrite(&tmp, sizeof(tmp), 1, fp) != 1) {
             perror("png carve state serialization");
             return false;
         }
     } else {
-        if (fb(*sp, sizeof(PNGCarveState), 1, fp) != 1) {
+        unsigned char prefix[sizeof(magic)];
+        bool read_ok = fread(prefix, sizeof(prefix), 1, fp) == 1;
+        bool prior_version = read_ok
+            && memcmp(prefix, "PNGCS001", sizeof(prefix)) == 0;
+        bool second_version = read_ok
+            && memcmp(prefix, "PNGCS002", sizeof(prefix)) == 0;
+        if (read_ok && (memcmp(prefix, magic, sizeof(magic)) == 0
+                        || prior_version || second_version)) {
+            const size_t expected_bytes = prior_version
+                ? offsetof(PNGCarveState, gap_match)
+                    + offsetof(PNGGapMatchState, batch_matches)
+                : second_version ? offsetof(PNGCarveState, retry_crc_pos)
+                : sizeof(PNGCarveState);
+            uint64_t bytes = 0;
+            read_ok = fread(&bytes, sizeof(bytes), 1, fp) == 1
+                && bytes == expected_bytes
+                && fread(*sp, expected_bytes, 1, fp) == 1;
+            if (read_ok && prior_version && !(*sp)->gap_match.indexed) {
+                png_gap_resume_reset(*sp);
+            }
+        }
+        else if (read_ok && prefix[0] == 0) {
+            // The previous writer always cleared valid before its raw record.
+            const size_t legacy_bytes = offsetof(PNGCarveState, gap_match);
+            memcpy(*sp, prefix, sizeof(prefix));
+            read_ok = fread((unsigned char *)*sp + sizeof(prefix),
+                legacy_bytes - sizeof(prefix), 1, fp) == 1;
+            png_gap_resume_reset(*sp);
+        }
+        else {
+            read_ok = false;
+        }
+        if (!read_ok) {
             perror("png carve state deserialization");
             free(*sp);
             *sp = NULL;
@@ -8643,15 +8703,13 @@ static inline PNGSolverContext *png_solver_ctx_clone(
     dst->m3_htab[mi] = (Er2Entry **)calloc(
         PNG_M3_BUCKETS, sizeof(Er2Entry *));
     if (!dst->m3_pool[mi] || !dst->m3_htab[mi]) goto fail;
-    uint32_t out = 0;
-    for (uint32_t b = 0; b < PNG_M3_BUCKETS; b++) {
-      for (Er2Entry *e = src->m3_htab[mi][b]; e; e = e->next) {
-        Er2Entry *copy = &dst->m3_pool[mi][out++];
-        *copy = *e;
-        uint32_t idx = copy->shifted_crc % PNG_M3_BUCKETS;
-        copy->next = dst->m3_htab[mi][idx];
-        dst->m3_htab[mi][idx] = copy;
-      }
+    // Saved scan indices refer to pool order, not hash-bucket order.
+    for (uint32_t i = 0; i < count; i++) {
+      Er2Entry *copy = &dst->m3_pool[mi][i];
+      *copy = src->m3_pool[mi][i];
+      uint32_t idx = copy->shifted_crc % PNG_M3_BUCKETS;
+      copy->next = dst->m3_htab[mi][idx];
+      dst->m3_htab[mi][idx] = copy;
     }
   }
 
@@ -8809,6 +8867,11 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
   uint32_t bs = scalpel_state.blocksize;
   uint32_t block_forward[32];
   png_crc_forward_for_len((z_off_t)bs, block_forward);
+  // Bind saved cursors to the immutable index without hashing it per attempt.
+  XXH3_state_t hash;
+  XXH3_64bits_reset(&hash);
+  XXH3_64bits_update(&hash, &M, sizeof(M));
+  XXH3_64bits_update(&hash, &bs, sizeof(bs));
   for (int64_t start = 0; start < max_windows64; start++) {
     bool ok_window = true;
     uint32_t run_crc = crc32(0, NULL, 0);
@@ -8830,6 +8893,8 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
     uint32_t idx = run_crc % PNG_GAP_WINDOW_BUCKETS;
     we->next = gt->buckets[idx];
     gt->buckets[idx] = we;
+    XXH3_64bits_update(&hash, &run_crc, sizeof(run_crc));
+    XXH3_64bits_update(&hash, &start, sizeof(start));
   }
 
   if (gt->count == 0) {
@@ -8838,6 +8903,7 @@ static inline PNGGapWindowTable *png_gap_window_table_get(
     return NULL;
   }
 
+  gt->universe_hash = XXH3_64bits_digest(&hash);
   ht->gap_windows[M] = gt;
   pthread_mutex_unlock(&png_gap_window_lock);
   return gt;
@@ -9659,6 +9725,19 @@ static inline int png_crc_solve_idat(
                     free(_pb);
                     return 2;
                   }
+                  if (png_reassembly_yield_requested(candidate)) {
+                    // Interrupted validation is not a rejected match. Retry
+                    // this bucket, including this choice, after the checkpoint.
+                    local->d1_resume_valid = true;
+                    local->d1_resume_fpos = fpos;
+                    local->d1_resume_bk = bk;
+                    local->d1_resume_crc_pos = crc_pos;
+                    local->d1_resume_suffix_nb = suffix_start_nb;
+                    local->d1_resume_fill_needed = fill_needed;
+                    free(_pb);
+                    resize_blockvector(candidate->b, suffix_start_nb);
+                    return -1;
+                  }
                   // Rejected — fall through to restore and keep scanning.
                 }
               }
@@ -10361,9 +10440,29 @@ static inline int png_crc_solve_idat(
     if (gap_index
         && png_crc_inverse_for_len((z_off_t)suffix_partial_len,
                                    gap_suffix_inv)) {
+      XXH3_state_t gap_hash;
+      XXH3_64bits_reset(&gap_hash);
+      XXH3_64bits_update(&gap_hash, &gap_index->universe_hash,
+          sizeof(gap_index->universe_hash));
+      for (int64_t si = 0; si < suffix_cand_count; si++) {
+        const PNGSuffixCand *sc = &suffix_cands[si];
+        XXH3_64bits_update(&gap_hash, &sc->actual_block, sizeof(sc->actual_block));
+        XXH3_64bits_update(&gap_hash, &sc->apparent_block, sizeof(sc->apparent_block));
+        XXH3_64bits_update(&gap_hash, &sc->partial_crc, sizeof(sc->partial_crc));
+        XXH3_64bits_update(&gap_hash, &sc->stored_crc, sizeof(sc->stored_crc));
+        XXH3_64bits_update(&gap_hash, &sc->valid, sizeof(sc->valid));
+      }
+      for (uint64_t i = 0; i < suffix_start_nb; i++) {
+        int64_t actual = blockvector_get_actual_blocknumber(candidate->b, i);
+        XXH3_64bits_update(&gap_hash, &actual, sizeof(actual));
+      }
+      XXH3_64bits_update(&gap_hash, &crc_prefix, sizeof(crc_prefix));
+      uint64_t universe_hash = XXH3_64bits_digest(&gap_hash);
       bool gap_geom_match = (local->gap_fast_suffix_nb == suffix_start_nb
                              && local->gap_fast_crc_pos == crc_pos
-                             && local->gap_fast_M == M);
+                             && local->gap_fast_M == M
+                             && local->gap_match.indexed
+                             && local->gap_match.universe_hash == universe_hash);
       if (gap_geom_match && local->gap_fast_exhausted
           && local->gap_fast_si == -1) {
         goto gap_fast_path_done;
@@ -10372,43 +10471,42 @@ static inline int png_crc_solve_idat(
       int64_t resume_si = 0;
       if (gap_geom_match && local->gap_fast_resume_valid) {
         resume_si = local->gap_fast_si;
-        if (resume_si < 0) {
+        if (resume_si < 0 || resume_si > suffix_cand_count) {
           resume_si = 0;
         }
       } else {
-        local->gap_fast_resume_valid = false;
-        local->gap_fast_exhausted = false;
+        png_gap_resume_reset(local);
         local->gap_fast_suffix_nb = suffix_start_nb;
         local->gap_fast_crc_pos = crc_pos;
         local->gap_fast_M = M;
+        local->gap_fast_start = INT64_MAX;
+        local->gap_match.indexed = true;
+        local->gap_match.universe_hash = universe_hash;
       }
+      local->gap_fast_resume_valid = true;
 
-	      z_off_t middle_len = (z_off_t)((uint64_t)M * (uint64_t)bs);
-	      uint32_t shifted_prefix = (uint32_t)crc32_combine(
-	          (uLong)crc_prefix, 0UL, middle_len);
-	      int64_t current_total_ap = (int64_t)filemirror_apparent_blocks(
-	          scalpel_state.filemirror);
-	      uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
-	      bool best_found = false;
-	      bool best_validated = false;
-	      uint64_t best_validates_to = 0;
-	      uint64_t best_advance_to = 0;
-	      uint32_t best_locality = 0;
-	      int64_t best_window_ap[PNG_GAP_INDEX_MAX_M];
-	      int64_t best_suffix_ap = -1;
-	      uint64_t best_data_length = 0;
-	      uint64_t best_num_blocks = 0;
-	      PNGSolverStateSnapshot best_snap = {0};
-	      bool stop_gap_scan = false;
+      z_off_t middle_len = (z_off_t)((uint64_t)M * (uint64_t)bs);
+      uint32_t shifted_prefix = (uint32_t)crc32_combine(
+          (uLong)crc_prefix, 0UL, middle_len);
+      int64_t current_total_ap = (int64_t)filemirror_apparent_blocks(
+          scalpel_state.filemirror);
+      uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
+      PNGGapMatchState *best = &local->gap_match;
+      bool stop_gap_scan = best->best_found
+          && (best->best_validated || best->best_locality == M);
 
-	      for (int64_t si = resume_si;
-	           si < suffix_cand_count && !stop_gap_scan; si++) {
-	        if ((si & 0x3FF) == 0
-	            && png_reassembly_yield_requested(candidate)) {
+      for (int64_t si = resume_si;
+           si < suffix_cand_count && !stop_gap_scan; si++) {
+        int64_t resume_actual = si == resume_si
+            ? local->gap_fast_start : INT64_MAX;
+        local->gap_fast_si = si;
+        local->gap_fast_start = resume_actual;
+        if ((si & 0x3FF) == 0
+            && png_reassembly_yield_requested(candidate)) {
           local->gap_fast_resume_valid = true;
           local->gap_fast_exhausted = false;
           local->gap_fast_si = si;
-          local->gap_fast_start = 0;
+          local->gap_fast_start = resume_actual;
           local->gap_fast_M = M;
           local->gap_fast_suffix_nb = suffix_start_nb;
           local->gap_fast_crc_pos = crc_pos;
@@ -10440,8 +10538,13 @@ static inline int png_crc_solve_idat(
         uint32_t req_run = req_left ^ shifted_prefix;
         uint32_t bucket = req_run % PNG_GAP_WINDOW_BUCKETS;
 
-	        for (PNGGapWindowEntry *we = gap_index->buckets[bucket];
-	             we && !stop_gap_scan; we = we->next) {
+        for (PNGGapWindowEntry *we = gap_index->buckets[bucket];
+             we && !stop_gap_scan; we = we->next) {
+          // The index prepends increasing actual starts. Resume the same
+          // match after an interrupted confirmation, not the next suffix.
+          if (we->start_actual > resume_actual) {
+            continue;
+          }
           if (we->crc != req_run) {
             continue;
           }
@@ -10493,6 +10596,15 @@ static inline int png_crc_solve_idat(
           uint64_t vt;
           bool validated = png_direct_validate(work->id, candidate, &vt,
               local, uuidp, uuidc);
+          if (!validated && png_reassembly_yield_requested(candidate)) {
+            png_solver_restore(local, &pre_snap);
+            local->gap_fast_si = si;
+            local->gap_fast_start = we->start_actual;
+            local->solver_suffix_nb = suffix_start_nb;
+            free(suffix_cands);
+            resize_blockvector(candidate->b, suffix_start_nb);
+            return -1;
+          }
           uint64_t advance_to = local->last_chunk_crc_pos;
           uint32_t locality = png_gap_locality_score(candidate,
               suffix_start_nb, first_full, window_ap, M);
@@ -10515,25 +10627,23 @@ static inline int png_crc_solve_idat(
                 locality, plausible ? 1 : 0);
           }
           if (plausible && png_gap_match_better(validated, vt, advance_to,
-              locality, best_found, best_validated, best_validates_to,
-              best_advance_to, best_locality)) {
-            best_found = true;
-            best_validated = validated;
-            best_validates_to = vt;
-            best_advance_to = advance_to;
-            best_locality = locality;
-            memcpy(best_window_ap, window_ap,
-                M * sizeof(best_window_ap[0]));
-            best_suffix_ap = sc->apparent_block;
-            best_data_length = blockvector_get_data_length(candidate->b);
-            best_num_blocks = blockvector_get_num_blocks(candidate->b);
-            png_solver_snapshot(&best_snap, local);
+              locality, best->best_found, best->best_validated,
+              best->best_validates_to,
+              best->best_advance_to, best->best_locality)) {
+            best->best_found = true;
+            best->best_validated = validated;
+            best->best_validates_to = vt;
+            best->best_advance_to = advance_to;
+            best->best_locality = locality;
+            best->best_start_actual = we->start_actual;
+            best->best_suffix_actual = sc->actual_block;
             if (validated || locality == M) {
               stop_gap_scan = true;
             }
           }
 
           png_solver_restore(local, &pre_snap);
+          local->gap_fast_start = we->start_actual - 1;
           png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
           blockvector_set_data_length(candidate->b,
               (suffix_start_nb + fill_needed) * (uint64_t)bs);
@@ -10545,31 +10655,61 @@ static inline int png_crc_solve_idat(
                 suffix_start_nb + f);
           }
         }
+        local->gap_fast_si = si + 1;
+        local->gap_fast_start = INT64_MAX;
       }
 
-	      if (best_found) {
-	        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
-	        for (uint32_t f = 0; f < M; f++) {
-	          blockvector_set_apparent_blocknumber(candidate->b,
-	              suffix_start_nb + first_full + f, best_window_ap[f]);
-	        }
-	        blockvector_set_apparent_blocknumber(candidate->b,
-	            suffix_start_nb + suffix_fill_pos, best_suffix_ap);
-	        for (uint32_t f = 0; f < fill_needed; f++) {
-	          inflate_blockvector_single_block(candidate->b,
-	              suffix_start_nb + f);
-	        }
-	        if (best_data_length > 0) {
-	          blockvector_set_data_length(candidate->b, best_data_length);
-	        }
-	        if (best_num_blocks > 0) {
-	          resize_blockvector(candidate->b, best_num_blocks);
-	        }
-	        png_solver_restore(local, &best_snap);
-	        solved = true;
-	      }
+      if (best->best_found) {
+        int64_t best_window_ap[PNG_GAP_INDEX_MAX_M];
+        int64_t best_suffix_ap = png_crc_actual_to_apparent(ht,
+            best->best_suffix_actual);
+        bool placeable = best_suffix_ap >= 0
+            && !_AB_IN_BV_PREFIX(best_suffix_ap)
+            && best->best_start_actual >= 0
+            && (int64_t)M <= ht->actual_count
+            && best->best_start_actual <= ht->actual_count - (int64_t)M;
+        for (uint32_t f = 0; f < M && placeable; f++) {
+          int64_t actual = best->best_start_actual + (int64_t)f;
+          best_window_ap[f] = png_crc_actual_to_apparent(ht, actual);
+          placeable = best_window_ap[f] >= 0
+              && best_window_ap[f] != best_suffix_ap
+              && !_AB_IN_BV_PREFIX(best_window_ap[f]);
+        }
+        if (placeable) {
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+          for (uint32_t f = 0; f < M; f++) {
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full + f, best_window_ap[f]);
+          }
+          blockvector_set_apparent_blocknumber(candidate->b,
+              suffix_start_nb + suffix_fill_pos, best_suffix_ap);
+          for (uint32_t f = 0; f < fill_needed; f++) {
+            inflate_blockvector_single_block(candidate->b,
+                suffix_start_nb + f);
+          }
+          // Recreate the parser state rather than persisting a heap snapshot.
+          PNGSolverStateSnapshot pre_snap;
+          png_solver_snapshot(&pre_snap, local);
+          uint64_t vt = 0;
+          bool validated = png_direct_validate(work->id, candidate, &vt,
+              local, uuidp, uuidc);
+          if (!validated && png_reassembly_yield_requested(candidate)) {
+            png_solver_restore(local, &pre_snap);
+            local->solver_suffix_nb = suffix_start_nb;
+            free(suffix_cands);
+            resize_blockvector(candidate->b, suffix_start_nb);
+            return -1;
+          }
+          solved = validated || local->last_chunk_crc_pos >= target
+              || best->best_locality == M;
+          if (!solved) {
+            png_solver_restore(local, &pre_snap);
+            resize_blockvector(candidate->b, suffix_start_nb);
+          }
+        }
+      }
 
-	      local->gap_fast_resume_valid = false;
+      local->gap_fast_resume_valid = false;
       if (!solved) {
         local->gap_fast_exhausted = true;
         local->gap_fast_suffix_nb = suffix_start_nb;
@@ -10595,7 +10735,6 @@ static inline int png_crc_solve_idat(
     uint32_t *ab_crc = (uint32_t *)calloc((size_t)total_ap, sizeof(uint32_t));
     bool *ab_valid = (bool *)calloc((size_t)total_ap, sizeof(bool));
     if (ab_crc && ab_valid) {
-      // Populate from hash table — O(N).
       for (uint32_t b = 0; b < PNG_CRC_HASH_BUCKETS; b++) {
         for (PNGCrcEntry *e = ht->buckets[b]; e; e = e->next) {
           int64_t ab = filemirror_apparent_blocknumber(
@@ -10607,269 +10746,237 @@ static inline int png_crc_solve_idat(
         }
       }
 
-      // For each suffix candidate, slide an M-block window across all
-      // apparent blocks and check if the combined CRC matches.
-      //
-      // Resume across yields: without this, the scan restarts from
-      // start=0 on every (very frequent at big-test scale) yield, so
-      // it never reaches the end.  Resume state lives in PNGCarveState
-      // (direct fields, not solver_ctx) so it survives the solver_ctx
-      // free/rebuild that M=2/M=3 MitM performs.
-      //
-      // If the scan already finished for this (suffix_nb, crc_pos, M)
-      // without finding a match, skip GAP entirely so later strategies
-      // get their turn instead of re-scanning 1M windows.
+      XXH3_state_t gap_hash;
+      XXH3_64bits_reset(&gap_hash);
+      XXH3_64bits_update(&gap_hash, ab_crc,
+          (size_t)total_ap * sizeof(*ab_crc));
+      XXH3_64bits_update(&gap_hash, ab_valid,
+          (size_t)total_ap * sizeof(*ab_valid));
+      for (int64_t ab = 0; ab < total_ap; ab++) {
+        int64_t actual = filemirror_actual_blocknumber(
+            scalpel_state.filemirror, ab);
+        XXH3_64bits_update(&gap_hash, &actual, sizeof(actual));
+      }
+      for (int64_t si = 0; si < suffix_cand_count; si++) {
+        const PNGSuffixCand *sc = &suffix_cands[si];
+        XXH3_64bits_update(&gap_hash, &sc->actual_block, sizeof(sc->actual_block));
+        XXH3_64bits_update(&gap_hash, &sc->apparent_block, sizeof(sc->apparent_block));
+        XXH3_64bits_update(&gap_hash, &sc->partial_crc, sizeof(sc->partial_crc));
+        XXH3_64bits_update(&gap_hash, &sc->stored_crc, sizeof(sc->stored_crc));
+        XXH3_64bits_update(&gap_hash, &sc->valid, sizeof(sc->valid));
+      }
+      for (uint64_t i = 0; i < suffix_start_nb; i++) {
+        int64_t actual = blockvector_get_actual_blocknumber(candidate->b, i);
+        XXH3_64bits_update(&gap_hash, &actual, sizeof(actual));
+      }
+      XXH3_64bits_update(&gap_hash, &crc_prefix, sizeof(crc_prefix));
+      uint64_t universe_hash = XXH3_64bits_digest(&gap_hash);
       bool gap_geom_match = (local->gap_fast_suffix_nb == suffix_start_nb
                              && local->gap_fast_crc_pos == crc_pos
-                             && local->gap_fast_M == M);
+                             && local->gap_fast_M == M
+                             && !local->gap_match.indexed
+                             && local->gap_match.universe_hash == universe_hash);
       if (gap_geom_match && local->gap_fast_exhausted
           && local->gap_fast_si == -1) {
-        // Skip GAP fast path entirely.
         free(ab_crc);
         free(ab_valid);
         goto gap_fast_path_done;
       }
       int64_t resume_si = 0;
       int64_t resume_start = 0;
-      if (gap_geom_match && local->gap_fast_resume_valid) {
+      if (gap_geom_match && local->gap_fast_resume_valid
+          && local->gap_fast_si >= 0
+          && local->gap_fast_si <= suffix_cand_count
+          && local->gap_fast_start >= 0
+          && local->gap_fast_start <= total_ap
+          && local->gap_match.batch_matches <= PNG_GAP_MAX_MATCHES) {
         resume_si = local->gap_fast_si;
         resume_start = local->gap_fast_start;
       } else {
-        // Geometry changed — invalidate any stale state.
-        local->gap_fast_resume_valid = false;
-        local->gap_fast_exhausted = false;
+        png_gap_resume_reset(local);
         local->gap_fast_suffix_nb = suffix_start_nb;
         local->gap_fast_crc_pos = crc_pos;
         local->gap_fast_M = M;
+        local->gap_match.universe_hash = universe_hash;
       }
-      // ---- Phase 1: collect CRC matches (up to cap) without committing ----
-      // CRC32 collides at ~2^-32 per comparison; across ~N*total_apparent
-      // windows at 20k-entry hash table scale we see ~4-8 matches per call
-      // per the stuck-N diagnosis.  Committing the FIRST match (which is
-      // what the pre-multi-match code did) almost guarantees picking a
-      // spurious one: the validator's full-chain check is the reliable
-      // arbiter but only one placement can be committed per solver call.
-      // Collect up to PNG_GAP_MAX_MATCHES, then Phase 2 validates each and
-      // commits the one whose validator walks farthest.
-      #define PNG_GAP_MAX_MATCHES 32
-      int64_t gap_match_start[PNG_GAP_MAX_MATCHES];
-      int64_t gap_match_sc_idx[PNG_GAP_MAX_MATCHES];
-      uint32_t gap_match_count = 0;
-      bool gap_yielded = false;
-      bool gap_match_cap_reached = false;
-      int64_t gap_cap_resume_si = 0;
-      int64_t gap_cap_resume_start = 0;
+      local->gap_fast_resume_valid = true;
+
+      // ---- Phase 1: scan and confirm matches without committing.
+      // Keeping the best result and current cursor avoids losing a local
+      // batch of untested matches when a checkpoint interrupts the scan.
+      PNGGapMatchState *best = &local->gap_match;
+      bool stop_gap_scan = best->batch_matches == PNG_GAP_MAX_MATCHES
+          || (best->best_found
+              && (best->best_validated || best->best_locality == M));
+      uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
       uint32_t gap_block_forward[32];
       uint32_t gap_suffix_forward[32];
       png_crc_forward_for_len((z_off_t)bs, gap_block_forward);
       png_crc_forward_for_len((z_off_t)suffix_partial_len,
-                              gap_suffix_forward);
+          gap_suffix_forward);
 
       for (int64_t si = resume_si;
-           si < suffix_cand_count
-               && gap_match_count < PNG_GAP_MAX_MATCHES
-               && !gap_yielded;
-           si++) {
+           si < suffix_cand_count && !stop_gap_scan; si++) {
         PNGSuffixCand *sc = &suffix_cands[si];
-        if (!sc->valid) { continue; }
-
-        int64_t start_init = (si == resume_si) ? resume_start : 0;
+        if (!sc->valid) {
+          continue;
+        }
+        int64_t start_init = si == resume_si ? resume_start : 0;
         for (int64_t start = start_init;
-             start + (int64_t)M <= total_ap
-                 && gap_match_count < PNG_GAP_MAX_MATCHES
-                 && !gap_yielded;
-             start++) {
+             (int64_t)M <= total_ap && start <= total_ap - (int64_t)M
+                 && !stop_gap_scan; start++) {
+          local->gap_fast_si = si;
+          local->gap_fast_start = start;
           if ((start & 0xFF) == 0
               && png_reassembly_yield_requested(candidate)) {
-            // GAP fast path yield — save progress directly in PNGCarveState
-            // so the next call can resume rather than rescan from 0.
-            local->gap_fast_resume_valid = true;
-            local->gap_fast_exhausted = false;
-            local->gap_fast_si = si;
-            local->gap_fast_start = start;
-            local->gap_fast_M = M;
-            local->gap_fast_suffix_nb = suffix_start_nb;
-            local->gap_fast_crc_pos = crc_pos;
             local->solver_suffix_nb = suffix_start_nb;
-            gap_yielded = true;
-            break;
+            free(ab_crc);
+            free(ab_valid);
+            free(suffix_cands);
+            resize_blockvector(candidate->b, suffix_start_nb);
+            return -1;
           }
-          // Skip if any block in the window is invalid or covered.
           bool window_ok = true;
           uint32_t window_crc = crc_prefix;
           for (uint32_t f = 0; f < M; f++) {
             int64_t ab = start + (int64_t)f;
-            if (!ab_valid[ab]) { window_ok = false; break; }
-            if (filemirror_actual_block_covered(scalpel_state.filemirror,
-                    filemirror_actual_blocknumber(
-                        scalpel_state.filemirror, ab))) {
-              window_ok = false; break;
+            if (!ab_valid[ab]
+                || filemirror_actual_block_covered(scalpel_state.filemirror,
+                    filemirror_actual_blocknumber(scalpel_state.filemirror, ab))) {
+              window_ok = false;
+              break;
             }
             window_crc = png_crc_apply_forward(gap_block_forward,
                 window_crc) ^ ab_crc[ab];
           }
-          if (!window_ok) { continue; }
-
-          // Combine with suffix partial and check against stored CRC.
+          if (!window_ok) {
+            continue;
+          }
           uint32_t full_crc = png_crc_apply_forward(gap_suffix_forward,
               window_crc) ^ sc->partial_crc;
-          if (full_crc != sc->stored_crc) { continue; }
-
-          // CRC match — record it, keep scanning.
-          gap_match_start[gap_match_count] = start;
-          gap_match_sc_idx[gap_match_count] = si;
-          gap_match_count++;
-          if (gap_match_count >= PNG_GAP_MAX_MATCHES) {
-            gap_match_cap_reached = true;
-            if (start + 1 + (int64_t)M <= total_ap) {
-              gap_cap_resume_si = si;
-              gap_cap_resume_start = start + 1;
-            } else {
-              gap_cap_resume_si = si + 1;
-              gap_cap_resume_start = 0;
-            }
-            break;
+          if (full_crc != sc->stored_crc) {
+            continue;
           }
-        }
-        if (gap_match_cap_reached) {
-          break;
-        }
-      }
 
-      if (gap_yielded) {
-        // Partial scan — honor the yield now, even if we have matches.
-        // Next call's resume will continue the scan from where we left off
-        // and collect any matches we missed here.
-        free(ab_crc); free(ab_valid);
-        free(suffix_cands);
-        resize_blockvector(candidate->b, suffix_start_nb);
-        return -1;
-      }
-
-
-	      // ---- Phase 2: try each collected match.  First one whose validator
-	      // walks farthest commits; others are rolled back.  CRC equality
-	      // proves the current chunk bytes, but at corpus scale multiple
-	      // placements can satisfy that equality.  Ranking by downstream
-	      // validation avoids committing the first same-offset echo match.
-	      uint64_t target = crc_pos + 12 + (uint64_t)idat_sz;
-	      bool best_found = false;
-	      bool best_validated = false;
-	      uint64_t best_validates_to = 0;
-	      uint64_t best_advance_to = 0;
-	      uint32_t best_locality = 0;
-	      int64_t best_start = -1;
-	      int64_t best_sc_idx = -1;
-	      uint64_t best_data_length = 0;
-	      uint64_t best_num_blocks = 0;
-	      PNGSolverStateSnapshot best_snap = {0};
-	      for (uint32_t mi = 0; mi < gap_match_count && !solved; mi++) {
-	        int64_t m_start = gap_match_start[mi];
-	        int64_t m_si = gap_match_sc_idx[mi];
-        PNGSuffixCand *m_sc = &suffix_cands[m_si];
-        // Place blocks.
-        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
-        for (uint32_t f = 0; f < M; f++) {
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+          for (uint32_t f = 0; f < M; f++) {
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full + f, start + (int64_t)f);
+          }
           blockvector_set_apparent_blocknumber(candidate->b,
-              suffix_start_nb + first_full + f, m_start + (int64_t)f);
-        }
-        blockvector_set_apparent_blocknumber(candidate->b,
-            suffix_start_nb + suffix_fill_pos, m_sc->apparent_block);
-        for (uint32_t f = 0; f < fill_needed; f++) {
-          inflate_blockvector_single_block(candidate->b,
-              suffix_start_nb + f);
-        }
-        // Snapshot + validate.  On reject, roll state back to pre-match
-        // so the next match attempt sees a clean slate.
-        PNGSolverStateSnapshot pre_snap;
-        png_solver_snapshot(&pre_snap, local);
-        uint64_t vt;
-        bool validated = png_direct_validate(work->id, candidate, &vt,
-            local, uuidp, uuidc);
-        uint64_t advance_to = local->last_chunk_crc_pos;
-        uint32_t locality = png_gap_contiguous_locality_score(candidate,
-            suffix_start_nb, first_full, m_start, M);
-        bool accept = validated || (advance_to >= target)
-            || locality == M;
-        if (png_trace_this) {
-          lock_fprintf(stdout,
-              "PNG_TRACE_GAP_SCAN_TRY mi=%u si=%" PRId64
-              " sc_actual=%" PRId64 " sc_ap=%" PRId64
-              " start=%" PRId64 " M=%u validated=%d"
-              " vt=%" PRIu64 " advance=%" PRIu64
-              " target=%" PRIu64 " locality=%u plausible=%d\n",
-              mi, m_si, m_sc->actual_block, m_sc->apparent_block,
-              m_start, M, validated ? 1 : 0, vt, advance_to,
-              target, locality, accept ? 1 : 0);
-        }
-        if (accept) {
-          if (png_gap_match_better(validated, vt, advance_to, locality,
-              best_found, best_validated, best_validates_to,
-              best_advance_to, best_locality)) {
-            best_found = true;
-            best_validated = validated;
-            best_validates_to = vt;
-            best_advance_to = advance_to;
-            best_locality = locality;
-            best_start = m_start;
-            best_sc_idx = m_si;
-            best_data_length = blockvector_get_data_length(candidate->b);
-            best_num_blocks = blockvector_get_num_blocks(candidate->b);
-            png_solver_snapshot(&best_snap, local);
+              suffix_start_nb + suffix_fill_pos, sc->apparent_block);
+          for (uint32_t f = 0; f < fill_needed; f++) {
+            inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
           }
-          if (validated || locality == M) {
-            solved = true;
+          PNGSolverStateSnapshot pre_snap;
+          png_solver_snapshot(&pre_snap, local);
+          uint64_t vt = 0;
+          bool validated = png_direct_validate(work->id, candidate, &vt,
+              local, uuidp, uuidc);
+          if (!validated && png_reassembly_yield_requested(candidate)) {
+            png_solver_restore(local, &pre_snap);
+            local->solver_suffix_nb = suffix_start_nb;
+            free(ab_crc);
+            free(ab_valid);
+            free(suffix_cands);
+            resize_blockvector(candidate->b, suffix_start_nb);
+            return -1;
+          }
+          uint64_t advance_to = local->last_chunk_crc_pos;
+          uint32_t locality = png_gap_contiguous_locality_score(candidate,
+              suffix_start_nb, first_full, start, M);
+          bool accept = validated || advance_to >= target || locality == M;
+          if (png_trace_this) {
+            lock_fprintf(stdout,
+                "PNG_TRACE_GAP_SCAN_TRY si=%" PRId64
+                " sc_actual=%" PRId64 " sc_ap=%" PRId64
+                " start=%" PRId64 " M=%u validated=%d"
+                " vt=%" PRIu64 " advance=%" PRIu64
+                " target=%" PRIu64 " locality=%u plausible=%d\n",
+                si, sc->actual_block, sc->apparent_block, start, M,
+                validated ? 1 : 0, vt, advance_to, target, locality, accept ? 1 : 0);
+          }
+          if (accept && png_gap_match_better(validated, vt, advance_to, locality,
+              best->best_found, best->best_validated, best->best_validates_to,
+              best->best_advance_to, best->best_locality)) {
+            best->best_found = true;
+            best->best_validated = validated;
+            best->best_validates_to = vt;
+            best->best_advance_to = advance_to;
+            best->best_locality = locality;
+            best->best_start_actual = filemirror_actual_blocknumber(
+                scalpel_state.filemirror, start);
+            best->best_suffix_actual = sc->actual_block;
+          }
+          png_solver_restore(local, &pre_snap);
+          best->batch_matches++;
+          local->gap_fast_si = si;
+          local->gap_fast_start = start + 1;
+          stop_gap_scan = best->batch_matches == PNG_GAP_MAX_MATCHES
+              || (best->best_found
+                  && (best->best_validated || best->best_locality == M));
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+          blockvector_set_data_length(candidate->b,
+              (suffix_start_nb + fill_needed) * (uint64_t)bs);
+          for (uint32_t f = 0; f < fill_needed; f++) {
+            int64_t orig = last_block + 1 + (int64_t)f;
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + f, orig);
+            inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
           }
         }
-        // Restore state and BV for next match.  Accepted candidates are
-        // committed after ranking, not inside this loop.
-        png_solver_restore(local, &pre_snap);
-        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
-        blockvector_set_data_length(candidate->b,
-            (suffix_start_nb + fill_needed) * (uint64_t)bs);
-        for (uint32_t f = 0; f < fill_needed; f++) {
-          int64_t orig = last_block + 1 + (int64_t)f;
+        if (!stop_gap_scan) {
+          local->gap_fast_si = si + 1;
+          local->gap_fast_start = 0;
+        }
+      }
+
+      // Revalidate the saved best mapping instead of serializing parser buffers.
+      if (best->best_found) {
+        int64_t best_start = filemirror_apparent_blocknumber(
+            scalpel_state.filemirror, best->best_start_actual);
+        int64_t best_suffix = filemirror_apparent_blocknumber(
+            scalpel_state.filemirror, best->best_suffix_actual);
+        bool placeable = best_start >= 0 && (int64_t)M <= total_ap
+            && best_start <= total_ap - (int64_t)M
+            && best_suffix >= 0 && best_suffix < total_ap;
+        if (placeable) {
+          png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
+          for (uint32_t f = 0; f < M; f++) {
+            blockvector_set_apparent_blocknumber(candidate->b,
+                suffix_start_nb + first_full + f, best_start + (int64_t)f);
+          }
           blockvector_set_apparent_blocknumber(candidate->b,
-              suffix_start_nb + f, orig);
-          inflate_blockvector_single_block(candidate->b,
-              suffix_start_nb + f);
+              suffix_start_nb + suffix_fill_pos, best_suffix);
+          for (uint32_t f = 0; f < fill_needed; f++) {
+            inflate_blockvector_single_block(candidate->b, suffix_start_nb + f);
+          }
+          PNGSolverStateSnapshot pre_snap;
+          png_solver_snapshot(&pre_snap, local);
+          uint64_t vt = 0;
+          bool validated = png_direct_validate(work->id, candidate, &vt,
+              local, uuidp, uuidc);
+          if (!validated && png_reassembly_yield_requested(candidate)) {
+            png_solver_restore(local, &pre_snap);
+            local->solver_suffix_nb = suffix_start_nb;
+            free(ab_crc);
+            free(ab_valid);
+            free(suffix_cands);
+            resize_blockvector(candidate->b, suffix_start_nb);
+            return -1;
+          }
+          solved = validated || local->last_chunk_crc_pos >= target
+              || best->best_locality == M;
+          if (!solved) {
+            png_solver_restore(local, &pre_snap);
+            resize_blockvector(candidate->b, suffix_start_nb);
+          }
         }
       }
-	      if (best_found && best_sc_idx >= 0) {
-	        PNGSuffixCand *best_sc = &suffix_cands[best_sc_idx];
-	        png_solver_resize_trial(candidate, suffix_start_nb + fill_needed);
-	        for (uint32_t f = 0; f < M; f++) {
-	          blockvector_set_apparent_blocknumber(candidate->b,
-	              suffix_start_nb + first_full + f, best_start + (int64_t)f);
-	        }
-	        blockvector_set_apparent_blocknumber(candidate->b,
-	            suffix_start_nb + suffix_fill_pos, best_sc->apparent_block);
-	        for (uint32_t f = 0; f < fill_needed; f++) {
-	          inflate_blockvector_single_block(candidate->b,
-	              suffix_start_nb + f);
-	        }
-	        if (best_data_length > 0) {
-	          blockvector_set_data_length(candidate->b, best_data_length);
-	        }
-	        if (best_num_blocks > 0) {
-	          resize_blockvector(candidate->b, best_num_blocks);
-	        }
-	        png_solver_restore(local, &best_snap);
-	        solved = true;
-	      }
-	      if (!solved && gap_match_count > 0) {
-	        // All matches rejected.  Leave state clean.
-	        resize_blockvector(candidate->b, suffix_start_nb);
-      }
-      if (!solved && gap_match_cap_reached
-          && gap_cap_resume_si < suffix_cand_count) {
-        local->gap_fast_resume_valid = true;
-        local->gap_fast_exhausted = false;
-        local->gap_fast_si = gap_cap_resume_si;
-        local->gap_fast_start = gap_cap_resume_start;
-        local->gap_fast_M = M;
-        local->gap_fast_suffix_nb = suffix_start_nb;
-        local->gap_fast_crc_pos = crc_pos;
+      if (!solved && best->batch_matches == PNG_GAP_MAX_MATCHES
+          && local->gap_fast_si < suffix_cand_count) {
+        best->batch_matches = 0;
+        best->best_found = false;
         local->solver_suffix_nb = suffix_start_nb;
         free(ab_crc);
         free(ab_valid);
@@ -10877,14 +10984,10 @@ static inline int png_crc_solve_idat(
         resize_blockvector(candidate->b, suffix_start_nb);
         return -1;
       }
-      #undef PNG_GAP_MAX_MATCHES
     }
     free(ab_crc);
     free(ab_valid);
 
-    // GAP fast path finished for this (suffix_nb, crc_pos, M) without
-    // yielding.  If solved, clear state (caller returns 2).  If not,
-    // mark exhausted so the next call skips GAP and gives MitM a turn.
     local->gap_fast_resume_valid = false;
     if (!solved) {
       local->gap_fast_exhausted = true;
@@ -11443,6 +11546,8 @@ static inline int png_crc_solve_idat(
             local->m2_resume.best_found = false;
           }
         }
+        // A fully checked match only needs its final confirmation retried.
+        stop_m2_scan = m2_best_found && m2_best_validated;
 
         if (local->m2_resume.suffix_actual >= 0) {
           bool found_suffix = false;
@@ -11634,6 +11739,14 @@ static inline int png_crc_solve_idat(
                   uint64_t _svt2;
                   _sv2 = png_direct_validate(work->id, candidate, &_svt2, local,
                                              uuidp, uuidc);
+                  if (!_sv2 && png_reassembly_yield_requested(candidate)) {
+                    png_solver_restore(local, &_pre_snap);
+                    local->m2_resume.suffix_actual = sc->actual_block;
+                    local->m2_resume.bucket = br;
+                    local->m2_resume.next_actual = er->actual_block;
+                    resize_blockvector(candidate->b, suffix_start_nb);
+                    return -1;
+                  }
                   uint64_t _advance = local->last_chunk_crc_pos;
                   bool _plausible = _sv2 || _advance > _crc_pre;
                   int64_t _window_ap[PNG_GAP_INDEX_MAX_M];
@@ -11699,7 +11812,6 @@ static inline int png_crc_solve_idat(
       }
     } // end suffix candidate loop (M=2)
 
-    png_m2_resume_reset(&local->m2_resume);
     if (m2_best_found) {
       int64_t m2_best_left =
           png_crc_actual_to_apparent(ht, m2_best_left_actual);
@@ -11730,6 +11842,11 @@ static inline int png_crc_solve_idat(
         uint64_t final_vt = 0;
         bool final_validated = png_direct_validate(
             work->id, candidate, &final_vt, local, uuidp, uuidc);
+        if (!final_validated && png_reassembly_yield_requested(candidate)) {
+          png_solver_restore(local, &final_pre_snap);
+          resize_blockvector(candidate->b, suffix_start_nb);
+          return -1;
+        }
         bool final_plausible =
             final_validated || local->last_chunk_crc_pos > final_crc_pre;
         if (final_plausible) {
@@ -11746,6 +11863,7 @@ static inline int png_crc_solve_idat(
         }
       }
     }
+    png_m2_resume_reset(&local->m2_resume);
 
     // ================================================================
     // M=3 algebraic solver: O(S × N) where S ~ 1-5 suffix candidates.
@@ -11868,6 +11986,8 @@ static inline int png_crc_solve_idat(
             scalpel_state.filemirror);
         uint32_t *m3_ab_crc = NULL;
         bool *m3_ab_valid = NULL;
+        XXH3_state_t m3_hash_state;
+        bool m3_hash_ok = XXH3_64bits_reset(&m3_hash_state) == XXH_OK;
         if (m3_total_ap > 0) {
           m3_ab_crc = (uint32_t *)calloc((size_t)m3_total_ap,
                                          sizeof(uint32_t));
@@ -11885,11 +12005,60 @@ static inline int png_crc_solve_idat(
                 if (ab >= 0 && ab < m3_total_ap) {
                   m3_ab_crc[ab] = e->crc;
                   m3_ab_valid[ab] = true;
+                  const int64_t identity[] = {e->actual_block, ab};
+                  m3_hash_ok = m3_hash_ok && XXH3_64bits_update(
+                      &m3_hash_state, identity, sizeof(identity)) == XXH_OK;
                 }
               }
             }
           }
         }
+
+        // Numeric cursors cannot be reused after rebuilding a different table
+        // or compacting the apparent blockmap. Keep the prefix, restart the scan.
+        m3_hash_ok = m3_hash_ok && m3_ab_crc && m3_ab_valid;
+        for (int mi = 0; mi < 3 && m3_hash_ok; mi++) {
+          int ti = M3_TAB(mi);
+          uint32_t count = sctx->m3_count[ti];
+          m3_hash_ok = XXH3_64bits_update(&m3_hash_state,
+              &count, sizeof(count)) == XXH_OK;
+          for (uint32_t i = 0; i < count && m3_hash_ok; i++) {
+            m3_hash_ok = XXH3_64bits_update(&m3_hash_state,
+                &sctx->m3_pool[ti][i].actual_block, sizeof(int64_t)) == XXH_OK;
+          }
+        }
+        for (int64_t i = 0; i < suffix_cand_count && m3_hash_ok; i++) {
+          const int64_t identity[] = {sc_arr[i].actual_block,
+              sc_arr[i].apparent_block, sc_arr[i].valid ? 1 : 0};
+          m3_hash_ok = XXH3_64bits_update(&m3_hash_state,
+              identity, sizeof(identity)) == XXH_OK;
+        }
+        uint64_t m3_universe_hash = m3_hash_ok
+            ? XXH3_64bits_digest(&m3_hash_state) : 0;
+        if (resume_phase != 0 && (!m3_hash_ok
+            || local->solver_m4_universe_hash != m3_universe_hash)) {
+          resume_si = 0;
+          resume_er1 = 0;
+          resume_er2 = 0;
+          resume_phase = 0;
+          resume_pair = 0;
+          png_solver_resume_reset(local);
+        }
+        local->solver_m4_universe_hash = m3_universe_hash;
+
+        // Retry the current match after interruption, not the next polled entry.
+        #define PNG_M3_PAUSE(_phase, _pair, _right, _right2) do { \
+          local->solver_phase = (_phase); \
+          local->solver_pair_idx = (_pair); \
+          local->solver_suffix_idx = si; \
+          local->solver_right_idx = (_right); \
+          local->solver_right_idx2 = (_right2); \
+          local->solver_suffix_nb = suffix_start_nb; \
+          resize_blockvector(candidate->b, suffix_start_nb); \
+          free(m3_ab_crc); \
+          free(m3_ab_valid); \
+          return -1; \
+        } while (0)
 
         for (int64_t si = resume_si; si < suffix_cand_count && !solved; si++) {
           PNGSuffixCand *sc = &sc_arr[si];
@@ -11992,6 +12161,9 @@ static inline int png_crc_solve_idat(
                           GREEN, (_kind), _pa0, _pa1, _pa2, sap, BLACK); \
                     } \
                     solved = true; \
+                  } \
+                  if (!solved && png_reassembly_yield_requested(candidate)) { \
+                    PNG_M3_PAUSE(5, 0, 0, 0); \
                   } \
                   if (!solved) { PNG_M3_RESTORE_CONTIG(); } \
                 } \
@@ -12320,6 +12492,9 @@ static inline int png_crc_solve_idat(
                     }
                   }
                   if (!solved) {
+                    if (png_reassembly_yield_requested(candidate)) {
+                      PNG_M3_PAUSE(4, (uint8_t)spi, start, 0);
+                    }
                     for (uint32_t f = 0; f < fill_needed; f++) {
                       int64_t orig = last_block + 1 + (int64_t)f;
                       blockvector_set_apparent_blocknumber(candidate->b,
@@ -12395,10 +12570,16 @@ static inline int png_crc_solve_idat(
                         && _tp[3]=='D' && _nl == 0) { _sok = true; }
                   }
                   if (_sok) {
+                    PNGSolverStateSnapshot pre_validate;
+                    png_solver_snapshot(&pre_validate, local);
                     uint64_t _cp = local->last_chunk_crc_pos;
                     bool _sv2; uint64_t _svt2;
                     _sv2 = png_direct_validate(work->id, candidate,
                         &_svt2, local, uuidp, uuidc);
+                    if (!_sv2 && png_reassembly_yield_requested(candidate)) {
+                      png_solver_restore(local, &pre_validate);
+                      PNG_M3_PAUSE(5, 0, 0, 0);
+                    }
                     if (_sv2 || local->last_chunk_crc_pos > _cp) {
                       if (scalpel_state.mode_verbose) {
                         lock_fprintf(stdout,
@@ -12535,10 +12716,16 @@ static inline int png_crc_solve_idat(
                               && _nl == 0) { _sok = true; }
                         }
                         if (_sok) {
+                          PNGSolverStateSnapshot pre_validate;
+                          png_solver_snapshot(&pre_validate, local);
                           uint64_t _cp = local->last_chunk_crc_pos;
                           bool _sv; uint64_t _svt;
                           _sv = png_direct_validate(work->id, candidate,
                               &_svt, local, uuidp, uuidc);
+                          if (!_sv && png_reassembly_yield_requested(candidate)) {
+                            png_solver_restore(local, &pre_validate);
+                            PNG_M3_PAUSE(1, (uint8_t)pi, ei, 0);
+                          }
                           if (_sv || local->last_chunk_crc_pos > _cp) {
                             if (scalpel_state.mode_verbose) {
                               lock_fprintf(stdout,
@@ -12739,10 +12926,16 @@ static inline int png_crc_solve_idat(
                             && _nl == 0) { _sok = true; }
                       }
                       if (_sok) {
+                        PNGSolverStateSnapshot pre_validate;
+                        png_solver_snapshot(&pre_validate, local);
                         uint64_t _cp = local->last_chunk_crc_pos;
                         bool _sv; uint64_t _svt;
                         _sv = png_direct_validate(work->id, candidate,
                             &_svt, local, uuidp, uuidc);
+                        if (!_sv && png_reassembly_yield_requested(candidate)) {
+                          png_solver_restore(local, &pre_validate);
+                          PNG_M3_PAUSE(2, 0, ei, e1);
+                        }
                         if (_sv || local->last_chunk_crc_pos > _cp) {
                           if (scalpel_state.mode_verbose) {
                             lock_fprintf(stdout,
@@ -12772,6 +12965,7 @@ static inline int png_crc_solve_idat(
             }
           }
         } // end suffix candidate loop (M=3)
+        #undef PNG_M3_PAUSE
 
         free(m3_ab_crc);
         free(m3_ab_valid);
@@ -13120,6 +13314,16 @@ static inline int png_crc_solve_idat(
                   }
                   if (!solved) {
                     png_solver_restore(local, &pre_snap);
+                    if (png_reassembly_yield_requested(candidate)) {
+                      local->solver_phase = 3;
+                      local->solver_suffix_idx = si;
+                      local->solver_right_idx = r0;
+                      local->solver_right_idx2 = r1;
+                      local->solver_suffix_nb = suffix_start_nb;
+                      local->solver_m4_universe_hash = m4_universe_hash;
+                      m4_yielded = true;
+                      goto m4_done;
+                    }
                     for (uint32_t f = 0; f < fill_needed; f++) {
                       int64_t original = last_block + 1 + (int64_t)f;
                       blockvector_set_apparent_blocknumber(candidate->b,
@@ -13147,6 +13351,7 @@ m4_done:
     free(shifted);
     free(flat);
     if (m4_yielded) {
+      free(suffix_cands);
       resize_blockvector(candidate->b, suffix_start_nb);
       return -1;
     }
@@ -13181,6 +13386,34 @@ m4_done:
   return 0;
 }
 
+// An active solver's prefix is working search state, not a validated output.
+// Keep it with its resume cursor; only trial blocks beyond it may be removed.
+static inline uint64_t png_search_prefix_blocks(const PNGCarveState *local,
+                                                uint64_t current_blocks);
+static inline uint64_t png_search_prefix_blocks(const PNGCarveState *local,
+                                                uint64_t current_blocks) {
+  if (!local) {
+    return 0;
+  }
+  const uint64_t prefixes[] = {
+    local->solver_phase ? local->solver_suffix_nb : 0,
+    local->m2_resume.active ? local->m2_resume.suffix_nb : 0,
+    local->bbk_resume_active ? local->bbk_resume_suffix_nb : 0,
+    local->d1_resume_valid ? local->d1_resume_suffix_nb : 0,
+    local->gap_fast_resume_valid && !local->gap_fast_exhausted
+        ? local->gap_fast_suffix_nb : 0
+  };
+  uint64_t keep = 0;
+  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    uint64_t blocks = prefixes[i];
+    if (blocks > 0 && blocks <= current_blocks
+        && (keep == 0 || blocks < keep)) {
+      keep = blocks;
+    }
+  }
+  return keep;
+}
+
 // Initialize (or re-initialize after checkpoint) a PNG reassembly candidate.
 // Handles covered blocks that appeared during checkpoint: truncates BV at
 // first hole and resets stale CRC carve state.  Mirrors the role of
@@ -13212,10 +13445,12 @@ static inline void png_reassembly_init_candidate(CarveInfo *candidate,
   // PNG wants LR-style truncation: CRC chain breaks at the hole, so
   // nothing past it is trustworthy.
   uint64_t nb = blockvector_get_num_blocks(candidate->b);
+  bool prefix_had_hole = false;
   for (uint64_t hi = 0; hi < nb; hi++) {  // Start at 0: corrupt block 0 causes Cat5
     int64_t ab = blockvector_get_apparent_blocknumber(candidate->b, hi);
     int64_t act = blockvector_get_actual_blocknumber(candidate->b, hi);
     if (ab < 0 || act < 0) {
+      prefix_had_hole = true;
       if (scalpel_state.mode_verbose) {
         lock_fprintf(stdout,
             "PNG init_candidate: hole at index %" PRIu64
@@ -13313,6 +13548,12 @@ static inline void png_reassembly_init_candidate(CarveInfo *candidate,
   // are WRONG blocks.  Walk the PNG chunk chain and verify CRC32 for
   // each chunk.  Trim at the first CRC failure.
   nb = blockvector_get_num_blocks(candidate->b);
+  if (!prefix_had_hole && nb > 0
+      && png_search_prefix_blocks(local, nb) == nb) {
+    // Resume the same prefix instead of testing an invented contiguous tail.
+    // The solver still validates every proposed continuation before accepting it.
+    return;
+  }
   if (nb > 2) {
     uint8_t *data = (uint8_t *)blockvector_get_data_pointer(
         candidate->b);
@@ -13606,6 +13847,31 @@ static inline bool png_preserve_crc_frontier_in_candidate(
   return true;
 }
 
+// If a tentative prefix prevents CRC recovery, reopen it once at this chunk.
+// The retry key survives parser refreshes and checkpoints, unlike local flags.
+static inline bool png_retry_unverified_prefix(PNGCarveState *local,
+                                                CarveInfo *candidate);
+static inline bool png_retry_unverified_prefix(PNGCarveState *local,
+                                                CarveInfo *candidate) {
+  if (!local || !candidate || !candidate->b
+      || scalpel_state.blocksize <= 0 || local->last_chunk_crc_pos == 0
+      || local->retry_crc_pos == local->last_chunk_crc_pos) {
+    return false;
+  }
+  uint64_t verified_blocks = CEILDIV(local->last_chunk_crc_pos,
+                                      (uint64_t)scalpel_state.blocksize);
+  if (verified_blocks >= blockvector_get_num_blocks(candidate->b)
+      || !png_preserve_crc_frontier_in_candidate(local, candidate)) {
+    return false;
+  }
+  local->retry_crc_pos = local->last_chunk_crc_pos;
+  local->valid = false;
+  local->n_crc_ckpts = 0;
+  local->exhausted_waiting_for_checkpoint = false;
+  png_reassembly_search_resume_reset(local);
+  return true;
+}
+
 static inline bool png_trim_output_blind_idat_tail(
     PNGCarveState *local, CarveInfo *candidate) {
   if (!local || !candidate || !candidate->b
@@ -13713,34 +13979,14 @@ static inline void png_trim_checkpoint_candidate(
   }
 
   uint64_t cur_blocks = blockvector_get_num_blocks(candidate->b);
-  uint64_t keep_blocks = cur_blocks;
-
-  if (local->solver_phase != 0
-      && local->solver_suffix_nb > 0
-      && local->solver_suffix_nb < keep_blocks) {
-    keep_blocks = local->solver_suffix_nb;
+  uint64_t keep_blocks = png_search_prefix_blocks(local, cur_blocks);
+  if (keep_blocks > 0) {
+    if (keep_blocks < cur_blocks) {
+      resize_blockvector(candidate->b, keep_blocks);
+    }
+    return;
   }
-  if (local->m2_resume.active
-      && local->m2_resume.suffix_nb > 0
-      && local->m2_resume.suffix_nb < keep_blocks) {
-    keep_blocks = local->m2_resume.suffix_nb;
-  }
-  if (local->bbk_resume_active
-      && local->bbk_resume_suffix_nb > 0
-      && local->bbk_resume_suffix_nb < keep_blocks) {
-    keep_blocks = local->bbk_resume_suffix_nb;
-  }
-  if (local->d1_resume_valid
-      && local->d1_resume_suffix_nb > 0
-      && local->d1_resume_suffix_nb < keep_blocks) {
-    keep_blocks = local->d1_resume_suffix_nb;
-  }
-  if (local->gap_fast_resume_valid
-      && !local->gap_fast_exhausted
-      && local->gap_fast_suffix_nb > 0
-      && local->gap_fast_suffix_nb < keep_blocks) {
-    keep_blocks = local->gap_fast_suffix_nb;
-  }
+  keep_blocks = cur_blocks;
   if (local->safe_partial_blocks > 0
       && local->safe_partial_blocks < keep_blocks) {
     keep_blocks = local->safe_partial_blocks;
@@ -13982,7 +14228,10 @@ png_reassembly_restart:
       // SKIP when the solver placed blocks past the CRC boundary on the
       // previous pass — those blocks are correct but not yet CRC-verified.
       // Trimming them forces the solver to re-solve, causing infinite stalls.
-      if (crc_pos > 0 && !solver_advanced_last_pass) {
+      uint64_t resume_blocks = blockvector_get_num_blocks(candidate->b);
+      bool continuing_search = resume_blocks > 0
+          && png_search_prefix_blocks(local, resume_blocks) == resume_blocks;
+      if (crc_pos > 0 && !solver_advanced_last_pass && !continuing_search) {
         uint64_t crc_blk = (crc_pos + (uint64_t)scalpel_state.blocksize - 1)
                            / (uint64_t)scalpel_state.blocksize;
         uint64_t cur_nb = blockvector_get_num_blocks(candidate->b);
@@ -14410,13 +14659,14 @@ png_reassembly_restart:
 	              suffix_found = true;
 	              continue;  // gallop again from new position
 	            }
-	            if (fill_needed > PNG_POSTCRC_SMALL_SOLVER_FILL_MAX
+	            if (local->retry_crc_pos != crc_pos
+	                && fill_needed > PNG_POSTCRC_SMALL_SOLVER_FILL_MAX
 	                && gsvt >= suffix_start_dl + scalpel_state.blocksize - 1) {
 	              uint64_t idat_crc_field_pos =
 	                  crc_pos + 8 + (uint64_t)idat_sz;
 	              if (gsvt < idat_crc_field_pos) {
-	                // Keep the structurally proven local prefix so the next
-	                // pass solves only the actual seam near the CRC.
+	                // Try the tentative local prefix first. If the CRC search
+	                // fails, the exhaustion path reopens these blocks.
 	                uint64_t proven_blk =
 	                    (gsvt + 1 + (uint64_t)scalpel_state.blocksize - 1)
 	                    / (uint64_t)scalpel_state.blocksize;
@@ -15284,6 +15534,17 @@ png_reassembly_restart:
           blockvector_set_data_length(candidate->b, suffix_start_dl);
         }
         entry_last_chunk_crc_pos = local->last_chunk_crc_pos;
+        continue;
+      }
+
+      if (png_retry_unverified_prefix(local, candidate)) {
+        if (scalpel_state.mode_verbose) {
+          lock_fprintf(stdout,
+              "PNG SUFFIX: retrying unverified prefix at CRC=%" PRIu64 "\n",
+              local->retry_crc_pos);
+        }
+        solver_advanced_last_pass = false;
+        trimmed_stale_blocks = false;
         continue;
       }
 

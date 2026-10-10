@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -2189,6 +2193,12 @@ void handle_error(ScalpelError error, char *str, int line, const char *file) {
     // fatal
     scalpel_log_err("Scalpel will abort: %s\n", str);
     backtrace = true;
+    goto fatal;
+
+    break;
+
+  case SCALPEL_ERROR_RESOURCE_PATH:
+    scalpel_log_err("Resource configuration error: %s Aborting.\n", str);
     goto fatal;
 
     break;

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2021-2026 Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 // See LICENSE.md and README.md for licensing and commercial-use information.
 
 #ifndef SCALPEL_VALIDATOR_SEARCH_H

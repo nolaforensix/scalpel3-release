@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -48,7 +52,7 @@
 #define CFBF_MINI_STREAM_CUTOFF            UINT32_C(4096)
 #define CFBF_MAGIC_SIZE                     8u
 #define CFBF_STATE_MAGIC                   UINT32_C(0x43464246)
-#define CFBF_STATE_VERSION                UINT32_C(47)
+#define CFBF_STATE_VERSION                UINT32_C(51)
 #define CFBF_FREE_SECTOR                   UINT32_C(0xffffffff)
 #define CFBF_END_OF_CHAIN                  UINT32_C(0xfffffffe)
 #define CFBF_FAT_SECTOR                    UINT32_C(0xfffffffd)
@@ -108,6 +112,10 @@
 #define CFBF_REASSEMBLY_CONTENT_COMBINED       UINT32_C(11)
 #define CFBF_REASSEMBLY_CONTENT_COMPLETE       UINT32_C(12)
 #define CFBF_REASSEMBLY_STRUCTURAL_ANCHORS     UINT32_C(13)
+#define CFBF_REASSEMBLY_SUPPORTED_PAIRS        UINT32_C(14)
+#define CFBF_SUFFIX_STAGE_INITIAL             UINT32_C(1)
+#define CFBF_SUFFIX_STAGE_BEFORE_CONTENT      UINT32_C(2)
+#define CFBF_SUFFIX_STAGE_AFTER_CONTENT       UINT32_C(3)
 #define CFBF_STRUCTURAL_RESUME_TARGET_SCAN       UINT32_C(1)
 #define CFBF_STRUCTURAL_RESUME_SOURCE_SCAN       UINT32_C(2)
 #define CFBF_STRUCTURAL_SOURCE_TRIAL_LIMIT     UINT64_C(128)
@@ -335,6 +343,22 @@ typedef struct CfbfCarveState {
   uint32_t suffix_hypothesis_count;
   CfbfSuffixHypothesis
       suffix_hypotheses[CFBF_SUFFIX_HYPOTHESIS_LIMIT];
+  // Reservations at selection time determine search scope, not current ownership.
+  uint32_t atomic_reservation_valid;
+  uint32_t atomic_reserved;
+  uint32_t atomic_sources_valid;
+  uint32_t atomic_sources_count;
+  uint64_t atomic_sources_next;
+  uint64_t atomic_sources[CFBF_RANKED_SOURCE_LIMIT * 4];
+  // The shared suffix probe must return to the stage that invoked it.
+  uint32_t supported_suffix_stage;
+  // Pair ordinals apply only to the same physical mapping and source view.
+  XXH128_hash_t supported_pairs_view;
+  uint32_t supported_pairs_valid;
+  uint32_t supported_pairs_count;
+  uint32_t supported_pairs_next;
+  uint32_t supported_pairs_written;
+  uint32_t supported_pairs_limit;
 } CfbfCarveState;
 
 typedef struct CfbfSourceRunIterator {
@@ -951,6 +975,11 @@ static inline bool cfbf_reassembly_try_block_replacements(
     const CfbfTrialResult *current, uint64_t first_slot,
     uint64_t last_slot, uuid_string_t uuidp, uuid_string_t uuidc,
     bool *improved, bool *validated);
+static inline bool cfbf_reassembly_write_atomic_hypotheses(
+    CarveInfo *candidate, CfbfCarveState *state, const int64_t *base_mapping,
+    int64_t *suffix_mapping, int64_t *trial_mapping,
+    CfbfMappingIndex *suffix_index, uint8_t *trial_data,
+    const uint8_t **base_data, uint64_t length, int64_t header_actual);
 static inline bool cfbf_reassembly_try_atomic_pair(
     ThreadWork *work, CarveInfo **candidate, CfbfCarveState *state,
     const CfbfTrialResult *current, bool exhaustive, uuid_string_t uuidp,
@@ -964,6 +993,8 @@ static inline bool cfbf_reassembly_combined_pair_is_better(
 static inline bool cfbf_reassembly_combined_target_is_better(
     const CfbfCombinedTarget *candidate,
     const CfbfCombinedTarget *retained);
+static inline XXH128_hash_t cfbf_reassembly_supported_pairs_view(
+    BlockVector *blockvector, const CfbfModelRun *gaps, uint32_t gap_count);
 static inline bool cfbf_reassembly_try_supported_gap_pairs(
     ThreadWork *work, CarveInfo **candidate, CfbfCarveState *state,
     uint32_t maximum_gap_count, uuid_string_t uuidp,
@@ -7874,9 +7905,6 @@ static inline bool cfbf_reassembly_ranked_source_is_better(
   if (candidate->context_distance != retained->context_distance) {
     return candidate->context_distance < retained->context_distance;
   }
-  if (candidate->reserved != retained->reserved) {
-    return candidate->reserved < retained->reserved;
-  }
   if (rank_mode != 1
       && candidate->generic_all_positive
          != retained->generic_all_positive) {
@@ -7933,6 +7961,8 @@ static inline void cfbf_reassembly_retain_ranked_source(
 // Build a bounded union of the strongest source runs under independent model
 // and continuity orderings. This changes only time-to-trial: sources outside
 // the union remain reachable through the existing exhaustive traversal.
+// Temporary writer reservations must not reorder this retained search prefix.
+// Source availability and ownership checks remain separate from this ranking.
 //
 static inline uint32_t cfbf_reassembly_collect_ranked_sources(
     BlockVector *blockvector, const int64_t *mapping,
@@ -8317,9 +8347,8 @@ static inline bool cfbf_reassembly_isolated_repair_is_better(
   if (candidate->source_isolation != retained->source_isolation) {
     return candidate->source_isolation > retained->source_isolation;
   }
-  if (candidate->reserved != retained->reserved) {
-    return candidate->reserved < retained->reserved;
-  }
+  // Rank output-only alternatives by content and placement evidence, not
+  // temporary reservations that change with writer and checkpoint timing.
   if (candidate->context_distance != retained->context_distance) {
     return candidate->context_distance < retained->context_distance;
   }
@@ -8478,6 +8507,11 @@ static inline void cfbf_reassembly_reset_atomic_search(
   state->atomic_width_order = 0;
   state->atomic_target_slot = 0;
   state->atomic_source_actual = 0;
+  state->atomic_reservation_valid = 0;
+  state->atomic_reserved = UINT32_MAX;
+  state->atomic_sources_valid = 0;
+  state->atomic_sources_count = 0;
+  state->atomic_sources_next = 0;
   memset(&state->atomic_candidate, 0, sizeof(state->atomic_candidate));
   memset(state->atomic_width_candidates, 0,
          sizeof(state->atomic_width_candidates));
@@ -14692,6 +14726,72 @@ static inline bool cfbf_reassembly_write_content_hypothesis(
   return written;
 }
 
+// Scope the pair cursor to physical choices rather than apparent numbering.
+// Coverage in the reachable source span matters because it can change whether
+// a previously rejected mapping is available after a blockmap edit.
+static inline XXH128_hash_t cfbf_reassembly_supported_pairs_view(
+    BlockVector *blockvector, const CfbfModelRun *gaps, uint32_t gap_count) {
+
+  const uint64_t total_blocks = blockvector_get_num_blocks(blockvector);
+  const uint64_t image_blocks = CEILDIV(
+      filemirror_filesize(scalpel_state.filemirror), scalpel_state.blocksize);
+  const uint64_t header = (uint64_t)blockvector_get_actual_blocknumber(
+      blockvector, 0);
+  const uint64_t metadata[] = {
+    total_blocks, blockvector_get_data_length(blockvector), image_blocks,
+    scalpel_state.blocksize, gap_count
+  };
+  XXH3_state_t hash;
+  XXH3_128bits_reset(&hash);
+  XXH3_128bits_update(&hash, metadata, sizeof(metadata));
+  int64_t mapping[256];
+  for (uint64_t first = 0; first < total_blocks;) {
+    uint64_t count = total_blocks - first;
+    if (count > sizeof(mapping) / sizeof(mapping[0])) {
+      count = sizeof(mapping) / sizeof(mapping[0]);
+    }
+    for (uint64_t index = 0; index < count; index++) {
+      mapping[index] = blockvector_get_actual_blocknumber(
+          blockvector, first + index);
+    }
+    XXH3_128bits_update(&hash, mapping, (size_t)count * sizeof(mapping[0]));
+    first += count;
+  }
+  uint64_t largest = 0;
+  uint64_t second_largest = 0;
+  for (uint32_t index = 0; index < gap_count; index++) {
+    const uint64_t gap[] = {gaps[index].actual, gaps[index].width};
+    XXH3_128bits_update(&hash, gap, sizeof(gap));
+    if (gaps[index].width >= largest) {
+      second_largest = largest;
+      largest = gaps[index].width;
+    }
+    else if (gaps[index].width > second_largest) {
+      second_largest = gaps[index].width;
+    }
+  }
+  uint64_t end = header;
+  const uint64_t spans[] = {total_blocks, largest, second_largest};
+  for (uint32_t index = 0; index < 3; index++) {
+    end += spans[index] > image_blocks - end
+               ? image_blocks - end : spans[index];
+  }
+  for (uint64_t first = header; first < end;) {
+    uint8_t covered[256];
+    uint64_t count = end - first;
+    if (count > sizeof(covered)) {
+      count = sizeof(covered);
+    }
+    for (uint64_t index = 0; index < count; index++) {
+      covered[index] = filemirror_actual_block_covered(
+          scalpel_state.filemirror, (int64_t)(first + index)) ? 1 : 0;
+    }
+    XXH3_128bits_update(&hash, covered, (size_t)count);
+    first += count;
+  }
+  return XXH3_128bits_digest(&hash);
+}
+
 // Test pairs of physical gaps supported independently by allocation state or
 // uniform filler. These bounded hypotheses precede searches that mutate the
 // primary mapping, while complete CFBF validation remains authoritative.
@@ -14702,7 +14802,9 @@ static inline bool cfbf_reassembly_try_supported_gap_pairs(
     uuid_string_t uuidc, bool *attempted, bool *improved) {
 
   if (!work || !candidate || !*candidate || !(*candidate)->b || !state
-      || !attempted || !improved || state->search_phase != 0
+      || !attempted || !improved
+      || (state->search_phase != 0
+          && state->search_phase != CFBF_REASSEMBLY_SUPPORTED_PAIRS)
       || state->repairs != 0) {
     return false;
   }
@@ -14734,9 +14836,29 @@ static inline bool cfbf_reassembly_try_supported_gap_pairs(
 
   if (gap_count < 2
       || (maximum_gap_count != 0 && gap_count > maximum_gap_count)) {
+    if (state->search_phase == CFBF_REASSEMBLY_SUPPORTED_PAIRS) {
+      state->search_phase = 0;
+    }
     return false;
   }
   *attempted = true;
+  const XXH128_hash_t view = cfbf_reassembly_supported_pairs_view(
+      blockvector, gaps, gap_count);
+  const uint32_t pair_count = gap_count * (gap_count - 1) / 2;
+  if (state->supported_pairs_valid == 0
+      || state->supported_pairs_count != gap_count
+      || !XXH128_isEqual(view, state->supported_pairs_view)) {
+    state->supported_pairs_view = view;
+    state->supported_pairs_valid = 1;
+    state->supported_pairs_count = gap_count;
+    state->supported_pairs_next = 0;
+    state->supported_pairs_written = 0;
+  }
+  state->supported_pairs_limit = maximum_gap_count;
+  if (state->supported_pairs_next == pair_count) {
+    state->search_phase = 0;
+    return false;
+  }
   if (scalpel_state.mode_verbose) {
     lock_fprintf(
         stdout,
@@ -14786,7 +14908,8 @@ static inline bool cfbf_reassembly_try_supported_gap_pairs(
   }
 
   uint64_t trials = 0;
-  uint32_t hypotheses_written = 0;
+  uint32_t hypotheses_written = state->supported_pairs_written;
+  state->search_phase = CFBF_REASSEMBLY_SUPPORTED_PAIRS;
 
   for (uint32_t left_index = 0; left_index < gap_count; left_index++) {
     for (uint32_t right_index = left_index + 1;
@@ -14801,6 +14924,9 @@ static inline bool cfbf_reassembly_try_supported_gap_pairs(
         second = swap;
       }
       trials++;
+      if (trials <= state->supported_pairs_next) {
+        continue;
+      }
       if (first->actual > UINT64_MAX - first->width
           || first->actual + first->width > second->actual
           || first->actual <= (uint64_t)header_actual
@@ -14879,6 +15005,7 @@ static inline bool cfbf_reassembly_try_supported_gap_pairs(
                    *candidate, state, pair_mapping, &result,
                    repairs, true)) {
           hypotheses_written++;
+          state->supported_pairs_written = hypotheses_written;
           base_data = (const uint8_t *)
               blockvector_get_data_pointer(blockvector);
           if (!base_data) {
@@ -14892,6 +15019,7 @@ static inline bool cfbf_reassembly_try_supported_gap_pairs(
       }
 
 cfbf_supported_pair_prepass_poll:
+      state->supported_pairs_next = (uint32_t)trials;
       if ((trials & UINT64_C(0x0f)) == 0
           && cfbf_reassembly_poll(
                  work, candidate, state, uuidp, uuidc)) {
@@ -14908,6 +15036,7 @@ cfbf_supported_pair_prepass_poll:
   free(pair_mapping);
   free(first_mapping);
   free(base_mapping);
+  state->search_phase = 0;
   return false;
 }
 
@@ -15772,6 +15901,75 @@ static inline bool cfbf_reassembly_try_content_combined(
   return false;
 }
 
+// Publish the bounded per-width results before another search stage can replace
+// them. Availability and format evidence are checked again before writing.
+//
+static inline bool cfbf_reassembly_write_atomic_hypotheses(
+    CarveInfo *candidate, CfbfCarveState *state, const int64_t *base_mapping,
+    int64_t *suffix_mapping, int64_t *trial_mapping,
+    CfbfMappingIndex *suffix_index, uint8_t *trial_data,
+    const uint8_t **base_data, uint64_t length, int64_t header_actual) {
+  BlockVector *blockvector = candidate->b;
+  const uint64_t total_blocks = blockvector_get_num_blocks(blockvector);
+
+  for (uint64_t width_index = 0;
+       width_index < CFBF_NEARBY_RUN_WIDTH_LIMIT; width_index++) {
+    const CfbfAtomicCandidate *width_candidate =
+        &state->atomic_width_candidates[width_index];
+
+    if (width_candidate->valid == 0
+        || !cfbf_reassembly_build_suffix_mapping(
+               blockvector, base_mapping, suffix_mapping,
+               width_candidate->suffix_slot,
+               width_candidate->suffix_shift, header_actual)
+        || !cfbf_reassembly_mapping_index_build(
+               suffix_index, suffix_mapping, total_blocks)
+        || !cfbf_reassembly_build_mapped_run_indexed(
+               blockvector, suffix_mapping, suffix_index, trial_mapping,
+               width_candidate->target_slot, width_candidate->width,
+               (int64_t)width_candidate->source_actual)
+        || !cfbf_reassembly_materialize_mapping(
+               blockvector, trial_mapping, *base_data, trial_data, length)) {
+      continue;
+    }
+    CfbfTrialResult width_result;
+
+    memset(&width_result, 0, sizeof(width_result));
+    if (!cfbf_reassembly_evaluate_data(
+            trial_data, length, &width_result)
+        || !cfbf_reassembly_trial_recoverable(&width_result)) {
+      continue;
+    }
+    const uint64_t repair_count = width_candidate->suffix_shift
+                                  + width_candidate->width;
+    const uint32_t repairs = repair_count > UINT32_MAX
+        ? UINT32_MAX : (uint32_t)repair_count;
+
+    if (cfbf_reassembly_write_mapping_hypothesis(
+            candidate, state, trial_mapping, &width_result,
+            repairs, true)
+        && scalpel_state.mode_verbose) {
+      lock_fprintf(
+          stdout,
+          "CFBF bounded atomic hypothesis written: header=%" PRId64
+          " gap=%" PRIu64 "/%" PRIu64
+          " slot=%" PRIu64 " width=%" PRIu64
+          " source=%" PRIu64 " profile=%s.\n",
+          header_actual, width_candidate->suffix_slot,
+          width_candidate->suffix_shift, width_candidate->target_slot,
+          width_candidate->width, width_candidate->source_actual,
+          cfbf_profile_filetype(width_result.profile));
+    }
+    *base_data = (const uint8_t *)
+        blockvector_get_data_pointer(blockvector);
+    if (!*base_data) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // Resolve a gap and a displaced run as one atomic hypothesis. Every trial is
 // materialized privately. The bounded pass prioritizes the retained gap and
 // strongest source evidence; exhaustive traversal remains available when those
@@ -16010,20 +16208,6 @@ static inline bool cfbf_reassembly_try_atomic_pair(
              ? preferred_gap_count + 1
              : (exhaustive && state->pair_suffix_possible != 0 ? 3 : 1));
 
-  bool strong_mpp_solution = found
-      && solution_result.profile == CFBF_PROFILE_MPP
-      && solution_result.semantic_strength >= CFBF_SEMANTIC_STRONG
-      && solution_result.profile_evidence
-      && solution_reserved == 0
-      && ((solution_suffix_exact
-           && solution_source_isolation
-                  >= CFBF_DETACHED_SOURCE_ISOLATED_MIN
-           && (solution_target_exact
-               || solution_result.coherence_payloads != 0))
-          || (solution_target_exact
-              && solution_source_isolation != 0
-              && solution_result.coherence_payloads != 0));
-
   if (resuming && state->atomic_candidate.valid != 0
       && cfbf_reassembly_build_suffix_mapping(
              blockvector, base_mapping, suffix_mapping,
@@ -16114,6 +16298,10 @@ static inline bool cfbf_reassembly_try_atomic_pair(
         solution_result.profile, &solution_has_confidence,
         &solution_all_positive, &solution_confidence_gain,
         &solution_reserved, NULL);
+    // Writer reservations can clear at a checkpoint. Do not let that change
+    // whether the saved search still needs its unrestricted fallback.
+    solution_reserved = state->atomic_reservation_valid != 0
+        ? state->atomic_reserved : UINT32_MAX;
   }
   else if (resuming) {
     memset(&state->atomic_candidate, 0,
@@ -16134,37 +16322,14 @@ static inline bool cfbf_reassembly_try_atomic_pair(
         state->suffix_candidate_shift);
   }
 
-  const uint32_t first_search_pass = resuming && mpp_guided_search
-                                     && strong_mpp_solution
-      ? search_passes
-      : resuming
+  const uint32_t first_search_pass = resuming
       && resume_search_pass < search_passes
           ? resume_search_pass : 0;
 
   for (uint32_t search_pass = first_search_pass;
        search_pass < search_passes; search_pass++) {
-    const bool broad_mpp_fallback = mpp_guided_search
-                                    && search_pass == preferred_gap_count;
-
-    // A preferred Project repair backed by independent semantic and physical
-    // evidence does not need the unrestricted suffix fallback.
-    strong_mpp_solution = found
-        && solution_result.profile == CFBF_PROFILE_MPP
-        && solution_result.semantic_strength >= CFBF_SEMANTIC_STRONG
-        && solution_result.profile_evidence
-        && solution_reserved == 0
-        && ((solution_suffix_exact
-             && solution_source_isolation
-                    >= CFBF_DETACHED_SOURCE_ISOLATED_MIN
-             && (solution_target_exact
-                 || solution_result.coherence_payloads != 0))
-            || (solution_target_exact
-                && solution_source_isolation != 0
-                && solution_result.coherence_payloads != 0));
-
-    if (broad_mpp_fallback && strong_mpp_solution) {
-      break;
-    }
+    // Writer reservations can disappear at a checkpoint. They rank proposals,
+    // but cannot make an opaque reconstruction exempt from the remaining search.
     const bool preferred_gap_pass = (!exhaustive
                                      && preferred_gap_count > 0)
                                     || (mpp_guided_search
@@ -16397,39 +16562,54 @@ static inline bool cfbf_reassembly_try_atomic_pair(
               continue;
             }
 
-            if (!exhaustive && !scan_all_isolated_sources) {
-              ranked_source_count = cfbf_reassembly_collect_ranked_sources(
-                  blockvector, suffix_mapping, target_slot, width,
-                  source_profile, ranked_sources,
-                  CFBF_RANKED_SOURCE_LIMIT * 4);
-              source_count = ranked_source_count;
-              if (source_count == 0) {
-                continue;
-              }
-            }
-
-            CfbfSourceRunIterator source_iterator;
             const bool resume_source = resuming
                 && search_pass == resume_search_pass
                 && suffix_slot == resume_suffix_slot
                 && shift == resume_shift
                 && width_order == resume_width_order
                 && target_slot == resume_target_slot;
-            const uint64_t first_source_actual = resume_source
-                ? resume_source_actual : 0;
             uint64_t first_source_position = 0;
 
-            if (!exhaustive && !scan_all_isolated_sources && resume_source
-                && resume_source_actual > 0) {
-              for (uint64_t position = 0;
-                   position < source_count; position++) {
-                if (ranked_sources[position].actual + 1
-                    == resume_source_actual) {
-                  first_source_position = position + 1;
-                  break;
+            if (!exhaustive && !scan_all_isolated_sources) {
+              // Keep this target's ranked traversal stable when writer claims
+              // change across a checkpoint. Availability is still checked below.
+              if (resume_source && state->atomic_sources_valid != 0
+                  && state->atomic_sources_count
+                         <= CFBF_RANKED_SOURCE_LIMIT * 4
+                  && state->atomic_sources_next
+                         <= state->atomic_sources_count) {
+                ranked_source_count = state->atomic_sources_count;
+                first_source_position = state->atomic_sources_next;
+                for (uint32_t position = 0;
+                     position < ranked_source_count; position++) {
+                  ranked_sources[position].actual =
+                      state->atomic_sources[position];
                 }
               }
+              else {
+                ranked_source_count = cfbf_reassembly_collect_ranked_sources(
+                    blockvector, suffix_mapping, target_slot, width,
+                    source_profile, ranked_sources,
+                    CFBF_RANKED_SOURCE_LIMIT * 4);
+                state->atomic_sources_valid = 1;
+                state->atomic_sources_count = ranked_source_count;
+                state->atomic_sources_next = 0;
+                for (uint32_t position = 0;
+                     position < ranked_source_count; position++) {
+                  state->atomic_sources[position] =
+                      ranked_sources[position].actual;
+                }
+              }
+              source_count = ranked_source_count;
+              if (source_count == 0) {
+                state->atomic_sources_valid = 0;
+                continue;
+              }
             }
+
+            CfbfSourceRunIterator source_iterator;
+            const uint64_t first_source_actual = resume_source
+                ? resume_source_actual : 0;
 
             cfbf_reassembly_source_run_iterator_initialize(
                 &source_iterator, width, first_source_actual);
@@ -16543,10 +16723,17 @@ static inline bool cfbf_reassembly_try_atomic_pair(
 
                   if (width <= CFBF_NEARBY_RUN_WIDTH_LIMIT) {
                     const uint64_t width_index = width - 1;
+                    CfbfRepairCandidate output_rank = width_candidate;
+                    CfbfRepairCandidate retained_rank =
+                        state->atomic_width_ranks[width_index];
+
+                    // Writer clones hold temporary reservations, which do not
+                    // establish ownership of an opaque output hypothesis.
+                    output_rank.reserved = 0;
+                    retained_rank.reserved = 0;
 
                     if (cfbf_reassembly_repair_is_better(
-                            &width_candidate,
-                            &state->atomic_width_ranks[width_index])) {
+                            &output_rank, &retained_rank)) {
                       state->atomic_width_ranks[width_index] =
                           width_candidate;
                       state->atomic_width_candidates[width_index] =
@@ -16615,13 +16802,9 @@ static inline bool cfbf_reassembly_try_atomic_pair(
                     better = semantic_comparison > 0;
                   }
                   else {
-                    // Type confidence cannot distinguish blocks belonging to
-                    // different Project files. Prefer physical ownership
-                    // evidence before classifier and target-shape heuristics.
-                    if (mpp_tie && reserved != solution_reserved) {
-                      better = reserved < solution_reserved;
-                    }
-                    else if (mpp_tie
+                    // Rank by reproducible content evidence. Live reservation
+                    // counts still guard the strong Project acceptance below.
+                    if (mpp_tie
                              && trial.coherence_cost
                                     != solution_result.coherence_cost) {
                       better = trial.coherence_cost
@@ -16648,9 +16831,6 @@ static inline bool cfbf_reassembly_try_atomic_pair(
                                     != solution_confidence_gain) {
                       better = confidence_gain
                                > solution_confidence_gain;
-                    }
-                    else if (!mpp_tie && reserved != solution_reserved) {
-                      better = reserved < solution_reserved;
                     }
                     else if (!mpp_tie && source_isolation
                              != solution_source_isolation) {
@@ -16710,6 +16890,8 @@ static inline bool cfbf_reassembly_try_atomic_pair(
                     solution_source_isolation = source_isolation;
                     solution_context_distance = context_distance;
                     solution_width = width;
+                    state->atomic_reservation_valid = 1;
+                    state->atomic_reserved = reserved;
                     state->atomic_candidate = (CfbfAtomicCandidate) {
                       .valid = 1,
                       .suffix_slot = suffix_slot,
@@ -16733,6 +16915,9 @@ static inline bool cfbf_reassembly_try_atomic_pair(
                     "CFBF trial mapping could not be restored",
                     __LINE__, __FILE__);
               }
+              if (!exhaustive && !scan_all_isolated_sources) {
+                state->atomic_sources_next = source_index + 1;
+              }
               if ((trials & UINT64_C(0xff)) == 0
                   && cfbf_reassembly_poll(
                          work, candidate, state, uuidp, uuidc)) {
@@ -16746,6 +16931,9 @@ static inline bool cfbf_reassembly_try_atomic_pair(
               }
             }
             state->atomic_source_actual = 0;
+            state->atomic_sources_valid = 0;
+            state->atomic_sources_count = 0;
+            state->atomic_sources_next = 0;
           }
           state->atomic_target_slot = 1;
         }
@@ -16754,59 +16942,10 @@ static inline bool cfbf_reassembly_try_atomic_pair(
       state->atomic_shift = 1;
     }
     state->atomic_suffix_slot = 1;
-  }
-
-  for (uint64_t width_index = 0;
-       width_index < CFBF_NEARBY_RUN_WIDTH_LIMIT; width_index++) {
-    const CfbfAtomicCandidate *width_candidate =
-        &state->atomic_width_candidates[width_index];
-
-    if (width_candidate->valid == 0
-        || !cfbf_reassembly_build_suffix_mapping(
-               blockvector, base_mapping, suffix_mapping,
-               width_candidate->suffix_slot,
-               width_candidate->suffix_shift, header_actual)
-        || !cfbf_reassembly_mapping_index_build(
-               &suffix_index, suffix_mapping, total_blocks)
-        || !cfbf_reassembly_build_mapped_run_indexed(
-               blockvector, suffix_mapping, &suffix_index, trial_mapping,
-               width_candidate->target_slot, width_candidate->width,
-               (int64_t)width_candidate->source_actual)
-        || !cfbf_reassembly_materialize_mapping(
-               blockvector, trial_mapping, base_data, trial_data, length)) {
-      continue;
-    }
-    CfbfTrialResult width_result;
-
-    memset(&width_result, 0, sizeof(width_result));
-    if (!cfbf_reassembly_evaluate_data(
-            trial_data, length, &width_result)
-        || !cfbf_reassembly_trial_recoverable(&width_result)) {
-      continue;
-    }
-    const uint64_t repair_count = width_candidate->suffix_shift
-                                  + width_candidate->width;
-    const uint32_t repairs = repair_count > UINT32_MAX
-        ? UINT32_MAX : (uint32_t)repair_count;
-
-    if (cfbf_reassembly_write_mapping_hypothesis(
-            *candidate, state, trial_mapping, &width_result,
-            repairs, true)
-        && scalpel_state.mode_verbose) {
-      lock_fprintf(
-          stdout,
-          "CFBF bounded atomic hypothesis written: header=%" PRId64
-          " gap=%" PRIu64 "/%" PRIu64
-          " slot=%" PRIu64 " width=%" PRIu64
-          " source=%" PRIu64 " profile=%s.\n",
-          header_actual, width_candidate->suffix_slot,
-          width_candidate->suffix_shift, width_candidate->target_slot,
-          width_candidate->width, width_candidate->source_actual,
-          cfbf_profile_filetype(width_result.profile));
-    }
-    base_data = (const uint8_t *)
-        blockvector_get_data_pointer(blockvector);
-    if (!base_data) {
+    if (mpp_guided_search && search_pass + 1 == preferred_gap_count
+        && !cfbf_reassembly_write_atomic_hypotheses(
+               *candidate, state, base_mapping, suffix_mapping, trial_mapping,
+               &suffix_index, trial_data, &base_data, length, header_actual)) {
       cfbf_reassembly_mapping_index_clear(&suffix_index);
       free(trial_data);
       free(solution_mapping);
@@ -16817,18 +16956,50 @@ static inline bool cfbf_reassembly_try_atomic_pair(
     }
   }
 
+  if (!cfbf_reassembly_write_atomic_hypotheses(
+          *candidate, state, base_mapping, suffix_mapping, trial_mapping,
+          &suffix_index, trial_data, &base_data, length, header_actual)) {
+    cfbf_reassembly_mapping_index_clear(&suffix_index);
+    free(trial_data);
+    free(solution_mapping);
+    free(trial_mapping);
+    free(suffix_mapping);
+    free(base_mapping);
+    return false;
+  }
+
   if (exhaustive && ranking_profile == CFBF_PROFILE_MPP) {
     state->suffix_hypothesis_count = 0;
     memset(state->suffix_hypotheses, 0,
            sizeof(state->suffix_hypotheses));
   }
 
-  strong_mpp_solution = found
+  uint32_t live_solution_reserved = UINT32_MAX;
+
+  if (found) {
+    bool has_confidence = false;
+    bool all_positive = false;
+    int64_t confidence_gain = 0;
+
+    if (cfbf_reassembly_build_suffix_mapping(
+            blockvector, base_mapping, suffix_mapping,
+            state->atomic_candidate.suffix_slot,
+            state->atomic_candidate.suffix_shift, header_actual)) {
+      cfbf_reassembly_run_metrics(
+          blockvector, suffix_mapping, state->atomic_candidate.target_slot,
+          state->atomic_candidate.width,
+          (int64_t)state->atomic_candidate.source_actual,
+          solution_result.profile, &has_confidence, &all_positive,
+          &confidence_gain, &live_solution_reserved, NULL);
+    }
+  }
+  const bool strong_mpp_solution = found
       && ranking_profile == CFBF_PROFILE_MPP
       && solution_result.profile == CFBF_PROFILE_MPP
       && solution_result.semantic_strength >= CFBF_SEMANTIC_STRONG
       && solution_result.profile_evidence
       && solution_reserved == 0
+      && live_solution_reserved == 0
       && ((solution_suffix_exact
            && solution_source_isolation
                   >= CFBF_DETACHED_SOURCE_ISOLATED_MIN
@@ -16863,8 +17034,8 @@ static inline bool cfbf_reassembly_try_atomic_pair(
         state->atomic_candidate.source_actual);
   }
 
-  if (!exhaustive && !solution_authenticated && !strong_mpp_solution) {
-    if (found && ranking_profile != CFBF_PROFILE_MPP
+  if (!exhaustive && !solution_authenticated) {
+    if (found
         && cfbf_reassembly_trial_recoverable(&solution_result)) {
       (void)cfbf_reassembly_write_mapping_hypothesis(
           *candidate, state, solution_mapping, &solution_result, 2, true);
@@ -17032,7 +17203,7 @@ static inline void cfbf_reassembly(ThreadWork *work,
     bool improved = false;
     bool validated = false;
 
-    const bool resume_supported_suffix =
+    bool resume_supported_suffix =
         (state->search_phase == 1 || state->search_phase == 6)
         && state->suffix_pass == 6;
     const bool resume_suffix = state->search_phase == 1
@@ -17062,6 +17233,8 @@ static inline void cfbf_reassembly(ThreadWork *work,
     bool isolated_attempted = false;
     bool preferred_atomic_attempted = false;
     bool supported_pairs_attempted = false;
+    bool resume_supported_pairs =
+        state->search_phase == CFBF_REASSEMBLY_SUPPORTED_PAIRS;
 
     // Allocation metadata can locate displaced blocks. Try those mappings
     // before broader searches; the full validator still checks each result.
@@ -17088,7 +17261,11 @@ static inline void cfbf_reassembly(ThreadWork *work,
     // Probe parser-supported gap boundaries before generic searches emit
     // alternatives. A successful trial can identify a subtype even when the
     // original damaged mapping cannot be parsed.
-    if (state->search_phase == 0 && !current_complete) {
+    if ((state->search_phase == 0 && !current_complete)
+        || (resume_supported_suffix
+            && state->supported_suffix_stage
+                   <= CFBF_SUFFIX_STAGE_INITIAL)) {
+      state->supported_suffix_stage = CFBF_SUFFIX_STAGE_INITIAL;
       if (cfbf_reassembly_probe_supported_suffixes(
               work, candidate, state, &current, targeted_slot,
               uuidp, uuidc)) {
@@ -17099,6 +17276,8 @@ static inline void cfbf_reassembly(ThreadWork *work,
         cfbf_free_carve_state((void **)&state);
         return;
       }
+      state->supported_suffix_stage = 0;
+      resume_supported_suffix = false;
       const CfbfProfile supported_profile =
           cfbf_reassembly_supported_profile(state);
 
@@ -17150,7 +17329,8 @@ static inline void cfbf_reassembly(ThreadWork *work,
         carve_put_state((*candidate)->carvehashkey, state);
     }
 
-    if (state->search_phase == 0) {
+    if (state->search_phase == 0
+        || (resume_supported_pairs && state->supported_pairs_limit != 0)) {
       if (cfbf_reassembly_try_supported_gap_pairs(
               work, candidate, state,
               CFBF_SUPPORTED_PAIR_PREPASS_GAP_LIMIT,
@@ -17165,6 +17345,7 @@ static inline void cfbf_reassembly(ThreadWork *work,
       if (improved) {
         continue;
       }
+      resume_supported_pairs = false;
     }
 
     if (state->search_phase == 0) {
@@ -17187,9 +17368,12 @@ static inline void cfbf_reassembly(ThreadWork *work,
     // combined search. Keep the original mapping active so a displaced run
     // can be evaluated together with the retained suffix before either is
     // committed.
-    if (current.structurally_valid
-        && (resume_supported_suffix || resume_nearby_suffix
-            || state->search_phase == 0)) {
+    if ((current.structurally_valid
+         && (resume_nearby_suffix || state->search_phase == 0))
+        || (resume_supported_suffix
+            && state->supported_suffix_stage
+                   == CFBF_SUFFIX_STAGE_BEFORE_CONTENT)) {
+      state->supported_suffix_stage = CFBF_SUFFIX_STAGE_BEFORE_CONTENT;
       if (cfbf_reassembly_probe_supported_suffixes(
               work, candidate, state, &current, targeted_slot,
               uuidp, uuidc)) {
@@ -17200,10 +17384,13 @@ static inline void cfbf_reassembly(ThreadWork *work,
         cfbf_free_carve_state((void **)&state);
         return;
       }
+      state->supported_suffix_stage = 0;
+      resume_supported_suffix = false;
       resume_nearby_suffix = false;
     }
 
-    if (state->search_phase == 0 && !supported_pairs_attempted) {
+    if ((state->search_phase == 0 && !supported_pairs_attempted)
+        || resume_supported_pairs) {
       if (cfbf_reassembly_try_supported_gap_pairs(
               work, candidate, state, 0, uuidp, uuidc,
               &supported_pairs_attempted, &improved)) {
@@ -17262,10 +17449,12 @@ static inline void cfbf_reassembly(ThreadWork *work,
       }
     }
 
-    if (!current.structurally_valid
-        && (resume_supported_suffix
-            || (state->search_phase == 0
-                && state->suffix_candidate_valid == 0))) {
+    if ((!current.structurally_valid && state->search_phase == 0
+         && state->suffix_candidate_valid == 0)
+        || (resume_supported_suffix
+            && state->supported_suffix_stage
+                   == CFBF_SUFFIX_STAGE_AFTER_CONTENT)) {
+      state->supported_suffix_stage = CFBF_SUFFIX_STAGE_AFTER_CONTENT;
       if (cfbf_reassembly_probe_supported_suffixes(
               work, candidate, state, &current, targeted_slot,
               uuidp, uuidc)) {
@@ -17276,6 +17465,8 @@ static inline void cfbf_reassembly(ThreadWork *work,
         cfbf_free_carve_state((void **)&state);
         return;
       }
+      state->supported_suffix_stage = 0;
+      resume_supported_suffix = false;
     }
     if (state->search_phase == 0
         && state->suffix_candidate_valid != 0
@@ -17449,6 +17640,29 @@ static inline void cfbf_reassembly(ThreadWork *work,
         continue;
       }
     }
+    // Opaque candidates can be structurally complete while a replacement
+    // search is still refining them. Resume that search before the early exit.
+    if (resume_replacement && (current_complete || current.structurally_valid)
+        && total_blocks > 1) {
+      const uint64_t first_slot = resume_targeted_replacement
+          ? state->resume_slot : 1;
+      const uint64_t last_slot = resume_targeted_replacement
+          ? first_slot : total_blocks - 1;
+
+      if (cfbf_reassembly_try_block_replacements(
+              work, candidate, state, &current, first_slot, last_slot,
+              uuidp, uuidc, &improved, &validated)) {
+        cfbf_free_carve_state((void **)&state);
+        return;
+      }
+      if (validated || !*candidate) {
+        cfbf_free_carve_state((void **)&state);
+        return;
+      }
+      if (improved) {
+        continue;
+      }
+    }
     if (current_complete) {
       break;
     }
@@ -17607,7 +17821,7 @@ static inline void cfbf_reassembly(ThreadWork *work,
   cfbf_free_carve_state((void **)&state);
 }
 
-// Serialize the fixed-size CFBF validation state.
+// Serialize CFBF state, retaining the version 47 through 50 prefix readers.
 //
 static inline bool cfbf_serialize_carve_state(void **state, FILE *fp,
                                               StateSerialization mode) {
@@ -17619,13 +17833,76 @@ static inline bool cfbf_serialize_carve_state(void **state, FILE *fp,
   CfbfCarveState **typed = (CfbfCarveState **)state;
 
   if (mode == DESERIALIZE) {
-    *typed = (CfbfCarveState *)malloc(sizeof(**typed));
+    uint32_t header[2];
+
+    if (fread(header, sizeof(header), 1, fp) != 1
+        || header[0] != CFBF_STATE_MAGIC
+        || (header[1] != CFBF_STATE_VERSION
+            && header[1] != 47 && header[1] != 48 && header[1] != 49
+            && header[1] != 50)) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+      return false;
+    }
+    const size_t stored_size = header[1] == 47
+        ? offsetof(CfbfCarveState, atomic_reservation_valid)
+        : (header[1] == 48
+               ? offsetof(CfbfCarveState, atomic_sources_valid)
+               : (header[1] == 49
+                      ? offsetof(CfbfCarveState, supported_suffix_stage)
+                      : (header[1] == 50
+                             ? offsetof(CfbfCarveState, supported_pairs_view)
+                             : sizeof(**typed))));
+
+    *typed = (CfbfCarveState *)calloc(1, sizeof(**typed));
     check_memory_allocation(*typed, __LINE__, __FILE__,
                             "CFBF carve state");
+    memcpy(*typed, header, sizeof(header));
+    if (fread((uint8_t *)*typed + sizeof(header),
+              stored_size - sizeof(header), 1, fp) != 1
+        || (*typed)->atomic_reservation_valid > 1
+        || (*typed)->atomic_sources_valid > 1
+        || (*typed)->atomic_sources_count > CFBF_RANKED_SOURCE_LIMIT * 4
+        || (*typed)->atomic_sources_next > (*typed)->atomic_sources_count
+        || (*typed)->supported_suffix_stage > CFBF_SUFFIX_STAGE_AFTER_CONTENT
+        || (*typed)->supported_pairs_valid > 1
+        || (*typed)->supported_pairs_count > CFBF_SUPPORTED_GAP_LIMIT
+        || ((*typed)->supported_pairs_valid != 0
+            && (*typed)->supported_pairs_count < 2)
+        || ((*typed)->supported_pairs_valid == 0
+            && ((*typed)->supported_pairs_count != 0
+                || (*typed)->supported_pairs_next != 0
+                || (*typed)->supported_pairs_written != 0
+                || (*typed)->supported_pairs_limit != 0))
+        || (*typed)->supported_pairs_next
+               > ((*typed)->supported_pairs_count > 1
+                      ? (*typed)->supported_pairs_count
+                            * ((*typed)->supported_pairs_count - 1) / 2
+                      : 0)
+        || (*typed)->supported_pairs_written
+               > CFBF_CONTENT_PAIR_HYPOTHESIS_LIMIT
+        || (*typed)->supported_pairs_written > (*typed)->supported_pairs_next
+        || (*typed)->supported_pairs_limit > CFBF_SUPPORTED_GAP_LIMIT
+        || ((*typed)->supported_pairs_limit != 0
+            && (*typed)->supported_pairs_count
+                   > (*typed)->supported_pairs_limit)
+        || ((*typed)->search_phase == CFBF_REASSEMBLY_SUPPORTED_PAIRS
+            && (*typed)->supported_pairs_valid == 0)) {
+      free(*typed);
+      *typed = NULL;
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+      return false;
+    }
+    if (header[1] == 47) {
+      // Old records lack the selection-time count; finish rather than prune.
+      (*typed)->atomic_reserved = UINT32_MAX;
+    }
+    (*typed)->version = CFBF_STATE_VERSION;
+    return true;
   }
-  size_t count = mode == SERIALIZE
-                     ? fwrite(*typed, sizeof(**typed), 1, fp)
-                     : fread(*typed, sizeof(**typed), 1, fp);
+  if (!*typed) {
+    return false;
+  }
+  size_t count = fwrite(*typed, sizeof(**typed), 1, fp);
 
   if (count != 1) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);

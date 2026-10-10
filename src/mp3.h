@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -432,6 +436,27 @@ typedef struct {
 	Mp3ChecksumCrcTransform *tail_transforms;
 } Mp3ChecksumState;
 
+typedef enum {
+	MP3_GREEDY_INACTIVE = 0,
+	MP3_GREEDY_BEGIN,
+	MP3_GREEDY_CRC,
+	MP3_GREEDY_COUNT,
+	MP3_GREEDY_SCORE,
+	MP3_GREEDY_FINISHED
+} Mp3GreedyPhase;
+
+// Retain decisions and comparison results, not transient decoder buffers.
+typedef struct {
+	uint64_t signature;
+	uint32_t phase;
+	uint32_t next;
+	uint32_t matches;
+	int32_t best_index;
+	uint32_t best_peaks_ok;
+	uint32_t best_stereo;
+	Peak best_peaks[2][6];
+} Mp3GreedySearch;
+
 typedef struct{
 	Mp3Fragment *fragments;
 	uint16_t num_frags;
@@ -446,6 +471,7 @@ typedef struct{
 	uint32_t direct_second;
 	bool direct_search_complete;
 	Mp3ChecksumState checksum;
+	Mp3GreedySearch greedy;
 	uint8_t fragment_discovery_phase;
 	int64_t fragment_discovery_next_actual;
 	uint32_t fragment_discovery_peak_index;
@@ -777,6 +803,15 @@ static inline bool mp3_compare_carve_state(const void *state1, const void *state
 static inline void mp3_print_carve_state(const void *state);
 static uint64_t mp3_fragment_search_signature(const Mp3CarveState *state,
 	uint32_t blocksize);
+static uint64_t mp3_greedy_search_signature(const Mp3CarveState *state,
+	uint32_t blocksize);
+static bool mp3_greedy_search_resume(Mp3CarveState *state, uint32_t blocksize);
+static void mp3_greedy_search_begin(Mp3CarveState *state, uint32_t blocksize,
+	uint32_t phase);
+static void mp3_greedy_search_io(Mp3GreedySearch *search, uint16_t count,
+	FILE *fp, StateSerialization mode);
+static bool mp3_greedy_search_equal(const Mp3GreedySearch *a,
+	const Mp3GreedySearch *b);
 static void mp3_checksum_state_allocate(Mp3ChecksumState *state);
 static void mp3_checksum_state_free(Mp3ChecksumState *state);
 static void mp3_checksum_state_clone(Mp3ChecksumState *target,
@@ -3160,6 +3195,57 @@ static void mp3_checksum_state_io(Mp3ChecksumState *state, FILE *fp,
 	}
 }
 
+// Encode the fallback frontier explicitly, including its current spectral winner.
+static void mp3_greedy_search_io(Mp3GreedySearch *search, uint16_t count,
+	FILE *fp, StateSerialization mode){
+	size_t (*io)(void *, size_t, size_t, FILE *) = mode == SERIALIZE
+		? (size_t (*)(void *, size_t, size_t, FILE *))fwrite : fread;
+#define MP3_GREEDY_FIELD(field) \
+	if(io(&search->field, sizeof(search->field), 1, fp) != 1){ \
+		handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__); \
+	}
+	MP3_GREEDY_FIELD(signature);
+	MP3_GREEDY_FIELD(phase);
+	MP3_GREEDY_FIELD(next);
+	MP3_GREEDY_FIELD(matches);
+	MP3_GREEDY_FIELD(best_index);
+	MP3_GREEDY_FIELD(best_peaks_ok);
+	MP3_GREEDY_FIELD(best_stereo);
+	for(size_t channel = 0; channel < 2; channel++){
+		for(size_t peak = 0; peak < 6; peak++){
+			MP3_GREEDY_FIELD(best_peaks[channel][peak].val);
+			MP3_GREEDY_FIELD(best_peaks[channel][peak].index);
+		}
+	}
+#undef MP3_GREEDY_FIELD
+	if(search->phase > MP3_GREEDY_FINISHED || search->next > count
+		|| search->matches > count || search->best_peaks_ok > 1
+		|| search->best_stereo > 1
+		|| (search->phase && (search->best_index < -1
+			|| search->best_index >= (int32_t)count))){
+		handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+	}
+}
+
+// Equality must not depend on Peak/struct padding.
+static bool mp3_greedy_search_equal(const Mp3GreedySearch *a,
+	const Mp3GreedySearch *b){
+	if(a->signature != b->signature || a->phase != b->phase || a->next != b->next
+		|| a->matches != b->matches || a->best_index != b->best_index
+		|| a->best_peaks_ok != b->best_peaks_ok || a->best_stereo != b->best_stereo){
+		return false;
+	}
+	for(size_t channel = 0; channel < 2; channel++){
+		for(size_t peak = 0; peak < 6; peak++){
+			if(a->best_peaks[channel][peak].val != b->best_peaks[channel][peak].val
+				|| a->best_peaks[channel][peak].index != b->best_peaks[channel][peak].index){
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 //serialize or deserialize carve state to a file
 static inline bool mp3_serialize_carve_state(void **state, FILE *fp,
 											StateSerialization mode){
@@ -3175,9 +3261,10 @@ static inline bool mp3_serialize_carve_state(void **state, FILE *fp,
 		check_memory_allocation(*s, __LINE__, __FILE__, "s");
 	}
 
-	uint32_t version = UINT32_C(0x4d503303);
+	uint32_t version = UINT32_C(0x4d503304);
 	if(fb(&version, sizeof(version), 1, fp) != 1
-		|| (version != UINT32_C(0x4d503303)
+		|| (version != UINT32_C(0x4d503304)
+			&& version != UINT32_C(0x4d503303)
 			&& version != UINT32_C(0x4d503302))){
 		handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
 	}
@@ -3216,7 +3303,7 @@ static inline bool mp3_serialize_carve_state(void **state, FILE *fp,
         }
 		// The integrated 0x4d503302 format has neither split-byte field.
 		// They are reconstructed from the physical run when old state resumes.
-		if (version == UINT32_C(0x4d503303)
+		if (version >= UINT32_C(0x4d503303)
 			&& (fb(&frag->frontFrameHeaderBreak, sizeof(uint8_t), 1, fp) != 1
 				|| fb(&frag->rearFrameHeaderBreak, sizeof(uint8_t), 1, fp) != 1)) {
 			handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
@@ -3237,7 +3324,7 @@ static inline bool mp3_serialize_carve_state(void **state, FILE *fp,
             perror("mp3 fragment metadata");
             handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
         }
-		if(version == UINT32_C(0x4d503303)){
+		if(version >= UINT32_C(0x4d503303)){
 			Mp3HeaderBreakContext *contexts[2] = {
 				&frag->frontHeaderContext, &frag->rearHeaderContext};
 			for(uint8_t side = 0; side < 2; side++){
@@ -3291,10 +3378,16 @@ static inline bool mp3_serialize_carve_state(void **state, FILE *fp,
 		handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
 	}
 	mp3_checksum_state_io(&(*s)->checksum, fp, mode);
+	if(version >= UINT32_C(0x4d503304)){
+		mp3_greedy_search_io(&(*s)->greedy, (*s)->num_frags, fp, mode);
+	}
 	return true;
 }
 
 static inline bool mp3_states_equal(Mp3CarveState *a, Mp3CarveState *b){
+	if(!mp3_greedy_search_equal(&a->greedy, &b->greedy)){
+		return false;
+	}
 	if(!mp3_checksum_states_equal(&a->checksum, &b->checksum)){
 		return false;
 	}
@@ -3338,6 +3431,7 @@ static inline void *mp3_clone_carve_state(const void *srcstate){
 	Mp3Fragment *dst;
 	check_memory_allocation(d, __LINE__, __FILE__, "d");
 	mp3_checksum_state_clone(&d->checksum, &s->checksum);
+	d->greedy = s->greedy;
 	d->num_frags = s->num_frags;
 	d->cur_index = s->cur_index;
 	d->structural_signature = s->structural_signature;
@@ -3406,6 +3500,9 @@ static inline void mp3_free_carve_state(void **state){
 static inline bool mp3_compare_carve_state(const void *state1, const void *state2){
 	Mp3CarveState *s1 = (Mp3CarveState *)state1;
 	Mp3CarveState *s2 = (Mp3CarveState *)state2;
+	if(!mp3_greedy_search_equal(&s1->greedy, &s2->greedy)){
+		return false;
+	}
 	if(!mp3_checksum_states_equal(&s1->checksum, &s2->checksum)){
 		return false;
 	}
@@ -5012,6 +5109,40 @@ static uint64_t mp3_fragment_search_signature(const Mp3CarveState *state,
 		}
 	}
 	return signature;
+}
+
+// A greedy frontier belongs to one committed prefix and ordered available catalog.
+static uint64_t mp3_greedy_search_signature(const Mp3CarveState *state,
+	uint32_t blocksize){
+	uint64_t signature = mp3_fragment_search_signature(state, blocksize);
+	signature = (signature ^ state->cur_index) * UINT64_C(1099511628211);
+	for(uint16_t i = 0; i < state->cur_index; i++){
+		signature = (signature ^ state->indexes[i]) * UINT64_C(1099511628211);
+	}
+	for(uint16_t i = 0; i < state->num_frags; i++){
+		signature = (signature ^ state->fragments[i].active) * UINT64_C(1099511628211);
+	}
+	return signature;
+}
+
+// Coverage changes can remove/split fragments; only the affected frontier resets.
+static bool mp3_greedy_search_resume(Mp3CarveState *state, uint32_t blocksize){
+	if(state->greedy.phase == MP3_GREEDY_INACTIVE){
+		return false;
+	}
+	if(state->greedy.signature != mp3_greedy_search_signature(state, blocksize)){
+		memset(&state->greedy, 0, sizeof(state->greedy));
+		return false;
+	}
+	return true;
+}
+
+static void mp3_greedy_search_begin(Mp3CarveState *state, uint32_t blocksize,
+	uint32_t phase){
+	memset(&state->greedy, 0, sizeof(state->greedy));
+	state->greedy.signature = mp3_greedy_search_signature(state, blocksize);
+	state->greedy.phase = phase;
+	state->greedy.best_index = -1;
 }
 
 // Test the initial run's endpoint, then direct one- and two-fragment continuations.
@@ -8927,8 +9058,9 @@ void mp3_custom_reassembly(ThreadWork *work,
 			goto done_abandon_candidate;
 		}
 	}
+	bool resume_greedy = mp3_greedy_search_resume(carve_state, blocksize);
 	if(state_existed && carve_state->fragment_discovery_phase
-		== MP3_FRAGMENT_DISCOVERY_COMPLETE){
+		== MP3_FRAGMENT_DISCOVERY_COMPLETE && !resume_greedy){
 		// A completed discovery state may return here after the assembled
 		// blockvector was extended. New candidates and discovery resumes have
 		// not changed since contiguous carving already rejected them, so
@@ -9003,6 +9135,9 @@ void mp3_custom_reassembly(ThreadWork *work,
 		goto done_promising_candidate;
 	}
 
+	if(resume_greedy){
+		goto greedy_construction;
+	}
 	Mp3ChecksumSearchResult checksum_search =
 		mp3_reassembly_find_checksum_path(work, candidate, carve_state,
 			blocksize, uuidp, uuidc);
@@ -9027,6 +9162,7 @@ void mp3_custom_reassembly(ThreadWork *work,
 		goto done_in_progress_candidate;
 	}
 
+	greedy_construction:;
 	//construction init
 	// Holds the -1 sentinel plus every index representable by num_frags.
 	int32_t bestIndex;
@@ -9040,7 +9176,7 @@ void mp3_custom_reassembly(ThreadWork *work,
 	uint8_t protectedBytes = 0;
 	uint16_t frameLengthInBytes = 0;
 	bool loop;
-	bool bestPeaksOk, compPeaksOk;
+	bool bestPeaksOk = false, compPeaksOk;
 	Peak bestPeaksL[6], bestPeaksR[6];
 	Peak compPeaksL[6], compPeaksR[6];
 	Peak tempPeaksL[6], tempPeaksR[6];
@@ -9053,6 +9189,13 @@ void mp3_custom_reassembly(ThreadWork *work,
 	char *frame_buf;
 	char *data;
 	Mp3Fragment *current_fragment, *comp_fragment, *best_comp_fragment;
+	Mp3GreedySearch *greedy = &carve_state->greedy;
+	if(greedy->phase == MP3_GREEDY_INACTIVE){
+		mp3_greedy_search_begin(carve_state, blocksize, MP3_GREEDY_BEGIN);
+	}
+	if(greedy->phase == MP3_GREEDY_FINISHED){
+		goto done_validate_candidate;
+	}
 
 	#ifdef DEBUG_REASSEMBLY_CONST
 		lock_fprintf(stdout, "\n\nBeginning reconstruction...\n\n");
@@ -9071,6 +9214,7 @@ void mp3_custom_reassembly(ThreadWork *work,
 		current_fragment = &carve_state->fragments[
 			carve_state->indexes[carve_state->cur_index - 1]];
 		if(!mp3_reassembly_frame_stream(b, current_fragment, blocksize, &bs)){
+			greedy->phase = MP3_GREEDY_FINISHED;
 			goto done_validate_candidate;
 		}
 
@@ -9109,6 +9253,9 @@ void mp3_custom_reassembly(ThreadWork *work,
 		}
 		current_fragment = &carve_state->fragments[carve_state->indexes[carve_state->cur_index - 1]];
 		if(crc && current_fragment->size*blocksize - current_fragment->offsetFramePosition+2 <= protectedBytes){
+			if(greedy->phase == MP3_GREEDY_BEGIN){
+				greedy->phase = MP3_GREEDY_CRC;
+			}
 			//Reached if CRC is present and block boundary resides within protected bytes
 			#ifdef DEBUG_REASSEMBLY_CONST
 				lock_fprintf(stdout, "Fragment %d found to reside on CRC boundary\n", carve_state->indexes[carve_state->cur_index - 1]);
@@ -9134,7 +9281,8 @@ void mp3_custom_reassembly(ThreadWork *work,
 			frameByteLengthCalc(mpegVersion, layer, bitrate, samplingrate,
 				padding, &frameLengthInBytes);
 			bool found_crc = false;
-			for(int k = 0; k < carve_state->num_frags; k++){
+			for(int k = (int)greedy->next; k < carve_state->num_frags; k++){
+				greedy->next = (uint32_t)k;
 				if(atomic_load_explicit(&REASS_RETURN_TO_IDLE,
 					memory_order_acquire)){
 					deflate_blockvector(b);
@@ -9187,6 +9335,7 @@ void mp3_custom_reassembly(ThreadWork *work,
 				}
 			}
 			if(!found_crc){
+				greedy->phase = MP3_GREEDY_FINISHED;
 				//if CRC was not found, we can be confident that the next section of the file does not exist in the blockmap
 				#ifdef DEBUG_REASSEMBLY_CONST
 					lock_fprintf(stdout, "CRC not found, confident next section does not exist in file, validate\n\n");
@@ -9196,15 +9345,27 @@ void mp3_custom_reassembly(ThreadWork *work,
 		}
 		else{
 			//This is reached if CRC isn't present or applicable, in other words 'pain'
-			bestIndex = -1;
+			if(greedy->phase == MP3_GREEDY_BEGIN){
+				greedy->phase = MP3_GREEDY_COUNT;
+			}
+			bestIndex = greedy->best_index;
+			best_comp_fragment = bestIndex < 0 ? NULL : &carve_state->fragments[bestIndex];
+			bestPeaksOk = greedy->best_peaks_ok;
+			bestIsStereo = greedy->best_stereo;
+			memcpy(bestPeaksL, greedy->best_peaks[0], sizeof(bestPeaksL));
+			memcpy(bestPeaksR, greedy->best_peaks[1], sizeof(bestPeaksR));
+			loop = bestIndex >= 0;
 
 			#ifdef DEBUG_REASSEMBLY_CONST
 				lock_fprintf(stdout, "CRC either not present or not applicable\n");
 			#endif
 
 			//How many possibilities? Generated for demonstration of usefulness
-			count = 0;
-			for(int k = 0; k < carve_state->num_frags; k++){
+			count = (uint16_t)greedy->matches;
+			for(int k = (int)greedy->next;
+				greedy->phase == MP3_GREEDY_COUNT && k < carve_state->num_frags; k++){
+				greedy->next = (uint32_t)k;
+				greedy->matches = count;
 				if(atomic_load_explicit(&REASS_RETURN_TO_IDLE,
 					memory_order_acquire)){
 					deflate_blockvector(b);
@@ -9221,6 +9382,11 @@ void mp3_custom_reassembly(ThreadWork *work,
 					count++;
 				}
 			}
+			if(greedy->phase == MP3_GREEDY_COUNT){
+				greedy->matches = count;
+				greedy->next = 0;
+				greedy->phase = MP3_GREEDY_SCORE;
+			}
 			if(count >= 2){
 				#ifdef DEBUG_REASSEMBLY_CONST
 					lock_fprintf(stdout, "Index %d has %d solutions, requires frequency analysis\n",carve_state->indexes[carve_state->cur_index - 1],count);
@@ -9233,7 +9399,13 @@ void mp3_custom_reassembly(ThreadWork *work,
 			// branch below can never trigger. Skip the getPeaks() call for it in that case;
 			// its peaks would never be compared against anything.
 
-			for(int k = 0; k < carve_state->num_frags; k++){
+			for(int k = (int)greedy->next; k < carve_state->num_frags; k++){
+				greedy->next = (uint32_t)k;
+				greedy->best_index = bestIndex;
+				greedy->best_peaks_ok = bestPeaksOk;
+				greedy->best_stereo = bestIsStereo;
+				memcpy(greedy->best_peaks[0], bestPeaksL, sizeof(bestPeaksL));
+				memcpy(greedy->best_peaks[1], bestPeaksR, sizeof(bestPeaksR));
 				if(atomic_load_explicit(&REASS_RETURN_TO_IDLE,
 					memory_order_acquire)){
 					deflate_blockvector(b);
@@ -9620,6 +9792,7 @@ void mp3_custom_reassembly(ThreadWork *work,
 				}
 			}
 			if(bestIndex == -1){ //no fragment matched offset
+				greedy->phase = MP3_GREEDY_FINISHED;
 				#ifdef DEBUG_REASSEMBLY_CONST
 					lock_fprintf(stdout, "Candidate could not find a fragment with matching offset, nothing left to do.\n");
 				#endif
@@ -9650,6 +9823,8 @@ void mp3_custom_reassembly(ThreadWork *work,
 			count++;
 		}
 		blockvector_set_data_length_to_mapped_extent(candidate->b);
+		mp3_greedy_search_begin(carve_state, blocksize,
+			loop ? MP3_GREEDY_BEGIN : MP3_GREEDY_FINISHED);
 		#ifdef DEBUG_REASSEMBLY_CONST
 			//display_blockvector(b, "blockvector");
 		#endif

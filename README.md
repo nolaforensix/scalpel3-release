@@ -18,12 +18,13 @@ Richard III (golden@cct.lsu.edu) to discuss commercial licensing.
 
 # Background and Information
 
-Scalpel3 is a file carving application that runs on Linux and macOS.  The first version of scalpel,
-released in 2005, was based on Foremost 0.69. Since then, a number of releases have followed, with
-the latest being scalpel3.  scalpel3 is a complete rewrite and has an entirely different internal
-architecture, focused on high-performance recovery of both unfragmented and fragmented
-files. Important features of scalpel3 include a massively threaded design, asynchronous read and
-write operations to hide latency associated with data transfers, and dependence on single-threaded
+Scalpel3 is a file carving application that runs on Linux and macOS. Golden G. Richard III was
+the sole developer of Scalpel (v1), released in 2005 and based on Foremost 0.69. Golden G.
+Richard III and Vico Marziale subsequently co-designed and co-developed Scalpel2. Scalpel3 is
+a complete rewrite with an entirely different internal architecture, focused on high-performance
+recovery of both unfragmented and fragmented files. Important features of scalpel3 include a
+massively threaded design, asynchronous read and write operations to hide latency associated with
+data transfers, and dependence on single-threaded
 but thread-safe architecture-agnostic file and block validator functions.  These file and block
 validator functions allow support for new file types to be rapidly integrated and tested without
 modifying (or even understanding) the complex threading model and other optimizations used by

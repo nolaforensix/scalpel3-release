@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -3266,6 +3270,8 @@ static inline void access_reassembly(ThreadWork *work,
   }
   else if (!XXH128_isEqual(state->progress.view, validator_search_view(*candidate))) {
     access_search_reset(state);
+    // A completed review cannot exclude alternatives in a changed source view.
+    state->progress.have_last_reviewed_mapping = false;
   }
   access_reassembly_continue(work, candidate, uuidp, uuidc, state);
   access_free_carve_state((void **)&state);

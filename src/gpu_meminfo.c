@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -46,10 +50,11 @@
  *                 stats when Metal is unavailable.
  *   - else      : CPU via sysconf.
  *
- * This file is ORT-free and self-contained (no scalpel.h), so it builds and
- * can be syntax-checked stand-alone.
+ * This file is ORT-free (no scalpel.h). Standalone programs provide the
+ * lock_fprintf() output helper without linking the carving backend.
  */
 #include "gpu_meminfo.h"
+#include "scalpel_output.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -409,7 +414,11 @@ int gpu_plan_batch(const gpu_batch_spec_t *spec) {
     /* 1. forced batch (caller's env override) short-circuits everything. */
     if (spec->force_batch > 0) {
         int b = clampi(spec->force_batch, minb, maxb);
-        fprintf(stdout, "[gpu_batch:%s] forced batch=%d (min=%d max=%d)\n",
+        lock_fprintf(stdout,
+                "GPU batch planning (%s):\n"
+                "  Selection:                explicit override\n"
+                "  Batch size:               %d\n"
+                "  Batch limits:             %d minimum, %d maximum (nonpositive = unlimited)\n",
                 label, b, minb, maxb);
         return b;
     }
@@ -436,9 +445,16 @@ int gpu_plan_batch(const gpu_batch_spec_t *spec) {
     }
     int b = clampi((int) batch, minb, maxb);
 
-    fprintf(stdout,
-            "[gpu_batch:%s] backend=%s free=%.1f MiB total=%.1f MiB frac=%.2f "
-            "per_sample=%zu B overhead=%.0f MiB -> batch=%d (min=%d max=%d)\n",
+    lock_fprintf(stdout,
+            "GPU batch planning (%s):\n"
+            "  Backend:                  %s\n"
+            "  Available memory:         %.1f MiB\n"
+            "  Total memory:             %.1f MiB\n"
+            "  Memory fraction:          %.2f\n"
+            "  Memory per sample:        %zu bytes\n"
+            "  Reserved overhead:        %.0f MiB\n"
+            "  Batch size:               %d\n"
+            "  Batch limits:             %d minimum, %d maximum (nonpositive = unlimited)\n",
             label, info.backend,
             info.free_bytes / 1048576.0, info.total_bytes / 1048576.0, frac,
             per_sample, overhead / 1048576.0,

@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -109,12 +113,17 @@
 #define RAR_COMPRESSED_PROBE_WIDTH_LIMIT   UINT64_C(32)
 #define RAR_RANKED_TIE_SOURCE_TRIALS       UINT64_C(1024)
 #define RAR_REASSEMBLY_BUFFER_COPIES       UINT64_C(3)
-#define RAR_REASSEMBLY_BLOCK_OVERHEAD      UINT64_C(128)
+#define RAR_REASSEMBLY_BLOCK_OVERHEAD      UINT64_C(256)
 #define RAR_REASSEMBLY_MEMORY_DIVISOR      UINT64_C(4)
 #define RAR_REASSEMBLY_FALLBACK_BUDGET     UINT64_C(536870912)
 #define RAR_REASSEMBLY_WAIT_NANOSECONDS    10000000L
 #define RAR_CARVE_STATE_MAGIC             UINT32_C(0x52415253)
-#define RAR_CARVE_STATE_VERSION           UINT32_C(2)
+#define RAR_CARVE_STATE_VERSION           UINT32_C(7)
+#define RAR_CARVE_STATE_VERSION_BUDGET    UINT32_C(6)
+#define RAR_CARVE_STATE_VERSION_EXTENSION UINT32_C(5)
+#define RAR_CARVE_STATE_VERSION_STORED    UINT32_C(4)
+#define RAR_CARVE_STATE_VERSION_GAPS      UINT32_C(3)
+#define RAR_CARVE_STATE_VERSION_SEARCH    UINT32_C(2)
 #define RAR_CARVE_STATE_VERSION_LEGACY    UINT32_C(1)
 #define RAR_SEARCH_GEOMETRY_INITIALIZED    UINT32_C(0x01)
 #define RAR_SEARCH_RANKED_REPAIR_PENDING   UINT32_C(0x02)
@@ -234,6 +243,36 @@ typedef enum RarRepairScope {
   RAR_REPAIR_SCOPE_HYPOTHESIS
 } RarRepairScope;
 
+// A stored-member search retains its repaired mapping, uniqueness evidence and
+// CRC chunk. The three physical mappings are followed by computed CRC records.
+typedef struct RarStoredSearch {
+  uint64_t blocks;
+  uint64_t image_blocks;
+  uint64_t archive_size;
+  uint64_t blocksize;
+  uint64_t view_hash;
+  uint64_t layout_hash;
+  uint64_t header_index;
+  uint64_t chunk_start;
+  uint64_t width;
+  uint64_t destination;
+  uint64_t match_index;
+  uint64_t crc_count;
+  uint32_t matches;
+  uint32_t repaired_any;
+  uint32_t result;
+  uint32_t complete;
+  int64_t values[];
+} RarStoredSearch;
+
+typedef struct RarExtensionProgress {
+  uint64_t view;
+  uint64_t next_width;
+  uint64_t best_width;
+  RarProgressScore best_progress;
+  uint32_t active;
+} RarExtensionProgress;
+
 // Preserve the original physical candidate before contiguous validation trims
 // it to the checksum-protected prefix. Actual block numbers survive blockmap
 // changes and are converted back to the current apparent view on reassembly.
@@ -279,6 +318,11 @@ typedef struct RarCarveState {
   int64_t resume_best_source;
   uint32_t resume_have_best;
   uint32_t resume_have_second;
+  uint64_t gap_solutions;
+  RarStoredSearch *stored_search;
+  RarExtensionProgress extension;
+  uint64_t resume_source_trials;
+  uint64_t resume_source_trial_base;
   int64_t actual_blocks[];
 } RarCarveState;
 
@@ -302,6 +346,11 @@ typedef enum RarMemoryReservationResult {
   RAR_MEMORY_STOPPED,
   RAR_MEMORY_UNAVAILABLE
 } RarMemoryReservationResult;
+
+static inline bool rar_extension_progress_valid(const RarCarveState *state);
+static inline uint64_t rar_extension_view(const int64_t *mapping,
+    uint64_t blocks, uint64_t extent, uint64_t destination, uint64_t width,
+    int64_t source, uint64_t limit, uint32_t needleidx);
 
 static _Atomic uint64_t rar_reassembly_memory_reserved = 0;
 static _Atomic uint64_t rar_reassembly_memory_budget_cached = 0;
@@ -340,8 +389,16 @@ static inline bool rar_carve_state_size(uint64_t block_count,
                                         uint64_t selection_count,
                                         uint64_t logical_blocks,
                                         size_t *state_size);
+static inline bool rar_stored_search_size(uint64_t blocks,
+                                           uint64_t crc_count, size_t *size);
+static inline bool rar_stored_search_valid(const RarStoredSearch *search,
+                                            uint64_t logical_blocks);
+static inline RarStoredSearch *rar_stored_search_prepare(
+    RarCarveState *state, const RarLayout *layout, const int64_t *mapping,
+    uint64_t blocks, uint32_t needleidx);
 static inline uint64_t *rar_carve_state_selection(RarCarveState *state);
 static inline int64_t *rar_carve_state_best_mapping(RarCarveState *state);
+static inline int64_t *rar_carve_state_gap_solution(RarCarveState *state);
 static inline int64_t *rar_carve_state_recipe(RarCarveState *state);
 static inline bool rar_serialize_carve_state(void **state, FILE *fp,
                                              StateSerialization mode);
@@ -646,10 +703,10 @@ static inline bool rar_carve_state_size(uint64_t block_count,
     return false;
   }
   entries += selection_count;
-  if (logical_blocks > (UINT64_MAX - entries) / 2) {
+  if (logical_blocks > (UINT64_MAX - entries) / 3) {
     return false;
   }
-  entries += logical_blocks * 2;
+  entries += logical_blocks * 3;
   if (entries > (SIZE_MAX - header_size) / sizeof(int64_t)) {
     return false;
   }
@@ -677,6 +734,57 @@ static inline int64_t *rar_carve_state_recipe(RarCarveState *state) {
   return best ? best + state->logical_blocks : NULL;
 }
 
+// Keep the first validated gap mapping separately from decoder-progress ranks.
+static inline int64_t *rar_carve_state_gap_solution(RarCarveState *state) {
+
+  int64_t *recipe = rar_carve_state_recipe(state);
+
+  return recipe ? recipe + state->logical_blocks : NULL;
+}
+
+// Keep sizes checked for both live state and untrusted checkpoint lengths.
+static inline bool rar_stored_search_size(uint64_t blocks,
+                                           uint64_t crc_count, size_t *size) {
+  const size_t header = offsetof(RarStoredSearch, values);
+  if (!size || blocks == 0
+      || blocks > (UINT64_MAX - crc_count) / 3
+      || blocks * 3 + crc_count > (SIZE_MAX - header) / sizeof(int64_t)) {
+    return false;
+  }
+  *size = header + (size_t)(blocks * 3 + crc_count) * sizeof(int64_t);
+  return true;
+}
+
+static inline bool rar_stored_search_valid(const RarStoredSearch *search,
+                                            uint64_t logical_blocks) {
+  size_t size = 0;
+  return search && search->blocks == logical_blocks
+      && search->image_blocks > 0 && search->blocksize > 0
+      && search->archive_size > 0
+      && search->chunk_start <= search->image_blocks
+      && search->crc_count <= search->image_blocks - search->chunk_start
+      && search->width <= logical_blocks
+      && search->destination <= logical_blocks
+      && search->match_index <= search->image_blocks
+      && search->matches <= 2 && search->repaired_any <= 1
+      && search->complete <= 1 && search->result <= RAR_REPAIR_AMBIGUOUS
+      && rar_stored_search_size(search->blocks, search->crc_count, &size);
+}
+
+static inline bool rar_extension_progress_valid(const RarCarveState *state) {
+  const RarExtensionProgress *extension = &state->extension;
+  return !extension->active
+      || (extension->active == 1 && state->resume_active
+          && state->resume_probe_only && state->resume_have_best
+          && state->resume_source_index == state->resume_source_count
+          && state->resume_best_source >= 0
+          && (uint64_t)state->resume_best_source < state->resume_image_blocks
+          && extension->best_width > 0
+          && extension->best_width < extension->next_width
+          && extension->next_width <= RAR_COMPRESSED_PROBE_WIDTH_LIMIT + 1
+          && extension->best_width <= state->logical_blocks);
+}
+
 // Serialize the original RAR candidate mapping so a checkpoint restore can
 // reconstruct the physical archive span that existed before prefix trimming.
 //
@@ -694,12 +802,32 @@ static inline bool rar_serialize_carve_state(void **state, FILE *fp,
 
     if (!*rar_state || (*rar_state)->magic != RAR_CARVE_STATE_MAGIC
         || (*rar_state)->version != RAR_CARVE_STATE_VERSION
+        || !rar_extension_progress_valid(*rar_state)
         || !rar_carve_state_size((*rar_state)->block_count,
                                  (*rar_state)->selection_count,
-                                 (*rar_state)->logical_blocks, &state_size)
-        || fwrite(*rar_state, state_size, 1, fp) != 1) {
+                                 (*rar_state)->logical_blocks, &state_size)) {
       perror("RAR carve state serialization");
       handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    RarCarveState header = **rar_state;
+    header.stored_search = NULL;
+    uint64_t stored_size = 0;
+    size_t bytes = 0;
+    const RarStoredSearch *stored = (*rar_state)->stored_search;
+    if (stored) {
+      if (!rar_stored_search_valid(stored, header.logical_blocks)
+          || !rar_stored_search_size(stored->blocks, stored->crc_count, &bytes)) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR stored search",
+                     __LINE__, __FILE__);
+      }
+      stored_size = bytes;
+    }
+    if (fwrite(&header, header_size, 1, fp) != 1
+        || fwrite((*rar_state)->actual_blocks, state_size - header_size, 1, fp) != 1
+        || fwrite(&stored_size, sizeof(stored_size), 1, fp) != 1
+        || (stored_size && fwrite(stored, bytes, 1, fp) != 1)) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "RAR carve state serialization",
+                   __LINE__, __FILE__);
     }
     return true;
   }
@@ -709,6 +837,11 @@ static inline bool rar_serialize_carve_state(void **state, FILE *fp,
   if (fread(prefix, sizeof(prefix), 1, fp) != 1
       || prefix[0] != RAR_CARVE_STATE_MAGIC
       || (prefix[1] != RAR_CARVE_STATE_VERSION
+          && prefix[1] != RAR_CARVE_STATE_VERSION_BUDGET
+          && prefix[1] != RAR_CARVE_STATE_VERSION_EXTENSION
+          && prefix[1] != RAR_CARVE_STATE_VERSION_STORED
+          && prefix[1] != RAR_CARVE_STATE_VERSION_GAPS
+          && prefix[1] != RAR_CARVE_STATE_VERSION_SEARCH
           && prefix[1] != RAR_CARVE_STATE_VERSION_LEGACY)) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR carve state",
                  __LINE__, __FILE__);
@@ -734,27 +867,110 @@ static inline bool rar_serialize_carve_state(void **state, FILE *fp,
     header.block_count = legacy.block_count;
   }
   else if (fread((uint8_t *)&header + sizeof(prefix),
-                 header_size - sizeof(prefix), 1, fp) != 1) {
+                 (prefix[1] == RAR_CARVE_STATE_VERSION_SEARCH
+                     ? offsetof(RarCarveState, gap_solutions)
+                     : (prefix[1] == RAR_CARVE_STATE_VERSION_GAPS
+                         ? offsetof(RarCarveState, stored_search)
+                         : (prefix[1] == RAR_CARVE_STATE_VERSION_STORED
+                             ? offsetof(RarCarveState, extension)
+                             : (prefix[1] == RAR_CARVE_STATE_VERSION_EXTENSION
+                                 ? offsetof(RarCarveState, resume_source_trials)
+                                 : (prefix[1] == RAR_CARVE_STATE_VERSION_BUDGET
+                                     ? offsetof(RarCarveState, resume_source_trial_base)
+                                     : header_size)))))
+                     - sizeof(prefix), 1, fp) != 1) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR carve state header",
                  __LINE__, __FILE__);
   }
 
   size_t state_size = 0;
 
-  if (!rar_carve_state_size(header.block_count, header.selection_count,
+  if (header.stored_search != NULL || header.gap_solutions > 1
+      || header.resume_source_trial_base > header.resume_source_trials
+      || !rar_extension_progress_valid(&header)
+      || (header.gap_solutions && (!header.selection_initialized
+          || !header.logical_blocks || header.repair_pass >= 4))
+      || !rar_carve_state_size(header.block_count, header.selection_count,
                             header.logical_blocks, &state_size)) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR carve state size",
                  __LINE__, __FILE__);
   }
-  *rar_state = (RarCarveState *)malloc(state_size);
+  *rar_state = (RarCarveState *)calloc(1, state_size);
   check_memory_allocation(*rar_state, __LINE__, __FILE__, "RarCarveState");
   memcpy(*rar_state, &header, header_size);
-  const size_t entries = (state_size - header_size) / sizeof(int64_t);
+  size_t entries = (state_size - header_size) / sizeof(int64_t);
+
+  if (prefix[1] < RAR_CARVE_STATE_VERSION_GAPS) {
+    entries -= (size_t)header.logical_blocks;
+  }
 
   if (fread((*rar_state)->actual_blocks, sizeof(int64_t), entries, fp)
       != entries) {
     perror("RAR carve state block mapping deserialization");
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+  }
+  if (prefix[1] == RAR_CARVE_STATE_VERSION_SEARCH
+      && (*rar_state)->selection_initialized) {
+    // Old searches omitted the uniqueness accumulator. Recheck this pass,
+    // preserving earlier passes and their retained decoder-progress mappings.
+    (*rar_state)->selection_initialized = 0;
+    (*rar_state)->gap_ordinal = 0;
+    (*rar_state)->probe_index = 0;
+    (*rar_state)->resume_active = 0;
+  }
+  if (prefix[1] >= RAR_CARVE_STATE_VERSION_STORED) {
+    uint64_t stored_size = 0;
+    if (fread(&stored_size, sizeof(stored_size), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR stored size",
+                   __LINE__, __FILE__);
+    }
+    if (stored_size) {
+      RarStoredSearch stored_header;
+      size_t bytes = 0;
+      const size_t stored_head = offsetof(RarStoredSearch, values);
+      if (stored_size < stored_head
+          || fread(&stored_header, stored_head, 1, fp) != 1
+          || !rar_stored_search_valid(&stored_header, header.logical_blocks)
+          || !rar_stored_search_size(stored_header.blocks,
+                                    stored_header.crc_count, &bytes)
+          || stored_size != bytes) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR stored search",
+                     __LINE__, __FILE__);
+      }
+      RarStoredSearch *stored = (RarStoredSearch *)malloc(bytes);
+      check_memory_allocation(stored, __LINE__, __FILE__, "RAR stored search");
+      memcpy(stored, &stored_header, stored_head);
+      if (fread(stored->values, bytes - stored_head, 1, fp) != 1) {
+        free(stored);
+        handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR stored mappings",
+                     __LINE__, __FILE__);
+      }
+      for (uint64_t slot = 0; slot < stored->blocks * 2
+           + (stored->matches ? stored->blocks : 0); slot++) {
+        if (stored->values[slot] < 0) {
+          free(stored);
+          handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR stored block",
+                       __LINE__, __FILE__);
+        }
+      }
+      for (uint64_t slot = 0; slot < stored->crc_count; slot++) {
+        if ((uint64_t)stored->values[3 * stored->blocks + slot] >> 33) {
+          free(stored);
+          handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR stored CRC",
+                       __LINE__, __FILE__);
+        }
+      }
+      (*rar_state)->stored_search = stored;
+    }
+  }
+  if (header.gap_solutions) {
+    const int64_t *first = rar_carve_state_gap_solution(*rar_state);
+    for (uint64_t slot = 0; slot < header.logical_blocks; slot++) {
+      if (first[slot] < 0) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid RAR gap solution",
+                     __LINE__, __FILE__);
+      }
+    }
   }
   return true;
 }
@@ -768,6 +984,8 @@ static inline void *rar_clone_carve_state(const void *srcstate) {
 
   if (!source || source->magic != RAR_CARVE_STATE_MAGIC
       || source->version != RAR_CARVE_STATE_VERSION
+      || source->resume_source_trial_base > source->resume_source_trials
+      || !rar_extension_progress_valid(source)
       || !rar_carve_state_size(source->block_count, source->selection_count,
                                source->logical_blocks, &state_size)) {
     return NULL;
@@ -777,6 +995,20 @@ static inline void *rar_clone_carve_state(const void *srcstate) {
   check_memory_allocation(destination, __LINE__, __FILE__,
                           "RarCarveState clone");
   memcpy(destination, source, state_size);
+  destination->stored_search = NULL;
+  if (source->stored_search) {
+    size_t bytes = 0;
+    if (!rar_stored_search_valid(source->stored_search, source->logical_blocks)
+        || !rar_stored_search_size(source->stored_search->blocks,
+                                  source->stored_search->crc_count, &bytes)) {
+      free(destination);
+      return NULL;
+    }
+    destination->stored_search = (RarStoredSearch *)malloc(bytes);
+    check_memory_allocation(destination->stored_search, __LINE__, __FILE__,
+                            "RAR stored search clone");
+    memcpy(destination->stored_search, source->stored_search, bytes);
+  }
   return destination;
 }
 
@@ -786,6 +1018,9 @@ static inline void rar_free_carve_state(void **state) {
 
   if (!state) {
     return;
+  }
+  if (*state) {
+    free(((RarCarveState *)*state)->stored_search);
   }
   free(*state);
   *state = NULL;
@@ -2207,7 +2442,7 @@ static inline bool rar_reassembly_memory_requirement(
                                 &block_memory)
       || __builtin_add_overflow(buffer_memory, block_memory,
                                 &working_memory)
-      || __builtin_add_overflow(working_memory, RAR_CRC_INDEX_BUDGET,
+      || __builtin_add_overflow(working_memory, RAR_CRC_INDEX_BUDGET * 3,
                                 required)) {
     return false;
   }
@@ -3149,6 +3384,75 @@ static inline bool rar_mapping_uses_source(const int64_t *mapping,
   return false;
 }
 
+// Match the search query before reusing positions or checksum results. Apparent
+// runs depend on the ordered view and eligibility; a changed view is a new query.
+static inline RarStoredSearch *rar_stored_search_prepare(
+    RarCarveState *state, const RarLayout *layout, const int64_t *mapping,
+    uint64_t blocks, uint32_t needleidx) {
+  if (!state || !layout || !mapping || blocks != state->logical_blocks) {
+    return NULL;
+  }
+  const uint64_t image_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  uint64_t view = UINT64_C(1469598103934665603);
+  for (uint64_t apparent = 0; apparent < image_blocks; apparent++) {
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, (int64_t)apparent);
+    const bool eligible = actual >= 0
+        && !filemirror_actual_block_covered(scalpel_state.filemirror, actual)
+        && filemirror_get_blocktype(scalpel_state.filemirror, actual, needleidx)
+               != BLOCK_CONFIDENCE_INVALID;
+    view = (view ^ (uint64_t)actual) * UINT64_C(1099511628211);
+    view = (view ^ (uint64_t)eligible) * UINT64_C(1099511628211);
+  }
+  uint64_t layout_hash = UINT64_C(1469598103934665603);
+  for (uint64_t index = 0; index < layout->header_count; index++) {
+    const RarHeaderInfo *header = &layout->headers[index];
+    const uint64_t fields[] = {
+        header->logical_offset, header->header_size, header->data_size,
+        header->data_crc, header->file, header->stored, header->has_data_crc};
+    for (uint32_t field = 0; field < sizeof(fields) / sizeof(fields[0]); field++) {
+      layout_hash = (layout_hash ^ fields[field]) * UINT64_C(1099511628211);
+    }
+  }
+  RarStoredSearch *search = state->stored_search;
+  bool same = search && rar_stored_search_valid(search, blocks)
+      && search->image_blocks == image_blocks
+      && search->archive_size == layout->archive_size
+      && search->blocksize == scalpel_state.blocksize
+      && search->view_hash == view && search->layout_hash == layout_hash
+      && search->header_index <= layout->header_count;
+  for (uint64_t slot = 0; same && slot < blocks; slot++) {
+    same = search->values[slot] == filemirror_actual_blocknumber(
+        scalpel_state.filemirror, mapping[slot]);
+  }
+  if (same) {
+    return search;
+  }
+  free(search);
+  state->stored_search = NULL;
+  size_t bytes = 0;
+  if (!rar_stored_search_size(blocks, 0, &bytes)) {
+    return NULL;
+  }
+  search = (RarStoredSearch *)calloc(1, bytes);
+  check_memory_allocation(search, __LINE__, __FILE__, "RAR stored search");
+  search->blocks = blocks;
+  search->image_blocks = image_blocks;
+  search->archive_size = layout->archive_size;
+  search->blocksize = scalpel_state.blocksize;
+  search->view_hash = view;
+  search->layout_hash = layout_hash;
+  search->width = 1;
+  if (!rar_store_actual_mapping(mapping, blocks, search->values)) {
+    free(search);
+    return NULL;
+  }
+  memcpy(search->values + blocks, search->values,
+         (size_t)blocks * sizeof(int64_t));
+  state->stored_search = search;
+  return search;
+}
+
 // Repair displaced runs in stored members by solving the member CRC equation.
 // A source run is retained only when it is the unique mapping, across every
 // possible run width and destination, that restores the stored member CRC.
@@ -3163,22 +3467,37 @@ static inline RarRepairResult rar_repair_stored_members(
   int64_t *trial_mapping = NULL;
   int64_t *unique_mapping = NULL;
   uint32_t *member_prefix = NULL;
-  bool repaired_any = false;
+  RarStoredSearch *search = NULL;
+  RarCrcSource *sources = NULL;
+  uint32_t *run_crcs = NULL;
+  uint8_t *run_usable = NULL;
 
   if (!work || !candidate || !*candidate || !layout || !mapping || !trial
       || !solution || scalpel_state.blocksize == 0) {
     return RAR_REPAIR_NONE;
   }
-  if (!rar_materialize_mapping(mapping, blocks, layout->archive_size, trial)) {
-    return RAR_REPAIR_NONE;
-  }
-
   const uint64_t blocksize = scalpel_state.blocksize;
   const uint64_t image_blocks =
       filemirror_apparent_blocks(scalpel_state.filemirror);
   if (image_blocks == 0 || blocks > SIZE_MAX / sizeof(int64_t)
       || blocks == SIZE_MAX
       || blocks + 1 > SIZE_MAX / sizeof(uint32_t)) {
+    return RAR_REPAIR_NONE;
+  }
+
+  search = rar_stored_search_prepare(state, layout, mapping, blocks,
+                                     (*candidate)->needleidx);
+  if (!search || !rar_load_actual_mapping(search->values + blocks,
+                                          blocks, mapping)) {
+    return RAR_REPAIR_NONE;
+  }
+  if (search->complete) {
+    if (search->result == RAR_REPAIR_MATCH) {
+      memcpy(solution, mapping, (size_t)blocks * sizeof(*solution));
+    }
+    return (RarRepairResult)search->result;
+  }
+  if (!rar_materialize_mapping(mapping, blocks, layout->archive_size, trial)) {
     return RAR_REPAIR_NONE;
   }
 
@@ -3196,11 +3515,17 @@ static inline RarRepairResult rar_repair_stored_members(
   check_memory_allocation(member_prefix, __LINE__, __FILE__,
                           "member_prefix");
 
-  for (uint64_t header_index = 0;
+  if (search->matches && !rar_load_actual_mapping(
+          search->values + 2 * blocks, blocks, unique_mapping)) {
+    goto cleanup;
+  }
+  for (uint64_t header_index = search->header_index;
        header_index < layout->header_count; header_index++) {
+    search->header_index = header_index;
     const RarHeaderInfo *header = &layout->headers[header_index];
     if (!header->file || !header->stored || !header->has_data_crc
         || header->data_size == 0) {
+      search->header_index = header_index + 1;
       continue;
     }
 
@@ -3213,6 +3538,7 @@ static inline RarRepairResult rar_repair_stored_members(
     }
     if (rar_header_crc32(trial + data_offset, header->data_size)
         == header->data_crc) {
+      search->header_index = header_index + 1;
       continue;
     }
 
@@ -3223,7 +3549,6 @@ static inline RarRepairResult rar_repair_stored_members(
       goto cleanup;
     }
 
-    uint64_t matches = 0;
     const uint64_t maximum_width = destination_end - destination_first;
     const uint64_t overlap = maximum_width - 1;
     const uint64_t bytes_per_source = sizeof(RarCrcSource)
@@ -3254,16 +3579,12 @@ static inline RarRepairResult rar_repair_stored_members(
       goto cleanup;
     }
 
-    RarCrcSource *sources = (RarCrcSource *)malloc(
+    sources = (RarCrcSource *)malloc(
         (size_t)index_capacity * sizeof(*sources));
-    uint32_t *run_crcs = (uint32_t *)calloc(
+    run_crcs = (uint32_t *)calloc(
         (size_t)index_capacity, sizeof(*run_crcs));
-    uint8_t *run_usable = (uint8_t *)calloc(
+    run_usable = (uint8_t *)calloc(
         (size_t)index_capacity, sizeof(*run_usable));
-    uint32_t *block_crcs = (uint32_t *)malloc(
-        (size_t)(index_capacity + overlap) * sizeof(*block_crcs));
-    uint8_t *block_usable = (uint8_t *)malloc(
-        (size_t)(index_capacity + overlap) * sizeof(*block_usable));
 
     check_memory_allocation(sources, __LINE__, __FILE__,
                             "RAR stored CRC sources");
@@ -3271,10 +3592,6 @@ static inline RarRepairResult rar_repair_stored_members(
                             "RAR stored run CRCs");
     check_memory_allocation(run_usable, __LINE__, __FILE__,
                             "RAR stored run usability");
-    check_memory_allocation(block_crcs, __LINE__, __FILE__,
-                            "RAR stored block CRCs");
-    check_memory_allocation(block_usable, __LINE__, __FILE__,
-                            "RAR stored block usability");
 
     const uLong block_operator = crc32_combine_gen((z_off_t)blocksize);
     const uint64_t initial_prefix_length =
@@ -3294,8 +3611,9 @@ static inline RarRepairResult rar_repair_stored_members(
           member_prefix[boundary], block_crc, block_operator);
     }
 
-    for (uint64_t chunk_start = 0; chunk_start < image_blocks;
+    for (uint64_t chunk_start = search->chunk_start; chunk_start < image_blocks;
          chunk_start += index_capacity) {
+      search->chunk_start = chunk_start;
       uint64_t chunk_end = chunk_start + index_capacity;
 
       if (chunk_end < chunk_start || chunk_end > image_blocks) {
@@ -3309,17 +3627,21 @@ static inline RarRepairResult rar_repair_stored_members(
       }
       const uint64_t block_count = block_end - chunk_start;
 
+      size_t search_bytes = 0;
+      if (search->crc_count > block_count
+          || !rar_stored_search_size(blocks, block_count, &search_bytes)) {
+        goto cleanup;
+      }
+      search = (RarStoredSearch *)realloc(search, search_bytes);
+      check_memory_allocation(search, __LINE__, __FILE__, "RAR stored CRC chunk");
+      state->stored_search = search;
+      uint64_t *block_records = (uint64_t *)(search->values + 3 * blocks);
       memset(run_crcs, 0, (size_t)chunk_count * sizeof(*run_crcs));
       memset(run_usable, 0, (size_t)chunk_count * sizeof(*run_usable));
-      for (uint64_t block = 0; block < block_count; block++) {
+      for (uint64_t block = search->crc_count; block < block_count; block++) {
         if (rar_reassembly_poll(work, candidate, state, uuidp, uuidc,
                                 iterations)) {
           result = RAR_REPAIR_STOPPED;
-          free(block_usable);
-          free(block_crcs);
-          free(run_usable);
-          free(run_crcs);
-          free(sources);
           goto cleanup;
         }
         const uint64_t apparent = chunk_start + block;
@@ -3330,17 +3652,17 @@ static inline RarRepairResult rar_repair_stored_members(
             filemirror_actual_block_data_pointer(
                 scalpel_state.filemirror, actual, &available);
 
-        block_usable[block] = 0;
-        block_crcs[block] = 0;
+        block_records[block] = 0;
         if (data && available >= blocksize
             && !filemirror_actual_block_covered(
                    scalpel_state.filemirror, actual)
             && filemirror_get_blocktype(
                    scalpel_state.filemirror, actual,
                    (*candidate)->needleidx) != BLOCK_CONFIDENCE_INVALID) {
-          block_usable[block] = 1;
-          block_crcs[block] = rar_header_crc32(data, blocksize);
+          block_records[block] = UINT64_C(0x100000000)
+                                 | rar_header_crc32(data, blocksize);
         }
+        search->crc_count = block + 1;
       }
 
       for (uint64_t width = 1; width <= maximum_width; width++) {
@@ -3354,14 +3676,14 @@ static inline RarRepairResult rar_repair_stored_members(
           const uint64_t added = source + width - 1;
 
           if (width == 1) {
-            run_crcs[source] = block_crcs[source];
-            run_usable[source] = block_usable[source];
+            run_crcs[source] = (uint32_t)block_records[source];
+            run_usable[source] = (uint8_t)(block_records[source] >> 32);
           }
           else {
             run_crcs[source] = (uint32_t)crc32_combine_op(
-                run_crcs[source], block_crcs[added], block_operator);
+                run_crcs[source], (uint32_t)block_records[added], block_operator);
             run_usable[source] = run_usable[source]
-                                 && block_usable[added];
+                                 && (block_records[added] >> 32);
           }
           if (!run_usable[source]) {
             continue;
@@ -3371,12 +3693,24 @@ static inline RarRepairResult rar_repair_stored_members(
               (int64_t)(chunk_start + source);
           source_count++;
         }
+        if (width < search->width) {
+          continue;
+        }
+        search->width = width;
         qsort(sources, (size_t)source_count, sizeof(*sources),
               rar_compare_crc_sources);
 
         const uint64_t run_bytes = width * blocksize;
-        for (uint64_t destination = destination_first;
+        const uint64_t next_destination = search->destination > destination_first
+            ? search->destination : destination_first;
+        for (uint64_t destination = next_destination;
              destination + width <= destination_end; destination++) {
+          search->destination = destination;
+          if (rar_reassembly_poll(work, candidate, state, uuidp, uuidc,
+                                  iterations)) {
+            result = RAR_REPAIR_STOPPED;
+            goto cleanup;
+          }
           const uint64_t destination_index =
               destination - destination_first;
           const uint64_t tail_index = destination_index + width;
@@ -3415,9 +3749,20 @@ static inline RarRepairResult rar_repair_stored_members(
               upper = middle;
             }
           }
+          if (search->match_index > lower) {
+            lower = search->match_index;
+          }
           for (uint64_t match = lower;
                match < source_count
                && sources[match].crc == required_crc; match++) {
+            search->match_index = match;
+            if (rar_reassembly_poll(work, candidate, state, uuidp, uuidc,
+                                    iterations)) {
+              result = RAR_REPAIR_STOPPED;
+              goto cleanup;
+            }
+            // This trial is complete before the next polling point.
+            search->match_index = match + 1;
             const int64_t source = sources[match].apparent_start;
 
             if (rar_mapping_uses_source(mapping, blocks, destination, width,
@@ -3436,35 +3781,43 @@ static inline RarRepairResult rar_repair_stored_members(
                        != header->data_crc) {
               continue;
             }
-            if (matches == 0) {
+            if (search->matches == 0) {
               memcpy(unique_mapping, trial_mapping,
                      (size_t)blocks * sizeof(*unique_mapping));
+              if (!rar_store_actual_mapping(unique_mapping, blocks,
+                                             search->values + 2 * blocks)) {
+                goto cleanup;
+              }
             }
             else if (memcmp(unique_mapping, trial_mapping,
                             (size_t)blocks * sizeof(*unique_mapping)) == 0) {
               continue;
             }
-            matches++;
-            if (matches > 1) {
+            search->matches++;
+            if (search->matches > 1) {
               result = RAR_REPAIR_AMBIGUOUS;
-              free(block_usable);
-              free(block_crcs);
-              free(run_usable);
-              free(run_crcs);
-              free(sources);
               goto cleanup;
             }
           }
+          search->destination = destination + 1;
+          search->match_index = 0;
         }
+        search->width = width + 1;
+        search->destination = 0;
+        search->match_index = 0;
       }
+      search->chunk_start = chunk_end;
+      search->crc_count = 0;
+      search->width = 1;
     }
 
-    free(block_usable);
-    free(block_crcs);
     free(run_usable);
     free(run_crcs);
     free(sources);
-    if (matches != 1) {
+    run_usable = NULL;
+    run_crcs = NULL;
+    sources = NULL;
+    if (search->matches != 1) {
       goto cleanup;
     }
     memcpy(mapping, unique_mapping, (size_t)blocks * sizeof(*mapping));
@@ -3472,15 +3825,36 @@ static inline RarRepairResult rar_repair_stored_members(
                                  trial)) {
       goto cleanup;
     }
-    repaired_any = true;
+    if (!rar_store_actual_mapping(mapping, blocks, search->values + blocks)) {
+      goto cleanup;
+    }
+    search->repaired_any = 1;
+    search->header_index = header_index + 1;
+    search->chunk_start = 0;
+    search->crc_count = 0;
+    search->width = 1;
+    search->destination = 0;
+    search->match_index = 0;
+    search->matches = 0;
   }
 
-  if (repaired_any) {
+  if (search->repaired_any) {
     memcpy(solution, mapping, (size_t)blocks * sizeof(*solution));
     result = RAR_REPAIR_MATCH;
   }
 
 cleanup:
+  if (search && result != RAR_REPAIR_STOPPED) {
+    search->result = result;
+    search->complete = 1;
+    search->crc_count = 0;
+    search->width = 0;
+    search->destination = 0;
+    search->match_index = 0;
+  }
+  free(sources);
+  free(run_crcs);
+  free(run_usable);
   free(member_prefix);
   free(unique_mapping);
   free(trial_mapping);
@@ -3533,6 +3907,42 @@ static inline int rar_compare_resume_position(
     }
   }
   return 0;
+}
+
+// Only the candidate and the selected extension window determine whether its
+// completed decoder trials remain applicable after an apparent-view change.
+static inline uint64_t rar_extension_view(const int64_t *mapping,
+    uint64_t blocks, uint64_t extent, uint64_t destination, uint64_t width,
+    int64_t source, uint64_t limit, uint32_t needleidx) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  const uint64_t fields[] = {blocks, extent, scalpel_state.blocksize,
+                            destination, width, (uint64_t)source, limit};
+  for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
+    hash = (hash ^ fields[index]) * UINT64_C(1099511628211);
+  }
+  for (uint64_t slot = 0; slot < blocks; slot++) {
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, mapping[slot]);
+    hash = (hash ^ (uint64_t)actual) * UINT64_C(1099511628211);
+  }
+  const uint64_t image_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  if (source < 0 || (uint64_t)source >= image_blocks) {
+    return 0;
+  }
+  if (limit > image_blocks - (uint64_t)source) {
+    limit = image_blocks - (uint64_t)source;
+  }
+  for (uint64_t offset = 0; offset < limit; offset++) {
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, source + (int64_t)offset);
+    const bool unavailable = actual < 0
+        || filemirror_actual_block_covered(scalpel_state.filemirror, actual)
+        || filemirror_get_blocktype(scalpel_state.filemirror, actual, needleidx)
+               == BLOCK_CONFIDENCE_INVALID;
+    hash = (hash ^ (uint64_t)actual) * UINT64_C(1099511628211);
+    hash = (hash ^ (uint64_t)unavailable) * UINT64_C(1099511628211);
+  }
+  return hash;
 }
 
 // Repair one displaced run inside compressed member data. libarchive's
@@ -3606,7 +4016,15 @@ static inline RarRepairResult rar_repair_compressed_member(
       && state->resume_probe_only == (uint32_t)probe_only
       && state->resume_gap_ordinal == gap_ordinal
       && state->resume_probe_index == probe_index
-      && state->resume_image_blocks == image_blocks;
+      && state->resume_image_blocks == image_blocks
+      && state->resume_member_pass < 2
+      && state->resume_header_index < layout->header_count
+      && state->resume_destination_pass < 2
+      && state->resume_chunk_start < image_blocks
+      && state->resume_width_order < blocks
+      && state->resume_destination_index < blocks;
+  // Index preparation can checkpoint before a trial cursor exists. Its unset
+  // sentinels do not mean that every compressed-member trial has completed.
   if (!resume_call) {
     state->resume_active = 1;
     state->resume_scope = (uint32_t)scope;
@@ -3629,6 +4047,14 @@ static inline RarRepairResult rar_repair_compressed_member(
     state->resume_best_source = -1;
     state->resume_have_best = 0;
     state->resume_have_second = 0;
+    state->resume_source_trials = 0;
+    state->resume_source_trial_base = 0;
+    memset(&state->extension, 0, sizeof(state->extension));
+  }
+  // A checkpoint is not a new acceleration probe with a fresh trial budget.
+  source_trials = state->resume_source_trials;
+  if (source_trials >= maximum_source_trials) {
+    return RAR_REPAIR_NONE;
   }
 
   for (uint64_t header_index = 0;
@@ -3834,6 +4260,13 @@ static inline RarRepairResult rar_repair_compressed_member(
            destination_pass++) {
         for (uint64_t chunk_start = 0; chunk_start < image_blocks;
              chunk_start += index_capacity) {
+          // Rebuild only the active chunk's disposable source index, not the
+          // indices of already completed member/destination/chunk prefixes.
+          if (resume_call && rar_compare_resume_position(
+                  state, member_pass, header_index, destination_pass,
+                  chunk_start, UINT64_MAX, UINT64_MAX) < 0) {
+            continue;
+          }
           uint64_t chunk_end = chunk_start + index_capacity;
 
           if (chunk_end < chunk_start || chunk_end > image_blocks) {
@@ -3962,6 +4395,11 @@ static inline RarRepairResult rar_repair_compressed_member(
               source_count++;
             }
             accumulated_width = width;
+            if (resume_call && rar_compare_resume_position(
+                    state, member_pass, header_index, destination_pass,
+                    chunk_start, width_order, UINT64_MAX) < 0) {
+              continue;
+            }
             qsort(sources, (size_t)source_count, sizeof(*sources),
                   rar_compare_source_choices);
 
@@ -4019,6 +4457,14 @@ static inline RarRepairResult rar_repair_compressed_member(
             for (uint64_t destination_index = destination_begin;
                  destination_index < destination_limit;
                  destination_index++) {
+              const int resume_position = resume_call
+                  ? rar_compare_resume_position(
+                        state, member_pass, header_index, destination_pass,
+                        chunk_start, width_order, destination_index)
+                  : 1;
+              if (resume_position < 0) {
+                continue;
+              }
               const uint64_t destination =
                   destinations[destination_index].slot;
               RarProgressScore width_best_progress = {0, 0, 0};
@@ -4095,15 +4541,6 @@ static inline RarRepairResult rar_repair_compressed_member(
                   seam_ordered = true;
                 }
               }
-              const int resume_position = resume_call
-                  ? rar_compare_resume_position(
-                        state, member_pass, header_index, destination_pass,
-                        chunk_start, width_order, destination_index)
-                  : 1;
-
-              if (resume_call && resume_position < 0) {
-                continue;
-              }
               const uint64_t source_hash = rar_source_choices_hash(
                   sources, source_count);
 
@@ -4119,6 +4556,13 @@ static inline RarRepairResult rar_repair_compressed_member(
                 have_width_second = state->resume_have_second != 0;
               }
               else {
+                // If the current source ordering changed, its replay must not
+                // consume the bounded probe budget a second time.
+                if (resume_call && resume_position == 0) {
+                  source_trials = state->resume_source_trial_base;
+                  state->resume_source_trials = source_trials;
+                }
+                state->resume_source_trial_base = source_trials;
                 state->resume_member_pass = member_pass;
                 state->resume_header_index = header_index;
                 state->resume_destination_pass = destination_pass;
@@ -4133,6 +4577,7 @@ static inline RarRepairResult rar_repair_compressed_member(
                 state->resume_best_source = -1;
                 state->resume_have_best = 0;
                 state->resume_have_second = 0;
+                memset(&state->extension, 0, sizeof(state->extension));
               }
               resume_call = false;
               for (uint64_t source_index = start_source_index;
@@ -4196,6 +4641,7 @@ static inline RarRepairResult rar_repair_compressed_member(
                     &trial_entries, &trial_output_progress,
                     &trial_encrypted, false);
                 source_trials++;
+                state->resume_source_trials = source_trials;
 
                 if (!trial_encrypted) {
                   const RarProgressScore trial_progress = {
@@ -4290,9 +4736,26 @@ static inline RarRepairResult rar_repair_compressed_member(
                 if (extension_limit > RAR_COMPRESSED_PROBE_WIDTH_LIMIT) {
                   extension_limit = RAR_COMPRESSED_PROBE_WIDTH_LIMIT;
                 }
+                RarExtensionProgress *pending = &state->extension;
+                const uint64_t view = rar_extension_view(
+                    mapping, blocks, layout->archive_size, destination, width,
+                    width_best_source, extension_limit, (*candidate)->needleidx);
+                if (!pending->active || pending->view != view) {
+                  memset(pending, 0, sizeof(*pending));
+                  pending->active = 1;
+                  pending->view = view;
+                  pending->next_width = width + 1;
+                  pending->best_width = width;
+                  pending->best_progress = width_best_progress;
+                }
+                extended_progress = pending->best_progress;
+                extended_width = pending->best_width;
                 if (rar_materialize_mapping(
                         mapping, blocks, layout->archive_size, trial)) {
-                  for (uint64_t offset = 0; offset < width; offset++) {
+                  // Rebuild bytes already examined, without repeating the
+                  // completed decompression trials or losing their best score.
+                  for (uint64_t offset = 0; offset < pending->next_width - 1;
+                       offset++) {
                     const int64_t apparent =
                         width_best_source + (int64_t)offset;
                     const int64_t actual = filemirror_actual_blocknumber(
@@ -4309,7 +4772,7 @@ static inline RarRepairResult rar_repair_compressed_member(
                                        * scalpel_state.blocksize,
                            data, (size_t)scalpel_state.blocksize);
                   }
-                  for (uint64_t extension = width + 1;
+                  for (uint64_t extension = pending->next_width;
                        extension <= extension_limit
                        && extension <= destination_end - destination
                        && extension <= image_blocks
@@ -4406,6 +4869,9 @@ static inline RarRepairResult rar_repair_compressed_member(
                         goto cleanup;
                       }
                     }
+                    pending->next_width = extension + 1;
+                    pending->best_width = extended_width;
+                    pending->best_progress = extended_progress;
                   }
                 }
                 memcpy(solution, mapping,
@@ -4415,6 +4881,7 @@ static inline RarRepairResult rar_repair_compressed_member(
                       width_best_source + (int64_t)offset;
                 }
                 result = RAR_REPAIR_PROGRESS;
+                memset(pending, 0, sizeof(*pending));
                 goto cleanup;
               }
             }
@@ -4430,6 +4897,9 @@ static inline RarRepairResult rar_repair_compressed_member(
 
 cleanup:
   free(destination_backup);
+  if (result != RAR_REPAIR_STOPPED) {
+    memset(&state->extension, 0, sizeof(state->extension));
+  }
   free(destinations);
   free(sources);
   free(mapped_blocks);
@@ -4534,6 +5004,7 @@ static inline void rar_reassembly(ThreadWork *work, CarveInfo **candidate,
   bool compressed_recipe_invalidated = false;
   bool preserve_encrypted_extent = false;
   bool stopped = false;
+  bool resume_gap_solution = false;
 
   memset(&layout, 0, sizeof(layout));
   if (!work || !candidate || !*candidate || !(*candidate)->b
@@ -4753,6 +5224,7 @@ static inline void rar_reassembly(ThreadWork *work, CarveInfo **candidate,
   // earliest search pass needed to derive replacement state.
   //
   if (best_mapping_invalidated) {
+    state->gap_solutions = 0;
     state->repair_pass = 0;
     state->gap_ordinal = 0;
     state->probe_index = 0;
@@ -4768,6 +5240,7 @@ static inline void rar_reassembly(ThreadWork *work, CarveInfo **candidate,
     have_compressed_recipe = false;
   }
   else if (compressed_recipe_invalidated && state->repair_pass >= 2) {
+    state->gap_solutions = 0;
     if (state->repair_pass > 2) {
       state->repair_pass = 2;
     }
@@ -4776,6 +5249,23 @@ static inline void rar_reassembly(ThreadWork *work, CarveInfo **candidate,
     state->selection_initialized = 0;
     state->prepass_complete = 0;
     state->resume_active = 0;
+  }
+
+  if (state->gap_solutions) {
+    if (rar_load_actual_mapping(rar_carve_state_gap_solution(state),
+                                 logical_blocks, solution)) {
+      solutions = state->gap_solutions;
+      resume_gap_solution = true;
+    }
+    else {
+      // A covered source invalidates this pass's uniqueness evidence, not
+      // the work already completed in unrelated earlier repair passes.
+      state->gap_solutions = 0;
+      state->selection_initialized = 0;
+      state->gap_ordinal = 0;
+      state->probe_index = 0;
+      state->resume_active = 0;
+    }
   }
 
   // Try the best-ranked inserted-block hypothesis before enumerating the full
@@ -4910,7 +5400,9 @@ static inline void rar_reassembly(ThreadWork *work, CarveInfo **candidate,
   // invocation resumes the same hypothesis and decoder source trial.
   //
   for (uint32_t repair_pass = state->repair_pass;
-       repair_pass < 4 && solutions == 0; repair_pass++) {
+       repair_pass < 4 && (solutions == 0 || resume_gap_solution);
+       repair_pass++) {
+    resume_gap_solution = false;
     state->repair_pass = repair_pass;
 
     if (repair_pass > 0 && have_best_mapping
@@ -5089,7 +5581,12 @@ static inline void rar_reassembly(ThreadWork *work, CarveInfo **candidate,
         if (solutions == 0) {
           memcpy(solution, validated_mapping,
                  (size_t)logical_blocks * sizeof(*solution));
+          if (!rar_store_actual_mapping(solution, logical_blocks,
+                                         rar_carve_state_gap_solution(state))) {
+            goto no_solution;
+          }
           solutions = 1;
+          state->gap_solutions = 1;
         }
         else if (memcmp(solution, validated_mapping,
                         (size_t)logical_blocks * sizeof(*solution)) != 0) {
@@ -5109,6 +5606,7 @@ static inline void rar_reassembly(ThreadWork *work, CarveInfo **candidate,
     }
 
 next_repair_pass:
+    state->gap_solutions = 0;
     state->repair_pass = repair_pass + 1;
     state->gap_ordinal = 0;
     state->probe_index = 0;

@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -73,7 +77,7 @@
 #define AVI_CONTENT_BOUNDARY_NUMERATOR 4U
 #define AVI_CONTENT_BOUNDARY_DENOMINATOR 3U
 #define AVI_CARVE_STATE_MAGIC UINT32_C(0x41564953)
-#define AVI_CARVE_STATE_VERSION 2U
+#define AVI_CARVE_STATE_VERSION 8U
 
 #define AVI_FLAG_HAS_INDEX UINT32_C(0x00000010)
 #define AVI_INDEX_OF_INDEXES 0U
@@ -84,6 +88,12 @@ typedef enum AviParseResult {
   AVI_PARSE_PARTIAL = 1,
   AVI_PARSE_COMPLETE = 2
 } AviParseResult;
+
+typedef enum AviTrialResult {
+  AVI_TRIAL_ERROR = 0,
+  AVI_TRIAL_READY = 1,
+  AVI_TRIAL_INTERRUPTED = 2
+} AviTrialResult;
 
 typedef enum AviRunSearchResult {
   AVI_RUN_SEARCH_NO_MATCH = 0,
@@ -167,21 +177,21 @@ typedef struct AviStateIndexEntry {
   uint32_t size;
 } AviStateIndexEntry;
 
-typedef struct AviCarveState {
-  uint32_t magic;
-  uint32_t version;
-  uint64_t archive_extent;
-  uint64_t entry_count;
-  uint64_t repairs;
-  uint32_t initialized;
+typedef struct AviBlockSearch {
+  uint64_t view;
+  uint64_t target_slot;
+  uint64_t image_blocks;
+  uint64_t next_actual;
+  uint64_t baseline_to;
+  uint64_t best_validates_to;
+  uint64_t best_distance;
+  int64_t best_actual;
+  int64_t best_reserved;
+  uint32_t best_confidence;
+  uint32_t blocksize;
+  uint32_t active;
   uint32_t reserved;
-  AviStateIndexEntry entries[];
-} AviCarveState;
-
-typedef struct AviContentHistogram {
-  uint64_t bins[AVI_CONTENT_HISTOGRAM_BINS];
-  uint64_t samples;
-} AviContentHistogram;
+} AviBlockSearch;
 
 typedef struct AviRunContentCandidate {
   uint64_t start;
@@ -196,11 +206,120 @@ typedef struct AviClassifiedRunTrial {
   uint64_t content_cost;
   uint64_t distance;
   int64_t reserved;
-  bool validates;
-  bool complete;
-  bool contiguous;
-  bool isolated;
+  uint32_t validates;
+  uint32_t complete;
+  uint32_t contiguous;
+  uint32_t isolated;
 } AviClassifiedRunTrial;
+
+typedef struct AviClassifiedSearch {
+  uint64_t view;
+  uint64_t target_slot;
+  uint64_t run_blocks;
+  uint64_t image_blocks;
+  uint64_t baseline_to;
+  uint64_t next_actual;
+  uint64_t lowest_content_cost;
+  uint64_t second_content_cost;
+  uint64_t lowest_content_start;
+  uint64_t second_content_start;
+  uint64_t lowest_content_confidence;
+  int64_t lowest_content_reserved;
+  AviClassifiedRunTrial best;
+  AviRunContentCandidate fallback[AVI_CONTENT_FALLBACK_RUNS];
+  uint32_t fallback_count;
+  uint32_t fallback_next;
+  uint32_t lowest_content_isolated;
+  uint32_t blocksize;
+  uint32_t allow_content_only;
+  uint32_t require_complete;
+  uint32_t owner;
+  uint32_t active;
+} AviClassifiedSearch;
+
+typedef struct AviShiftSearch {
+  uint64_t view;
+  uint64_t target_slot;
+  uint64_t image_blocks;
+  uint64_t baseline_to;
+  uint64_t repair_end;
+  uint64_t next_entry;
+  uint64_t next_shift;
+  uint64_t best_shift;
+  uint64_t best_validates_to;
+  uint64_t classified_slot;
+  uint32_t blocksize;
+  uint32_t phase;
+  uint32_t owner;
+  uint32_t reserved;
+} AviShiftSearch;
+
+typedef struct AviDisplacedSearch {
+  uint64_t view;
+  uint64_t target_slot;
+  uint64_t image_blocks;
+  uint64_t baseline_to;
+  uint64_t repair_end;
+  uint64_t next_actual;
+  uint64_t probe_blocks;
+  uint64_t reconnects_to;
+  uint64_t mapped;
+  uint64_t proven_blocks;
+  uint64_t previous_validates_to;
+  int64_t best_start;
+  uint64_t best_mapped;
+  uint64_t best_validates_to;
+  uint32_t blocksize;
+  // Full probe, proven-prefix probe, incremental extension, commit, exhausted.
+  uint32_t phase;
+} AviDisplacedSearch;
+
+typedef struct AviCarveState {
+  uint32_t magic;
+  uint32_t version;
+  uint64_t archive_extent;
+  uint64_t entry_count;
+  uint64_t repairs;
+  uint32_t initialized;
+  uint32_t reserved;
+  AviBlockSearch block_search;
+  // Indexed-run comparisons retain the current extension and earlier best run.
+  struct {
+    uint64_t view;
+    uint64_t target_slot;
+    uint64_t image_blocks;
+    uint64_t baseline_to;
+    uint64_t next_actual;
+    uint64_t mapped;
+    uint64_t minimum_blocks;
+    uint64_t previous_validates_to;
+    int64_t best_start;
+    uint64_t best_mapped;
+    uint64_t best_validates_to;
+    uint64_t classified_slot;
+    uint32_t blocksize;
+    uint32_t active;
+  } indexed_search;
+  // Separate cursors for complete-only and partial zero-gap passes.
+  struct {
+    uint64_t view;
+    uint64_t start_slot;
+    uint64_t next_slot;
+    uint64_t image_blocks;
+    uint64_t baseline_to;
+    uint32_t blocksize;
+    uint32_t active;
+  } zero_gap_search[2];
+  AviClassifiedSearch classified_search;
+  AviShiftSearch shift_search;
+  AviDisplacedSearch displaced_search;
+  AviStateIndexEntry entries[];
+} AviCarveState;
+
+typedef struct AviContentHistogram {
+  uint64_t bins[AVI_CONTENT_HISTOGRAM_BINS];
+  uint64_t samples;
+} AviContentHistogram;
 
 static inline uint16_t avi_read_le16(const uint8_t *data);
 static inline uint32_t avi_read_le32(const uint8_t *data);
@@ -330,10 +449,34 @@ static inline void avi_file_validate(char *data, uint64_t length,
                                      uint32_t blocksize, void *carvehashkey);
 static inline bool avi_reassembly_initialize_candidate(
     CarveInfo *candidate, AviCarveState *state);
-static inline bool avi_reassembly_validate_candidate(
+static inline AviTrialResult avi_reassembly_validate_candidate(
     CarveInfo *candidate, const AviCarveState *state,
     bool *validates, uint64_t *validates_to, uint64_t *repair_from,
     uint64_t *repair_end, uint64_t payload_validation_from);
+static inline bool avi_reassembly_checkpoint(
+    ThreadWork *work, CarveInfo *candidate, AviCarveState *state,
+    uuid_string_t uuidp, uuid_string_t uuidc);
+static inline uint64_t avi_reassembly_block_search_view(
+    const CarveInfo *candidate, const AviCarveState *state);
+static inline bool avi_reassembly_block_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t target_slot, uint64_t image_blocks, uint64_t validates_to);
+static inline bool avi_reassembly_indexed_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t target_slot, uint64_t image_blocks, uint64_t validates_to);
+static inline bool avi_reassembly_zero_gap_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t start_slot, uint64_t image_blocks, uint64_t validates_to,
+    bool require_complete);
+static inline bool avi_reassembly_classified_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t image_blocks, uint64_t validates_to);
+static inline bool avi_reassembly_shift_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t image_blocks, uint64_t validates_to, uint64_t repair_end);
+static inline bool avi_reassembly_shift_matches(
+    const uint8_t *data, uint64_t length, const AviStateIndexEntry *entry,
+    uint64_t shift);
 static inline bool avi_reassembly_refresh_state(
     CarveInfo *candidate, AviCarveState **state);
 static inline bool avi_reassembly_actual_block_suspect(
@@ -363,7 +506,7 @@ static inline bool avi_reassembly_source_run_isolated(
 static inline bool avi_reassembly_content_boundary(
     const CarveInfo *candidate, int64_t actual,
     const AviContentHistogram *context_histogram, uint64_t source_cost);
-static inline bool avi_reassembly_trial_classified_run(
+static inline AviTrialResult avi_reassembly_trial_classified_run(
     CarveInfo *candidate, const AviCarveState *state, uint64_t target_slot,
     uint64_t run_blocks, uint64_t start, const int64_t *saved,
     const AviContentHistogram *context_histogram,
@@ -374,7 +517,7 @@ static inline bool avi_classified_run_trial_better(
     bool base_complete,
     uint64_t base_crc_slices, uint64_t current_validates_to);
 static inline AviRunSearchResult avi_reassembly_find_classified_run(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t run_blocks, uint64_t image_blocks,
     uint64_t current_validates_to, bool allow_content_only,
     bool require_complete, uuid_string_t uuidp, uuid_string_t uuidc);
@@ -387,13 +530,18 @@ static inline bool avi_reassembly_rotate_suffix(
     uint64_t target_slot, uint64_t shift, uint64_t image_blocks,
     uint64_t required_validates_to, bool retain_partial,
     bool *validates, uint64_t *validates_to);
+static inline bool avi_reassembly_rotate_suffix_trial(
+    CarveInfo *candidate, const AviCarveState *state,
+    uint64_t target_slot, uint64_t shift, uint64_t image_blocks,
+    uint64_t required_validates_to, bool retain_partial,
+    bool *validates, uint64_t *validates_to, bool *interrupted);
 static inline AviRunSearchResult avi_reassembly_find_zero_gap(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t start_slot, uint64_t image_blocks,
     uint64_t current_validates_to, bool require_complete,
     uint64_t *repair_slot, uuid_string_t uuidp, uuid_string_t uuidc);
 static inline AviRunSearchResult avi_reassembly_find_shifted_suffix(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t image_blocks, uint64_t current_validates_to,
     uint64_t repair_end, uuid_string_t uuidp, uuid_string_t uuidc);
 static inline bool avi_reassembly_source_matches_index(
@@ -406,13 +554,16 @@ static inline uint64_t avi_reassembly_earliest_repair_slot(
     const AviCarveState *state, uint64_t failure_offset,
     uint64_t target_slot);
 static inline AviRunSearchResult avi_reassembly_find_indexed_run(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t image_blocks, uint64_t current_validates_to,
     uuid_string_t uuidp, uuid_string_t uuidc);
 static inline AviRunSearchResult avi_reassembly_find_displaced_run(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t image_blocks, uint64_t current_validates_to,
     uint64_t repair_end, uuid_string_t uuidp, uuid_string_t uuidc);
+static inline bool avi_reassembly_displaced_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t image_blocks, uint64_t validates_to, uint64_t repair_end);
 static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
                                   uuid_string_t uuidp,
                                   uuid_string_t uuidc);
@@ -595,9 +746,8 @@ static inline bool avi_media_chunk_ids_compatible(uint32_t expected,
 
 static inline bool avi_parser_stop_requested(AviParser *parser) {
 
-  if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)
-      || atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
-                              memory_order_acquire)) {
+  // The exit request precedes the point at which workers may safely yield.
+  if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
     parser->layout->interrupted = true;
     return true;
   }
@@ -1398,10 +1548,203 @@ static inline bool avi_carve_state_valid(const AviCarveState *state) {
       || state->entry_count > state->archive_extent / AVI_INDEX_ENTRY_SIZE) {
     return false;
   }
+  const AviBlockSearch *search = &state->block_search;
+
+  if (search->active > 1) {
+    return false;
+  }
+  if (search->active
+      && (!state->initialized || search->blocksize == 0
+          || search->target_slot == 0
+          || search->target_slot >= CEILDIV(state->archive_extent,
+                                             search->blocksize)
+          || search->image_blocks == 0 || search->image_blocks > INT64_MAX
+          || search->next_actual > search->image_blocks
+          || search->baseline_to >= state->archive_extent
+          || search->best_validates_to < search->baseline_to
+          || search->best_validates_to >= state->archive_extent
+          || search->best_actual < -1 || search->best_reserved < 0
+          || search->best_confidence > 100
+          || (search->best_actual >= 0
+              && ((uint64_t)search->best_actual >= search->next_actual
+                  || search->best_validates_to == search->baseline_to))
+          || (search->best_actual < 0
+              && search->best_validates_to != search->baseline_to))) {
+    return false;
+  }
   for (uint64_t entry = 0; entry < state->entry_count; entry++) {
     if (!avi_is_media_chunk(state->entries[entry].id)
         || state->entries[entry].offset >= state->archive_extent
         || state->entries[entry].size > state->archive_extent) {
+      return false;
+    }
+  }
+  if (state->indexed_search.active > 2) {
+    return false;
+  }
+  if (state->indexed_search.active) {
+    const uint32_t bs = state->indexed_search.blocksize;
+    if (!state->initialized || !bs
+        || !state->indexed_search.target_slot
+        || state->indexed_search.target_slot >= CEILDIV(state->archive_extent, bs)
+        || !state->indexed_search.image_blocks
+        || state->indexed_search.image_blocks > INT64_MAX
+        || state->indexed_search.next_actual > state->indexed_search.image_blocks
+        || state->indexed_search.baseline_to >= state->archive_extent
+        || state->indexed_search.best_validates_to < state->indexed_search.baseline_to
+        || state->indexed_search.best_validates_to >= state->archive_extent
+        || state->indexed_search.previous_validates_to < state->indexed_search.baseline_to
+        || state->indexed_search.previous_validates_to >= state->archive_extent
+        || state->indexed_search.best_start < -1) {
+      return false;
+    }
+    uint64_t suffix = CEILDIV(state->archive_extent, bs)
+        - state->indexed_search.target_slot;
+    if (state->indexed_search.mapped > suffix
+        || state->indexed_search.mapped > state->indexed_search.image_blocks
+            - state->indexed_search.next_actual
+        || state->indexed_search.minimum_blocks > suffix
+        || state->indexed_search.best_mapped > suffix
+        || (state->indexed_search.active == 2
+            && (state->indexed_search.next_actual != state->indexed_search.image_blocks
+                || state->indexed_search.mapped))
+        || (state->indexed_search.best_start < 0
+            && (state->indexed_search.best_mapped
+                || state->indexed_search.best_validates_to != state->indexed_search.baseline_to))
+        || (state->indexed_search.best_start >= 0
+            && (!state->indexed_search.best_mapped
+                || state->indexed_search.best_validates_to == state->indexed_search.baseline_to
+                || (uint64_t)state->indexed_search.best_start >= state->indexed_search.image_blocks
+                || state->indexed_search.best_mapped > state->indexed_search.image_blocks
+                    - (uint64_t)state->indexed_search.best_start))) {
+      return false;
+    }
+  }
+  for (uint32_t index = 0; index < 2; index++) {
+    if (state->zero_gap_search[index].active > 1) {
+      return false;
+    }
+    if (state->zero_gap_search[index].active
+        && (!state->initialized || !state->zero_gap_search[index].blocksize
+            || !state->zero_gap_search[index].image_blocks
+            || state->zero_gap_search[index].image_blocks > INT64_MAX
+            || state->zero_gap_search[index].baseline_to >= state->archive_extent
+            || state->zero_gap_search[index].next_slot < state->zero_gap_search[index].start_slot
+            || state->zero_gap_search[index].next_slot > CEILDIV(state->archive_extent,
+                                                    state->zero_gap_search[index].blocksize))) {
+      return false;
+    }
+  }
+  const AviClassifiedSearch *classified = &state->classified_search;
+  if (classified->active > 2) {
+    return false;
+  }
+  if (classified->active) {
+    if (!state->initialized || !classified->blocksize || !classified->run_blocks
+        || !classified->image_blocks || classified->image_blocks > INT64_MAX
+        || classified->baseline_to >= state->archive_extent
+        || classified->target_slot >= CEILDIV(state->archive_extent, classified->blocksize)
+        || classified->run_blocks > CEILDIV(state->archive_extent, classified->blocksize)
+            - classified->target_slot
+        || classified->run_blocks > classified->image_blocks
+        || classified->next_actual > classified->image_blocks - classified->run_blocks + 1
+        || classified->fallback_count > AVI_CONTENT_FALLBACK_RUNS
+        || classified->fallback_next > classified->fallback_count
+        || classified->allow_content_only > 1 || classified->require_complete > 1
+        || classified->lowest_content_isolated > 1
+        || classified->owner < 1 || classified->owner > 4
+        || classified->lowest_content_reserved < 0
+        || classified->best.reserved < 0 || classified->best.validates > 1
+        || classified->best.complete > 1 || classified->best.contiguous > 1
+        || classified->best.isolated > 1
+        || classified->best.validates_to < classified->baseline_to
+        || classified->best.validates_to >= state->archive_extent
+        || (classified->active == 2
+            && (classified->next_actual != classified->image_blocks - classified->run_blocks + 1
+                || classified->fallback_next != classified->fallback_count))
+        || (classified->fallback_next
+            && classified->next_actual != classified->image_blocks - classified->run_blocks + 1)
+        || classified->owner != (classified->baseline_to == state->archive_extent - 1 ? 1U
+            : classified->require_complete ? 2U : classified->run_blocks > 1 ? 3U : 4U)) {
+      return false;
+    }
+    const uint64_t sources[] = {classified->best.start, classified->lowest_content_start,
+                                classified->second_content_start};
+    for (uint32_t index = 0; index < 3; index++) {
+      if (sources[index] != UINT64_MAX
+          && sources[index] > classified->image_blocks - classified->run_blocks) {
+        return false;
+      }
+    }
+    for (uint32_t index = 0; index < classified->fallback_count; index++) {
+      if (classified->fallback[index].start > classified->image_blocks - classified->run_blocks) {
+        return false;
+      }
+    }
+  }
+  const AviShiftSearch *shift = &state->shift_search;
+  if (shift->phase > 5) {
+    return false;
+  }
+  if (shift->phase) {
+    if (!state->initialized || !shift->blocksize || !shift->target_slot
+        || shift->target_slot >= CEILDIV(state->archive_extent, shift->blocksize)
+        || !shift->image_blocks || shift->image_blocks > INT64_MAX
+        || shift->baseline_to >= state->archive_extent
+        || shift->repair_end > state->archive_extent
+        || shift->next_entry > state->entry_count
+        || !shift->next_shift
+        || shift->next_shift > CEILDIV(state->archive_extent, shift->blocksize) - shift->target_slot
+        || shift->best_shift >= CEILDIV(state->archive_extent, shift->blocksize) - shift->target_slot
+        || shift->best_validates_to < shift->baseline_to
+        || shift->best_validates_to >= state->archive_extent
+        || (shift->best_shift == 0 && shift->best_validates_to != shift->baseline_to)
+        || (shift->best_shift && shift->best_validates_to == shift->baseline_to)
+        || (shift->phase == 1 && !state->entry_count)
+        || (shift->phase == 4 && (!shift->best_shift
+            || shift->best_validates_to != state->archive_extent - 1))
+        || shift->owner < 1 || shift->owner > 2) {
+      return false;
+    }
+  }
+  const AviDisplacedSearch *displaced = &state->displaced_search;
+  if (displaced->phase > 5) {
+    return false;
+  }
+  if (displaced->phase) {
+    if (!state->initialized || !displaced->blocksize || !displaced->target_slot
+        || displaced->target_slot >= CEILDIV(state->archive_extent, displaced->blocksize)
+        || !displaced->image_blocks || displaced->image_blocks > INT64_MAX
+        || displaced->next_actual > displaced->image_blocks
+        || displaced->baseline_to >= state->archive_extent
+        || displaced->repair_end > state->archive_extent
+        || displaced->reconnects_to >= state->archive_extent
+        || displaced->previous_validates_to < displaced->baseline_to
+        || displaced->previous_validates_to >= state->archive_extent
+        || displaced->best_validates_to < displaced->baseline_to
+        || displaced->best_validates_to >= state->archive_extent
+        || displaced->best_start < -1) {
+      return false;
+    }
+    uint64_t suffix = CEILDIV(state->archive_extent, displaced->blocksize)
+        - displaced->target_slot;
+    if (displaced->probe_blocks > suffix || displaced->mapped > suffix
+        || displaced->mapped > displaced->image_blocks - displaced->next_actual
+        || displaced->proven_blocks > displaced->mapped
+        || displaced->best_mapped > suffix
+        || ((displaced->phase == 1 || displaced->phase == 2)
+            && !displaced->probe_blocks)
+        || (displaced->phase == 1 && (displaced->mapped || displaced->proven_blocks))
+        || (displaced->phase == 2 && (!displaced->mapped || !displaced->proven_blocks))
+        || (displaced->phase == 3 && (displaced->probe_blocks || displaced->proven_blocks))
+        || (displaced->phase >= 4 && (displaced->mapped || displaced->proven_blocks
+            || displaced->next_actual != displaced->image_blocks))
+        || (displaced->best_start < 0 && (displaced->best_mapped
+            || displaced->best_validates_to != displaced->baseline_to))
+        || (displaced->best_start >= 0 && (!displaced->best_mapped
+            || (uint64_t)displaced->best_start >= displaced->image_blocks
+            || displaced->best_mapped > displaced->image_blocks - (uint64_t)displaced->best_start
+            || displaced->best_validates_to == displaced->baseline_to))) {
       return false;
     }
   }
@@ -1634,9 +1977,14 @@ static inline bool avi_serialize_carve_state(void **state, FILE *fp,
   }
 
   memset(&header, 0, sizeof(header));
-  if (fread(&header, offsetof(AviCarveState, entries), 1, fp) != 1
+  const size_t legacy_size = offsetof(AviCarveState, block_search);
+
+  if (fread(&header, legacy_size, 1, fp) != 1
       || header.magic != AVI_CARVE_STATE_MAGIC
-      || header.version != AVI_CARVE_STATE_VERSION
+      || (header.version != AVI_CARVE_STATE_VERSION
+          && header.version != 7U && header.version != 6U
+          && header.version != 5U && header.version != 4U
+          && header.version != 3U && header.version != 2U)
       || header.archive_extent < AVI_RIFF_HEADER_SIZE
       || header.archive_extent > AVI_MAX_ARCHIVE_SIZE
       || header.initialized > 1
@@ -1646,6 +1994,38 @@ static inline bool avi_serialize_carve_state(void **state, FILE *fp,
     handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid AVI carve state",
                  __LINE__, __FILE__);
   }
+  if (header.version >= 3U
+      && fread(&header.block_search, sizeof(header.block_search), 1, fp)
+             != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid AVI block search state",
+                 __LINE__, __FILE__);
+  }
+  if (header.version >= 4U
+      && fread(&header.indexed_search, sizeof(header.indexed_search), 1, fp) != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid AVI indexed search state",
+                 __LINE__, __FILE__);
+  }
+  if (header.version >= 5U
+      && fread(header.zero_gap_search, sizeof(header.zero_gap_search), 1, fp) != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid AVI zero-gap search state",
+                 __LINE__, __FILE__);
+  }
+  if (header.version >= 6U
+      && fread(&header.classified_search, sizeof(header.classified_search), 1, fp) != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid AVI classified search state",
+                 __LINE__, __FILE__);
+  }
+  if (header.version >= 7U
+      && fread(&header.shift_search, sizeof(header.shift_search), 1, fp) != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid AVI shifted search state",
+                 __LINE__, __FILE__);
+  }
+  if (header.version >= 8U
+      && fread(&header.displaced_search, sizeof(header.displaced_search), 1, fp) != 1) {
+    handle_error(SCALPEL_ERROR_CHECKPOINT, "invalid AVI displaced search state",
+                 __LINE__, __FILE__);
+  }
+  header.version = AVI_CARVE_STATE_VERSION;
   *avi_state = (AviCarveState *)malloc(state_size);
   check_memory_allocation(*avi_state, __LINE__, __FILE__, "AviCarveState");
   memcpy(*avi_state, &header, offsetof(AviCarveState, entries));
@@ -2614,14 +2994,14 @@ static inline bool avi_reassembly_initialize_candidate(
 }
 
 
-static inline bool avi_reassembly_validate_candidate(
+static inline AviTrialResult avi_reassembly_validate_candidate(
     CarveInfo *candidate, const AviCarveState *state,
     bool *validates, uint64_t *validates_to, uint64_t *repair_from,
     uint64_t *repair_end, uint64_t payload_validation_from) {
 
   if (!candidate || !candidate->b || !state || !validates
       || !validates_to) {
-    return false;
+    return AVI_TRIAL_ERROR;
   }
   const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer(
       candidate->b);
@@ -2638,8 +3018,11 @@ static inline bool avi_reassembly_validate_candidate(
   if (repair_end) {
     *repair_end = 0;
   }
+  if (layout.interrupted) {
+    return AVI_TRIAL_INTERRUPTED;
+  }
   if (result == AVI_PARSE_INVALID) {
-    return true;
+    return AVI_TRIAL_READY;
   }
   uint64_t index_failure = length;
 
@@ -2657,6 +3040,9 @@ static inline bool avi_reassembly_validate_candidate(
 
     result = avi_parse_file(data, length, 0, &complete_layout);
     layout = complete_layout;
+    if (layout.interrupted) {
+      return AVI_TRIAL_INTERRUPTED;
+    }
   }
   if (layout.failure_offset == UINT64_MAX) {
     *validates_to = AVI_RIFF_HEADER_SIZE - 1;
@@ -2683,6 +3069,145 @@ static inline bool avi_reassembly_validate_candidate(
       *validates = true;
     }
   }
+  return AVI_TRIAL_READY;
+}
+
+
+// Queue only a coherent parent mapping; parsing interruption is not rejection.
+static inline bool avi_reassembly_checkpoint(
+    ThreadWork *work, CarveInfo *candidate, AviCarveState *state,
+    uuid_string_t uuidp, uuid_string_t uuidc) {
+
+  if (!atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+    return false;
+  }
+  inflate_blockvector(candidate->b);
+  blockvector_set_data_length(candidate->b, state->archive_extent);
+  carve_put_state(candidate->carvehashkey, state);
+  return reassembly_time_to_checkpoint(work->id, candidate, uuidp, uuidc);
+}
+
+
+// Search decisions depend on physical candidate content, not renumbered apparent blocks.
+static inline uint64_t avi_reassembly_block_search_view(
+    const CarveInfo *candidate, const AviCarveState *state) {
+
+  uint64_t view = UINT64_C(14695981039346656037);
+  uint64_t blocks = blockvector_get_num_blocks(candidate->b);
+  const uint64_t geometry[] = {blocks, state->archive_extent,
+      state->entry_count, state->repairs};
+
+  for (size_t index = 0; index < sizeof(geometry) / sizeof(geometry[0]); index++) {
+    view = (view ^ geometry[index]) * UINT64_C(1099511628211);
+  }
+  for (uint64_t slot = 0; slot < blocks; slot++) {
+    view = (view ^ (uint64_t)blockvector_get_actual_blocknumber(candidate->b,
+                                                                slot))
+        * UINT64_C(1099511628211);
+  }
+  for (uint64_t entry = 0; entry < state->entry_count; entry++) {
+    view = (view ^ state->entries[entry].offset) * UINT64_C(1099511628211);
+    view = (view ^ state->entries[entry].id) * UINT64_C(1099511628211);
+    view = (view ^ state->entries[entry].size) * UINT64_C(1099511628211);
+  }
+  return view;
+}
+
+
+static inline bool avi_reassembly_block_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t target_slot, uint64_t image_blocks, uint64_t validates_to) {
+
+  const AviBlockSearch *search = &state->block_search;
+
+  if (!search->active || search->target_slot != target_slot
+      || search->image_blocks != image_blocks
+      || search->blocksize != scalpel_state.blocksize
+      || search->baseline_to != validates_to
+      || search->view != avi_reassembly_block_search_view(candidate, state)) {
+    return false;
+  }
+  // A newly claimed winner requires a new search rather than committing stale evidence.
+  if (search->best_actual >= 0
+      && avi_reassembly_find_actual_slot(candidate->b, search->best_actual) < 0
+      && (filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                          search->best_actual) < 0
+          || filemirror_actual_block_covered(scalpel_state.filemirror,
+                                             search->best_actual))) {
+    return false;
+  }
+  return true;
+}
+
+
+// A checkpoint resumes one indexed extension against the same physical prefix.
+static inline bool avi_reassembly_indexed_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t target_slot, uint64_t image_blocks, uint64_t validates_to) {
+
+  if (!state->indexed_search.active
+      || state->indexed_search.target_slot != target_slot
+      || state->indexed_search.image_blocks != image_blocks
+      || state->indexed_search.baseline_to != validates_to
+      || state->indexed_search.blocksize != scalpel_state.blocksize
+      || state->indexed_search.view != avi_reassembly_block_search_view(candidate, state)) {
+    return false;
+  }
+  if (state->indexed_search.best_start >= 0) {
+    for (uint64_t slot = 0; slot < state->indexed_search.best_mapped; slot++) {
+      int64_t actual = state->indexed_search.best_start + (int64_t)slot;
+      if (filemirror_apparent_blocknumber(scalpel_state.filemirror, actual) < 0
+          || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+
+static inline bool avi_reassembly_zero_gap_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t start_slot, uint64_t image_blocks, uint64_t validates_to,
+    bool require_complete) {
+
+  uint32_t index = require_complete ? 1 : 0;
+  return state->zero_gap_search[index].active
+      && state->zero_gap_search[index].view == avi_reassembly_block_search_view(candidate, state)
+      && state->zero_gap_search[index].start_slot == start_slot
+      && state->zero_gap_search[index].image_blocks == image_blocks
+      && state->zero_gap_search[index].baseline_to == validates_to
+      && state->zero_gap_search[index].blocksize == scalpel_state.blocksize;
+}
+
+
+// Ranking survives apparent renumbering; a newly claimed ranked source needs reconsideration.
+static inline bool avi_reassembly_classified_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t image_blocks, uint64_t validates_to) {
+
+  const AviClassifiedSearch *search = &state->classified_search;
+  if (!search->active || search->image_blocks != image_blocks
+      || search->baseline_to != validates_to || search->blocksize != scalpel_state.blocksize
+      || search->view != avi_reassembly_block_search_view(candidate, state)) {
+    return false;
+  }
+  for (uint32_t index = 0; index < 3 + search->fallback_count; index++) {
+    uint64_t source = index == 0 ? search->best.start
+        : index == 1 ? search->lowest_content_start
+        : index == 2 ? search->second_content_start
+        : search->fallback[index - 3].start;
+    if (source == UINT64_MAX) {
+      continue;
+    }
+    for (uint64_t block = 0; block < search->run_blocks; block++) {
+      int64_t actual = (int64_t)(source + block);
+      if (filemirror_apparent_blocknumber(scalpel_state.filemirror, actual) < 0
+          || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+        return false;
+      }
+    }
+  }
   return true;
 }
 
@@ -2701,7 +3226,7 @@ static inline bool avi_reassembly_refresh_state(
   AviLayout layout;
   AviParseResult result = avi_parse_file(data, length, UINT64_MAX, &layout);
 
-  if (result == AVI_PARSE_INVALID) {
+  if (layout.interrupted || result == AVI_PARSE_INVALID) {
     return false;
   }
   AviCarveState *refreshed = avi_capture_legacy_index(data, length, &layout);
@@ -3073,7 +3598,7 @@ static inline bool avi_reassembly_content_boundary(
 }
 
 
-static inline bool avi_reassembly_trial_classified_run(
+static inline AviTrialResult avi_reassembly_trial_classified_run(
     CarveInfo *candidate, const AviCarveState *state, uint64_t target_slot,
     uint64_t run_blocks, uint64_t start, const int64_t *saved,
     const AviContentHistogram *context_histogram,
@@ -3082,7 +3607,7 @@ static inline bool avi_reassembly_trial_classified_run(
   if (!candidate || !candidate->b || !state || !saved || !trial
       || run_blocks == 0 || start > INT64_MAX
       || run_blocks - 1 > (uint64_t)INT64_MAX - start) {
-    return false;
+    return AVI_TRIAL_ERROR;
   }
   memset(trial, 0, sizeof(*trial));
   trial->start = start;
@@ -3132,7 +3657,7 @@ static inline bool avi_reassembly_trial_classified_run(
       blockvector_set_apparent_blocknumber(
           candidate->b, target_slot + block, saved[block]);
     }
-    return false;
+    return AVI_TRIAL_ERROR;
   }
 
   AviContentHistogram source_histogram;
@@ -3162,10 +3687,12 @@ static inline bool avi_reassembly_trial_classified_run(
   }
   inflate_blockvector(candidate->b);
   blockvector_set_data_length(candidate->b, state->archive_extent);
-  avi_reassembly_validate_candidate(
-      candidate, state, &trial->validates, &trial->validates_to, NULL, NULL,
+  bool validates = false;
+  AviTrialResult validation = avi_reassembly_validate_candidate(
+      candidate, state, &validates, &trial->validates_to, NULL, NULL,
       target_slot * (uint64_t)scalpel_state.blocksize);
 
+  trial->validates = validates;
   const uint8_t *trial_data = (const uint8_t *)
       blockvector_get_data_pointer(candidate->b);
   AviLayout trial_layout;
@@ -3183,7 +3710,10 @@ static inline bool avi_reassembly_trial_classified_run(
   }
   inflate_blockvector(candidate->b);
   blockvector_set_data_length(candidate->b, state->archive_extent);
-  return true;
+  if (validation == AVI_TRIAL_INTERRUPTED || trial_layout.interrupted) {
+    return AVI_TRIAL_INTERRUPTED;
+  }
+  return validation;
 }
 
 
@@ -3239,13 +3769,13 @@ static inline bool avi_classified_run_trial_better(
 // for opaque codec payloads, where no individual block can advance the RIFF parser before the
 // complete run has been restored.
 static inline AviRunSearchResult avi_reassembly_find_classified_run(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t run_blocks, uint64_t image_blocks,
     uint64_t current_validates_to, bool allow_content_only,
     bool require_complete, uuid_string_t uuidp, uuid_string_t uuidc) {
 
   if (!work || !candidate || !*candidate || !(*candidate)->b || !state
-      || run_blocks == 0) {
+      || run_blocks == 0 || run_blocks > image_blocks) {
     return AVI_RUN_SEARCH_NO_MATCH;
   }
   uint64_t total_blocks = blockvector_get_num_blocks((*candidate)->b);
@@ -3274,12 +3804,21 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
     }
   }
 
+classified_base_parse:
+  ;
   const uint8_t *base_data = (const uint8_t *)blockvector_get_data_pointer(
       (*candidate)->b);
   uint64_t length = blockvector_get_data_length((*candidate)->b);
   AviLayout base_layout;
   AviParseResult base_result = avi_parse_file(base_data, length, 0,
                                                &base_layout);
+  if (base_layout.interrupted) {
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      free(saved);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
+    goto classified_base_parse;
+  }
   uint64_t base_index_failure = length;
   bool base_index_valid = avi_validate_indexed_prefix(
       base_data, length, state, &base_index_failure);
@@ -3318,37 +3857,52 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
   uint64_t base_content_cost = have_fine_context
       ? avi_content_histogram_cost(&fine_context, &current_content)
       : UINT64_MAX;
-  AviRunContentCandidate fallback[AVI_CONTENT_FALLBACK_RUNS];
-  uint32_t fallback_count = 0;
-  AviClassifiedRunTrial best;
-
-  memset(&best, 0, sizeof(best));
-  best.start = UINT64_MAX;
-  best.validates_to = current_validates_to;
-  best.crc_slices = base_layout.ffv1_crc_slices;
-  best.content_cost = UINT64_MAX;
-  best.distance = UINT64_MAX;
-  best.reserved = INT64_MAX;
-  uint64_t lowest_content_cost = UINT64_MAX;
-  uint64_t second_content_cost = UINT64_MAX;
-  uint64_t lowest_content_start = UINT64_MAX;
-  uint64_t lowest_content_confidence = 0;
-  int64_t lowest_content_reserved = INT64_MAX;
-  bool lowest_content_isolated = false;
+  AviClassifiedSearch *search = &state->classified_search;
+  if (!avi_reassembly_classified_search_current(*candidate, state, image_blocks,
+                                                current_validates_to)
+      || search->target_slot != target_slot || search->run_blocks != run_blocks
+      || search->allow_content_only != (uint32_t)allow_content_only
+      || search->require_complete != (uint32_t)require_complete) {
+    memset(search, 0, sizeof(*search));
+    search->view = avi_reassembly_block_search_view(*candidate, state);
+    search->target_slot = target_slot;
+    search->run_blocks = run_blocks;
+    search->image_blocks = image_blocks;
+    search->baseline_to = current_validates_to;
+    search->blocksize = scalpel_state.blocksize;
+    search->allow_content_only = allow_content_only;
+    search->require_complete = require_complete;
+    search->owner = current_validates_to == state->archive_extent - 1 ? 1
+        : require_complete ? 2 : run_blocks > 1 ? 3 : 4;
+    search->active = 1;
+    search->best.start = UINT64_MAX;
+    search->best.validates_to = current_validates_to;
+    search->best.crc_slices = base_layout.ffv1_crc_slices;
+    search->best.content_cost = UINT64_MAX;
+    search->best.distance = UINT64_MAX;
+    search->best.reserved = INT64_MAX;
+    search->lowest_content_cost = UINT64_MAX;
+    search->second_content_cost = UINT64_MAX;
+    search->lowest_content_start = UINT64_MAX;
+    search->second_content_start = UINT64_MAX;
+    search->lowest_content_reserved = INT64_MAX;
+  }
+  if (search->active == 2) {
+    free(saved);
+    return AVI_RUN_SEARCH_NO_MATCH;
+  }
   int64_t previous_actual = target_slot > 0
       ? blockvector_get_actual_blocknumber(
             (*candidate)->b, target_slot - 1) : -1;
 
-  for (uint64_t start = 0; start + run_blocks <= image_blocks; start++) {
+  for (uint64_t start = search->next_actual; start + run_blocks <= image_blocks;
+       start++, search->next_actual = start) {
     if ((start & UINT64_C(0x3f)) == 0) {
       if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
         free(saved);
         return AVI_RUN_SEARCH_STOPPED;
       }
-      if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                               memory_order_acquire)
-          && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                            uuidc)) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
         free(saved);
         return AVI_RUN_SEARCH_STOPPED;
       }
@@ -3394,8 +3948,8 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
                                           &source_histogram);
       }
       if (cost != UINT64_MAX) {
-        if (fallback_count < AVI_CONTENT_FALLBACK_RUNS) {
-          fallback[fallback_count++] = (AviRunContentCandidate){
+        if (search->fallback_count < AVI_CONTENT_FALLBACK_RUNS) {
+          search->fallback[search->fallback_count++] = (AviRunContentCandidate){
               .start = start,
               .cost = cost
           };
@@ -3403,17 +3957,17 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
         else {
           uint32_t worst = 0;
 
-          for (uint32_t index = 1; index < fallback_count; index++) {
-            if (fallback[index].cost > fallback[worst].cost
-                || (fallback[index].cost == fallback[worst].cost
-                    && fallback[index].start > fallback[worst].start)) {
+          for (uint32_t index = 1; index < search->fallback_count; index++) {
+            if (search->fallback[index].cost > search->fallback[worst].cost
+                || (search->fallback[index].cost == search->fallback[worst].cost
+                    && search->fallback[index].start > search->fallback[worst].start)) {
               worst = index;
             }
           }
-          if (cost < fallback[worst].cost
-              || (cost == fallback[worst].cost
-                  && start < fallback[worst].start)) {
-            fallback[worst] = (AviRunContentCandidate){
+          if (cost < search->fallback[worst].cost
+              || (cost == search->fallback[worst].cost
+                  && start < search->fallback[worst].start)) {
+            search->fallback[worst] = (AviRunContentCandidate){
                 .start = start,
                 .cost = cost
             };
@@ -3423,34 +3977,46 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
       continue;
     }
 
+classified_source_retry:
+    ;
     AviClassifiedRunTrial trial;
-
-    if (!avi_reassembly_trial_classified_run(
-            *candidate, state, target_slot, run_blocks, start, saved,
-            &fine_context, &trial)) {
+    AviTrialResult result = avi_reassembly_trial_classified_run(
+        *candidate, state, target_slot, run_blocks, start, saved,
+        &fine_context, &trial);
+    if (result == AVI_TRIAL_INTERRUPTED) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        free(saved);
+        return AVI_RUN_SEARCH_STOPPED;
+      }
+      goto classified_source_retry;
+    }
+    if (result != AVI_TRIAL_READY) {
       continue;
     }
     if (trial.validates_to >= current_validates_to
         && trial.content_cost != UINT64_MAX && trial.isolated) {
-      if (trial.reserved < lowest_content_reserved) {
-        lowest_content_reserved = trial.reserved;
-        second_content_cost = UINT64_MAX;
-        lowest_content_cost = trial.content_cost;
-        lowest_content_start = trial.start;
-        lowest_content_confidence = trial.confidence;
-        lowest_content_isolated = trial.isolated;
+      if (trial.reserved < search->lowest_content_reserved) {
+        search->lowest_content_reserved = trial.reserved;
+        search->second_content_cost = UINT64_MAX;
+        search->second_content_start = UINT64_MAX;
+        search->lowest_content_cost = trial.content_cost;
+        search->lowest_content_start = trial.start;
+        search->lowest_content_confidence = trial.confidence;
+        search->lowest_content_isolated = trial.isolated;
       }
-      else if (trial.reserved == lowest_content_reserved
-               && trial.content_cost < lowest_content_cost) {
-        second_content_cost = lowest_content_cost;
-        lowest_content_cost = trial.content_cost;
-        lowest_content_start = trial.start;
-        lowest_content_confidence = trial.confidence;
-        lowest_content_isolated = trial.isolated;
+      else if (trial.reserved == search->lowest_content_reserved
+               && trial.content_cost < search->lowest_content_cost) {
+        search->second_content_cost = search->lowest_content_cost;
+        search->second_content_start = search->lowest_content_start;
+        search->lowest_content_cost = trial.content_cost;
+        search->lowest_content_start = trial.start;
+        search->lowest_content_confidence = trial.confidence;
+        search->lowest_content_isolated = trial.isolated;
       }
-      else if (trial.reserved == lowest_content_reserved
-               && trial.content_cost < second_content_cost) {
-        second_content_cost = trial.content_cost;
+      else if (trial.reserved == search->lowest_content_reserved
+               && trial.content_cost < search->second_content_cost) {
+        search->second_content_cost = trial.content_cost;
+        search->second_content_start = trial.start;
       }
     }
     bool complete_trial = trial.validates
@@ -3458,41 +4024,58 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
 
     if ((!require_complete || complete_trial)
         && avi_classified_run_trial_better(
-            &trial, &best, allow_content_only, base_complete,
+            &trial, &search->best, allow_content_only, base_complete,
             base_layout.ffv1_crc_slices, current_validates_to)) {
-      best = trial;
+      search->best = trial;
     }
   }
 
-  for (uint32_t index = 0; index < fallback_count; index++) {
+  for (uint32_t index = search->fallback_next; index < search->fallback_count;
+       index++, search->fallback_next = index) {
+classified_fallback_retry:
+    ;
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      free(saved);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
     AviClassifiedRunTrial trial;
-
-    if (!avi_reassembly_trial_classified_run(
-            *candidate, state, target_slot, run_blocks,
-            fallback[index].start, saved, &fine_context, &trial)) {
+    AviTrialResult result = avi_reassembly_trial_classified_run(
+        *candidate, state, target_slot, run_blocks,
+        search->fallback[index].start, saved, &fine_context, &trial);
+    if (result == AVI_TRIAL_INTERRUPTED) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        free(saved);
+        return AVI_RUN_SEARCH_STOPPED;
+      }
+      goto classified_fallback_retry;
+    }
+    if (result != AVI_TRIAL_READY) {
       continue;
     }
     if (trial.validates_to >= current_validates_to
         && trial.content_cost != UINT64_MAX && trial.isolated) {
-      if (trial.reserved < lowest_content_reserved) {
-        lowest_content_reserved = trial.reserved;
-        second_content_cost = UINT64_MAX;
-        lowest_content_cost = trial.content_cost;
-        lowest_content_start = trial.start;
-        lowest_content_confidence = trial.confidence;
-        lowest_content_isolated = trial.isolated;
+      if (trial.reserved < search->lowest_content_reserved) {
+        search->lowest_content_reserved = trial.reserved;
+        search->second_content_cost = UINT64_MAX;
+        search->second_content_start = UINT64_MAX;
+        search->lowest_content_cost = trial.content_cost;
+        search->lowest_content_start = trial.start;
+        search->lowest_content_confidence = trial.confidence;
+        search->lowest_content_isolated = trial.isolated;
       }
-      else if (trial.reserved == lowest_content_reserved
-               && trial.content_cost < lowest_content_cost) {
-        second_content_cost = lowest_content_cost;
-        lowest_content_cost = trial.content_cost;
-        lowest_content_start = trial.start;
-        lowest_content_confidence = trial.confidence;
-        lowest_content_isolated = trial.isolated;
+      else if (trial.reserved == search->lowest_content_reserved
+               && trial.content_cost < search->lowest_content_cost) {
+        search->second_content_cost = search->lowest_content_cost;
+        search->second_content_start = search->lowest_content_start;
+        search->lowest_content_cost = trial.content_cost;
+        search->lowest_content_start = trial.start;
+        search->lowest_content_confidence = trial.confidence;
+        search->lowest_content_isolated = trial.isolated;
       }
-      else if (trial.reserved == lowest_content_reserved
-               && trial.content_cost < second_content_cost) {
-        second_content_cost = trial.content_cost;
+      else if (trial.reserved == search->lowest_content_reserved
+               && trial.content_cost < search->second_content_cost) {
+        search->second_content_cost = trial.content_cost;
+        search->second_content_start = trial.start;
       }
     }
     bool complete_trial = trial.validates
@@ -3500,13 +4083,14 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
 
     if ((!require_complete || complete_trial)
         && avi_classified_run_trial_better(
-            &trial, &best, allow_content_only, base_complete,
+            &trial, &search->best, allow_content_only, base_complete,
             base_layout.ffv1_crc_slices, current_validates_to)) {
-      best = trial;
+      search->best = trial;
     }
   }
 
-  if (best.start == UINT64_MAX) {
+  if (search->best.start == UINT64_MAX) {
+    search->active = 2;
     if (scalpel_state.mode_verbose) {
       lock_fprintf(stdout,
                    "AVI classified run unavailable: target=%" PRIu64
@@ -3514,18 +4098,18 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
                    " content-cost=%" PRIu64 " second=%" PRIu64
                    " confidence=%" PRIu64 " reservations=%" PRId64
                    " isolated=%s.\n",
-                   target_slot, run_blocks, lowest_content_start,
-                   lowest_content_cost, second_content_cost,
-                   lowest_content_confidence, lowest_content_reserved,
-                   lowest_content_isolated ? "true" : "false");
+                   target_slot, run_blocks, search->lowest_content_start,
+                   search->lowest_content_cost, search->second_content_cost,
+                   search->lowest_content_confidence, search->lowest_content_reserved,
+                   search->lowest_content_isolated ? "true" : "false");
     }
     free(saved);
     return AVI_RUN_SEARCH_NO_MATCH;
   }
 
-  bool content_only = !best.validates
-      && best.validates_to <= current_validates_to
-      && best.crc_slices <= base_layout.ffv1_crc_slices;
+  bool content_only = !search->best.validates
+      && search->best.validates_to <= current_validates_to
+      && search->best.crc_slices <= base_layout.ffv1_crc_slices;
 
   // Content similarity can order opaque payload hypotheses only when the target is a literal zero
   // run. Nonzero payload blocks require structural, index, or codec evidence before replacement.
@@ -3533,12 +4117,13 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
       && (!allow_content_only
           || !target_all_zero
           || base_content_cost == UINT64_MAX
-          || best.content_cost == UINT64_MAX
-          || best.content_cost * AVI_CONTENT_RATIO_DENOMINATOR
+          || search->best.content_cost == UINT64_MAX
+          || search->best.content_cost * AVI_CONTENT_RATIO_DENOMINATOR
                  > base_content_cost * AVI_CONTENT_RATIO_NUMERATOR
-          || (second_content_cost != UINT64_MAX
-              && best.content_cost * AVI_CONTENT_RATIO_DENOMINATOR
-                     > second_content_cost * AVI_CONTENT_RATIO_NUMERATOR))) {
+          || (search->second_content_cost != UINT64_MAX
+              && search->best.content_cost * AVI_CONTENT_RATIO_DENOMINATOR
+                     > search->second_content_cost * AVI_CONTENT_RATIO_NUMERATOR))) {
+    search->active = 2;
     if (scalpel_state.mode_verbose) {
       lock_fprintf(stdout,
                    "AVI classified run rejected: target=%" PRIu64
@@ -3546,45 +4131,66 @@ static inline AviRunSearchResult avi_reassembly_find_classified_run(
                    " base-cost=%" PRIu64 " content-cost=%" PRIu64
                    " second=%" PRIu64 " confidence=%" PRIu64
                    " reservations=%" PRId64 " isolated=%s.\n",
-                   target_slot, run_blocks, best.start, base_content_cost,
-                   best.content_cost, second_content_cost, best.confidence,
-                   best.reserved, best.isolated ? "true" : "false");
+                   target_slot, run_blocks, search->best.start, base_content_cost,
+                   search->best.content_cost, search->second_content_cost, search->best.confidence,
+                   search->best.reserved, search->best.isolated ? "true" : "false");
     }
     free(saved);
     return AVI_RUN_SEARCH_NO_MATCH;
   }
 
+classified_apply_retry:
   for (uint64_t block = 0; block < run_blocks; block++) {
     int64_t apparent = filemirror_apparent_blocknumber(
-        scalpel_state.filemirror, (int64_t)(best.start + block));
+        scalpel_state.filemirror, (int64_t)(search->best.start + block));
 
     if (apparent < 0
         || filemirror_actual_block_covered(
-            scalpel_state.filemirror, (int64_t)(best.start + block))
+            scalpel_state.filemirror, (int64_t)(search->best.start + block))
         || avi_reassembly_find_actual_slot(
-            (*candidate)->b, (int64_t)(best.start + block)) >= 0) {
+            (*candidate)->b, (int64_t)(search->best.start + block)) >= 0) {
       free(saved);
       return AVI_RUN_SEARCH_NO_MATCH;
     }
-    blockvector_set_apparent_blocknumber(
-        (*candidate)->b, target_slot + block, apparent);
+  }
+  for (uint64_t block = 0; block < run_blocks; block++) {
+    int64_t apparent = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, (int64_t)(search->best.start + block));
+    blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + block, apparent);
   }
   inflate_blockvector((*candidate)->b);
   blockvector_set_data_length((*candidate)->b, state->archive_extent);
   bool validates = false;
   uint64_t validates_to = 0;
 
-  avi_reassembly_validate_candidate(
+  AviTrialResult validation = avi_reassembly_validate_candidate(
       *candidate, state, &validates, &validates_to, NULL, NULL,
       target_slot * (uint64_t)scalpel_state.blocksize);
+  if (validation != AVI_TRIAL_READY) {
+    for (uint64_t block = 0; block < run_blocks; block++) {
+      blockvector_set_apparent_blocknumber(
+          (*candidate)->b, target_slot + block, saved[block]);
+    }
+    inflate_blockvector((*candidate)->b);
+    blockvector_set_data_length((*candidate)->b, state->archive_extent);
+    if (validation == AVI_TRIAL_INTERRUPTED) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        free(saved);
+        return AVI_RUN_SEARCH_STOPPED;
+      }
+      goto classified_apply_retry;
+    }
+    free(saved);
+    return AVI_RUN_SEARCH_NO_MATCH;
+  }
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout,
                  "AVI classified run: target=%" PRIu64
                  " source=%" PRIu64 " blocks=%" PRIu64
                  " advances to=%" PRIu64 " CRC slices=%" PRIu64
                  " content-cost=%" PRIu64 " reservations=%" PRId64 ".\n",
-                 target_slot, best.start, run_blocks, validates_to,
-                 best.crc_slices, best.content_cost, best.reserved);
+                 target_slot, search->best.start, run_blocks, validates_to,
+                 search->best.crc_slices, search->best.content_cost, search->best.reserved);
   }
   free(saved);
   if (validates) {
@@ -3639,12 +4245,15 @@ static inline int64_t avi_reassembly_find_apparent_slot(
 
 // Rotate a physically shifted suffix as one unit. The mapping is restored unless the complete file
 // validates or the caller explicitly requests retention of a strictly better partial result.
-static inline bool avi_reassembly_rotate_suffix(
+static inline bool avi_reassembly_rotate_suffix_trial(
     CarveInfo *candidate, const AviCarveState *state,
     uint64_t target_slot, uint64_t shift, uint64_t image_blocks,
     uint64_t required_validates_to, bool retain_partial,
-    bool *validates, uint64_t *validates_to) {
+    bool *validates, uint64_t *validates_to, bool *interrupted) {
 
+  if (interrupted) {
+    *interrupted = false;
+  }
   if (!candidate || !candidate->b || !state || !validates
       || !validates_to) {
     return false;
@@ -3743,9 +4352,13 @@ static inline bool avi_reassembly_rotate_suffix(
   if (available) {
     inflate_blockvector(candidate->b);
     blockvector_set_data_length(candidate->b, state->archive_extent);
-    parsed = avi_reassembly_validate_candidate(
+    AviTrialResult result = avi_reassembly_validate_candidate(
         candidate, state, validates, validates_to, NULL, NULL,
         target_slot * (uint64_t)scalpel_state.blocksize);
+    parsed = result == AVI_TRIAL_READY;
+    if (interrupted) {
+      *interrupted = result == AVI_TRIAL_INTERRUPTED;
+    }
   }
   bool retained = parsed
       && (*validates
@@ -3764,10 +4377,22 @@ static inline bool avi_reassembly_rotate_suffix(
 }
 
 
+static inline bool avi_reassembly_rotate_suffix(
+    CarveInfo *candidate, const AviCarveState *state,
+    uint64_t target_slot, uint64_t shift, uint64_t image_blocks,
+    uint64_t required_validates_to, bool retain_partial,
+    bool *validates, uint64_t *validates_to) {
+
+  return avi_reassembly_rotate_suffix_trial(candidate, state, target_slot,
+      shift, image_blocks, required_validates_to, retain_partial,
+      validates, validates_to, NULL);
+}
+
+
 // A zero run states an exact possible gap width. Prefer a repair that reaches the complete declared
 // extent, while allowing the caller to make a second pass that retains structural progress.
 static inline AviRunSearchResult avi_reassembly_find_zero_gap(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t start_slot, uint64_t image_blocks,
     uint64_t current_validates_to, bool require_complete,
     uint64_t *repair_slot, uuid_string_t uuidp, uuid_string_t uuidc) {
@@ -3777,13 +4402,34 @@ static inline AviRunSearchResult avi_reassembly_find_zero_gap(
     return AVI_RUN_SEARCH_NO_MATCH;
   }
   uint64_t total_blocks = blockvector_get_num_blocks((*candidate)->b);
-  uint64_t search_slot = start_slot;
+  uint32_t index = require_complete ? 1 : 0;
+  if (start_slot >= total_blocks) {
+    return AVI_RUN_SEARCH_NO_MATCH;
+  }
+  if (!avi_reassembly_zero_gap_search_current(*candidate, state, start_slot,
+                                             image_blocks, current_validates_to,
+                                             require_complete)) {
+    memset(&state->zero_gap_search[index], 0, sizeof(state->zero_gap_search[index]));
+    state->zero_gap_search[index].view = avi_reassembly_block_search_view(*candidate, state);
+    state->zero_gap_search[index].start_slot = start_slot;
+    state->zero_gap_search[index].next_slot = start_slot;
+    state->zero_gap_search[index].image_blocks = image_blocks;
+    state->zero_gap_search[index].baseline_to = current_validates_to;
+    state->zero_gap_search[index].blocksize = scalpel_state.blocksize;
+    state->zero_gap_search[index].active = 1;
+  }
+  uint64_t search_slot = state->zero_gap_search[index].next_slot;
   uint64_t suspect_slot = 0;
   uint64_t suspect_blocks = 0;
 
   while (avi_reassembly_find_suspect_run(
              *candidate, search_slot, &suspect_slot, &suspect_blocks)) {
+    state->zero_gap_search[index].next_slot = suspect_slot;
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      return AVI_RUN_SEARCH_STOPPED;
+    }
     uint64_t zero_blocks = 0;
+    bool interrupted = false;
 
     while (suspect_slot + zero_blocks < total_blocks) {
       int64_t actual = blockvector_get_actual_blocknumber(
@@ -3804,10 +4450,10 @@ static inline AviRunSearchResult avi_reassembly_find_zero_gap(
       if (require_complete && state->archive_extent > 1) {
         required_validates_to = state->archive_extent - 2;
       }
-      if (avi_reassembly_rotate_suffix(
+      if (avi_reassembly_rotate_suffix_trial(
               *candidate, state, suspect_slot, zero_blocks, image_blocks,
               required_validates_to, true, &gap_validates,
-              &gap_validates_to)) {
+              &gap_validates_to, &interrupted)) {
         if (scalpel_state.mode_verbose) {
           lock_fprintf(stdout,
                        "AVI zero-gap suffix: target=%" PRIu64
@@ -3824,24 +4470,71 @@ static inline AviRunSearchResult avi_reassembly_find_zero_gap(
         return AVI_RUN_SEARCH_IMPROVED;
       }
     }
-    search_slot = suspect_slot + suspect_blocks;
+    // Rotation restores the parent on interruption; retry this unfinished width.
+    if (!interrupted) {
+      search_slot = suspect_slot + suspect_blocks;
+      state->zero_gap_search[index].next_slot = search_slot;
+    }
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      return AVI_RUN_SEARCH_STOPPED;
+    }
     if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
       return AVI_RUN_SEARCH_STOPPED;
     }
-    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)
-        && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                          uuidc)) {
-      return AVI_RUN_SEARCH_STOPPED;
-    }
   }
+  state->zero_gap_search[index].next_slot = total_blocks;
   return AVI_RUN_SEARCH_NO_MATCH;
 }
 
 
 // A whole-block gap shifts every later chunk header by the same amount. Use index entries as anchors
 // to identify possible shifts, then require the repaired candidate to pass normal AVI validation.
+static inline bool avi_reassembly_shift_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t image_blocks, uint64_t validates_to, uint64_t repair_end) {
+
+  const AviShiftSearch *search = &state->shift_search;
+  if (!search->phase || search->image_blocks != image_blocks
+      || search->baseline_to != validates_to || search->repair_end != repair_end
+      || search->blocksize != scalpel_state.blocksize
+      || search->view != avi_reassembly_block_search_view(candidate, state)) {
+    return false;
+  }
+  int64_t tail = blockvector_get_actual_blocknumber(candidate->b,
+      blockvector_get_num_blocks(candidate->b) - 1);
+  for (uint64_t index = 0; index < search->best_shift; index++) {
+    if (tail < 0 || (uint64_t)tail >= image_blocks
+        || index >= image_blocks - (uint64_t)tail - 1) {
+      return false;
+    }
+    int64_t actual = tail + 1 + (int64_t)index;
+    if (filemirror_apparent_blocknumber(scalpel_state.filemirror, actual) < 0
+        && !filemirror_actual_block_is_zero(scalpel_state.filemirror, actual)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+
+static inline bool avi_reassembly_shift_matches(
+    const uint8_t *data, uint64_t length, const AviStateIndexEntry *entry,
+    uint64_t shift) {
+
+  uint64_t bytes;
+  uint64_t offset;
+  return data
+      && !__builtin_mul_overflow(shift, (uint64_t)scalpel_state.blocksize, &bytes)
+      && !__builtin_add_overflow(entry->offset, bytes, &offset)
+      && avi_range_available(length, offset, AVI_CHUNK_HEADER_SIZE)
+      && avi_read_le32(data + offset) == entry->id
+      && avi_read_le32(data + offset + 4) == entry->size;
+}
+
+
+// Keep the trial cursor and winner; reconstruct only the cheap duplicate-shift index on restore.
 static inline AviRunSearchResult avi_reassembly_find_shifted_suffix(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t image_blocks, uint64_t current_validates_to,
     uint64_t repair_end, uuid_string_t uuidp, uuid_string_t uuidc) {
 
@@ -3854,250 +4547,155 @@ static inline AviRunSearchResult avi_reassembly_find_shifted_suffix(
     return AVI_RUN_SEARCH_NO_MATCH;
   }
   uint64_t possible_shifts = total_blocks - target_slot;
-  if (possible_shifts > SIZE_MAX) {
+  uint64_t length = blockvector_get_data_length((*candidate)->b);
+  if (possible_shifts > SIZE_MAX
+      || (!state->entry_count && (!repair_end || repair_end > length))) {
     return AVI_RUN_SEARCH_NO_MATCH;
   }
-  if (state->entry_count == 0) {
-    uint64_t length = blockvector_get_data_length((*candidate)->b);
-    uint64_t best_shift = 0;
-    uint64_t best_validates_to = current_validates_to;
-
-    if (!blockvector_get_data_pointer((*candidate)->b)
-        || repair_end == 0 || repair_end > length) {
-      return AVI_RUN_SEARCH_NO_MATCH;
-    }
-    for (uint64_t shift = 1; shift < possible_shifts; shift++) {
-      if ((shift & UINT64_C(0x3f)) == 0) {
-        if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-          return AVI_RUN_SEARCH_STOPPED;
-        }
-        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                 memory_order_acquire)
-            && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                              uuidc)) {
-          return AVI_RUN_SEARCH_STOPPED;
-        }
-      }
-      uint64_t shift_bytes;
-      uint64_t anchor_offset;
-
-      if (__builtin_mul_overflow(shift,
-                                 (uint64_t)scalpel_state.blocksize,
-                                 &shift_bytes)
-          || __builtin_add_overflow(repair_end, shift_bytes, &anchor_offset)
-          || !avi_range_available(length, anchor_offset,
-                                  AVI_CHUNK_HEADER_SIZE)) {
-        continue;
-      }
-      const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer(
-          (*candidate)->b);
-
-      if (!data) {
-        return AVI_RUN_SEARCH_NO_MATCH;
-      }
-      uint32_t anchor_id = avi_read_le32(data + anchor_offset);
-      uint32_t anchor_size = avi_read_le32(data + anchor_offset + 4);
-
-      if ((!avi_is_media_chunk(anchor_id)
-           && anchor_id != AVI_FOURCC('L', 'I', 'S', 'T')
-           && anchor_id != AVI_FOURCC('J', 'U', 'N', 'K')
-           && anchor_id != AVI_FOURCC('i', 'd', 'x', '1'))
-          || anchor_size > state->archive_extent
-          || (anchor_id == AVI_FOURCC('L', 'I', 'S', 'T')
-              && anchor_size < sizeof(uint32_t))) {
-        continue;
-      }
-      bool validates = false;
-      uint64_t validates_to = 0;
-      bool retained = avi_reassembly_rotate_suffix(
-          *candidate, state, target_slot, shift, image_blocks,
-          current_validates_to, false, &validates, &validates_to);
-
-      if (retained && validates) {
-        return AVI_RUN_SEARCH_VALIDATED;
-      }
-      if (validates_to >= repair_end - 1
-          && validates_to > best_validates_to) {
-        best_shift = shift;
-        best_validates_to = validates_to;
-      }
-    }
-    if (best_shift > 0) {
-      bool validates = false;
-      uint64_t validates_to = 0;
-
-      if (avi_reassembly_rotate_suffix(
-              *candidate, state, target_slot, best_shift, image_blocks,
-              current_validates_to, true, &validates, &validates_to)) {
-        if (scalpel_state.mode_verbose) {
-          lock_fprintf(stdout,
-                       "AVI shifted suffix: target=%" PRIu64
-                       " shift=%" PRIu64 " advances to=%" PRIu64 ".\n",
-                       target_slot, best_shift, validates_to);
-        }
-        if (validates) {
-          return AVI_RUN_SEARCH_VALIDATED;
-        }
-        if (validates_to == state->archive_extent - 1) {
-          return AVI_RUN_SEARCH_COMPLETE;
-        }
-        return AVI_RUN_SEARCH_IMPROVED;
-      }
-    }
+  AviShiftSearch *search = &state->shift_search;
+  if (!avi_reassembly_shift_search_current(*candidate, state, image_blocks,
+                                            current_validates_to, repair_end)
+      || search->target_slot != target_slot) {
+    uint32_t owner = search->owner == 1 ? 1 : 2;
+    uint64_t classified_slot = search->classified_slot;
+    *search = (AviShiftSearch){
+        .view = avi_reassembly_block_search_view(*candidate, state),
+        .target_slot = target_slot, .image_blocks = image_blocks,
+        .baseline_to = current_validates_to, .repair_end = repair_end,
+        .next_shift = 1, .best_validates_to = current_validates_to,
+        .classified_slot = classified_slot, .blocksize = scalpel_state.blocksize,
+        .phase = state->entry_count ? 1 : 2, .owner = owner};
+  }
+  if (search->phase == 5) {
     return AVI_RUN_SEARCH_NO_MATCH;
   }
   uint8_t *tried = (uint8_t *)calloc((size_t)possible_shifts, 1);
+  check_memory_allocation(tried, __LINE__, __FILE__, "AVI shifted suffix candidates");
 
-  check_memory_allocation(tried, __LINE__, __FILE__,
-                          "AVI shifted suffix candidates");
-  uint64_t anchors_examined = 0;
-  uint64_t best_shift = 0;
-  uint64_t best_validates_to = current_validates_to;
-
-  for (uint64_t entry_index = 0; entry_index < state->entry_count;
-       entry_index++) {
-    const AviStateIndexEntry *entry = &state->entries[entry_index];
-
-    if (entry->offset <= current_validates_to
-        || !avi_range_available(state->archive_extent, entry->offset,
-                                AVI_CHUNK_HEADER_SIZE)) {
+  // A completed trial is identified by an earlier matching index entry, or an earlier shift
+  // at the saved entry. Rebuilding these flags never repeats codec validation.
+  const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer((*candidate)->b);
+  for (uint64_t entry = 0; entry < state->entry_count && entry <= search->next_entry;
+       entry++) {
+    const AviStateIndexEntry *anchor = &state->entries[entry];
+    if (anchor->offset <= current_validates_to
+        || !avi_range_available(state->archive_extent, anchor->offset, AVI_CHUNK_HEADER_SIZE)) {
       continue;
     }
-    for (uint64_t shift = 1; shift < possible_shifts; shift++) {
-      uint64_t shift_bytes;
-      uint64_t shifted_offset;
-
-      if (tried[shift]
-          || __builtin_mul_overflow(shift,
-                                    (uint64_t)scalpel_state.blocksize,
-                                    &shift_bytes)
-          || __builtin_add_overflow(entry->offset, shift_bytes,
-                                    &shifted_offset)
-          || !avi_range_available(state->archive_extent, shifted_offset,
-                                  AVI_CHUNK_HEADER_SIZE)) {
-        continue;
-      }
-      const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer(
-          (*candidate)->b);
-
-      if (!data || avi_read_le32(data + shifted_offset) != entry->id
-          || avi_read_le32(data + shifted_offset + 4) != entry->size) {
-        continue;
-      }
-      tried[shift] = 1;
-
-      bool validates = false;
-      uint64_t validates_to = 0;
-      bool retained = avi_reassembly_rotate_suffix(
-          *candidate, state, target_slot, shift, image_blocks,
-          current_validates_to, false, &validates, &validates_to);
-
-      if (retained && validates) {
-        free(tried);
-        return AVI_RUN_SEARCH_VALIDATED;
-      }
-      if (!validates && validates_to == state->archive_extent - 1
-          && avi_reassembly_rotate_suffix(
-              *candidate, state, target_slot, shift, image_blocks,
-              current_validates_to, true, &validates, &validates_to)) {
-        free(tried);
-        return AVI_RUN_SEARCH_COMPLETE;
-      }
-      if (validates_to > best_validates_to) {
-        best_shift = shift;
-        best_validates_to = validates_to;
-      }
-    }
-
-    anchors_examined++;
-    if ((anchors_examined & UINT64_C(0x3f)) == 0) {
-      if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-        free(tried);
-        return AVI_RUN_SEARCH_STOPPED;
-      }
-      if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                               memory_order_acquire)
-          && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                            uuidc)) {
-        free(tried);
-        return AVI_RUN_SEARCH_STOPPED;
+    uint64_t end = entry < search->next_entry ? possible_shifts : search->next_shift;
+    for (uint64_t shift = 1; shift < end; shift++) {
+      if (avi_reassembly_shift_matches(data, state->archive_extent, anchor, shift)) {
+        tried[shift] = 1;
       }
     }
   }
 
-  // A late gap can lie beyond the final captured index entry. In that case, the end of the damaged
-  // codec-validated frame provides the same shifted chunk-header anchor used by unindexed AVIs.
-  if (best_shift == 0 && repair_end > 0
-      && repair_end <= state->archive_extent) {
-    for (uint64_t shift = 1; shift < possible_shifts; shift++) {
-      uint64_t shift_bytes;
-      uint64_t anchor_offset;
-
-      if (tried[shift]
-          || __builtin_mul_overflow(shift,
-                                    (uint64_t)scalpel_state.blocksize,
-                                    &shift_bytes)
-          || __builtin_add_overflow(repair_end, shift_bytes,
-                                    &anchor_offset)
-          || !avi_range_available(state->archive_extent, anchor_offset,
-                                  AVI_CHUNK_HEADER_SIZE)) {
-        continue;
+  while (search->phase <= 2) {
+    if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+      free(tried);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      free(tried);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
+    if (search->phase == 1 && search->next_entry == state->entry_count) {
+      search->phase = search->best_shift ? 3 : 2;
+      search->next_shift = 1;
+      continue;
+    }
+    if (search->next_shift == possible_shifts) {
+      if (search->phase == 1) {
+        search->next_entry++;
+        search->next_shift = 1;
       }
-      const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer(
-          (*candidate)->b);
-
-      if (!data) {
-        free(tried);
-        return AVI_RUN_SEARCH_NO_MATCH;
+      else {
+        search->phase = 3;
       }
-      uint32_t anchor_id = avi_read_le32(data + anchor_offset);
-      uint32_t anchor_size = avi_read_le32(data + anchor_offset + 4);
-
-      if ((!avi_is_media_chunk(anchor_id)
-           && anchor_id != AVI_FOURCC('L', 'I', 'S', 'T')
-           && anchor_id != AVI_FOURCC('J', 'U', 'N', 'K')
-           && anchor_id != AVI_FOURCC('i', 'd', 'x', '1'))
-          || anchor_size > state->archive_extent
-          || (anchor_id == AVI_FOURCC('L', 'I', 'S', 'T')
-              && anchor_size < sizeof(uint32_t))) {
-        continue;
-      }
-      tried[shift] = 1;
-      bool validates = false;
-      uint64_t validates_to = 0;
-      bool retained = avi_reassembly_rotate_suffix(
-          *candidate, state, target_slot, shift, image_blocks,
-          current_validates_to, false, &validates, &validates_to);
-
-      if (retained && validates) {
-        free(tried);
-        return AVI_RUN_SEARCH_VALIDATED;
-      }
-      if (validates_to >= repair_end - 1
-          && validates_to > best_validates_to) {
-        best_shift = shift;
-        best_validates_to = validates_to;
+      continue;
+    }
+    uint64_t shift = search->next_shift;
+    data = (const uint8_t *)blockvector_get_data_pointer((*candidate)->b);
+    bool anchor_matches = false;
+    if (data && !tried[shift] && search->phase == 1) {
+      const AviStateIndexEntry *entry = &state->entries[search->next_entry];
+      anchor_matches = entry->offset > current_validates_to
+          && avi_range_available(state->archive_extent, entry->offset, AVI_CHUNK_HEADER_SIZE)
+          && avi_reassembly_shift_matches(data, state->archive_extent, entry, shift);
+    }
+    else if (data && !tried[shift] && search->phase == 2 && repair_end
+             && repair_end <= state->archive_extent) {
+      uint64_t bytes;
+      uint64_t offset;
+      if (!__builtin_mul_overflow(shift, (uint64_t)scalpel_state.blocksize, &bytes)
+          && !__builtin_add_overflow(repair_end, bytes, &offset)
+          && avi_range_available(length, offset, AVI_CHUNK_HEADER_SIZE)) {
+        uint32_t id = avi_read_le32(data + offset);
+        uint32_t size = avi_read_le32(data + offset + 4);
+        anchor_matches = (avi_is_media_chunk(id) || id == AVI_FOURCC('L', 'I', 'S', 'T')
+                || id == AVI_FOURCC('J', 'U', 'N', 'K') || id == AVI_FOURCC('i', 'd', 'x', '1'))
+            && size <= state->archive_extent
+            && (id != AVI_FOURCC('L', 'I', 'S', 'T') || size >= sizeof(uint32_t));
       }
     }
-  }
-
-  if (best_shift > 0) {
+    if (!anchor_matches) {
+      search->next_shift++;
+      continue;
+    }
     bool validates = false;
+    bool interrupted = false;
     uint64_t validates_to = 0;
+    bool retained = avi_reassembly_rotate_suffix_trial(*candidate, state,
+        target_slot, shift, image_blocks, current_validates_to, false,
+        &validates, &validates_to, &interrupted);
+    if (interrupted) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        free(tried);
+        return AVI_RUN_SEARCH_STOPPED;
+      }
+      continue;
+    }
+    if (retained && validates) {
+      free(tried);
+      return AVI_RUN_SEARCH_VALIDATED;
+    }
+    tried[shift] = 1;
+    search->next_shift++;
+    if ((search->phase == 1 || validates_to >= repair_end - 1)
+        && validates_to > search->best_validates_to) {
+      search->best_shift = shift;
+      search->best_validates_to = validates_to;
+    }
+    if (search->phase == 1 && validates_to == state->archive_extent - 1) {
+      search->phase = 4;
+    }
+  }
 
-    if (avi_reassembly_rotate_suffix(
-            *candidate, state, target_slot, best_shift, image_blocks,
-            current_validates_to, true, &validates, &validates_to)) {
+  while (search->best_shift) {
+    bool validates = false;
+    bool interrupted = false;
+    uint64_t validates_to = 0;
+    bool retained = avi_reassembly_rotate_suffix_trial(*candidate, state,
+        target_slot, search->best_shift, image_blocks, current_validates_to, true,
+        &validates, &validates_to, &interrupted);
+    if (interrupted) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        free(tried);
+        return AVI_RUN_SEARCH_STOPPED;
+      }
+      continue;
+    }
+    if (retained) {
       free(tried);
       if (validates) {
         return AVI_RUN_SEARCH_VALIDATED;
       }
-      if (validates_to == state->archive_extent - 1) {
-        return AVI_RUN_SEARCH_COMPLETE;
-      }
-      return AVI_RUN_SEARCH_IMPROVED;
+      return validates_to == state->archive_extent - 1
+          ? AVI_RUN_SEARCH_COMPLETE : AVI_RUN_SEARCH_IMPROVED;
     }
+    break;
   }
+  search->phase = 5;
   free(tried);
   return AVI_RUN_SEARCH_NO_MATCH;
 }
@@ -4249,7 +4847,7 @@ static inline uint64_t avi_reassembly_earliest_repair_slot(
 // Use the first unverified index entry to locate a displaced physical run. Mapping continues through
 // that independently described chunk header before validation decides whether the run is useful.
 static inline AviRunSearchResult avi_reassembly_find_indexed_run(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t image_blocks, uint64_t current_validates_to,
     uuid_string_t uuidp, uuid_string_t uuidc) {
 
@@ -4305,13 +4903,40 @@ static inline AviRunSearchResult avi_reassembly_find_indexed_run(
         blockvector_get_apparent_blocknumber((*candidate)->b, slot);
   }
 
-  int64_t best_start = -1;
-  uint64_t best_mapped = 0;
-  uint64_t best_validates_to = current_validates_to;
+  if (!avi_reassembly_indexed_search_current(*candidate, state, target_slot,
+                                             image_blocks, current_validates_to)) {
+    uint64_t classified_slot = state->indexed_search.classified_slot;
+    memset(&state->indexed_search, 0, sizeof(state->indexed_search));
+    state->indexed_search.view = avi_reassembly_block_search_view(*candidate, state);
+    state->indexed_search.target_slot = target_slot;
+    state->indexed_search.image_blocks = image_blocks;
+    state->indexed_search.baseline_to = current_validates_to;
+    state->indexed_search.previous_validates_to = current_validates_to;
+    state->indexed_search.best_start = -1;
+    state->indexed_search.best_validates_to = current_validates_to;
+    state->indexed_search.classified_slot = classified_slot;
+    state->indexed_search.blocksize = scalpel_state.blocksize;
+    state->indexed_search.active = 1;
+  }
+  int64_t best_start = state->indexed_search.best_start;
+  uint64_t best_mapped = state->indexed_search.best_mapped;
+  uint64_t best_validates_to = state->indexed_search.best_validates_to;
 
-  for (uint64_t start_index = 0; start_index < image_blocks;
+  for (uint64_t start_index = state->indexed_search.next_actual; start_index < image_blocks;
        start_index++) {
+    state->indexed_search.next_actual = start_index;
+    if ((start_index & 63U) == 0
+        && reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+      free(saved);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      free(saved);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
     int64_t start = (int64_t)start_index;
+    uint64_t pending_mapped = state->indexed_search.mapped;
+    state->indexed_search.mapped = 0;
     uint64_t minimum_blocks = 0;
     uint64_t corroborating_blocks = 0;
 
@@ -4342,10 +4967,52 @@ static inline AviRunSearchResult avi_reassembly_find_indexed_run(
       continue;
     }
 
-    uint64_t previous_validates_to = current_validates_to;
-    uint64_t mapped = 0;
+    uint64_t previous_validates_to = pending_mapped
+        ? state->indexed_search.previous_validates_to : current_validates_to;
+    uint64_t mapped = pending_mapped;
+    if (mapped) {
+      bool available = true;
+      for (uint64_t slot = 0; slot < mapped; slot++) {
+        int64_t actual = start + (int64_t)slot;
+        int64_t apparent = filemirror_apparent_blocknumber(scalpel_state.filemirror, actual);
+        if (apparent < 0 || avi_reassembly_find_apparent_slot((*candidate)->b, apparent) >= 0
+            || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+          available = false;
+          break;
+        }
+        blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + slot, apparent);
+      }
+      if (!available) {
+        for (uint64_t slot = 0; slot < mapped; slot++) {
+          blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + slot, saved[slot]);
+        }
+        mapped = 0;
+        state->indexed_search.mapped = 0;
+        previous_validates_to = current_validates_to;
+      }
+      else {
+        minimum_blocks = state->indexed_search.minimum_blocks;
+      }
+    }
     for (; mapped < suffix_blocks && start_index + mapped < image_blocks;
          mapped++) {
+      state->indexed_search.mapped = mapped;
+      state->indexed_search.minimum_blocks = minimum_blocks;
+      state->indexed_search.previous_validates_to = previous_validates_to;
+      if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        for (uint64_t slot = 0; slot < mapped; slot++) {
+          blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + slot, saved[slot]);
+        }
+        if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+          free(saved);
+          return AVI_RUN_SEARCH_STOPPED;
+        }
+        for (uint64_t slot = 0; slot < mapped; slot++) {
+          int64_t apparent = filemirror_apparent_blocknumber(
+              scalpel_state.filemirror, start + (int64_t)slot);
+          blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + slot, apparent);
+        }
+      }
       int64_t actual = start + (int64_t)mapped;
       int64_t apparent = filemirror_apparent_blocknumber(
           scalpel_state.filemirror, actual);
@@ -4368,11 +5035,20 @@ static inline AviRunSearchResult avi_reassembly_find_indexed_run(
       bool validates = false;
       uint64_t validates_to = 0;
 
-      if (!avi_reassembly_validate_candidate(
+      if (avi_reassembly_validate_candidate(
               *candidate, state, &validates, &validates_to, NULL, NULL,
-              target_slot * (uint64_t)scalpel_state.blocksize)) {
-        mapped++;
-        break;
+              target_slot * (uint64_t)scalpel_state.blocksize)
+              != AVI_TRIAL_READY) {
+        for (uint64_t slot = 0; slot <= mapped; slot++) {
+          blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + slot, saved[slot]);
+        }
+        inflate_blockvector((*candidate)->b);
+        blockvector_set_data_length((*candidate)->b, state->archive_extent);
+        free(saved);
+        if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+          return AVI_RUN_SEARCH_STOPPED;
+        }
+        return AVI_RUN_SEARCH_NO_MATCH;
       }
       if (validates) {
         free(saved);
@@ -4394,6 +5070,9 @@ static inline AviRunSearchResult avi_reassembly_find_indexed_run(
         best_start = start;
         best_mapped = proven_blocks;
         best_validates_to = validates_to;
+        state->indexed_search.best_start = best_start;
+        state->indexed_search.best_mapped = best_mapped;
+        state->indexed_search.best_validates_to = best_validates_to;
       }
       if (validates_to < previous_validates_to) {
         mapped++;
@@ -4447,21 +5126,11 @@ static inline AviRunSearchResult avi_reassembly_find_indexed_run(
     }
     inflate_blockvector((*candidate)->b);
     blockvector_set_data_length((*candidate)->b, state->archive_extent);
-
-    if ((start_index & UINT64_C(0x3f)) == 0) {
-      if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-        free(saved);
-        return AVI_RUN_SEARCH_STOPPED;
-      }
-      if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                               memory_order_acquire)
-          && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                            uuidc)) {
-        free(saved);
-        return AVI_RUN_SEARCH_STOPPED;
-      }
-    }
+    state->indexed_search.mapped = 0;
+    state->indexed_search.next_actual = start_index + 1;
   }
+  state->indexed_search.next_actual = image_blocks;
+  state->indexed_search.active = 2;
 
   if (best_start >= 0) {
     bool available = true;
@@ -4503,351 +5172,233 @@ static inline AviRunSearchResult avi_reassembly_find_indexed_run(
 }
 
 
-// Test displaced physical runs without committing intermediate guesses. Codec-aware validation
-// supplies the acceptance test; the original mapping is restored after every unsuccessful run.
+// Retain physical search positions while unrelated blockmap entries are renumbered.
+static inline bool avi_reassembly_displaced_search_current(
+    const CarveInfo *candidate, const AviCarveState *state,
+    uint64_t image_blocks, uint64_t validates_to, uint64_t repair_end) {
+
+  const AviDisplacedSearch *search = &state->displaced_search;
+  if (!search->phase || search->image_blocks != image_blocks
+      || search->baseline_to != validates_to || search->repair_end != repair_end
+      || search->blocksize != scalpel_state.blocksize
+      || search->view != avi_reassembly_block_search_view(candidate, state)) {
+    return false;
+  }
+  if (search->best_start >= 0) {
+    for (uint64_t slot = 0; slot < search->best_mapped; slot++) {
+      int64_t actual = search->best_start + (int64_t)slot;
+      if (filemirror_apparent_blocknumber(scalpel_state.filemirror, actual) < 0
+          || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+
+// Keep the pending probe separate from completed extensions. Temporary mappings are rolled back
+// before checkpointing, then reconstructed without repeating their completed codec checks.
 static inline AviRunSearchResult avi_reassembly_find_displaced_run(
-    ThreadWork *work, CarveInfo **candidate, const AviCarveState *state,
+    ThreadWork *work, CarveInfo **candidate, AviCarveState *state,
     uint64_t target_slot, uint64_t image_blocks, uint64_t current_validates_to,
     uint64_t repair_end, uuid_string_t uuidp, uuid_string_t uuidc) {
 
-  if (!work || !candidate || !*candidate || !(*candidate)->b || !state) {
+  if (!work || !candidate || !*candidate || !(*candidate)->b || !state
+      || !scalpel_state.blocksize) {
     return AVI_RUN_SEARCH_NO_MATCH;
   }
   uint64_t total_blocks = blockvector_get_num_blocks((*candidate)->b);
-  if (target_slot >= total_blocks) {
+  if (!target_slot || target_slot >= total_blocks) {
     return AVI_RUN_SEARCH_NO_MATCH;
   }
   uint64_t suffix_blocks = total_blocks - target_slot;
   if (suffix_blocks > SIZE_MAX / sizeof(int64_t)) {
     return AVI_RUN_SEARCH_NO_MATCH;
   }
-  int64_t *saved = (int64_t *)malloc(
-      (size_t)suffix_blocks * sizeof(int64_t));
-
-  check_memory_allocation(saved, __LINE__, __FILE__,
-                          "AVI displaced run");
-  for (uint64_t slot = target_slot; slot < total_blocks; slot++) {
-    saved[slot - target_slot] =
-        blockvector_get_apparent_blocknumber((*candidate)->b, slot);
+  AviDisplacedSearch *search = &state->displaced_search;
+  if (!avi_reassembly_displaced_search_current(*candidate, state, image_blocks,
+                                                current_validates_to, repair_end)
+      || search->target_slot != target_slot) {
+    uint64_t interval_end = repair_end;
+    uint64_t suspect_blocks = avi_reassembly_suspect_run(*candidate, target_slot);
+    if (interval_end <= current_validates_to + 1) {
+      for (uint64_t entry = 0; entry < state->entry_count; entry++) {
+        if (state->entries[entry].offset > current_validates_to + 1) {
+          interval_end = state->entries[entry].offset;
+          break;
+        }
+      }
+    }
+    *search = (AviDisplacedSearch){
+        .view = avi_reassembly_block_search_view(*candidate, state),
+        .target_slot = target_slot, .image_blocks = image_blocks,
+        .baseline_to = current_validates_to, .repair_end = repair_end,
+        .previous_validates_to = current_validates_to, .best_start = -1,
+        .best_validates_to = current_validates_to,
+        .blocksize = scalpel_state.blocksize, .phase = 3};
+    if (interval_end > current_validates_to + 1) {
+      uint64_t end_slot = CEILDIV(interval_end, scalpel_state.blocksize);
+      search->probe_blocks = end_slot > target_slot ? end_slot - target_slot : 0;
+      if (search->probe_blocks < suspect_blocks) {
+        search->probe_blocks = suspect_blocks;
+      }
+      if (search->probe_blocks > suffix_blocks) {
+        search->probe_blocks = suffix_blocks;
+      }
+      if (__builtin_add_overflow(interval_end, (uint64_t)AVI_CHUNK_HEADER_SIZE - 1,
+                                 &search->reconnects_to)
+          || search->reconnects_to >= state->archive_extent) {
+        search->reconnects_to = state->archive_extent - 1;
+      }
+      search->phase = search->probe_blocks ? 1 : 4;
+      if (!search->probe_blocks) {
+        search->next_actual = image_blocks;
+      }
+    }
+  }
+  if (search->phase == 5) {
+    return AVI_RUN_SEARCH_NO_MATCH;
+  }
+  int64_t *saved = (int64_t *)malloc((size_t)suffix_blocks * sizeof(int64_t));
+  check_memory_allocation(saved, __LINE__, __FILE__, "AVI displaced run");
+  for (uint64_t slot = 0; slot < suffix_blocks; slot++) {
+    saved[slot] = blockvector_get_apparent_blocknumber((*candidate)->b, target_slot + slot);
   }
 
-  uint64_t proven_interval_end = repair_end;
-  uint64_t suspect_blocks = avi_reassembly_suspect_run(
-      *candidate, target_slot);
-
-  // Opaque media lacks a codec-derived endpoint. Its next indexed chunk header still supplies an
-  // independent reconnection point for testing a displaced physical run as one operation.
-  if (proven_interval_end <= current_validates_to + 1) {
-    for (uint64_t entry = 0; entry < state->entry_count; entry++) {
-      if (state->entries[entry].offset > current_validates_to + 1) {
-        proven_interval_end = state->entries[entry].offset;
+  while (search->phase < 4) {
+    if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+      free(saved);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      free(saved);
+      return AVI_RUN_SEARCH_STOPPED;
+    }
+    if (search->next_actual == image_blocks) {
+      search->phase = 4;
+      search->mapped = 0;
+      search->proven_blocks = 0;
+      break;
+    }
+    uint64_t wanted = search->phase == 1 ? search->probe_blocks
+        : search->phase == 2 ? search->proven_blocks : search->mapped + 1;
+    uint64_t mapped = 0;
+    for (; mapped < wanted && mapped < image_blocks - search->next_actual; mapped++) {
+      int64_t actual = (int64_t)(search->next_actual + mapped);
+      int64_t apparent = filemirror_apparent_blocknumber(scalpel_state.filemirror, actual);
+      if (apparent < 0
+          || avi_reassembly_find_apparent_slot((*candidate)->b, apparent) >= 0
+          || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
         break;
       }
+      blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + mapped, apparent);
     }
-  }
-
-  if (proven_interval_end > current_validates_to + 1
-      && scalpel_state.blocksize > 0) {
-    uint64_t repair_end_slot = CEILDIV(proven_interval_end,
-                                       scalpel_state.blocksize);
-    uint64_t probe_blocks = repair_end_slot > target_slot
-        ? repair_end_slot - target_slot : 0;
-    uint64_t reconnects_to = proven_interval_end;
-    int64_t best_start = -1;
-    uint64_t best_mapped = 0;
-    uint64_t best_validates_to = current_validates_to;
-
-    if (probe_blocks > suffix_blocks) {
-      probe_blocks = suffix_blocks;
-    }
-    if (suspect_blocks > probe_blocks) {
-      probe_blocks = suspect_blocks < suffix_blocks
-          ? suspect_blocks : suffix_blocks;
-    }
-    if (__builtin_add_overflow(reconnects_to,
-                               (uint64_t)AVI_CHUNK_HEADER_SIZE - 1,
-                               &reconnects_to)
-        || reconnects_to >= state->archive_extent) {
-      reconnects_to = state->archive_extent - 1;
-    }
-    for (uint64_t start_index = 0;
-         probe_blocks > 0 && start_index < image_blocks; start_index++) {
-      uint64_t mapped = 0;
-
-      for (; mapped < probe_blocks && start_index + mapped < image_blocks;
-           mapped++) {
-        int64_t actual = (int64_t)(start_index + mapped);
-        int64_t apparent = filemirror_apparent_blocknumber(
-            scalpel_state.filemirror, actual);
-
-        if (apparent < 0
-            || avi_reassembly_find_apparent_slot((*candidate)->b,
-                                                  apparent) >= 0
-            || filemirror_actual_block_covered(scalpel_state.filemirror,
-                                                actual)) {
-          break;
-        }
-        blockvector_set_apparent_blocknumber(
-            (*candidate)->b, target_slot + mapped, apparent);
-      }
-      if (mapped > 0) {
-        inflate_blockvector((*candidate)->b);
-        blockvector_set_data_length((*candidate)->b,
-                                    state->archive_extent);
-
-        bool validates = false;
-        uint64_t validates_to = 0;
-        uint64_t proven_blocks = 0;
-
-        if (avi_reassembly_validate_candidate(
-                *candidate, state, &validates, &validates_to, NULL, NULL,
-                target_slot * (uint64_t)scalpel_state.blocksize)) {
-          if (validates) {
-            free(saved);
-            return AVI_RUN_SEARCH_VALIDATED;
-          }
-          if (validates_to == state->archive_extent - 1) {
-            free(saved);
-            return AVI_RUN_SEARCH_COMPLETE;
-          }
-          if (validates_to > current_validates_to) {
-            uint64_t failure_slot = (validates_to + 1)
-                / scalpel_state.blocksize;
-
-            proven_blocks = failure_slot > target_slot
-                ? failure_slot - target_slot : 0;
-
-            if (proven_blocks > mapped) {
-              proven_blocks = mapped;
-            }
-          }
-        }
-        if (proven_blocks > 0) {
-          for (uint64_t slot = 0; slot < mapped; slot++) {
-            blockvector_set_apparent_blocknumber(
-                (*candidate)->b, target_slot + slot, saved[slot]);
-          }
-          for (uint64_t slot = 0; slot < proven_blocks; slot++) {
-            int64_t apparent = filemirror_apparent_blocknumber(
-                scalpel_state.filemirror,
-                (int64_t)(start_index + slot));
-
-            blockvector_set_apparent_blocknumber(
-                (*candidate)->b, target_slot + slot, apparent);
-          }
-          inflate_blockvector((*candidate)->b);
-          blockvector_set_data_length((*candidate)->b,
-                                      state->archive_extent);
-          validates = false;
-          validates_to = 0;
-          if (avi_reassembly_validate_candidate(
-                  *candidate, state, &validates, &validates_to, NULL, NULL,
-                  target_slot * (uint64_t)scalpel_state.blocksize)) {
-            if (validates) {
-              free(saved);
-              return AVI_RUN_SEARCH_VALIDATED;
-            }
-            if (validates_to == state->archive_extent - 1) {
-              free(saved);
-              return AVI_RUN_SEARCH_COMPLETE;
-            }
-            if (validates_to >= reconnects_to
-                && validates_to > best_validates_to) {
-              best_start = (int64_t)start_index;
-              best_mapped = proven_blocks;
-              best_validates_to = validates_to;
-            }
-          }
-        }
-      }
-      for (uint64_t slot = 0; slot < mapped; slot++) {
-        blockvector_set_apparent_blocknumber(
-            (*candidate)->b, target_slot + slot, saved[slot]);
-      }
-      if ((start_index & UINT64_C(0x3f)) == 0) {
-        inflate_blockvector((*candidate)->b);
-        blockvector_set_data_length((*candidate)->b,
-                                    state->archive_extent);
-        if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-          free(saved);
-          return AVI_RUN_SEARCH_STOPPED;
-        }
-        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                 memory_order_acquire)
-            && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                              uuidc)) {
-          free(saved);
-          return AVI_RUN_SEARCH_STOPPED;
-        }
+    bool validates = false;
+    uint64_t validates_to = 0;
+    AviTrialResult result = AVI_TRIAL_READY;
+    bool evaluated = mapped > 0 && (search->phase == 1 || mapped == wanted);
+    if (evaluated) {
+      inflate_blockvector((*candidate)->b);
+      blockvector_set_data_length((*candidate)->b, state->archive_extent);
+      result = avi_reassembly_validate_candidate(
+          *candidate, state, &validates, &validates_to, NULL, NULL,
+          target_slot * (uint64_t)scalpel_state.blocksize);
+      if (result == AVI_TRIAL_READY
+          && (validates || validates_to == state->archive_extent - 1)) {
+        free(saved);
+        return validates ? AVI_RUN_SEARCH_VALIDATED : AVI_RUN_SEARCH_COMPLETE;
       }
     }
-    if (best_start >= 0) {
-      bool available = true;
-
-      if (scalpel_state.mode_verbose) {
-        lock_fprintf(stdout,
-                     "AVI media run: target=%" PRIu64
-                     " source=%" PRId64 " blocks=%" PRIu64
-                     " advances to=%" PRIu64 ".\n",
-                     target_slot, best_start, best_mapped,
-                     best_validates_to);
-      }
-
-      for (uint64_t mapped = 0; mapped < best_mapped; mapped++) {
-        int64_t actual = best_start + (int64_t)mapped;
-        int64_t apparent = filemirror_apparent_blocknumber(
-            scalpel_state.filemirror, actual);
-
-        if (apparent < 0
-            || avi_reassembly_find_apparent_slot((*candidate)->b,
-                                                  apparent) >= 0
-            || filemirror_actual_block_covered(scalpel_state.filemirror,
-                                                actual)) {
-          available = false;
-          break;
-        }
-        blockvector_set_apparent_blocknumber(
-            (*candidate)->b, target_slot + mapped, apparent);
-      }
-      if (available) {
-        inflate_blockvector((*candidate)->b);
-        blockvector_set_data_length((*candidate)->b,
-                                    state->archive_extent);
-      }
-      else {
-        for (uint64_t slot = target_slot; slot < total_blocks; slot++) {
-          blockvector_set_apparent_blocknumber(
-              (*candidate)->b, slot, saved[slot - target_slot]);
-        }
-      }
-      free(saved);
-      return available ? AVI_RUN_SEARCH_IMPROVED
-                       : AVI_RUN_SEARCH_NO_MATCH;
+    for (uint64_t slot = 0; slot < mapped; slot++) {
+      blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + slot, saved[slot]);
     }
     inflate_blockvector((*candidate)->b);
     blockvector_set_data_length((*candidate)->b, state->archive_extent);
-    free(saved);
-    return AVI_RUN_SEARCH_NO_MATCH;
-  }
-
-  for (uint64_t start_index = 0; start_index < image_blocks;
-       start_index++) {
-    int64_t start = (int64_t)start_index;
-    int64_t start_apparent = filemirror_apparent_blocknumber(
-        scalpel_state.filemirror, start);
-
-    if (start_apparent < 0
-        || avi_reassembly_find_apparent_slot((*candidate)->b,
-                                              start_apparent) >= 0
-        || filemirror_actual_block_covered(scalpel_state.filemirror,
-                                            start)) {
+    if (result == AVI_TRIAL_INTERRUPTED) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        free(saved);
+        return AVI_RUN_SEARCH_STOPPED;
+      }
       continue;
     }
 
-    uint64_t previous_validates_to = current_validates_to;
-    uint64_t mapped = 0;
-    for (; mapped < suffix_blocks && start_index + mapped < image_blocks;
-         mapped++) {
-      int64_t actual = start + (int64_t)mapped;
-      int64_t apparent = filemirror_apparent_blocknumber(
-          scalpel_state.filemirror, actual);
-
-      if (apparent < 0
-          || avi_reassembly_find_apparent_slot((*candidate)->b,
-                                                apparent) >= 0
-          || filemirror_actual_block_covered(scalpel_state.filemirror,
-                                              actual)) {
-        break;
-      }
-      blockvector_set_apparent_blocknumber(
-          (*candidate)->b, target_slot + mapped, apparent);
-      inflate_blockvector((*candidate)->b);
-      blockvector_set_data_length((*candidate)->b, state->archive_extent);
-
-      bool validates = false;
-      uint64_t validates_to = 0;
-      if (!avi_reassembly_validate_candidate(
-              *candidate, state, &validates, &validates_to, NULL, NULL,
-              target_slot * (uint64_t)scalpel_state.blocksize)) {
-        mapped++;
-        break;
-      }
-      if (validates) {
-        free(saved);
-        return AVI_RUN_SEARCH_VALIDATED;
-      }
-      if (validates_to == state->archive_extent - 1) {
-        free(saved);
-        return AVI_RUN_SEARCH_COMPLETE;
-      }
-      if (validates_to <= previous_validates_to) {
-        uint64_t known_failure_slot = (validates_to + 1)
-            / scalpel_state.blocksize;
-
-        if (validates_to < previous_validates_to
-            || known_failure_slot <= target_slot + mapped) {
-          mapped++;
-          break;
+    if (evaluated && result == AVI_TRIAL_READY && search->phase == 1) {
+      uint64_t proven = 0;
+      if (validates_to > current_validates_to) {
+        uint64_t failure_slot = (validates_to + 1) / scalpel_state.blocksize;
+        proven = failure_slot > target_slot ? failure_slot - target_slot : 0;
+        if (proven > mapped) {
+          proven = mapped;
         }
       }
-      else {
-        previous_validates_to = validates_to;
+      if (proven) {
+        search->mapped = mapped;
+        search->proven_blocks = proven;
+        search->phase = 2;
+        continue;
       }
-
-      if (mapped > 0 && (mapped & UINT64_C(0x3f)) == 0) {
-        if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-          free(saved);
-          return AVI_RUN_SEARCH_STOPPED;
-        }
-        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                 memory_order_acquire)) {
-          for (uint64_t slot = 0; slot <= mapped; slot++) {
-            blockvector_set_apparent_blocknumber(
-                (*candidate)->b, target_slot + slot, saved[slot]);
-          }
-          inflate_blockvector((*candidate)->b);
-          blockvector_set_data_length((*candidate)->b,
-                                      state->archive_extent);
-          if (reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                            uuidc)) {
-            free(saved);
-            return AVI_RUN_SEARCH_STOPPED;
-          }
-          mapped++;
-          break;
+    }
+    else if (evaluated && result == AVI_TRIAL_READY && search->phase == 2) {
+      if (validates_to >= search->reconnects_to
+          && validates_to > search->best_validates_to) {
+        search->best_start = (int64_t)search->next_actual;
+        search->best_mapped = search->proven_blocks;
+        search->best_validates_to = validates_to;
+      }
+    }
+    else if (evaluated && result == AVI_TRIAL_READY && search->phase == 3) {
+      uint64_t failure_slot = (validates_to + 1) / scalpel_state.blocksize;
+      if (validates_to > search->previous_validates_to
+          || (validates_to == search->previous_validates_to
+              && failure_slot > target_slot + mapped - 1)) {
+        search->previous_validates_to = validates_to;
+        search->mapped = mapped;
+        if (mapped < suffix_blocks && mapped < image_blocks - search->next_actual) {
+          continue;
         }
       }
     }
-
-    for (uint64_t slot = 0; slot < mapped; slot++) {
-      blockvector_set_apparent_blocknumber(
-          (*candidate)->b, target_slot + slot, saved[slot]);
-    }
-    if ((start_index & UINT64_C(0x3f)) == 0) {
-      inflate_blockvector((*candidate)->b);
-      blockvector_set_data_length((*candidate)->b, state->archive_extent);
-      if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-        free(saved);
-        return AVI_RUN_SEARCH_STOPPED;
-      }
-      if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                               memory_order_acquire)
-          && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                            uuidc)) {
-        free(saved);
-        return AVI_RUN_SEARCH_STOPPED;
-      }
-    }
+    search->next_actual++;
+    search->mapped = 0;
+    search->proven_blocks = 0;
+    search->previous_validates_to = current_validates_to;
+    search->phase = search->probe_blocks ? 1 : 3;
   }
 
-  for (uint64_t slot = target_slot; slot < total_blocks; slot++) {
-    blockvector_set_apparent_blocknumber(
-        (*candidate)->b, slot, saved[slot - target_slot]);
+  if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+    free(saved);
+    return AVI_RUN_SEARCH_STOPPED;
+  }
+  bool available = search->best_start >= 0;
+  if (available) {
+    for (uint64_t mapped = 0; mapped < search->best_mapped; mapped++) {
+      int64_t actual = search->best_start + (int64_t)mapped;
+      int64_t apparent = filemirror_apparent_blocknumber(scalpel_state.filemirror, actual);
+      if (apparent < 0
+          || avi_reassembly_find_apparent_slot((*candidate)->b, apparent) >= 0
+          || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+        available = false;
+        break;
+      }
+      blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + mapped, apparent);
+    }
+    if (available && scalpel_state.mode_verbose) {
+      lock_fprintf(stdout, "AVI media run: target=%" PRIu64
+          " source=%" PRId64 " blocks=%" PRIu64 " advances to=%" PRIu64 ".\n",
+          target_slot, search->best_start, search->best_mapped, search->best_validates_to);
+    }
+  }
+  if (!available) {
+    for (uint64_t slot = 0; slot < suffix_blocks; slot++) {
+      blockvector_set_apparent_blocknumber((*candidate)->b, target_slot + slot, saved[slot]);
+    }
   }
   inflate_blockvector((*candidate)->b);
   blockvector_set_data_length((*candidate)->b, state->archive_extent);
+  search->phase = 5;
   free(saved);
-  return AVI_RUN_SEARCH_NO_MATCH;
+  return available ? AVI_RUN_SEARCH_IMPROVED : AVI_RUN_SEARCH_NO_MATCH;
 }
 
 
@@ -4883,11 +5434,16 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
   uint64_t current_repair_end = 0;
   bool current_validates = false;
 
-  if (!avi_reassembly_validate_candidate(*candidate, state,
+  if (avi_reassembly_validate_candidate(*candidate, state,
                                          &current_validates,
                                          &current_validates_to,
                                          &current_repair_from,
-                                         &current_repair_end, 0)) {
+                                         &current_repair_end, 0)
+          != AVI_TRIAL_READY) {
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
     avi_free_carve_state((void **)&state);
     destroy_candidate(candidate);
     return;
@@ -4909,6 +5465,10 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
   }
 
   while (state->repairs <= total_blocks * 2) {
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
     if (reassembly_check_max_size(work->id, *candidate, uuidp, uuidc)) {
       break;
     }
@@ -4917,6 +5477,10 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       uint64_t suspect_slot = 0;
       uint64_t suspect_blocks = 0;
       AviRunSearchResult classified_result = AVI_RUN_SEARCH_NO_MATCH;
+      if (avi_reassembly_classified_search_current(*candidate, state,
+              image_blocks, current_validates_to) && state->classified_search.owner == 1) {
+        search_slot = state->classified_search.target_slot;
+      }
 
       while (avi_reassembly_find_suspect_run(
                  *candidate, search_slot, &suspect_slot, &suspect_blocks)) {
@@ -4935,6 +5499,11 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         search_slot = suspect_slot + suspect_blocks;
       }
 
+      if (classified_result == AVI_RUN_SEARCH_NO_MATCH
+          && avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        avi_free_carve_state((void **)&state);
+        return;
+      }
       if (classified_result == AVI_RUN_SEARCH_VALIDATED) {
         (*candidate)->flavor = VALIDATED;
         state->repairs += suspect_blocks;
@@ -4949,11 +5518,16 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         state->repairs += suspect_blocks;
         avi_reassembly_refresh_state(*candidate, &state);
         carve_put_state((*candidate)->carvehashkey, state);
-        if (!avi_reassembly_validate_candidate(
+        if (avi_reassembly_validate_candidate(
                 *candidate, state, &current_validates,
                 &current_validates_to, &current_repair_from,
                 &current_repair_end,
-                suspect_slot * (uint64_t)scalpel_state.blocksize)) {
+                suspect_slot * (uint64_t)scalpel_state.blocksize)
+                != AVI_TRIAL_READY) {
+          if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+            avi_free_carve_state((void **)&state);
+            return;
+          }
           avi_free_carve_state((void **)&state);
           destroy_candidate(candidate);
           return;
@@ -4982,6 +5556,11 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
     if (target_slot >= total_blocks) {
       break;
     }
+    if (avi_reassembly_block_search_current(
+            *candidate, state, target_slot, image_blocks, current_validates_to)) {
+      goto single_block_search;
+    }
+    memset(&state->block_search, 0, sizeof(state->block_search));
     uint64_t earliest_repair_slot = avi_reassembly_earliest_repair_slot(
         state, failure_offset, target_slot);
 
@@ -5036,13 +5615,55 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
     uint64_t suspect_slot = 0;
     uint64_t suspect_blocks = 0;
     uint64_t classified_blocks = 0;
+    uint32_t content_pass = 0;
+    uint64_t content_resume_slot = UINT64_MAX;
+    uint64_t fallback_slot = target_slot;
     AviRunSearchResult classified_result = AVI_RUN_SEARCH_NO_MATCH;
-    AviRunSearchResult suffix_result = avi_reassembly_find_zero_gap(
+    AviRunSearchResult suffix_result = AVI_RUN_SEARCH_NO_MATCH;
+    if (avi_reassembly_displaced_search_current(*candidate, state, image_blocks,
+                                                 current_validates_to, current_repair_end)) {
+      structured_slot = state->displaced_search.target_slot;
+      goto displaced_run_search;
+    }
+    if (avi_reassembly_shift_search_current(*candidate, state, image_blocks,
+                                             current_validates_to, current_repair_end)) {
+      classified_repair_slot = state->shift_search.classified_slot;
+      if (state->shift_search.owner == 1) {
+        goto classified_shifted_search;
+      }
+      fallback_slot = state->shift_search.target_slot;
+      goto fallback_shifted_search;
+    }
+    if (avi_reassembly_indexed_search_current(*candidate, state,
+            state->indexed_search.target_slot, image_blocks, current_validates_to)) {
+      structured_slot = state->indexed_search.target_slot;
+      classified_repair_slot = state->indexed_search.classified_slot;
+      goto indexed_run_search;
+    }
+    if (avi_reassembly_zero_gap_search_current(*candidate, state, media_search_slot,
+                                               image_blocks, current_validates_to, false)
+        && state->zero_gap_search[0].next_slot < total_blocks) {
+      goto partial_zero_gap_search;
+    }
+    if (avi_reassembly_classified_search_current(*candidate, state,
+                                                 image_blocks, current_validates_to)) {
+      if (state->classified_search.owner == 2) {
+        suspect_search_slot = state->classified_search.target_slot;
+        goto structural_classified_search;
+      }
+      if (state->classified_search.owner >= 3) {
+        content_pass = state->classified_search.owner - 3;
+        content_resume_slot = state->classified_search.target_slot;
+        goto content_classified_search;
+      }
+    }
+    suffix_result = avi_reassembly_find_zero_gap(
         work, candidate, state, media_search_slot, image_blocks,
         current_validates_to, true, &structured_slot, uuidp, uuidc);
 
     // If no gap reaches the complete declared extent, repair displaced runs that improve
     // structural or codec evidence before retaining a merely partial gap repair.
+structural_classified_search:
     while (suffix_result == AVI_RUN_SEARCH_NO_MATCH
            && avi_reassembly_find_suspect_run(
                *candidate, suspect_search_slot, &suspect_slot,
@@ -5066,6 +5687,7 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       suspect_search_slot = suspect_slot + suspect_blocks;
     }
 
+partial_zero_gap_search:
     if (suffix_result == AVI_RUN_SEARCH_NO_MATCH
         && classified_result == AVI_RUN_SEARCH_NO_MATCH) {
       suffix_result = avi_reassembly_find_zero_gap(
@@ -5076,11 +5698,13 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
     // A displaced run may not improve parsing until an earlier gap is repaired. Test multiblock
     // holes first because their combined content provides stronger ordering evidence than a single
     // block; single-block displacement remains fully supported on the second pass.
-    for (uint32_t content_pass = 0;
-         content_pass < 2 && suffix_result == AVI_RUN_SEARCH_NO_MATCH
+content_classified_search:
+    for (; content_pass < 2 && suffix_result == AVI_RUN_SEARCH_NO_MATCH
              && classified_result == AVI_RUN_SEARCH_NO_MATCH;
          content_pass++) {
-      suspect_search_slot = media_search_slot;
+      suspect_search_slot = content_resume_slot == UINT64_MAX
+          ? media_search_slot : content_resume_slot;
+      content_resume_slot = UINT64_MAX;
       while (avi_reassembly_find_suspect_run(
                  *candidate, suspect_search_slot, &suspect_slot,
                  &suspect_blocks)) {
@@ -5107,6 +5731,12 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       }
     }
 
+    if (classified_result == AVI_RUN_SEARCH_NO_MATCH
+        && suffix_result == AVI_RUN_SEARCH_NO_MATCH
+        && avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
     if (classified_result != AVI_RUN_SEARCH_NO_MATCH) {
       if (classified_result == AVI_RUN_SEARCH_VALIDATED) {
         (*candidate)->flavor = VALIDATED;
@@ -5122,12 +5752,16 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         state->repairs += classified_blocks;
         avi_reassembly_refresh_state(*candidate, &state);
         carve_put_state((*candidate)->carvehashkey, state);
-        if (!avi_reassembly_validate_candidate(
+        if (avi_reassembly_validate_candidate(
                 *candidate, state, &current_validates,
                 &current_validates_to, &current_repair_from,
                 &current_repair_end,
                 classified_repair_slot
-                    * (uint64_t)scalpel_state.blocksize)) {
+                    * (uint64_t)scalpel_state.blocksize) != AVI_TRIAL_READY) {
+          if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+            avi_free_carve_state((void **)&state);
+            return;
+          }
           avi_free_carve_state((void **)&state);
           destroy_candidate(candidate);
           return;
@@ -5146,19 +5780,25 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       }
     }
 
+classified_shifted_search:
     if (classified_repair_slot != UINT64_MAX
         && suffix_result == AVI_RUN_SEARCH_NO_MATCH) {
+      state->shift_search.owner = 1;
+      state->shift_search.classified_slot = classified_repair_slot;
       suffix_result = avi_reassembly_find_shifted_suffix(
           work, candidate, state, classified_repair_slot, image_blocks,
           current_validates_to, current_repair_end, uuidp, uuidc);
       structured_slot = classified_repair_slot;
     }
 
-    AviRunSearchResult indexed_run_result = AVI_RUN_SEARCH_NO_MATCH;
-
+    state->indexed_search.classified_slot = classified_repair_slot;
     if (suffix_result == AVI_RUN_SEARCH_NO_MATCH) {
       structured_slot = target_slot;
     }
+indexed_run_search:
+    ;
+    AviRunSearchResult indexed_run_result = AVI_RUN_SEARCH_NO_MATCH;
+
     while (suffix_result == AVI_RUN_SEARCH_NO_MATCH) {
       indexed_run_result = avi_reassembly_find_indexed_run(
           work, candidate, state, structured_slot, image_blocks,
@@ -5170,6 +5810,12 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       structured_slot--;
     }
 
+    if (indexed_run_result == AVI_RUN_SEARCH_NO_MATCH
+        && suffix_result == AVI_RUN_SEARCH_NO_MATCH
+        && avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
     if (indexed_run_result == AVI_RUN_SEARCH_VALIDATED) {
       (*candidate)->flavor = VALIDATED;
       state->repairs++;
@@ -5183,11 +5829,16 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       state->repairs++;
       avi_reassembly_refresh_state(*candidate, &state);
       carve_put_state((*candidate)->carvehashkey, state);
-      if (!avi_reassembly_validate_candidate(
+      if (avi_reassembly_validate_candidate(
               *candidate, state, &current_validates,
               &current_validates_to, &current_repair_from,
               &current_repair_end,
-              structured_slot * (uint64_t)scalpel_state.blocksize)) {
+              structured_slot * (uint64_t)scalpel_state.blocksize)
+              != AVI_TRIAL_READY) {
+        if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+          avi_free_carve_state((void **)&state);
+          return;
+        }
         avi_free_carve_state((void **)&state);
         destroy_candidate(candidate);
         return;
@@ -5206,7 +5857,7 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       return;
     }
 
-    uint64_t fallback_slot = target_slot;
+fallback_shifted_search:
     while (suffix_result == AVI_RUN_SEARCH_NO_MATCH) {
       if (fallback_slot == classified_repair_slot) {
         if (fallback_slot == earliest_repair_slot) {
@@ -5215,6 +5866,8 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         fallback_slot--;
         continue;
       }
+      state->shift_search.owner = 2;
+      state->shift_search.classified_slot = classified_repair_slot;
       suffix_result = avi_reassembly_find_shifted_suffix(
           work, candidate, state, fallback_slot, image_blocks,
           current_validates_to, current_repair_end, uuidp, uuidc);
@@ -5226,6 +5879,11 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       fallback_slot--;
     }
 
+    if (suffix_result == AVI_RUN_SEARCH_NO_MATCH
+        && avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
     if (suffix_result == AVI_RUN_SEARCH_VALIDATED) {
       (*candidate)->flavor = VALIDATED;
       state->repairs++;
@@ -5239,11 +5897,16 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       state->repairs++;
       avi_reassembly_refresh_state(*candidate, &state);
       carve_put_state((*candidate)->carvehashkey, state);
-      if (!avi_reassembly_validate_candidate(
+      if (avi_reassembly_validate_candidate(
               *candidate, state, &current_validates,
               &current_validates_to, &current_repair_from,
               &current_repair_end,
-              structured_slot * (uint64_t)scalpel_state.blocksize)) {
+              structured_slot * (uint64_t)scalpel_state.blocksize)
+              != AVI_TRIAL_READY) {
+        if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+          avi_free_carve_state((void **)&state);
+          return;
+        }
         avi_free_carve_state((void **)&state);
         destroy_candidate(candidate);
         return;
@@ -5262,9 +5925,10 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       return;
     }
 
-    AviRunSearchResult run_result = AVI_RUN_SEARCH_NO_MATCH;
-
     structured_slot = target_slot;
+displaced_run_search:
+    ;
+    AviRunSearchResult run_result = AVI_RUN_SEARCH_NO_MATCH;
     while (true) {
       run_result = avi_reassembly_find_displaced_run(
           work, candidate, state, structured_slot, image_blocks,
@@ -5276,6 +5940,11 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       structured_slot--;
     }
 
+    if (run_result == AVI_RUN_SEARCH_NO_MATCH
+        && avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
     if (run_result == AVI_RUN_SEARCH_VALIDATED) {
       (*candidate)->flavor = VALIDATED;
       state->repairs++;
@@ -5289,11 +5958,16 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       state->repairs++;
       avi_reassembly_refresh_state(*candidate, &state);
       carve_put_state((*candidate)->carvehashkey, state);
-      if (!avi_reassembly_validate_candidate(
+      if (avi_reassembly_validate_candidate(
               *candidate, state, &current_validates,
               &current_validates_to, &current_repair_from,
               &current_repair_end,
-              structured_slot * (uint64_t)scalpel_state.blocksize)) {
+              structured_slot * (uint64_t)scalpel_state.blocksize)
+              != AVI_TRIAL_READY) {
+        if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+          avi_free_carve_state((void **)&state);
+          return;
+        }
         avi_free_carve_state((void **)&state);
         destroy_candidate(candidate);
         return;
@@ -5312,20 +5986,45 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       return;
     }
 
+single_block_search:
+    ;
     int64_t target_apparent = blockvector_get_apparent_blocknumber(
         (*candidate)->b, target_slot);
     int64_t target_actual = blockvector_get_actual_blocknumber(
         (*candidate)->b, target_slot);
     int64_t previous_actual = blockvector_get_actual_blocknumber(
         (*candidate)->b, target_slot - 1);
-    int64_t best_actual = -1;
-    uint64_t best_validates_to = current_validates_to;
-    BlockValidationDecision best_confidence = BLOCK_CONFIDENCE_INVALID;
-    int64_t best_reserved = INT64_MAX;
-    uint64_t best_distance = UINT64_MAX;
+    AviBlockSearch *search = &state->block_search;
 
-    for (uint64_t actual_index = 0; actual_index < image_blocks;
+    if (!search->active) {
+      *search = (AviBlockSearch){
+          .view = avi_reassembly_block_search_view(*candidate, state),
+          .target_slot = target_slot, .image_blocks = image_blocks,
+          .baseline_to = current_validates_to,
+          .best_actual = -1, .best_validates_to = current_validates_to,
+          .best_confidence = BLOCK_CONFIDENCE_INVALID,
+          .best_reserved = INT64_MAX, .best_distance = UINT64_MAX,
+          .blocksize = scalpel_state.blocksize, .active = 1};
+    }
+    int64_t best_actual = search->best_actual;
+    uint64_t best_validates_to = search->best_validates_to;
+    BlockValidationDecision best_confidence = search->best_confidence;
+    int64_t best_reserved = search->best_reserved;
+    uint64_t best_distance = search->best_distance;
+
+    for (uint64_t actual_index = search->next_actual; actual_index < image_blocks;
          actual_index++) {
+      search->next_actual = actual_index;
+      if ((actual_index & UINT64_C(0x3f)) == 0) {
+        if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+          avi_free_carve_state((void **)&state);
+          return;
+        }
+        if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+          avi_free_carve_state((void **)&state);
+          return;
+        }
+      }
       int64_t actual = (int64_t)actual_index;
       int64_t available_apparent = filemirror_apparent_blocknumber(
           scalpel_state.filemirror, actual);
@@ -5336,11 +6035,13 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
           || (source_slot < 0
               && filemirror_actual_block_covered(scalpel_state.filemirror,
                                                  actual))) {
+        search->next_actual = actual_index + 1;
         continue;
       }
       int64_t trial_apparent = available_apparent;
 
       if (trial_apparent < 0) {
+        search->next_actual = actual_index + 1;
         continue;
       }
       int64_t source_apparent = source_slot >= 0
@@ -5368,10 +6069,10 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       uint64_t trial_deep_from = trial_deep_slot
           * (uint64_t)scalpel_state.blocksize;
 
-      if (!avi_reassembly_validate_candidate(*candidate, state,
-                                             &trial_validates,
-                                             &trial_validates_to, NULL, NULL,
-                                             trial_deep_from)) {
+      AviTrialResult validation = avi_reassembly_validate_candidate(
+          *candidate, state, &trial_validates, &trial_validates_to, NULL, NULL,
+          trial_deep_from);
+      if (validation == AVI_TRIAL_ERROR) {
         trial_validates_to = 0;
       }
 
@@ -5379,6 +6080,7 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         (*candidate)->flavor = VALIDATED;
         blockvector_set_data_length((*candidate)->b, state->archive_extent);
         state->repairs++;
+        memset(search, 0, sizeof(*search));
         carve_put_state((*candidate)->carvehashkey, state);
         avi_free_carve_state((void **)&state);
         write_candidate(candidate, false);
@@ -5391,6 +6093,11 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         blockvector_set_apparent_blocknumber((*candidate)->b,
                                              (uint64_t)source_slot,
                                              source_apparent);
+      }
+      if (validation == AVI_TRIAL_INTERRUPTED
+          && avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        avi_free_carve_state((void **)&state);
+        return;
       }
 
       BlockValidationDecision confidence = filemirror_get_blocktype(
@@ -5414,27 +6121,13 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         best_confidence = confidence;
         best_reserved = reserved;
         best_distance = distance;
+        search->best_actual = best_actual;
+        search->best_validates_to = best_validates_to;
+        search->best_confidence = best_confidence;
+        search->best_reserved = best_reserved;
+        search->best_distance = best_distance;
       }
-
-      if ((actual_index & UINT64_C(0x3f)) == 0) {
-        if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-          avi_free_carve_state((void **)&state);
-          return;
-        }
-        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                 memory_order_acquire)) {
-          inflate_blockvector((*candidate)->b);
-          blockvector_set_data_length((*candidate)->b,
-                                      state->archive_extent);
-        }
-        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
-                                 memory_order_acquire)
-            && reassembly_time_to_checkpoint(work->id, *candidate, uuidp,
-                                              uuidc)) {
-          avi_free_carve_state((void **)&state);
-          return;
-        }
-      }
+      search->next_actual = actual_index + 1;
     }
 
     // Trials restore the apparent mapping immediately; synchronize the derived actual mapping and
@@ -5442,6 +6135,10 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
     inflate_blockvector((*candidate)->b);
     blockvector_set_data_length((*candidate)->b, state->archive_extent);
 
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
     if (best_actual < 0 || best_validates_to <= current_validates_to) {
       if (scalpel_state.mode_verbose) {
         lock_fprintf(stdout,
@@ -5483,14 +6180,20 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
               *candidate, state, target_slot, shift, image_blocks,
               best_validates_to, true, &rotation_validates,
               &rotation_validates_to)) {
+        memset(search, 0, sizeof(*search));
         state->repairs += shift;
         avi_reassembly_refresh_state(*candidate, &state);
         carve_put_state((*candidate)->carvehashkey, state);
-        if (!avi_reassembly_validate_candidate(
+        if (avi_reassembly_validate_candidate(
                 *candidate, state, &rotation_validates,
                 &rotation_validates_to, &current_repair_from,
                 &current_repair_end,
-                target_slot * (uint64_t)scalpel_state.blocksize)) {
+                target_slot * (uint64_t)scalpel_state.blocksize)
+                != AVI_TRIAL_READY) {
+          if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+            avi_free_carve_state((void **)&state);
+            return;
+          }
           avi_free_carve_state((void **)&state);
           destroy_candidate(candidate);
           return;
@@ -5506,6 +6209,11 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
       }
     }
 
+    if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+      avi_free_carve_state((void **)&state);
+      return;
+    }
+    memset(search, 0, sizeof(*search));
     blockvector_set_apparent_blocknumber((*candidate)->b, target_slot,
                                          best_apparent);
     if (best_source_slot >= 0) {
@@ -5522,11 +6230,16 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
         && (uint64_t)best_source_slot < committed_deep_slot) {
       committed_deep_slot = (uint64_t)best_source_slot;
     }
-    if (!avi_reassembly_validate_candidate(
+    if (avi_reassembly_validate_candidate(
             *candidate, state, &current_validates,
             &current_validates_to, &current_repair_from,
             &current_repair_end,
-            committed_deep_slot * (uint64_t)scalpel_state.blocksize)) {
+            committed_deep_slot * (uint64_t)scalpel_state.blocksize)
+            != AVI_TRIAL_READY) {
+      if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+        avi_free_carve_state((void **)&state);
+        return;
+      }
       avi_free_carve_state((void **)&state);
       destroy_candidate(candidate);
       return;
@@ -5534,6 +6247,10 @@ static inline void avi_reassembly(ThreadWork *work, CarveInfo **candidate,
     carve_put_state((*candidate)->carvehashkey, state);
   }
 
+  if (avi_reassembly_checkpoint(work, *candidate, state, uuidp, uuidc)) {
+    avi_free_carve_state((void **)&state);
+    return;
+  }
   avi_free_carve_state((void **)&state);
   if (scalpel_state.write_promising) {
     (*candidate)->flavor = PROMISING;

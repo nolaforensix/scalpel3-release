@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -24,12 +28,8 @@
 // Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
-// scalpel3 is a complete rewrite of the open source scalpel, which was
-// originally developed by Golden G. Richard III in 2005 and then enhanced by
-// both Vico Marziale and Golden G. Richard until ~2013. Earlier versions of
-// scalpel had their roots in Foremost 0.69.  The emphasis of scalpel3 is on
-// *practical* solutions to solving file fragmentation for selected file types
-// and making this process as fast as possible on modern hardware.
+// The emphasis of scalpel3 is on *practical* solutions to solving file fragmentation for
+// selected file types and making this process as fast as possible on modern hardware.
 //
 // Yes, the authors know this is an NP-hard problem.  We will not be deterred.
 // :)
@@ -217,6 +217,7 @@ typedef char uuid_string_t[37];
 #include <unistd.h>
 #include <uuid/uuid.h>
 #include "scalpelv.h"
+#include "scalpel_output.h"
 #include "blockmap.h"
 #include "colors.h"
 #include "prioque.h"
@@ -476,12 +477,17 @@ typedef enum ScalpelError {
   SCALPEL_ERROR_BLOCK_STATE_IS_READ_ONLY,
   SCALPEL_ERROR_BAD_START_END_BLOCKS,
   SCALPEL_ERROR_OUTPUT_DIRECTORY_IN_USE,
+  SCALPEL_ERROR_RESOURCE_PATH,
 } ScalpelError;
 
 #define SCALPEL_WILDCARD_CHAR '?'
 
 #define SCALPEL_COPYRIGHT_STRING \
-  "scalpel3 is (c) 2021-2026 by Golden G. Richard III (@nolaforensix) and contributors.\n"
+  "The Scalpel Project is Copyright (C) 2005-2026 by " \
+  "Golden G. Richard III\n" \
+  "and contributors.\n\n" \
+  "Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the\n" \
+  "contributors listed in AUTHORS.\n"
 
 #define SCALPEL_BANNER_STRING \
   "scalpel3 v%s", SCALPEL_VERSION
@@ -1073,9 +1079,6 @@ void bt_error_callback(void *data,
                        const char *message,
                        int error_number);
 char *append_stars(char *p, size_t n);
-void lock_fprintf(FILE *stream, const char *format, ...) __attribute__((format(printf, 2, 3)));
-void lock_fprintf_argp(FILE *stream, const char *format, va_list argp);
-void lock_fputc(char c, FILE *stream);
 void frame_message(const char *msg);
 void catch_alarm(int signum);
 void copy_search_spec(SearchSpec *d, SearchSpec *s);

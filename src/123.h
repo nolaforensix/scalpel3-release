@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -112,6 +116,35 @@ typedef struct {
 // remaining slot.
 //
 // Only used during custom reassembly; contiguous recovery never touches it.
+#define FILE123_STATE_MAGIC UINT32_C(0x31323353)
+#define FILE123_STATE_VERSION UINT32_C(1)
+#define FILE123_SCAN_YIELDED INT64_C(-2)
+#define FILE123_SCAN_INTERVAL UINT64_C(128)
+
+typedef enum File123ScanKind {
+  FILE123_SCAN_NONE,
+  FILE123_SCAN_METADATA,
+  FILE123_SCAN_TYPE
+} File123ScanKind;
+
+typedef struct File123Scan {
+  XXH128_hash_t query;
+  uint64_t next_actual;
+  uint64_t remaining;
+  uint64_t image_blocks;
+  uint32_t kind;
+} File123Scan;
+
+// Exact layout of the original unversioned checkpoint record.
+typedef struct {
+  bool header_placed;
+  bool metadata_placed;
+  bool footer_placed;
+  uint8_t expected_blocks[10];
+  uint8_t recovered_blocks[10];
+  bool skeleton_initialized;
+} File123LegacyState;
+
 typedef struct {
   bool header_placed;
   bool metadata_placed;
@@ -129,7 +162,11 @@ typedef struct {
   // set true once expected_blocks[] has been populated from a metadata block.
   bool skeleton_initialized;
 
+  File123Scan scan;
 } File123ReassemblyState;
+
+_Static_assert(offsetof(File123ReassemblyState, scan) == sizeof(File123LegacyState),
+               "123 legacy checkpoint prefix layout");
 
 
 // ============================================================================
@@ -176,17 +213,17 @@ static inline size_t file_123_sizeof_carve_state(const void *state);
 static inline void file_123_print_carve_state(const void *state);
 
 // custom reassembly thread and its helpers
-static void file_123_reassembly_init_candidate(int id,
+static bool file_123_reassembly_init_candidate(ThreadWork *work,
                                               CarveInfo **candidate,
                                               uuid_string_t uuidp,
                                               uuid_string_t uuidc);
 static bool file_123_reassembly_prepare_for_extension(CarveInfo *cand,
                                               int64_t *hole_idx,
                                               int64_t *start_ap);
-static int64_t file_123_reassembly_get_block_choice(CarveInfo *candidate,
-                                                   int64_t *block_choice_start,
-                                                   int64_t logical_slot_index,
-                                                   char target_type);
+static int64_t file_123_reassembly_get_block_choice(
+    ThreadWork *work, CarveInfo **candidate, int64_t *block_choice_start,
+    int64_t logical_slot_index, char target_type,
+    uuid_string_t uuidp, uuid_string_t uuidc);
 static int64_t file_123_find_reusable_section_block(CarveInfo *candidate,
                                                    char target_type);
 static void file_123_reassembly_extension_successful(int id,
@@ -213,7 +250,18 @@ static void file_123_place_metadata_block(CarveInfo *candidate,
 static uint8_t *file_123_get_metadata_block_data(int64_t actual_blocknum);
 static bool file_123_validate_metadata_block(CarveInfo *candidate,
                              int64_t metadata_block);
-static int64_t file_123_find_valid_metadata_block(CarveInfo *candidate);
+static int64_t file_123_find_valid_metadata_block(
+    ThreadWork *work, CarveInfo **candidate, File123ReassemblyState *state,
+    uuid_string_t uuidp, uuid_string_t uuidc);
+static inline bool file_123_carve_state_valid(const File123ReassemblyState *state);
+static inline XXH128_hash_t file_123_scan_query(CarveInfo *candidate,
+                                               uint64_t slot, char target_type);
+static inline void file_123_scan_begin(CarveInfo *candidate,
+    File123ReassemblyState *state, File123ScanKind kind, uint64_t slot,
+    int64_t start_apparent, char target_type);
+static int64_t file_123_scan_blocks(ThreadWork *work, CarveInfo **candidate,
+    File123ReassemblyState *state, uint64_t slot, char target_type,
+    uuid_string_t uuidp, uuid_string_t uuidc, uint64_t *examined);
 static int64_t file_123_find_hole_end(CarveInfo *cand,
                              uint64_t start);
 static char file_123_block_type_for_slot(CarveInfo *cand,
@@ -669,36 +717,83 @@ static inline void file_123_print_block_state(const void *state) {
 // the hooks reduce to memcpy / malloc / free.
 
 
-// Tell scalpel how to serialize/deserialize the carve state
+// Validate fixed-size state before using restored fields.
+//
+static inline bool file_123_carve_state_valid(const File123ReassemblyState *state) {
+  if (!state) {
+    return false;
+  }
+  const uint8_t *bytes = (const uint8_t *)state;
+  const size_t flags[] = {
+    offsetof(File123ReassemblyState, header_placed),
+    offsetof(File123ReassemblyState, metadata_placed),
+    offsetof(File123ReassemblyState, footer_placed),
+    offsetof(File123ReassemblyState, skeleton_initialized)
+  };
+  for (uint32_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+    if (bytes[flags[i]] > 1) {
+      return false;
+    }
+  }
+  return state->scan.kind <= FILE123_SCAN_TYPE
+      && (state->scan.kind == FILE123_SCAN_NONE
+          || (state->scan.image_blocks > 0
+              && state->scan.image_blocks <= INT64_MAX
+              && state->scan.remaining <= state->scan.image_blocks
+              && state->scan.next_actual < state->scan.image_blocks));
+}
+
+// The original unversioned record is still readable; it had no scan frontier.
+//
 static inline bool file_123_serialize_carve_state(void **state, FILE *fp,
                                                 StateSerialization mode) {
-  File123ReassemblyState **s = (File123ReassemblyState **)state;
-
-
-  size_t (*fb)(void *ptr, size_t size, size_t nitems, FILE *stream) =
-      mode == SERIALIZE ?
-      (size_t (*)(void *, size_t, size_t, FILE *))fwrite :
-      (size_t (*)(void *, size_t, size_t, FILE *))fread;
-
-
-  if (mode == DESERIALIZE) {
-    *s = (File123ReassemblyState *)malloc(sizeof(File123ReassemblyState));
-    check_memory_allocation(*s, __LINE__, __FILE__, "File123ReassemblyState");
+  if (!state || !fp) {
+    return false;
+  }
+  File123ReassemblyState **typed = (File123ReassemblyState **)state;
+  if (mode == SERIALIZE) {
+    const uint32_t header[] = {FILE123_STATE_MAGIC, FILE123_STATE_VERSION};
+    if (!file_123_carve_state_valid(*typed)) {
+      return false;
+    }
+    if (fwrite(header, sizeof(header), 1, fp) != 1
+        || fwrite(*typed, sizeof(**typed), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    return true;
   }
 
-
-  // serialize/deserialize the entire struct with a single read/write.
-  // This works because all fields in the struct are fixed-sized; if your
-  // state has pointers or dynamic data, you'll need more elaborate code
-  // (see the msg field handling in gif.h)
-
-
-  if (fb(*s, sizeof(File123ReassemblyState), 1, fp) != 1) {
-    perror("file123 carve state serialization");
+  uint32_t marker = 0;
+  if (fread(&marker, sizeof(marker), 1, fp) != 1) {
     handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
   }
-
-
+  *typed = (File123ReassemblyState *)calloc(1, sizeof(**typed));
+  check_memory_allocation(*typed, __LINE__, __FILE__, "123 restored state");
+  if (marker == FILE123_STATE_MAGIC) {
+    uint32_t version = 0;
+    if (fread(&version, sizeof(version), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (version != FILE123_STATE_VERSION) {
+      file_123_free_carve_state(state);
+      return false;
+    }
+    if (fread(*typed, sizeof(**typed), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+  }
+  else {
+    uint8_t legacy[sizeof(File123LegacyState)];
+    memcpy(legacy, &marker, sizeof(marker));
+    if (fread(legacy + sizeof(marker), sizeof(legacy) - sizeof(marker), 1, fp) != 1) {
+      handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    memcpy(*typed, legacy, sizeof(legacy));
+  }
+  if (!file_123_carve_state_valid(*typed)) {
+    file_123_free_carve_state(state);
+    return false;
+  }
   return true;
 }
 
@@ -854,12 +949,13 @@ static inline void file_123_print_carve_state(const void *state) {
 // recovered_blocks[] counts against the current BV contents -- the
 // backend may have trimmed covered blocks between checkpoints, making the
 // saved counts stale.
-static void file_123_reassembly_init_candidate(int id,
+static bool file_123_reassembly_init_candidate(ThreadWork *work,
                                    CarveInfo **c_ptr,
                                    uuid_string_t uuidp,
                                    uuid_string_t uuidc){
 
   CarveInfo *candidate = *c_ptr;
+  const int id = work->id;
 
   if (scalpel_state.mode_verbose) {
     lock_fprintf(stdout,
@@ -930,7 +1026,7 @@ static void file_123_reassembly_init_candidate(int id,
 
     carve_put_state(candidate->carvehashkey, state);
     file_123_free_carve_state((void **)&state);
-    return;
+    return false;
   }
 
 
@@ -986,7 +1082,12 @@ static void file_123_reassembly_init_candidate(int id,
     file_123_place_metadata_block(candidate, m_apparent);
   } else {
     // no metadata block already in candidate; search for one
-    int64_t meta_block = file_123_find_valid_metadata_block(candidate);
+    int64_t meta_block = file_123_find_valid_metadata_block(
+        work, c_ptr, state, uuidp, uuidc);
+    if (meta_block == FILE123_SCAN_YIELDED) {
+      file_123_free_carve_state((void **)&state);
+      return true;
+    }
     if (meta_block < 0) {
       if (scalpel_state.mode_verbose){
         lock_fprintf(stdout,
@@ -995,7 +1096,7 @@ static void file_123_reassembly_init_candidate(int id,
       }
       file_123_free_carve_state((void **)&state);
       destroy_candidate(c_ptr);
-      return;
+      return false;
     }
     //metadata block found
     file_123_place_metadata_block(candidate, meta_block);
@@ -1011,7 +1112,7 @@ static void file_123_reassembly_init_candidate(int id,
     // shouldn’t happen; but for safety:
     file_123_free_carve_state((void **)&state);
     destroy_candidate(c_ptr);
-    return;
+    return false;
   }
 
 
@@ -1060,6 +1161,7 @@ static void file_123_reassembly_init_candidate(int id,
   carve_put_state(candidate->carvehashkey, st);
   file_123_free_carve_state((void **)&st);
   file_123_free_carve_state((void **)&state);
+  return false;
 }
 
 
@@ -1125,138 +1227,54 @@ static bool file_123_reassembly_prepare_for_extension(CarveInfo *cand,
 }
 
 
-// return the next apparent block number that should be tried in the
-// logical slot logical_slot_index. Adapted from the LR version but
-// tailored to 123 files.
+// Search from the preferred physical block, wrapping once. Rejected blocks
+// need not be tried again after a checkpoint; current selectability is checked
+// before every trial. Repeated identical digit blocks may reuse an already
+// placed block when deduplication has removed the other copies.
+// Returns an apparent block number, -1 when exhausted, or -2 after yielding.
 //
-// Scans the candidate-pool bitmap beginning at *block_choice_start,
-// skips duplicates already placed in the BV, accepts only blocks whose
-// File123BlockState type == target_type, removes every block it
-// inspects from the pool (so we never revisit it), and on success
-// updates *block_choice_start to one past the chosen block. If the
-// initial start was nonzero, wraps once to 0 to scan the lower apparent
-// block numbers before giving up.
-//
-// 123-specific behavior: when no fresh digit-section block remains for
-// a digit target, reuse an already-placed block of that same section.
-// This handles repeated identical section blocks when duplicates are
-// collapsed in the blockmap.
-//
-// Returns >=0 (apparent block number) on success or -1 if no usable
-// block remains. *block_choice_start is not advanced on failure, so
-// the caller can decide how to react (defer, abandon, etc).
-static int64_t file_123_reassembly_get_block_choice(CarveInfo *candidate,
-                                                    int64_t *block_choice_start,
-                                                    int64_t logical_slot_index,
-                                                    char target_type) {
-  int64_t block_choice;
-  int64_t start = (block_choice_start ? *block_choice_start : 0);
-  int64_t initial_start;
-  bool done = false;
-  bool reused_existing = false;
-  bool wrapped = false;
-  uint64_t evaluated;
-
-
-#if BLOCK_SELECTION_PERFORMANCE_STATS > 0
-  struct timespec BLK_starttime;
-  struct timespec BLK_endtime;
-  uint64_t BLK_examined = 0;
-
-
-  clock_gettime(CLOCK_MONOTONIC, &BLK_starttime);
-#endif
-
-  if (start < 0) {
-    start = 0;
+static int64_t file_123_reassembly_get_block_choice(
+    ThreadWork *work, CarveInfo **candidate, int64_t *block_choice_start,
+    int64_t logical_slot_index, char target_type,
+    uuid_string_t uuidp, uuid_string_t uuidc) {
+  File123ReassemblyState *state =
+      (File123ReassemblyState *)carve_get_state((*candidate)->carvehashkey);
+  if (!state) {
+    return -1;
   }
-  initial_start = start;
-
-  while (!done) {
-    block_choice = blockvector_get_choice(candidate->b, logical_slot_index, start,
-                                          filemirror_apparent_blocks(scalpel_state.filemirror), &evaluated);
-
+  file_123_scan_begin(*candidate, state, FILE123_SCAN_TYPE,
+      (uint64_t)logical_slot_index,
+      block_choice_start ? *block_choice_start : 0, target_type);
+  uint64_t examined = 0;
 #if BLOCK_SELECTION_PERFORMANCE_STATS > 0
-    BLK_examined += evaluated;
+  const uint32_t needleidx = (*candidate)->needleidx;
+  struct timespec started, ended;
+  clock_gettime(CLOCK_MONOTONIC, &started);
 #endif
-
-    if (block_choice == -1) {
-      if (!wrapped && initial_start > 0) {
-        wrapped = true;
-        start = 0;
-        continue;
-      }
-      done = true;
-    }
-    else {
-      // don't select the chosen block again
-      blockvector_remove_choice(candidate->b,
-                                logical_slot_index, block_choice);
-
-
-      // advance next block choice
-      start = block_choice + 1;
-
-
-      // don't select duplicate blocks or blocks of the wrong type
-      if (apparent_block_in_blockvector(candidate->b, block_choice) ||
-      filemirror_get_blocktype(scalpel_state.filemirror,
-                              filemirror_actual_blocknumber(scalpel_state.filemirror, block_choice),
-                              candidate->needleidx) == BLOCK_CONFIDENCE_INVALID){
-        block_choice = -1;
-      } else {
-        // check block type
-        int64_t actual_blk = filemirror_actual_blocknumber(
-          scalpel_state.filemirror, block_choice);
-
-
-        char hashkey[BLOCK_HASH_KEY_SIZE];
-        gen_block_hash_key(hashkey, candidate->needleidx, actual_blk);
-        File123BlockState *blk_state = (File123BlockState *)block_get_state(hashkey);
-        // find a block of the correct type being requested by the caller
-        if(!blk_state){
-          lock_fprintf(stderr, "No block state found for block %" PRId64 "\n", actual_blk);
-        }
-        if (blk_state && blk_state->value == target_type) {
-          done = true;
-        } else {
-          block_choice = -1;
-        }
-        file_123_free_block_state((void **)&blk_state);
-      }
+  int64_t choice = file_123_scan_blocks(work, candidate, state,
+      (uint64_t)logical_slot_index, target_type, uuidp, uuidc, &examined);
+#if BLOCK_SELECTION_PERFORMANCE_STATS > 0
+  clock_gettime(CLOCK_MONOTONIC, &ended);
+  const uint64_t elapsed = (ended.tv_sec - started.tv_sec) * NANOSECONDS_PER_SECOND
+                            + (ended.tv_nsec - started.tv_nsec);
+  atomic_fetch_add_explicit(&scalpel_state.search_specs[needleidx].BLK_calls,
+                           1, memory_order_acq_rel);
+  atomic_max_u64_pub(&scalpel_state.search_specs[needleidx].BLK_longest, elapsed);
+  atomic_fetch_add_explicit(&scalpel_state.search_specs[needleidx].BLK_total,
+                           elapsed, memory_order_acq_rel);
+  atomic_max_u64_pub(&scalpel_state.search_specs[needleidx].BLK_most_blocks, examined);
+#endif
+  file_123_free_carve_state((void **)&state);
+  if (choice >= 0) {
+    blockvector_remove_choice((*candidate)->b, (uint64_t)logical_slot_index, choice);
+    if (block_choice_start) {
+      *block_choice_start = choice + 1;
     }
   }
-
-  if (block_choice == -1 &&
-      target_type >= '0' && target_type <= '9') {
-    block_choice = file_123_find_reusable_section_block(candidate, target_type);
-    if (block_choice != -1) {
-      reused_existing = true;
-    }
+  else if (choice == -1 && target_type >= '0' && target_type <= '9') {
+    choice = file_123_find_reusable_section_block(*candidate, target_type);
   }
-
-
-  // only update block_choice_start if we found a valid block
-  if (block_choice_start && block_choice != -1 && !reused_existing) {
-    *block_choice_start = start;
-  }
-
-
-#if BLOCK_SELECTION_PERFORMANCE_STATS > 0
-  // update block selection performance stats
-  clock_gettime(CLOCK_MONOTONIC, &BLK_endtime);
-  uint64_t BLK_elapsed = (BLK_endtime.tv_sec - BLK_starttime.tv_sec) * NANOSECONDS_PER_SECOND
-                         + (BLK_endtime.tv_nsec - BLK_starttime.tv_nsec);
-
-
-  atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].BLK_calls, 1, memory_order_acq_rel);
-  atomic_max_u64_pub(&scalpel_state.search_specs[candidate->needleidx].BLK_longest, BLK_elapsed);
-  atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].BLK_total, BLK_elapsed, memory_order_acq_rel);
-  atomic_max_u64_pub(&scalpel_state.search_specs[candidate->needleidx].BLK_most_blocks, BLK_examined);
-#endif
-
-
-  return block_choice;
+  return choice;
 }
 
 
@@ -1701,71 +1719,110 @@ static char *file_123_blockvector_to_buffer_range(BlockVector *bv, int64_t start
 }
 
 
-// find a metadata block that matches `candidate`. Used by
-// file_123_reassembly_init_candidate() when no metadata block is
-// already present in the contiguous fragment.
+// Bind a scan to the candidate's physical mapping, not apparent numbering.
+// A changed candidate must reconsider earlier metadata compatibility decisions.
 //
-// Walks the apparent-block space, polling the block state set by the
-// block validator. For any block tagged 'm', call
-// file_123_validate_metadata_block() to confirm it pairs with this
-// candidate's header (file-ID match + section-layout consistency).
+static inline XXH128_hash_t file_123_scan_query(CarveInfo *candidate,
+                                               uint64_t slot, char target_type) {
+  XXH3_state_t hash;
+  XXH3_128bits_reset(&hash);
+  const uint64_t geometry[] = {
+    blockvector_get_num_blocks(candidate->b),
+    blockvector_get_data_length(candidate->b),
+    filemirror_filesize(scalpel_state.filemirror), scalpel_state.blocksize,
+    slot, (uint8_t)target_type, candidate->needleidx
+  };
+  XXH3_128bits_update(&hash, geometry, sizeof(geometry));
+  for (uint64_t i = 0; i < geometry[0]; i++) {
+    const int64_t actual = blockvector_get_actual_blocknumber(candidate->b, i);
+    XXH3_128bits_update(&hash, &actual, sizeof(actual));
+  }
+  return XXH3_128bits_digest(&hash);
+}
+
+static inline void file_123_scan_begin(CarveInfo *candidate,
+    File123ReassemblyState *state, File123ScanKind kind, uint64_t slot,
+    int64_t start_apparent, char target_type) {
+  const XXH128_hash_t query = file_123_scan_query(candidate, slot, target_type);
+  if (state->scan.kind == (uint32_t)kind
+      && XXH128_isEqual(query, state->scan.query)) {
+    return;
+  }
+  const uint64_t blocks = CEILDIV(
+      filemirror_filesize(scalpel_state.filemirror), scalpel_state.blocksize);
+  int64_t first = 0;
+  if (start_apparent >= 0
+      && (uint64_t)start_apparent < filemirror_apparent_blocks(scalpel_state.filemirror)) {
+    first = filemirror_actual_blocknumber(scalpel_state.filemirror, start_apparent);
+  }
+  if (first < 0 || (uint64_t)first >= blocks) {
+    first = 0;
+  }
+  state->scan = (File123Scan) {
+    .query = query, .next_actual = (uint64_t)first,
+    .remaining = blocks, .image_blocks = blocks, .kind = (uint32_t)kind
+  };
+}
+
+// Scan physical positions once, checking current selectability at each trial.
+// Return -2 only after saving progress and yielding with the committed mapping.
 //
-// Returns the apparent block number on success, -1 if no matching
-// metadata block exists in the image.
-static int64_t file_123_find_valid_metadata_block(CarveInfo *candidate) {
-  BlockVector *bv = candidate->b;
-  uint64_t slot = 0;
-  int64_t block_choice = -1;
-  int64_t start = 0;
-
-
-  BlockVector *scan_bv = NULL;
-  init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
-
-
-  uint64_t evaluated = 0;
-  while ((block_choice =
-    blockvector_get_choice(scan_bv, slot, start,
-      filemirror_apparent_blocks(scalpel_state.filemirror), &evaluated)) != -1) {
-
-    blockvector_remove_choice(scan_bv, slot, block_choice);
-    start = block_choice + 1;
-
-    if (apparent_block_in_blockvector(bv, block_choice)) {
-      continue;
+static int64_t file_123_scan_blocks(ThreadWork *work, CarveInfo **candidate,
+    File123ReassemblyState *state, uint64_t slot, char target_type,
+    uuid_string_t uuidp, uuid_string_t uuidc, uint64_t *examined) {
+  *examined = 0;
+  while (state->scan.remaining > 0) {
+    (*examined)++;
+    const uint64_t actual = state->scan.next_actual;
+    state->scan.next_actual = actual + 1 == state->scan.image_blocks ? 0 : actual + 1;
+    state->scan.remaining--;
+    const int64_t apparent = filemirror_apparent_blocknumber(
+        scalpel_state.filemirror, (int64_t)actual);
+    uint64_t evaluated = 0;
+    if (apparent >= 0
+        && filemirror_actual_blocknumber(scalpel_state.filemirror, apparent) == (int64_t)actual
+        && blockvector_get_choice((*candidate)->b, slot, apparent, 1, &evaluated) == apparent
+        && !apparent_block_in_blockvector((*candidate)->b, apparent)
+        && filemirror_get_blocktype(scalpel_state.filemirror, (int64_t)actual,
+                                    (*candidate)->needleidx) != BLOCK_CONFIDENCE_INVALID) {
+      char hashkey[BLOCK_HASH_KEY_SIZE];
+      gen_block_hash_key(hashkey, (*candidate)->needleidx, (int64_t)actual);
+      File123BlockState *block_state = (File123BlockState *)block_get_state(hashkey);
+      const bool matches = block_state && block_state->value == target_type;
+      file_123_free_block_state((void **)&block_state);
+      if (matches && (state->scan.kind != FILE123_SCAN_METADATA
+                      || file_123_validate_metadata_block(*candidate, apparent))) {
+        memset(&state->scan, 0, sizeof(state->scan));
+        carve_put_state((*candidate)->carvehashkey, state);
+        return apparent;
+      }
     }
-
-    int64_t  act = filemirror_actual_blocknumber(
-      scalpel_state.filemirror, block_choice);
-    if (filemirror_get_blocktype(scalpel_state.filemirror,
-                act, candidate->needleidx) == BLOCK_CONFIDENCE_INVALID){
-      continue;
-    }
-
-    char hashkey[BLOCK_HASH_KEY_SIZE];
-    gen_block_hash_key(hashkey, candidate->needleidx, act);
-    File123BlockState *st = (File123BlockState *)block_get_state(hashkey);
-
-    if (!st) {
-      continue;
-    }
-
-    if (st->value != 'm') {
-      file_123_free_block_state((void **)&st);
-      continue;
-    }
-
-
-    file_123_free_block_state((void **)&st);
-    if (file_123_validate_metadata_block(candidate, block_choice)) {
-      free_blockvector(&scan_bv);
-      return block_choice;
+    if (*examined % FILE123_SCAN_INTERVAL == 0) {
+      if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+        return FILE123_SCAN_YIELDED;
+      }
+      if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        carve_put_state((*candidate)->carvehashkey, state);
+        if (reassembly_time_to_checkpoint(work->id, *candidate, uuidp, uuidc)) {
+          return FILE123_SCAN_YIELDED;
+        }
+      }
     }
   }
-
-
-  free_blockvector(&scan_bv);
+  memset(&state->scan, 0, sizeof(state->scan));
+  carve_put_state((*candidate)->carvehashkey, state);
   return -1;
+}
+
+// Find a metadata block whose identifier and section layout match the header.
+// The common scan retains rejected-source progress across checkpoints.
+//
+static int64_t file_123_find_valid_metadata_block(
+    ThreadWork *work, CarveInfo **candidate, File123ReassemblyState *state,
+    uuid_string_t uuidp, uuid_string_t uuidc) {
+  file_123_scan_begin(*candidate, state, FILE123_SCAN_METADATA, 0, 0, 'm');
+  uint64_t examined = 0;
+  return file_123_scan_blocks(work, candidate, state, 0, 'm', uuidp, uuidc, &examined);
 }
 
 
@@ -2047,8 +2104,7 @@ static void file_123_reassembly(ThreadWork      *work,
 
 
   // initialize candidate
-  file_123_reassembly_init_candidate(work->id, c, uuidp, uuidc);
-  if (!*c) {
+  if (file_123_reassembly_init_candidate(work, c, uuidp, uuidc) || !*c) {
     return;
   }
 
@@ -2086,7 +2142,10 @@ static void file_123_reassembly(ThreadWork      *work,
 
     // get a block that matches the expected type
     int64_t blk_ap = file_123_reassembly_get_block_choice(
-                          *c, &start_ap, hole_idx, target_type);
+                          work, c, &start_ap, hole_idx, target_type, uuidp, uuidc);
+    if (blk_ap == FILE123_SCAN_YIELDED) {
+      return;
+    }
 
 
 

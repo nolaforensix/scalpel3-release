@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -163,6 +167,7 @@ typedef struct MboxParseCursor {
 typedef struct MboxTrialBuffer {
   const BlockVector *owner;
   uint8_t *data;
+  int64_t *actual_blocks;
   uint64_t blocks;
   uint64_t capacity;
 } MboxTrialBuffer;
@@ -331,6 +336,12 @@ static inline void mbox_prepare_trial_prefix(
 static inline void mbox_trial_buffer_init(
     MboxTrialBuffer *trial, const CarveInfo *candidate,
     uint64_t maximum_blocks);
+static inline void mbox_trial_buffer_free(MboxTrialBuffer *trial);
+static inline int mbox_compare_actual_blocks(const void *left,
+                                             const void *right);
+static inline uint64_t mbox_available_run_indexed(
+    const CarveInfo *candidate, int64_t first_actual,
+    uint64_t maximum_blocks, const MboxTrialBuffer *trial);
 static inline bool mbox_trial_buffer_append(
     MboxTrialBuffer *trial, const CarveInfo *candidate,
     int64_t first_actual, uint64_t run_blocks);
@@ -1926,6 +1937,21 @@ static inline void mbox_candidate_validate(CarveInfo *candidate,
   *promising = true;
 }
 
+// Sort physical block numbers without overflowing on their difference.
+static inline int mbox_compare_actual_blocks(const void *left,
+                                             const void *right) {
+  const int64_t a = *(const int64_t *)left;
+  const int64_t b = *(const int64_t *)right;
+  return (a > b) - (a < b);
+}
+
+// Release both disposable caches together, including after a partial setup.
+static inline void mbox_trial_buffer_free(MboxTrialBuffer *trial) {
+  free(trial->actual_blocks);
+  free(trial->data);
+  memset(trial, 0, sizeof(*trial));
+}
+
 // Only reuse within one search with an unchanged prefix. This is disposable
 // materialization, not search state; checkpoint reentry constructs a new buffer.
 static inline void mbox_trial_buffer_init(MboxTrialBuffer *trial,
@@ -1945,28 +1971,40 @@ static inline void mbox_trial_buffer_init(MboxTrialBuffer *trial,
   uint64_t capacity = (blocks + maximum_blocks) * blocksize;
   trial->data = malloc((size_t)capacity);
   check_memory_allocation(trial->data, __LINE__, __FILE__, "MBOX trial buffer");
+  // Retain the existing byte cache even when the optional index will not fit.
+  if (blocks != 0 && blocks <= (limit - capacity) / sizeof(int64_t)) {
+    trial->actual_blocks = malloc((size_t)blocks * sizeof(int64_t));
+    check_memory_allocation(trial->actual_blocks, __LINE__, __FILE__,
+                             "MBOX prefix block index");
+  }
   const uint64_t apparent_blocks = filemirror_apparent_blocks(
       scalpel_state.filemirror);
   for (uint64_t block = 0; block < blocks; block++) {
     int64_t apparent = blockvector_get_apparent_blocknumber(candidate->b, block);
     uint64_t length = 0;
     const char *data = NULL;
+    int64_t actual = -1;
     if (apparent >= 0 && (uint64_t)apparent < apparent_blocks) {
-      int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
-                                                     apparent);
+      actual = filemirror_actual_blocknumber(scalpel_state.filemirror, apparent);
       data = filemirror_actual_block_data_pointer(scalpel_state.filemirror,
                                                    actual, &length);
     }
     if (!data || length > blocksize) {
-      free(trial->data);
-      memset(trial, 0, sizeof(*trial));
+      mbox_trial_buffer_free(trial);
       return;
+    }
+    if (trial->actual_blocks) {
+      trial->actual_blocks[block] = actual;
     }
     memcpy(trial->data + block * blocksize, data, (size_t)length);
     if (length < blocksize) {
       memset(trial->data + block * blocksize + length, 0,
              (size_t)(blocksize - length));
     }
+  }
+  if (trial->actual_blocks && blocks > 1) {
+    qsort(trial->actual_blocks, (size_t)blocks, sizeof(int64_t),
+           mbox_compare_actual_blocks);
   }
   trial->owner = candidate->b;
   trial->blocks = blocks;
@@ -2001,9 +2039,9 @@ static inline bool mbox_trial_buffer_append(MboxTrialBuffer *trial,
   return true;
 }
 
-static inline uint64_t mbox_available_run(const CarveInfo *candidate,
-                                          int64_t first_actual,
-                                          uint64_t maximum_blocks) {
+static inline uint64_t mbox_available_run_indexed(
+    const CarveInfo *candidate, int64_t first_actual,
+    uint64_t maximum_blocks, const MboxTrialBuffer *trial) {
   if (!candidate || !candidate->b || first_actual < 0
       || maximum_blocks == 0 || scalpel_state.blocksize == 0) {
     return 0;
@@ -2026,23 +2064,43 @@ static inline uint64_t mbox_available_run(const CarveInfo *candidate,
     maximum_blocks = image_blocks - (uint64_t)first_actual;
   }
 
-  // Bound the run at its first reused block with one prefix scan, rather
-  // than searching the whole blockvector for every block in the run.
-  uint64_t apparent_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
-  uint64_t committed_blocks = blockvector_get_num_blocks(candidate->b);
-  for (uint64_t block = 0; block < committed_blocks; block++) {
-    int64_t apparent = blockvector_get_apparent_blocknumber(candidate->b, block);
-
-    if (apparent < 0 || (uint64_t)apparent >= apparent_blocks) {
-      continue;
+  const uint64_t committed_blocks = blockvector_get_num_blocks(candidate->b);
+  // Trials share one immutable prefix. Find its first reused physical block
+  // without rescanning the entire mapping on every proposed continuation.
+  if (trial && trial->actual_blocks && trial->owner == candidate->b
+      && trial->blocks == committed_blocks) {
+    uint64_t low = 0;
+    uint64_t high = committed_blocks;
+    while (low < high) {
+      const uint64_t middle = low + (high - low) / 2;
+      if (trial->actual_blocks[middle] < first_actual) {
+        low = middle + 1;
+      }
+      else {
+        high = middle;
+      }
     }
-    int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
-                                                  apparent);
-    if (actual >= first_actual
-        && (uint64_t)(actual - first_actual) < maximum_blocks) {
-      maximum_blocks = (uint64_t)(actual - first_actual);
-      if (maximum_blocks == 0) {
-        return 0;
+    if (low < committed_blocks
+        && (uint64_t)(trial->actual_blocks[low] - first_actual) < maximum_blocks) {
+      maximum_blocks = (uint64_t)(trial->actual_blocks[low] - first_actual);
+    }
+  }
+  else {
+    const uint64_t apparent_blocks = filemirror_apparent_blocks(
+        scalpel_state.filemirror);
+    for (uint64_t block = 0; block < committed_blocks; block++) {
+      int64_t apparent = blockvector_get_apparent_blocknumber(candidate->b, block);
+      if (apparent < 0 || (uint64_t)apparent >= apparent_blocks) {
+        continue;
+      }
+      int64_t actual = filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                                    apparent);
+      if (actual >= first_actual
+          && (uint64_t)(actual - first_actual) < maximum_blocks) {
+        maximum_blocks = (uint64_t)(actual - first_actual);
+        if (maximum_blocks == 0) {
+          return 0;
+        }
       }
     }
   }
@@ -2060,6 +2118,12 @@ static inline uint64_t mbox_available_run(const CarveInfo *candidate,
     available++;
   }
   return available;
+}
+
+static inline uint64_t mbox_available_run(const CarveInfo *candidate,
+                                          int64_t first_actual,
+                                          uint64_t maximum_blocks) {
+  return mbox_available_run_indexed(candidate, first_actual, maximum_blocks, NULL);
 }
 
 // Parse a proposed physical run without repeatedly materializing its prefix.
@@ -2086,8 +2150,8 @@ static inline uint64_t mbox_trial_run_buffered(
   uint64_t committed_blocks = blockvector_get_num_blocks(blockvector);
   uint64_t committed_length = committed_blocks
                               * (uint64_t)scalpel_state.blocksize;
-  uint64_t run_blocks = mbox_available_run(candidate, first_actual,
-                                           maximum_blocks);
+  uint64_t run_blocks = mbox_available_run_indexed(candidate, first_actual,
+                                                   maximum_blocks, trial);
 
   if (run_blocks == 0 || committed_blocks > UINT64_MAX - run_blocks) {
     return 0;
@@ -2726,17 +2790,17 @@ static inline MboxRunSearchResult mbox_find_continuation_run(
     examined++;
     if ((examined & UINT64_C(0xff)) == 0
         && reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-      free(trial.data);
+      mbox_trial_buffer_free(&trial);
       return MBOX_RUN_SEARCH_STOPPED;
     }
     if ((examined & UINT64_C(0x1f)) == 0
         && mbox_checkpoint_search(work, *candidate, search, blocks, length,
                                    uuidp, uuidc)) {
-      free(trial.data);
+      mbox_trial_buffer_free(&trial);
       return MBOX_RUN_SEARCH_STOPPED;
     }
   }
-  free(trial.data);
+  mbox_trial_buffer_free(&trial);
   return state->best_actual >= 0 && state->best_blocks > 0
       ? MBOX_RUN_SEARCH_READY : MBOX_RUN_SEARCH_NONE;
 }
@@ -2840,17 +2904,17 @@ static inline MboxRunSearchResult mbox_find_local_run(
     examined++;
     if ((examined & UINT64_C(0xff)) == 0
         && reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
-      free(trial.data);
+      mbox_trial_buffer_free(&trial);
       return MBOX_RUN_SEARCH_STOPPED;
     }
     if ((examined & UINT64_C(0x1f)) == 0
         && mbox_checkpoint_search(work, *candidate, search, checkpoint_blocks,
                                    checkpoint_length, uuidp, uuidc)) {
-      free(trial.data);
+      mbox_trial_buffer_free(&trial);
       return MBOX_RUN_SEARCH_STOPPED;
     }
   }
-  free(trial.data);
+  mbox_trial_buffer_free(&trial);
   return state->best_actual >= 0 && state->best_blocks > 0
       ? MBOX_RUN_SEARCH_READY : MBOX_RUN_SEARCH_NONE;
 }

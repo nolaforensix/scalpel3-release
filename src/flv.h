@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -62,7 +66,7 @@
 #define FLV_REPAIR_OUTPUT_MAX 64U
 #define FLV_REPAIR_ANY_PREVIOUS_SIZE UINT32_MAX
 #define FLV_CARVE_STATE_MAGIC UINT32_C(0x464c5653)
-#define FLV_CARVE_STATE_VERSION 7U
+#define FLV_CARVE_STATE_VERSION 8U
 
 #define FLV_TAG_AUDIO UINT8_C(8)
 #define FLV_TAG_VIDEO UINT8_C(9)
@@ -160,6 +164,8 @@ typedef struct FlvCarveState {
   uint32_t ambiguity_reserved;
   FlvRepairAmbiguity pending_ambiguity;
   FlvRepairAmbiguity ambiguities[FLV_REPAIR_HISTORY_MAX];
+  uint64_t extension_mapped;
+  uint64_t extension_signature;
 } FlvCarveState;
 
 typedef struct FlvContentHistogram {
@@ -230,6 +236,11 @@ static inline void flv_file_validate(char *data, uint64_t length,
                                      void *carvehashkey);
 static inline bool flv_serialize_carve_state(void **state, FILE *fp,
                                              StateSerialization mode);
+static inline uint64_t flv_extension_signature(
+    BlockVector *original, uint64_t target, int64_t actual);
+static inline uint64_t flv_reassembly_restore_extension(
+    CarveInfo *candidate, FlvCarveState *state, uint64_t mapped,
+    uint64_t maximum_blocks, uint64_t image_blocks);
 static inline void *flv_clone_carve_state(const void *srcstate);
 static inline void flv_free_carve_state(void **state);
 static inline void flv_print_carve_state(const void *state);
@@ -782,6 +793,7 @@ static inline bool flv_carve_state_valid(const FlvCarveState *state) {
   if (!state || state->magic != FLV_CARVE_STATE_MAGIC
       || state->version != FLV_CARVE_STATE_VERSION
       || state->stage > FLV_REPAIR_STAGE_PAIR_EXTEND
+      || state->extension_mapped > FLV_MAXIMUM_SIZE
       || state->ambiguity_count > FLV_REPAIR_HISTORY_MAX
       || state->pending_ambiguity.choice_count
           > FLV_REPAIR_BOUNDARY_CANDIDATES) {
@@ -1071,16 +1083,31 @@ static inline bool flv_serialize_carve_state(void **state, FILE *fp,
     check_memory_allocation(*flv_state, __LINE__, __FILE__,
                             "FlvCarveState");
   }
+  size_t record_size = mode == DESERIALIZE
+      ? offsetof(FlvCarveState, extension_mapped) : sizeof(**flv_state);
   if ((mode == SERIALIZE && !flv_carve_state_valid(*flv_state))
       || (mode == SERIALIZE
-          ? fwrite(*flv_state, sizeof(**flv_state), 1, fp)
-          : fread(*flv_state, sizeof(**flv_state), 1, fp)) != 1) {
+          ? fwrite(*flv_state, record_size, 1, fp)
+          : fread(*flv_state, record_size, 1, fp)) != 1) {
     if (mode == DESERIALIZE) {
       free(*flv_state);
       *flv_state = NULL;
     }
     handle_error(SCALPEL_ERROR_CHECKPOINT, "FLV carve state", __LINE__,
                  __FILE__);
+  }
+  if (mode == DESERIALIZE && (*flv_state)->version == 7U) {
+    (*flv_state)->version = FLV_CARVE_STATE_VERSION;
+  }
+  else if (mode == DESERIALIZE
+           && (*flv_state)->version == FLV_CARVE_STATE_VERSION) {
+    if (fread((uint8_t *)*flv_state + record_size,
+              sizeof(**flv_state) - record_size, 1, fp) != 1) {
+      free(*flv_state);
+      *flv_state = NULL;
+      handle_error(SCALPEL_ERROR_CHECKPOINT, "FLV extension state",
+                   __LINE__, __FILE__);
+    }
   }
   if (mode == DESERIALIZE && !flv_carve_state_valid(*flv_state)) {
     free(*flv_state);
@@ -2027,6 +2054,8 @@ static inline FlvRepairResult flv_reassembly_find_anchor(
     state->best_confidence = 0;
     state->best_reservations = INT64_MAX;
     state->extension_terminal_only = 0;
+    state->extension_mapped = 0;
+    state->extension_signature = 0;
     flv_repair_ambiguity_prepare(
         *candidate, first_target, last_target,
         &state->pending_ambiguity);
@@ -2279,6 +2308,59 @@ static inline FlvRepairResult flv_reassembly_find_pair_anchor(
   }
 }
 
+// Bind the saved extension to its unchanged rollback mapping and source run.
+static inline uint64_t flv_extension_signature(
+    BlockVector *original, uint64_t target, int64_t actual) {
+  uint64_t signature = UINT64_C(14695981039346656037);
+  uint64_t blocks = blockvector_get_num_blocks(original);
+  const uint64_t fields[] = {
+    scalpel_state.blocksize, target, (uint64_t)actual, blocks,
+    blockvector_get_data_length(original)
+  };
+  for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
+    signature = (signature ^ fields[index]) * UINT64_C(1099511628211);
+  }
+  for (uint64_t slot = 0; slot < blocks; slot++) {
+    signature = (signature ^ (uint64_t)blockvector_get_actual_blocknumber(
+        original, slot)) * UINT64_C(1099511628211);
+  }
+  return signature;
+}
+
+// Rebuild scratch bytes without repeating completed extension/validation batches.
+// If availability changed, restart this trial against the new map instead.
+static inline uint64_t flv_reassembly_restore_extension(
+    CarveInfo *candidate, FlvCarveState *state, uint64_t mapped,
+    uint64_t maximum_blocks, uint64_t image_blocks) {
+  uint64_t target = state->best_target_slot;
+  uint64_t retained = state->extension_mapped;
+  uint64_t actual = (uint64_t)state->best_actual;
+  if (retained <= mapped || target > maximum_blocks
+      || retained > maximum_blocks - target || actual >= image_blocks
+      || retained > image_blocks - actual
+      || retained > (uint64_t)INT64_MAX - actual) {
+    state->extension_mapped = 0;
+    return mapped;
+  }
+  for (uint64_t block = 0; block < retained; block++) {
+    int64_t source = (int64_t)(actual + block);
+    if (filemirror_apparent_blocknumber(scalpel_state.filemirror, source) < 0
+        || filemirror_actual_block_covered(scalpel_state.filemirror, source)
+        || flv_actual_in_prefix(candidate, target, source)) {
+      state->extension_mapped = 0;
+      return mapped;
+    }
+  }
+  resize_blockvector(candidate->b, target + retained);
+  for (uint64_t block = mapped; block < retained; block++) {
+    blockvector_set_apparent_blocknumber(candidate->b, target + block,
+        filemirror_apparent_blocknumber(scalpel_state.filemirror,
+                                       (int64_t)(actual + block)));
+  }
+  blockvector_set_data_length_to_mapped_extent(candidate->b);
+  return retained;
+}
+
 static inline FlvRepairResult flv_reassembly_extend_anchor(
     ThreadWork *work, CarveInfo **candidate, FlvCarveState *state,
     uuid_string_t uuidp, uuid_string_t uuidc) {
@@ -2302,6 +2384,13 @@ static inline FlvRepairResult flv_reassembly_extend_anchor(
   BlockVector *original = (*candidate)->b;
   BlockVector *hypothesis = NULL;
 
+  uint64_t signature = flv_extension_signature(
+      original, target_slot, actual_start);
+  if (state->extension_signature != signature) {
+    state->extension_mapped = 0;
+    state->extension_signature = signature;
+  }
+
   clone_blockvector(original, &hypothesis, false);
   (*candidate)->b = hypothesis;
   bool continuing = total_blocks > target_slot
@@ -2317,6 +2406,10 @@ static inline FlvRepairResult flv_reassembly_extend_anchor(
                                     scalpel_state.blocksize);
   uint64_t image_blocks = CEILDIV(
       filemirror_filesize(scalpel_state.filemirror), scalpel_state.blocksize);
+
+  mapped = flv_reassembly_restore_extension(
+      *candidate, state, mapped, maximum_blocks, image_blocks);
+  total_blocks = target_slot + mapped;
 
   while (total_blocks < maximum_blocks) {
     uint64_t add = FLV_REPAIR_EXTENSION_BLOCKS;
@@ -2380,6 +2473,7 @@ static inline FlvRepairResult flv_reassembly_extend_anchor(
           state->next_actual = 0;
           state->best_actual = -1;
           state->extension_terminal_only = 0;
+          state->extension_mapped = 0;
           flv_repair_ambiguity_reset(&state->pending_ambiguity);
           (*candidate)->b = original;
           free_blockvector(&hypothesis);
@@ -2392,6 +2486,7 @@ static inline FlvRepairResult flv_reassembly_extend_anchor(
         free_blockvector(&original);
         state->stage = FLV_REPAIR_STAGE_NONE;
         state->signature = 0;
+        state->extension_mapped = 0;
         state->repairs++;
         carve_put_state((*candidate)->carvehashkey, state);
         if (scalpel_state.write_promising) {
@@ -2442,6 +2537,7 @@ static inline FlvRepairResult flv_reassembly_extend_anchor(
       state->signature = 0;
       state->next_actual = 0;
       state->best_actual = -1;
+      state->extension_mapped = 0;
       state->repairs++;
       flv_repair_ambiguity_commit(
           state, target_slot, actual_start);
@@ -2460,6 +2556,7 @@ static inline FlvRepairResult flv_reassembly_extend_anchor(
     (*candidate)->b = hypothesis;
     if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
       (*candidate)->b = original;
+      state->extension_mapped = mapped;
       carve_put_state((*candidate)->carvehashkey, state);
       bool checkpointed = reassembly_time_to_checkpoint(
           work->id, *candidate, uuidp, uuidc);
@@ -2478,6 +2575,7 @@ static inline FlvRepairResult flv_reassembly_extend_anchor(
   state->stage = FLV_REPAIR_STAGE_NONE;
   state->signature = 0;
   state->extension_terminal_only = 0;
+  state->extension_mapped = 0;
   flv_repair_ambiguity_reset(&state->pending_ambiguity);
   (*candidate)->b = original;
   free_blockvector(&hypothesis);
@@ -2785,7 +2883,11 @@ static inline void flv_reassembly(ThreadWork *work, CarveInfo **candidate,
       }
     }
 
+    bool anchor_extension_finished = false;
+    bool pair_extension_finished = false;
+    bool terminal_extension_finished = false;
     if (state->stage == FLV_REPAIR_STAGE_EXTEND) {
+      bool terminal_only = state->extension_terminal_only != 0;
       FlvRepairResult extension = flv_reassembly_extend_anchor(
           work, candidate, state, uuidp, uuidc);
 
@@ -2796,6 +2898,8 @@ static inline void flv_reassembly(ThreadWork *work, CarveInfo **candidate,
       if (extension == FLV_REPAIR_PROGRESSED) {
         continue;
       }
+      terminal_extension_finished = terminal_only;
+      anchor_extension_finished = !terminal_only;
     }
     if (state->stage == FLV_REPAIR_STAGE_PAIR_EXTEND) {
       FlvRepairResult extension = flv_reassembly_extend_pair(
@@ -2808,6 +2912,7 @@ static inline void flv_reassembly(ThreadWork *work, CarveInfo **candidate,
       if (extension == FLV_REPAIR_PROGRESSED) {
         continue;
       }
+      pair_extension_finished = true;
     }
 
     bool needs_contiguous_extension =
@@ -2817,7 +2922,9 @@ static inline void flv_reassembly(ThreadWork *work, CarveInfo **candidate,
         || (result == FLV_PARSE_COMPLETE && layout.parsed_extent == length);
 
     if (needs_contiguous_extension
-        && state->stage != FLV_REPAIR_STAGE_EXTEND) {
+        && state->stage == FLV_REPAIR_STAGE_NONE
+        && !terminal_extension_finished && !anchor_extension_finished
+        && !pair_extension_finished) {
       uint64_t blocks = blockvector_get_num_blocks((*candidate)->b);
 
       if (blocks > 0) {
@@ -2834,6 +2941,8 @@ static inline void flv_reassembly(ThreadWork *work, CarveInfo **candidate,
                    scalpel_state.filemirror, last_actual + 1)) {
           state->stage = FLV_REPAIR_STAGE_EXTEND;
           state->extension_terminal_only = 1;
+          state->extension_mapped = 0;
+          state->extension_signature = 0;
           state->signature = 0;
           state->best_target_slot = blocks;
           state->best_actual = last_actual + 1;
@@ -2856,15 +2965,19 @@ static inline void flv_reassembly(ThreadWork *work, CarveInfo **candidate,
     }
 
     FlvRepairAnchor anchor;
-    FlvRepairResult search = flv_reassembly_find_anchor(
-        work, candidate, &layout, state, &anchor, uuidp, uuidc);
+    bool resuming_pair = state->stage == FLV_REPAIR_STAGE_PAIR_FIRST_SCAN
+        || state->stage == FLV_REPAIR_STAGE_PAIR_SECOND_SCAN;
+    FlvRepairResult search = anchor_extension_finished ? FLV_REPAIR_READY
+        : ((resuming_pair || pair_extension_finished) ? FLV_REPAIR_NO_MATCH
+            : flv_reassembly_find_anchor(
+                work, candidate, &layout, state, &anchor, uuidp, uuidc));
 
 
     if (search == FLV_REPAIR_STOPPED) {
       flv_free_carve_state((void **)&state);
       return;
     }
-    if (search == FLV_REPAIR_READY) {
+    if (search == FLV_REPAIR_READY && !anchor_extension_finished) {
       FlvRepairResult extension = flv_reassembly_extend_anchor(
           work, candidate, state, uuidp, uuidc);
 
@@ -2877,9 +2990,10 @@ static inline void flv_reassembly(ThreadWork *work, CarveInfo **candidate,
       }
     }
 
-    FlvRepairResult pair_search = FLV_REPAIR_NO_MATCH;
+    FlvRepairResult pair_search = pair_extension_finished
+        ? FLV_REPAIR_READY : FLV_REPAIR_NO_MATCH;
 
-    if (search == FLV_REPAIR_NO_MATCH) {
+    if (search == FLV_REPAIR_NO_MATCH && !pair_extension_finished) {
       FlvPairAnchor pair_anchor;
 
       pair_search = flv_reassembly_find_pair_anchor(

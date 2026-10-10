@@ -45,6 +45,7 @@
 
 #include "onnx_cuda_options.h"
 #include "onnx_providers.h"
+#include "scalpel_output.h"
 
 
 // Internal C++ declarations.  The public Scalpel-facing API is elf_onnx.h.
@@ -1387,7 +1388,7 @@ struct ElfDecodeJob {
         set_failure(ELF_ONNX_RETRYABLE);
       }
       catch (const std::exception& e) {
-        std::fprintf(stderr, "[elf onnx] output decoding failed: %s\n", e.what());
+        lock_fprintf(stderr, "ELF ONNX: output decoding failed: %s\n", e.what());
         set_failure(ELF_ONNX_FATAL);
       }
       catch (...) {
@@ -1469,8 +1470,8 @@ struct ElfSegmentationModelONNX::Impl {
     path /= "device-" + std::to_string(accelerator_device);
     std::filesystem::create_directories(path, error);
     if (error) {
-      std::fprintf(stderr,
-                   "[elf onnx] TensorRT cache directory %s is unavailable: %s\n",
+      lock_fprintf(stderr,
+                   "ELF ONNX: TensorRT cache directory %s is unavailable: %s\n",
                    path.string().c_str(), error.message().c_str());
       return std::string();
     }
@@ -1499,9 +1500,11 @@ struct ElfSegmentationModelONNX::Impl {
             "CUDA memory policy could not query the selected device");
       }
       if (! reported_cuda_policy) {
-        std::fprintf(stderr,
-                     "[elf onnx] CUDA device %d (physical %d): %.1f MiB free, "
-                     "%.1f MiB arena limit (%.0f%%).\n",
+        lock_fprintf(stdout,
+                     "ELF ONNX CUDA memory policy:\n"
+                     "  Device:                   %d (physical %d)\n"
+                     "  Available memory:         %.1f MiB\n"
+                     "  Arena limit:              %.1f MiB (%.0f%%)\n",
                      accelerator_device, policy.physical_device_id,
                      policy.free_bytes / 1048576.0,
                      policy.arena_limit / 1048576.0,
@@ -1599,8 +1602,8 @@ struct ElfSegmentationModelONNX::Impl {
         tensorrt_cache = tensorrt_cache_directory();
       }
       else if (tensorrt_setting && ! std::strcmp(tensorrt_setting, "true")) {
-        std::fprintf(stderr,
-                     "[elf onnx] TensorRT is unavailable; using CUDA: %s\n",
+        lock_fprintf(stdout,
+                     "ELF ONNX TensorRT is unavailable; using CUDA: %s\n",
                      reason[0] ? reason : "no compatible runtime");
       }
     }
@@ -1612,16 +1615,16 @@ struct ElfSegmentationModelONNX::Impl {
       if (! try_tensorrt) {
         throw;
       }
-      std::fprintf(stderr,
-                   "[elf onnx] TensorRT session creation failed; using CUDA: %s\n",
+      lock_fprintf(stderr,
+                   "WARNING: ELF ONNX TensorRT session creation failed; using CUDA: %s\n",
                    error.what());
       create_session(false);
     }
     if (using_tensorrt) {
-      std::fprintf(stderr,
-                   "[elf onnx] TensorRT enabled%s%s.\n",
-                   tensorrt_cache.empty() ? "" : ", engine cache ",
-                   tensorrt_cache.empty() ? "" : tensorrt_cache.c_str());
+      lock_fprintf(stdout,
+                   "ELF ONNX TensorRT enabled:\n"
+                   "  Engine cache:             %s\n",
+                   tensorrt_cache.empty() ? "disabled" : tensorrt_cache.c_str());
     }
 
     // Auto-discover IO names from the model.
@@ -1801,19 +1804,19 @@ struct ElfSegmentationModelONNX::Impl {
       if (using_tensorrt
           && ! terminate_requested.load(std::memory_order_acquire)) {
         try {
-          std::fprintf(stderr,
-                       "[elf onnx] TensorRT inference failed; rebuilding the "
+          lock_fprintf(stderr,
+                       "WARNING: ELF ONNX TensorRT inference failed; rebuilding the "
                        "session on CUDA: %s\n", message.c_str());
           create_session(false);
           return run_labels_batch(input, b, labels);
         }
         catch (const std::exception& fallback_error) {
-          std::fprintf(stderr,
-                       "[elf onnx] CUDA session rebuild failed: %s\n",
+          lock_fprintf(stderr,
+                       "ELF ONNX: CUDA session rebuild failed: %s\n",
                        fallback_error.what());
         }
       }
-      std::fprintf(stderr, "[elf onnx] ORT Run failed: %s\n", message.c_str());
+      lock_fprintf(stderr, "ELF ONNX: ORT Run failed: %s\n", message.c_str());
       if (message.find("terminate") != std::string::npos
           || message.find("Terminate") != std::string::npos) {
         inference_status = ELF_ONNX_TERMINATED;
@@ -1835,7 +1838,7 @@ struct ElfSegmentationModelONNX::Impl {
       inference_status = ELF_ONNX_RETRYABLE;
       return false;
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "[elf onnx] inference failed: %s\n", e.what());
+      lock_fprintf(stderr, "ELF ONNX: inference failed: %s\n", e.what());
       inference_status = ELF_ONNX_FATAL;
       return false;
     } catch (...) {
@@ -2043,7 +2046,7 @@ bool ElfSegmentationModelONNX::infer_batch(const uint8_t* blobs, size_t n,
     pimpl_->inference_status = ELF_ONNX_RETRYABLE;
     return false;
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "[elf onnx] output allocation failed: %s\n", e.what());
+    lock_fprintf(stderr, "ELF ONNX: output allocation failed: %s\n", e.what());
     pimpl_->inference_status = ELF_ONNX_FATAL;
     return false;
   } catch (...) {
@@ -2091,7 +2094,7 @@ bool ElfSegmentationModelONNX::infer_batch(const uint8_t* blobs, size_t n,
       pimpl_->inference_status = ELF_ONNX_RETRYABLE;
       return false;
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "[elf onnx] input allocation failed: %s\n", e.what());
+      lock_fprintf(stderr, "ELF ONNX: input allocation failed: %s\n", e.what());
       pimpl_->inference_status = ELF_ONNX_FATAL;
       return false;
     } catch (...) {
@@ -2186,13 +2189,13 @@ extern "C" elf_onnx_handle_t elf_onnx_create_batch_device_threads(
                                                         intra_op_threads);
     return reinterpret_cast<elf_onnx_handle_t>(h);
   } catch (const Ort::Exception& e) {
-    std::fprintf(stderr, "[elf onnx] session creation failed: %s\n", e.what());
+    lock_fprintf(stderr, "ELF ONNX: session creation failed: %s\n", e.what());
     return nullptr;
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "[elf onnx] session creation failed: %s\n", e.what());
+    lock_fprintf(stderr, "ELF ONNX: session creation failed: %s\n", e.what());
     return nullptr;
   } catch (...) {
-    std::fprintf(stderr, "[elf onnx] session creation failed with an unknown error.\n");
+    lock_fprintf(stderr, "ELF ONNX: session creation failed with an unknown error.\n");
     return nullptr;
   }
 }

@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -92,6 +96,7 @@ typedef struct RtfValidationSummary {
 } RtfValidationSummary;
 
 #define RTF_SEARCH_MAGIC UINT32_C(0x52544631)
+#define RTF_STATE_ENVELOPE_MAGIC UINT32_C(0x52544632)
 typedef enum {
   RTF_SEARCH_NONE, RTF_SEARCH_RANK, RTF_SEARCH_TRIAL, RTF_SEARCH_PARTIAL, RTF_SEARCH_BLOCK
 } RtfSearchPhase;
@@ -127,6 +132,7 @@ typedef struct {
 typedef struct {
   RtfSearchProgress progress;
   RtfInsertionProgress *insertion;
+  bool block_scan_exhausted;
 } RtfCarveState;
 
 static inline bool rtf_serialize_carve_state(void **state, FILE *fp, StateSerialization mode);
@@ -139,6 +145,10 @@ static inline void rtf_search_save(CarveInfo *candidate, RtfCarveState *state);
 static inline bool rtf_reassembly_insert_search(ThreadWork *work,
     CarveInfo **candidate, uint64_t gap_slot, bool *extended,
     uuid_string_t uuidp, uuid_string_t uuidc, RtfCarveState *state);
+static inline bool rtf_reassembly_write_inserted_at_stage(
+    ThreadWork *work, CarveInfo **candidate, uint64_t gap_slot,
+    bool *extended, bool following_relocated_run,
+    uuid_string_t uuidp, uuid_string_t uuidc, bool block_scan_exhausted);
 
 static inline bool rtf_ascii_hex(uint8_t value);
 static inline bool rtf_control_name_equals(const uint8_t *name,
@@ -2397,6 +2407,18 @@ static inline bool rtf_reassembly_write_inserted_hypotheses(
     bool *extended, bool following_relocated_run,
     uuid_string_t uuidp, uuid_string_t uuidc) {
 
+  return rtf_reassembly_write_inserted_at_stage(
+      work, candidate, gap_slot, extended, following_relocated_run,
+      uuidp, uuidc, false);
+}
+
+// An insertion search after block-scan exhaustion must return to that stage,
+// not replay the scan and replace the pending insertion's rankings.
+static inline bool rtf_reassembly_write_inserted_at_stage(
+    ThreadWork *work, CarveInfo **candidate, uint64_t gap_slot,
+    bool *extended, bool following_relocated_run,
+    uuid_string_t uuidp, uuid_string_t uuidc, bool block_scan_exhausted) {
+
   if (extended) {
     *extended = false;
   }
@@ -2416,6 +2438,7 @@ static inline bool rtf_reassembly_write_inserted_hypotheses(
     state->progress.magic = RTF_SEARCH_MAGIC;
     state->progress.gap_slot = gap_slot;
     state->progress.following_relocated_run = following_relocated_run;
+    state->block_scan_exhausted = block_scan_exhausted;
     state->insertion = calloc(1, sizeof(*state->insertion));
     check_memory_allocation(state->insertion, __LINE__, __FILE__, "RTF insertion progress");
   }
@@ -3732,6 +3755,10 @@ static inline void rtf_reassembly(ThreadWork *work,
     }
 
     const uint64_t trial_slot = block_count;
+    resume = rtf_search_load(*candidate);
+    const bool resumed_internal_search = resume
+        && resume->block_scan_exhausted;
+    rtf_free_carve_state((void **)&resume);
     const int64_t previous_actual = blockvector_get_actual_blocknumber(
         blockvector, trial_slot - 1);
     const uint64_t actual_blocks = CEILDIV(
@@ -3740,7 +3767,8 @@ static inline void rtf_reassembly(ThreadWork *work,
     bool adjacent_rejected = false;
     bool candidate_advanced = false;
 
-    if (previous_actual >= 0 && previous_actual < INT64_MAX
+    if (!resumed_internal_search && previous_actual >= 0
+        && previous_actual < INT64_MAX
         && (uint64_t)(previous_actual + 1) < actual_blocks) {
       const int64_t adjacent_actual = previous_actual + 1;
       const int64_t adjacent_apparent = filemirror_apparent_blocknumber(
@@ -3830,7 +3858,7 @@ static inline void rtf_reassembly(ThreadWork *work,
       }
     }
 
-    if (rtf_reassembly_write_inserted_hypotheses(
+    if (!resumed_internal_search && rtf_reassembly_write_inserted_hypotheses(
             work, candidate, trial_slot, &candidate_advanced,
             following_relocated_run, uuidp, uuidc)) {
       return;
@@ -3840,7 +3868,7 @@ static inline void rtf_reassembly(ThreadWork *work,
       continue;
     }
 
-    if (adjacent_rejected && trial_slot > 1) {
+    if (!resumed_internal_search && adjacent_rejected && trial_slot > 1) {
       const uint8_t *stalled_data = (const uint8_t *)
           blockvector_get_data_pointer(blockvector);
       uint64_t repair_slot = 0;
@@ -3876,7 +3904,7 @@ static inline void rtf_reassembly(ThreadWork *work,
     // Contiguous extension and bounded reconstruction have already been
     // attempted. Inside an unfinished encoded payload, generic block
     // selection would treat arbitrary hexadecimal data as useful progress.
-    if (current_summary.active_deep_payload) {
+    if (!resumed_internal_search && current_summary.active_deep_payload) {
       break;
     }
 
@@ -3890,7 +3918,8 @@ static inline void rtf_reassembly(ThreadWork *work,
     bool best_complete = false;
     bool best_local_forward = false;
     uint64_t examined = 0;
-    uint64_t next_apparent = 0;
+    uint64_t next_apparent = resumed_internal_search
+        ? (uint64_t)image_blocks : 0;
     resume = rtf_search_load(*candidate);
     const bool resumed_scan = resume && resume->progress.phase == RTF_SEARCH_BLOCK;
     if (resumed_scan) {
@@ -4063,8 +4092,9 @@ rtf_reassembly_poll:
 
         if (left_actual >= 0 && right_actual >= 0
             && left_actual + 1 != right_actual) {
-          if (rtf_reassembly_write_inserted_hypotheses(
-                  work, candidate, gap_slot, NULL, following_relocated_run, uuidp, uuidc)) {
+          if (rtf_reassembly_write_inserted_at_stage(
+                  work, candidate, gap_slot, NULL, following_relocated_run,
+                  uuidp, uuidc, true)) {
             return;
           }
         }
@@ -4126,15 +4156,38 @@ static inline bool rtf_serialize_carve_state(void **state, FILE *fp, StateSerial
     if (insertion != (saved->insertion != NULL)) {
       return false;
     }
-    return fwrite(&saved->progress, sizeof(saved->progress), 1, fp) == 1
+    const uint32_t envelope[] = {
+      RTF_STATE_ENVELOPE_MAGIC, saved->block_scan_exhausted ? 1 : 0
+    };
+    return (!saved->block_scan_exhausted || insertion)
+        && fwrite(envelope, sizeof(envelope), 1, fp) == 1
+        && fwrite(&saved->progress, sizeof(saved->progress), 1, fp) == 1
         && (!saved->insertion || fwrite(saved->insertion, sizeof(*saved->insertion), 1, fp) == 1);
   }
   RtfCarveState *saved = calloc(1, sizeof(*saved));
   check_memory_allocation(saved, __LINE__, __FILE__, "RTF restored search");
   RtfSearchProgress *p = &saved->progress;
-  if (fread(p, sizeof(*p), 1, fp) != 1 || p->magic != RTF_SEARCH_MAGIC
+  uint32_t marker = 0;
+  bool read_ok = fread(&marker, sizeof(marker), 1, fp) == 1;
+  if (read_ok && marker == RTF_STATE_ENVELOPE_MAGIC) {
+    uint32_t exhausted = 0;
+    read_ok = fread(&exhausted, sizeof(exhausted), 1, fp) == 1
+        && exhausted <= 1 && fread(p, sizeof(*p), 1, fp) == 1;
+    saved->block_scan_exhausted = exhausted != 0;
+  }
+  else if (read_ok && marker == RTF_SEARCH_MAGIC) {
+    p->magic = marker;
+    read_ok = fread((uint8_t *)p + sizeof(marker),
+                    sizeof(*p) - sizeof(marker), 1, fp) == 1;
+  }
+  else {
+    read_ok = false;
+  }
+  if (!read_ok || p->magic != RTF_SEARCH_MAGIC
       || (unsigned)p->phase > RTF_SEARCH_BLOCK || p->next_apparent > INT64_MAX
-      || p->gap_slot > INT64_MAX || p->best.apparent < -1) {
+      || p->gap_slot > INT64_MAX || p->best.apparent < -1
+      || (saved->block_scan_exhausted
+          && (p->phase < RTF_SEARCH_RANK || p->phase > RTF_SEARCH_PARTIAL))) {
     free(saved);
     return false;
   }

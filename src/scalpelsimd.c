@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -28,6 +32,7 @@
 //
 
 #include "scalpelsimd.h"
+#include "scalpel_output.h"
 #define SIMDE_ENABLE_NATIVE_ALIASES
 #include "simde/simde/arm/neon.h"
 #include "simde/simde/x86/avx2.h"
@@ -109,13 +114,12 @@ static void s3_print_simd_banner(void) {
 
   int vbytes = (int)(SIMDE_NATURAL_VECTOR_SIZE / 8);
 
-  fprintf(
-      stdout,
-      "Scalpel3 SIMD backend: %s, cpu_support: %s, vector_width: %dB\n",
-      s3_simd_mode_name(be),
-      s3_simd_mode_name(cpu),
-      vbytes
-  );
+  lock_fprintf(stdout,
+               "Scalpel3 SIMD configuration:\n"
+               "  Compiled backend:         %s\n"
+               "  CPU support:              %s\n"
+               "  Vector width:             %d bytes\n",
+               s3_simd_mode_name(be), s3_simd_mode_name(cpu), vbytes);
 }
 
 

@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -155,6 +159,8 @@ typedef struct XrefTables{
 typedef struct PDFEncryptionContext {
     bool active;
     bool encrypt_metadata;
+    bool aes;
+    bool identity;
     unsigned char file_key[16];
     size_t file_key_length;
 } PDFEncryptionContext;
@@ -230,6 +236,43 @@ typedef struct PDFStreamRepairCursor {
     int64_t next_actual;
 } PDFStreamRepairCursor;
 
+// Search decisions, not decoder scratch. Sources are physical block numbers.
+typedef struct PDFBackboneSearch {
+    uint32_t active;
+    uint32_t preferred_done;
+    uint64_t signature;
+    uint64_t insert;
+    int64_t next_actual;
+} PDFBackboneSearch;
+
+typedef struct PDFZlibBackboneSearch {
+    PDFBackboneSearch cursor;
+    uint32_t complete;
+} PDFZlibBackboneSearch;
+
+typedef struct PDFICCSearch {
+    uint32_t active;
+    uint64_t signature;
+    int64_t next_actual;
+    uint64_t viable_runs;
+    uint64_t best_score;
+    uint64_t second_score;
+    int64_t best_actual;
+    int64_t second_actual;
+} PDFICCSearch;
+
+typedef struct PDFZeroRunSearch {
+    uint32_t active;
+    uint64_t signature;
+    int64_t next_actual;
+} PDFZeroRunSearch;
+
+typedef struct PDFInteriorSplitSearch {
+    uint32_t active;
+    uint64_t signature;
+    int32_t next_split;
+} PDFInteriorSplitSearch;
+
 typedef struct PDFInteriorSearchState {
     bool active;
     size_t table;
@@ -237,7 +280,55 @@ typedef struct PDFInteriorSearchState {
     PDFStreamRepairCursor repair;
     uint64_t gap_extra;
     uint64_t gap_slot;
+    PDFBackboneSearch jpeg;
+    PDFICCSearch icc;
+    PDFZeroRunSearch zero;
+    PDFInteriorSplitSearch split;
+    PDFZlibBackboneSearch zlib;
 } PDFInteriorSearchState;
+
+enum PDFZlibSearchPhase {
+    PDF_ZLIB_THREE_RUN = 0,
+    PDF_ZLIB_TWO_RUN = 1,
+    PDF_ZLIB_BACKBONE = 2
+};
+
+// Deferred stream trials retain their phase, cursor and anchor identities,
+// never a zlib pointer or an unverified block assignment.
+typedef struct PDFThreeRunSearch {
+    bool active;
+    uint64_t candidate_signature;
+    uint64_t context_signature;
+    uint64_t stream_length;
+    uint64_t initial_blocks;
+    int32_t stream_offset;
+    int32_t block_span;
+    int64_t anchors[2];
+    int32_t anchor_count;
+    int32_t anchor_index;
+    int32_t prefix_limit;
+    int32_t middle_length;
+    int32_t prefix_length;
+    int64_t next_actual;
+    uint32_t phase;
+    PDFZlibBackboneSearch backbone;
+} PDFThreeRunSearch;
+
+// A layout search must retain its first success until uniqueness is established.
+typedef struct PDFPhysicalRunSearch {
+    uint32_t active;
+    uint32_t enumerated;
+    uint32_t complete;
+    uint64_t signature;
+    uint64_t boundary_count;
+    uint64_t total_slots;
+    uint64_t valid_layouts;
+    uint64_t trials;
+    uint64_t solution_length;
+    uint64_t next_footer;
+    uint64_t *boundaries;
+    int64_t *solution_actuals;
+} PDFPhysicalRunSearch;
 
 typedef struct PDFCarveState{
     XrefTables *xref_tables;  // Points to linked list of XrefTables
@@ -258,6 +349,9 @@ typedef struct PDFCarveState{
     uint64_t partial_search_length;
     int64_t partial_search_next;
     PDFInteriorSearchState interior_search;
+    PDFThreeRunSearch three_run;
+    bool physical_search_active;
+    PDFPhysicalRunSearch physical_search[2];
 } PDFCarveState;
 
 typedef struct PDFSlotDelta {
@@ -544,7 +638,8 @@ static void pdf_detect_linearization(PDFCarveState *s, const char *data, uint64_
 
 static bool pdf_place_blocks_at_slot(CarveInfo *candidate, const int64_t *actual_blocks, int count, uint64_t first_slot, const char *site);
 
-static bool pdf_repair_interior_zlib_backbone(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, bool exhaustive);
+static bool pdf_repair_interior_zlib_backbone(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, bool exhaustive, PDFZlibBackboneSearch *search);
+static bool pdf_repair_interior_zlib_zero_run(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, PDFZeroRunSearch *search);
 
 static bool pdf_repair_mapped_zlib_run(CarveInfo *candidate, int64_t stream_at,
                                       int stream_len, int64_t start_slot,
@@ -559,13 +654,30 @@ static bool pdf_repair_gapped_zlib_run(CarveInfo *candidate, int64_t stream_at,
 static void pdf_store_interior_search(CarveInfo *candidate,
                                       const PDFInteriorSearchState *search);
 
-static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, bool exhaustive);
+static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, bool exhaustive, PDFBackboneSearch *search);
 
 static inline uint32_t pdf_icc_lut_value(const unsigned char *profile,
                                          size_t offset,
                                          unsigned int bytes_per_value);
 
-static bool pdf_repair_interior_icc_lut(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot);
+static bool pdf_repair_interior_icc_lut(ThreadWork *work, CarveInfo *candidate, int64_t stream_at, int stream_len, int64_t start_slot, int64_t end_slot, PDFICCSearch *search);
+static bool pdf_serialize_auxiliary_search(PDFInteriorSearchState *search,
+                                          FILE *fp, StateSerialization mode);
+static bool pdf_serialize_interior_zlib_search(PDFInteriorSearchState *search,
+                                              FILE *fp, StateSerialization mode);
+static bool pdf_serialize_zlib_backbone_search(PDFZlibBackboneSearch *search,
+                                              FILE *fp, StateSerialization mode);
+static void pdf_physical_search_clear(PDFPhysicalRunSearch *search);
+static void pdf_physical_search_copy(PDFPhysicalRunSearch *dest,
+                                     const PDFPhysicalRunSearch *source);
+static bool pdf_serialize_physical_search(PDFPhysicalRunSearch *search,
+                                          FILE *fp, StateSerialization mode);
+static bool pdf_physical_solution_available(CarveInfo *candidate,
+                                             const PDFPhysicalRunSearch *search);
+static void pdf_store_physical_search(CarveInfo *candidate, bool logical_groups,
+                                       const PDFPhysicalRunSearch *search);
+static uint64_t pdf_interior_signature(CarveInfo *candidate,
+                                        int64_t stream_at, int stream_len);
 
 static int pdf_collect_xref_anchors(const char *data, uint64_t length, int64_t *out, int max_out);
 
@@ -617,6 +729,17 @@ static bool pdf_jpeg_body_ok(const unsigned char *buf, size_t len);
 
 static bool pdf_xml_body_ok(const unsigned char *buf, size_t len);
 
+static void pdf_store_three_run_search(CarveInfo *candidate,
+                                        const PDFThreeRunSearch *search);
+static bool pdf_serialize_three_run_search(PDFThreeRunSearch *search, FILE *fp,
+                                            StateSerialization mode);
+static uint64_t pdf_three_run_signature(CarveInfo *candidate,
+                                         int64_t first, int64_t count,
+                                         uint64_t seed);
+
+static bool pdf_first_stream_filter_is(const unsigned char *dictionary,
+                                        size_t length, const char *name);
+
 static bool pdf_streams_decode_ok(char *data, uint64_t length, XrefTables *tables,
                                   const XrefObject *xrefs, int num_tables,
                                   bool *damaged_metadata);
@@ -660,7 +783,7 @@ static bool pdf_initialize_encryption_context(
 static bool pdf_decrypt_stream(const PDFEncryptionContext *context,
                                int object_number, int generation,
                                const unsigned char *input, size_t length,
-                               unsigned char *output);
+                               unsigned char *output, size_t *output_length);
 
 static inline bool pdf_lexical_space(unsigned char c);
 
@@ -785,6 +908,11 @@ static void pdf_reassembly_extension(ThreadWork *work, CarveInfo **c, Object *ne
 static inline uint32_t pdf_block_validate(char *data, uint64_t length, BlockValidationDecision *decision, uint64_t *validates_to, uint32_t needleidx, uint32_t blocksize, void *blockhashkey);
 
 static inline void pdf_file_validate(char *data, uint64_t length, bool *validates, uint64_t *validates_to, bool *promising, uint32_t needleidx, uint32_t blocksize, void *carvehashkey);
+static void pdf_file_validate_content(char *data, uint64_t length, bool *validates,
+    uint64_t *validates_to, bool *promising, uint32_t needleidx,
+    uint32_t blocksize, void *carvehashkey, bool *unverified_complete);
+static uint64_t pdf_include_trailing_whitespace(const char *data,
+                                                uint64_t length, uint64_t end);
 static uint64_t pdf_partial_skip_space(const unsigned char *data, uint64_t cursor,
                                        uint64_t limit, bool (*stop)(void));
 static PDFPrefixScan pdf_scan_forward_prefix(const unsigned char *data,
@@ -1229,9 +1357,11 @@ Object* store_xref_table(char *data, int64_t offset, int *num_entries, int64_t l
     }
 
     *num_entries = count;
+    if (count == 0) {
+        return NULL;
+    }
     Object *entries = (Object*)malloc(sizeof(Object) * count);
     if (!entries) return NULL;
-    if (count == 0) return NULL;
 
     // Second pass parse each section
     int entry_index = 0;
@@ -1866,12 +1996,8 @@ char *decompress_with_uncompress(const char *input, size_t input_length, size_t 
         input_length--;
     }
 
-    while (input_length > 0 &&
-           (input[input_length - 1] == '\r' ||
-            input[input_length - 1] == '\n' ||
-            input[input_length - 1] == ' ')) {
-        input_length--;
-    }
+    // Compressed bytes, including Adler-32, may end with textual whitespace.
+    // Inflate stops at its own end marker; never trim bytes from the tail.
 
     uLongf output_size = 1024 * 1024;
     char *output = (char*)malloc(output_size);
@@ -2645,7 +2771,7 @@ static bool pdf_initialize_encryption_context(
             return false;
         }
         key_bits = 40;
-    } else if (revision == 3 && version == 2) {
+    } else if ((revision == 3 && version == 2) || (revision == 4 && version == 4)) {
         if (pdf_find_name_value(dictionary, dictionary_length, "Length",
                                 &value_offset) &&
             !pdf_parse_signed_integer(dictionary, dictionary_length,
@@ -2657,6 +2783,58 @@ static bool pdf_initialize_encryption_context(
         }
     } else {
         return false;
+    }
+
+    if (revision == 4) {
+        size_t method = 0, filters = 0, selected = 0;
+        if (pdf_find_name_value(dictionary, dictionary_length, "EncryptMetadata",
+                                &value_offset)) {
+            size_t end = 0;
+            if (!pdf_token_end(dictionary, dictionary_length, value_offset, &end)) {
+                return false;
+            }
+            if (end - value_offset == 5 && !memcmp(dictionary + value_offset, "false", 5)) {
+                context->encrypt_metadata = false;
+            } else if (end - value_offset != 4 || memcmp(dictionary + value_offset, "true", 4)) {
+                return false;
+            }
+        }
+        context->identity = true;
+        if (pdf_find_name_value(dictionary, dictionary_length, "StmF", &selected)) {
+            size_t end = 0;
+            if (!pdf_token_end(dictionary, dictionary_length, selected, &end) ||
+                dictionary[selected] != '/' || end - selected < 2 || end - selected > 128) {
+                return false;
+            }
+            char name[128];
+            memcpy(name, dictionary + selected + 1, end - selected - 1);
+            name[end - selected - 1] = 0;
+            if (strcmp(name, "Identity")) {
+                if (!pdf_find_name_value(dictionary, dictionary_length, "CF", &filters) ||
+                    !pdf_find_name_value(dictionary + filters, dictionary_length - filters,
+                                         name, &selected)) {
+                    return false;
+                }
+                selected += filters;
+                if (!pdf_find_name_value(dictionary + selected, dictionary_length - selected,
+                                         "CFM", &method)) {
+                    return false;
+                }
+                method += selected;
+                if (!pdf_token_end(dictionary, dictionary_length, method, &end)) {
+                    return false;
+                }
+                context->aes = end - method == 6 && !memcmp(dictionary + method, "/AESV2", 6);
+                context->identity = end - method == 5 && !memcmp(dictionary + method, "/None", 5);
+                if (!context->aes && !context->identity &&
+                    (end - method != 3 || memcmp(dictionary + method, "/V2", 3))) {
+                    return false;
+                }
+                if (context->aes && key_bits != 128) {
+                    return false;
+                }
+            }
+        }
     }
 
     unsigned char owner_entry[64];
@@ -2676,7 +2854,7 @@ static bool pdf_initialize_encryption_context(
     }
 
     size_t key_length = revision == 2 ? 5 : (size_t)(key_bits / 8);
-    unsigned char key_input[32 + 32 + 4 + sizeof(document_id)];
+    unsigned char key_input[32 + 32 + 4 + sizeof(document_id) + 4];
     size_t key_input_length = 0;
     memcpy(key_input + key_input_length, password_padding,
            sizeof(password_padding));
@@ -2690,6 +2868,10 @@ static bool pdf_initialize_encryption_context(
     }
     memcpy(key_input + key_input_length, document_id, document_id_length);
     key_input_length += document_id_length;
+    if (revision >= 4 && !context->encrypt_metadata) {
+        memset(key_input + key_input_length, 0xff, 4);
+        key_input_length += 4;
+    }
 
     unsigned char digest[16];
     if (!pdf_md5(key_input, key_input_length, digest)) {
@@ -2750,15 +2932,21 @@ static bool pdf_initialize_encryption_context(
 static bool pdf_decrypt_stream(const PDFEncryptionContext *context,
                                int object_number, int generation,
                                const unsigned char *input, size_t length,
-                               unsigned char *output) {
+                               unsigned char *output, size_t *output_length) {
     if (!context || !context->active || context->file_key_length == 0 ||
         context->file_key_length > sizeof(context->file_key) ||
         object_number < 0 || generation < 0 || generation > 65535 ||
-        (!input && length != 0) || (!output && length != 0)) {
+        (!input && length != 0) || (!output && length != 0) || !output_length) {
         return false;
     }
+    *output_length = 0;
+    if (context->identity) {
+        memcpy(output, input, length);
+        *output_length = length;
+        return true;
+    }
 
-    unsigned char key_material[21];
+    unsigned char key_material[25];
     memcpy(key_material, context->file_key, context->file_key_length);
     size_t key_material_length = context->file_key_length;
     key_material[key_material_length++] = (unsigned char)(object_number & 0xff);
@@ -2769,6 +2957,10 @@ static bool pdf_decrypt_stream(const PDFEncryptionContext *context,
     key_material[key_material_length++] = (unsigned char)(generation & 0xff);
     key_material[key_material_length++] =
         (unsigned char)((generation >> 8) & 0xff);
+    if (context->aes) {
+        memcpy(key_material + key_material_length, "sAlT", 4);
+        key_material_length += 4;
+    }
 
     unsigned char digest[16];
     if (!pdf_md5(key_material, key_material_length, digest)) {
@@ -2778,7 +2970,27 @@ static bool pdf_decrypt_stream(const PDFEncryptionContext *context,
     if (object_key_length > sizeof(digest)) {
         object_key_length = sizeof(digest);
     }
+    if (context->aes) {
+        if (length < 32 || length % 16 != 0 || length - 16 > INT_MAX) {
+            return false;
+        }
+        EVP_CIPHER_CTX *cipher = EVP_CIPHER_CTX_new();
+        if (!cipher) {
+            return false;
+        }
+        int produced = 0, final = 0;
+        bool ok = EVP_DecryptInit_ex(cipher, EVP_aes_128_cbc(), NULL, digest, input) == 1
+            && EVP_DecryptUpdate(cipher, output, &produced, input + 16, (int)(length - 16)) == 1
+            && EVP_DecryptFinal_ex(cipher, output + produced, &final) == 1;
+        EVP_CIPHER_CTX_free(cipher);
+        if (!ok) {
+            return false;
+        }
+        *output_length = (size_t)produced + (size_t)final;
+        return true;
+    }
     pdf_rc4_crypt(digest, object_key_length, input, output, length);
+    *output_length = length;
     return true;
 }
 
@@ -3162,37 +3374,46 @@ bool add_xref_table(PDFCarveState *state, XrefTables *xref_table, int table_idx)
 }
 
 /**
- * @description  Verifies that every startxref before the cutoff points at a valid
- *               xref: each startxref value must be in range and detect_xref_type()
- *               must recognise an xref there.
+ * @description  Verifies the startxref immediately preceding the accepted EOF.
+ *               Other occurrences can be ordinary text inside objects or streams.
  * @param data              The candidate buffer.
  * @param validation_cutoff The byte offset to stop scanning at.
- * @return       1 if all startxrefs resolve to a valid xref, 0 if one does not,
- *               -1 if a startxref value points past the cutoff.
+ * @return       1 if the terminal reference resolves, 0 otherwise.
  */
-int check_startxref(char *data, uint64_t validation_cutoff){
-    char *startxref_ptr = NULL;
-    uint64_t startxref_search = 0;
-
-    while(startxref_search < validation_cutoff &&
-          (startxref_ptr = memmem(&data[startxref_search],
-                                   validation_cutoff - startxref_search,
-                                   "startxref", 9))){
-        int64_t startxref_offset = startxref_ptr - data;
-        startxref_search = (uint64_t)(startxref_offset + 9);
-
-        int64_t startxref_value = extract_int(data, startxref_offset, (int64_t)validation_cutoff, NULL);
-        if(startxref_value == 0) continue;
-
-        if((uint64_t)startxref_value > validation_cutoff) return - 1;
-
-        if(detect_xref_type(data, startxref_value, validation_cutoff, &startxref_value) < 1){
+int check_startxref(char *data, uint64_t validation_cutoff) {
+    if (!data || validation_cutoff == UINT64_MAX) {
+        return 0;
+    }
+    uint64_t end = validation_cutoff + 1;
+    while (end && pdf_lexical_space((unsigned char)data[end - 1])) {
+        end--;
+    }
+    if (end < 5 || memcmp(data + end - 5, "%%EOF", 5)) {
+        return 0;
+    }
+    uint64_t eof = end - 5;
+    for (uint64_t pos = eof; pos > 0;) {
+        pos--;
+        if (eof - pos < 9 || memcmp(data + pos, "startxref", 9)) {
+            continue;
+        }
+        size_t value = pdf_skip_space_and_comments(
+            (const unsigned char *)data, pos + 9, eof);
+        size_t after = 0;
+        int64_t target = -1;
+        if (!pdf_parse_signed_integer((const unsigned char *)data, eof,
+                                       value, &target, &after)
+            || pdf_skip_space_and_comments((const unsigned char *)data, after, eof) != eof
+            || target < 0 || (uint64_t)target >= pos) {
             return 0;
         }
-
-
+        // Linearized first-page sections can use a zero terminal reference.
+        if (target == 0) {
+            return 1;
+        }
+        return detect_xref_type(data, target, (int64_t)end, &target) >= 1;
     }
-    return 1;
+    return 0;
 }
 
 /**
@@ -3963,6 +4184,47 @@ char *extract_dict(ThreadWork *work, CarveInfo *candidate,
     return NULL;
 }
 
+// Update only the deferred cursor, preserving the candidate's other PDF state.
+static void pdf_store_three_run_search(CarveInfo *candidate,
+                                        const PDFThreeRunSearch *search) {
+    PDFCarveState *state = carve_get_state(candidate->carvehashkey);
+    if (state) {
+        state->three_run = *search;
+        carve_put_state(candidate->carvehashkey, state);
+        pdf_free_carve_state((void **)&state);
+    }
+}
+
+// Hash actual identities so unrelated apparent-block renumbering is harmless.
+// A changed fixed mapping invalidates the saved search assumptions.
+static uint64_t pdf_three_run_signature(CarveInfo *candidate,
+                                         int64_t first, int64_t count,
+                                         uint64_t seed) {
+    int64_t total = (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
+    for (int64_t i = 0; i < count; i++) {
+        int64_t app = candidate
+            ? blockvector_get_apparent_blocknumber(candidate->b, (uint64_t)i)
+            : first + i;
+        int64_t actual = app >= 0 && app < total
+            ? filemirror_actual_blocknumber(scalpel_state.filemirror, app) : -1;
+        seed = XXH64(&actual, sizeof(actual), seed);
+    }
+    return seed;
+}
+
+// Changing the fixed candidate or stream makes the previous query obsolete;
+// unrelated blockmap compaction does not change physical source identities.
+static uint64_t pdf_interior_signature(CarveInfo *candidate,
+                                        int64_t stream_at, int stream_len) {
+    const uint64_t fields[] = {
+        (uint64_t)stream_at, (uint64_t)stream_len,
+        blockvector_get_data_length(candidate->b),
+        blockvector_get_num_blocks(candidate->b), scalpel_state.blocksize
+    };
+    return pdf_three_run_signature(candidate, 0, (int64_t)fields[3],
+        XXH64(fields, sizeof(fields), 0));
+}
+
 /**
  * @description  Reassembles a FlateDecode stream onto the candidate. Dispatches on
  *               mode: INBLOCK needs no extension; INNEXTBLOCK tries a contiguous
@@ -4032,6 +4294,13 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
         const unsigned char *stream_block =
             (const unsigned char*)get_apparent_block_data(scalpel_state.filemirror, block_choice);
         int stream_check = zlib_stream_reassembler_try_block(&r, stream_block, scalpel_state.blocksize);
+        if (stream_check < 0) {
+            // Allocation or inflate-copy failure can leave the live decoder
+            // advanced. It must not be reused to test a different block.
+            zlib_stream_reassembler_free(&r);
+            free((void *)stream_block);
+            return false;
+        }
         // Accept a block that validly continues (1) OR completes (2) the stream.
         // A small object stream that ends in this next block returns 2
         // (Z_STREAM_END); rejecting it (accepting only 1) discarded the
@@ -4068,11 +4337,20 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
          * Z_STREAM_END) as the oracle and committing nothing until it verifies.
          * DEFLATE has no local check to test a single block against, so the only
          * sound question is the global one -- does this whole assignment complete?
-         * -- asked once per candidate split. The stream is assumed to occupy at
-         * most two fragments.
+         * -- asked once per candidate split. Try two physical runs first, then
+         * the more general reconstruction paths below.
          */
         if (blocks_to_extend <= 0) return false;
         const int64_t tot_app = (int64_t)filemirror_apparent_blocks(scalpel_state.filemirror);
+        const uint64_t nb_before = blockvector_get_num_blocks(candidate->b);
+        PDFCarveState *saved = carve_get_state(candidate->carvehashkey);
+        PDFThreeRunSearch search = saved ? saved->three_run : (PDFThreeRunSearch){0};
+        pdf_free_carve_state((void **)&saved);
+        uint64_t signature = pdf_three_run_signature(candidate, 0, (int64_t)nb_before, 0);
+        bool resume = search.active && search.candidate_signature == signature
+            && search.initial_blocks == nb_before && search.stream_length == stream_length
+            && search.stream_offset == startstream_local_offset
+            && search.block_span == blocks_to_extend;
 
         // Endstream-block candidates, tried in order: the contiguous position
         // first (streams are usually contiguous, and content-only FINDENDSTREAM
@@ -4081,10 +4359,39 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
         int64_t es_cands[2];
         int n_es = 0;
         int64_t contig_es = (int64_t)streamstart_block_app + blocks_to_extend;
-        if (contig_es >= 0 && contig_es < tot_app) es_cands[n_es++] = contig_es;
-        int64_t findes = pdf_reassembly_get_block_choice(candidate, -1, endstream_local_offset, 0, 0, -1, FINDENDSTREAM,
-            (int64_t)blockvector_get_num_blocks(candidate->b) + (int64_t)blocks_to_extend - 1);
-        if (findes >= 0 && findes < tot_app && findes != contig_es) es_cands[n_es++] = findes;
+        int64_t findes = -1;
+        if (resume) {
+            n_es = search.anchor_count;
+            for (int i = 0; i < n_es; i++) {
+                es_cands[i] = filemirror_apparent_blocknumber(
+                    scalpel_state.filemirror, search.anchors[i]);
+                if (es_cands[i] < 0 || filemirror_actual_block_covered(
+                        scalpel_state.filemirror, search.anchors[i])) {
+                    resume = false;
+                    break;
+                }
+            }
+        }
+        if (!resume) {
+            n_es = 0;
+            if (contig_es >= 0 && contig_es < tot_app) {
+                es_cands[n_es++] = contig_es;
+            }
+            findes = pdf_reassembly_get_block_choice(candidate, -1,
+                endstream_local_offset, 0, 0, -1, FINDENDSTREAM,
+                (int64_t)nb_before + (int64_t)blocks_to_extend - 1);
+            if (findes >= 0 && findes < tot_app && findes != contig_es) {
+                es_cands[n_es++] = findes;
+            }
+        }
+        uint64_t context = pdf_three_run_signature(NULL,
+            (int64_t)streamstart_block_app, blocks_to_extend + (int64_t)1, signature);
+        for (int i = 0; i < n_es; i++) {
+            context = pdf_three_run_signature(NULL, es_cands[i] - blocks_to_extend,
+                blocks_to_extend + (int64_t)1, context);
+        }
+        resume = resume && context == search.context_signature;
+        const bool resume_three = resume && search.phase == PDF_ZLIB_THREE_RUN;
 #ifdef PDF_TRACE_STALL
         lock_fprintf(stdout,
             "[PDFZMB] candidates streamstart=%" PRIu64
@@ -4094,16 +4401,43 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
 #endif
         if (n_es == 0) return false;
 
-        const uint64_t nb_before   = blockvector_get_num_blocks(candidate->b);
         const int      n_interior  = blocks_to_extend - 1;   // last slot is the endstream block
+        if (!resume) {
+            memset(&search, 0, sizeof(search));
+            search.active = true;
+            search.phase = PDF_ZLIB_TWO_RUN;
+            search.candidate_signature = signature;
+            search.context_signature = context;
+            search.stream_length = stream_length;
+            search.initial_blocks = nb_before;
+            search.stream_offset = startstream_local_offset;
+            search.block_span = blocks_to_extend;
+            search.anchor_count = n_es;
+            search.prefix_length = n_interior;
+            for (int i = 0; i < n_es; i++) {
+                search.anchors[i] = filemirror_actual_blocknumber(
+                    scalpel_state.filemirror, es_cands[i]);
+            }
+        }
         int64_t *chosen = (int64_t*)malloc(sizeof(int64_t) * (size_t)blocks_to_extend);
         if (!chosen) return false;
 
         bool solved = false;
         uint64_t endstream_block_apparent = (uint64_t)es_cands[0];
-        for (int ei = 0; ei < n_es && !solved; ei++) {
+        const int first_anchor = search.anchor_index;
+        const int first_split = search.prefix_length;
+        for (int ei = first_anchor;
+             search.phase == PDF_ZLIB_TWO_RUN && ei < n_es && !solved; ei++) {
             endstream_block_apparent = (uint64_t)es_cands[ei];
-            for (int m = n_interior; m >= 0 && !solved; m--) {
+            for (int m = ei == first_anchor ? first_split : n_interior;
+                 m >= 0 && !solved; m--) {
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                    search.anchor_index = ei;
+                    search.prefix_length = m;
+                    pdf_store_three_run_search(candidate, &search);
+                    free(chosen);
+                    return false;
+                }
                 ZlibStreamReassembler r;
                 if (zlib_stream_reassembler_init(&r, (const unsigned char*)first_stream_block_data,
                         scalpel_state.blocksize, startstream_local_offset, (size_t)stream_length) == -1)
@@ -4145,6 +4479,11 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                 zlib_stream_reassembler_free(&r);
             }
         }
+        if (!solved && search.phase == PDF_ZLIB_TWO_RUN) {
+            search.phase = PDF_ZLIB_BACKBONE;
+            search.anchor_index = 0;
+            memset(&search.backbone, 0, sizeof(search.backbone));
+        }
 #ifdef PDF_TRACE_STALL
         if (solved) {
             lock_fprintf(stdout,
@@ -4161,7 +4500,14 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
          * clone so the active candidate remains untouched; the helper commits
          * to the clone only after the complete Flate checksum verifies.
          */
-        for (int ei = 0; ei < n_es && !solved; ei++) {
+        for (int ei = search.anchor_index;
+             search.phase == PDF_ZLIB_BACKBONE && ei < n_es && !solved; ei++) {
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                search.anchor_index = ei;
+                pdf_store_three_run_search(candidate, &search);
+                free(chosen);
+                return false;
+            }
             int64_t end_actual = filemirror_actual_blocknumber(
                 scalpel_state.filemirror, es_cands[ei]);
             if (end_actual < 0) {
@@ -4190,7 +4536,7 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                                   start_slot * (int64_t)scalpel_state.blocksize +
                                       startstream_local_offset,
                                   (int)stream_length, start_slot, end_slot,
-                                  false)) {
+                                  false, &search.backbone)) {
                 solved = true;
                 endstream_block_apparent = (uint64_t)es_cands[ei];
                 for (int i = 0; i < blocks_to_extend; i++) {
@@ -4203,6 +4549,13 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                 }
             }
             free_blockvector(&trial_bv);
+            if (!solved && atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                search.anchor_index = ei;
+                pdf_store_three_run_search(candidate, &search);
+                free(chosen);
+                return false;
+            }
+            memset(&search.backbone, 0, sizeof(search.backbone));
         }
 
         /*
@@ -4211,8 +4564,9 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
          * exact three-run assignments, shortest displaced run first, and still
          * commit only after zlib verifies the complete stream checksum.
          */
-        int prefix_limit = n_interior - 1;
-        if (!solved && n_interior > 0) {
+        resume = resume_three;
+        int prefix_limit = resume ? search.prefix_limit : n_interior - 1;
+        if (!resume && !solved && n_interior > 0) {
             prefix_limit = pdf_zlib_contiguous_prefix_blocks(
                 (const unsigned char *)first_stream_block_data,
                 startstream_local_offset, (size_t)stream_length,
@@ -4222,15 +4576,30 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                 return false;
             }
         }
-        uint64_t three_run_probes = 0;
-        for (int ei = 0; ei < n_es && !solved; ei++) {
+        if (!resume) {
+            memset(&search, 0, sizeof(search));
+            search.candidate_signature = signature;
+            search.context_signature = context;
+            search.stream_length = stream_length;
+            search.initial_blocks = nb_before;
+            search.stream_offset = startstream_local_offset;
+            search.block_span = blocks_to_extend;
+            search.anchor_count = n_es;
+            search.prefix_limit = prefix_limit;
+            for (int i = 0; i < n_es; i++) {
+                search.anchors[i] = filemirror_actual_blocknumber(
+                    scalpel_state.filemirror, es_cands[i]);
+            }
+        }
+        for (int ei = resume ? search.anchor_index : 0; ei < n_es && !solved; ei++) {
             endstream_block_apparent = (uint64_t)es_cands[ei];
-            for (int middle_len = 1; middle_len <= n_interior && !solved; middle_len++) {
+            for (int middle_len = resume ? search.middle_length : 1;
+                 middle_len <= n_interior && !solved; middle_len++) {
                 int max_prefix = n_interior - middle_len;
                 if (max_prefix > prefix_limit) {
                     max_prefix = prefix_limit;
                 }
-                for (int prefix_len = max_prefix;
+                for (int prefix_len = resume ? search.prefix_length : max_prefix;
                      prefix_len >= 0 && !solved;
                      prefix_len--) {
                     int tail_len = n_interior - prefix_len - middle_len;
@@ -4238,6 +4607,23 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                     uint64_t evaluated = 0;
                     int64_t scan_start = 0;
                     int64_t middle_start = -1;
+
+                    if (resume) {
+                        const int64_t actual_count = (int64_t)CEILDIV(
+                            filemirror_filesize(scalpel_state.filemirror), scalpel_state.blocksize);
+                        while (search.next_actual < actual_count) {
+                            scan_start = filemirror_apparent_blocknumber(
+                                scalpel_state.filemirror, search.next_actual);
+                            if (scan_start >= 0) {
+                                break;
+                            }
+                            search.next_actual++;
+                        }
+                        if (search.next_actual >= actual_count) {
+                            scan_start = tot_app;
+                        }
+                        resume = false;
+                    }
 
                     init_blockvector(scalpel_state.filemirror, &scan_bv, 1, false);
 
@@ -4251,9 +4637,15 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                             continue;
                         }
 
-                        if (((++three_run_probes & 0xffU) == 0U) &&
-                            atomic_load_explicit(&REASS_RETURN_TO_IDLE,
+                        if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                                  memory_order_acquire)) {
+                            search.active = true;
+                            search.anchor_index = ei;
+                            search.middle_length = middle_len;
+                            search.prefix_length = prefix_len;
+                            search.next_actual = filemirror_actual_blocknumber(
+                                scalpel_state.filemirror, middle_start);
+                            pdf_store_three_run_search(candidate, &search);
                             free_blockvector(&scan_bv);
                             free(chosen);
                             return false;
@@ -4333,6 +4725,8 @@ bool reconstruct_zlib_stream(ThreadWork *work, CarveInfo *candidate,
                 }
             }
         }
+        memset(&search, 0, sizeof(search));
+        pdf_store_three_run_search(candidate, &search);
 #ifdef PDF_TRACE_STALL
         if (solved) {
             lock_fprintf(stdout,
@@ -6823,15 +7217,33 @@ static bool pdf_xml_body_ok(const unsigned char *buf, size_t len) {
     return parser.state == X_TEXT && parser.tag_depth == 0;
 }
 
+// Only the first decoder in a filter chain can inspect the raw stream body.
+static bool pdf_first_stream_filter_is(const unsigned char *dictionary,
+                                        size_t length, const char *name) {
+    size_t value = 0;
+    if (!pdf_find_name_value(dictionary, length, "Filter", &value)) {
+        return false;
+    }
+    if (value < length && dictionary[value] == '[') {
+        value = pdf_skip_space_and_comments(dictionary, value + 1, length);
+    }
+    size_t end = 0;
+    size_t name_length = strlen(name);
+    return value < length && dictionary[value] == '/'
+        && pdf_token_end(dictionary, length, value, &end)
+        && end - value == name_length + 1
+        && !memcmp(dictionary + value + 1, name, name_length);
+}
+
 /**
  * @description  Returns false if any validated stream fails a content check -- i.e.
  *               a wrong block lives inside a stream body, which object-offset
  *               validation cannot see. A declared /Length bounds the body when it
  *               can be resolved; otherwise the endstream keyword is the fallback.
- *               Empty-password Standard Security Handler streams using supported
- *               RC4 revisions are authenticated and decrypted before inspection.
- *               Every per-format verifier self-gates on its signature so an
- *               unrecognised or chained encoding is skipped, never failed.
+ *               For supported RC4 and AES-128 Standard Security Handler revisions,
+ *               check the empty password and decrypt streams before inspection.
+ *               Unsupported encryption remains unverified. Chained
+ *               encodings are inspected only where the raw-body codec is known.
  * @param data        The assembled candidate buffer.
  * @param length      Length of the buffer.
  * @param tables      The xref tables locating object headers.
@@ -6846,6 +7258,22 @@ static bool pdf_streams_decode_ok(char *data, uint64_t length,
     PDFEncryptionContext encryption;
     bool decrypt_streams = pdf_initialize_encryption_context(
         (const unsigned char *)data, length, tables, xrefs, num_tables, &encryption);
+    bool encrypted = decrypt_streams;
+    if (!encrypted) {
+        for (int t = 0; t < num_tables; t++) {
+            uint64_t start = 0, end = 0;
+            size_t value = 0;
+            if (pdf_xref_dictionary((const unsigned char *)data, length,
+                    xrefs, num_tables, t, &start, &end) &&
+                pdf_find_name_value((const unsigned char *)data + start,
+                    end - start, "Encrypt", &value) &&
+                (end - start - value < 4 || memcmp(data + start + value, "null", 4))) {
+                encrypted = true;
+                break;
+            }
+        }
+    }
+    *damaged_metadata = encrypted && !decrypt_streams;
 
     for (int t = 0; t < num_tables; t++) {
         if (!tables[t].entries) continue;
@@ -6864,12 +7292,34 @@ static bool pdf_streams_decode_ok(char *data, uint64_t length,
                                                    (int)dict_len) == XML;
             if (!is_flate && !is_dct && !is_xml) continue;
 
+            uint64_t object_body = 0;
+            int generation = 0;
+            if (!pdf_indirect_object_body_start(
+                    (const unsigned char *)data, off, obj_end,
+                    tables[t].entries[j].obj_num, &object_body, &generation)
+                || object_body > (uint64_t)(sk - data)) {
+                return false;
+            }
+            const unsigned char *dictionary = (const unsigned char *)data + object_body;
+            size_t dictionary_length = (uint64_t)(sk - data) - object_body;
+            if (encrypted && pdf_first_stream_filter_is(dictionary, dictionary_length, "Crypt")) {
+                // A per-stream crypt filter overrides the document default.
+                *damaged_metadata = true;
+                continue;
+            }
+
             bool is_xref_stream =
                 memmem(data + off, dict_len, "/Type", 5) != NULL &&
                 memmem(data + off, dict_len, "/XRef", 5) != NULL;
             bool is_metadata_stream =
                 memmem(data + off, dict_len, "/Type", 5) != NULL &&
                 memmem(data + off, dict_len, "/Metadata", 9) != NULL;
+            if (encrypted && !decrypt_streams && !is_xref_stream) {
+                // Ciphertext is not a compressed stream. Preserve the candidate
+                // as unverified rather than testing random bytes as a codec.
+                *damaged_metadata = true;
+                continue;
+            }
 
             uint64_t sdat = (uint64_t)(sk - data) + 6;            // past "stream"
             if (sdat < length && data[sdat] == '\r') sdat++;
@@ -6897,32 +7347,34 @@ static bool pdf_streams_decode_ok(char *data, uint64_t length,
             unsigned char *decrypted = NULL;
             if (decrypt_streams && !is_xref_stream &&
                 (encryption.encrypt_metadata || !is_metadata_stream)) {
-                uint64_t object_body = 0;
-                int generation = 0;
-                if (pdf_indirect_object_body_start(
-                        (const unsigned char *)data, off, obj_end,
-                        tables[t].entries[j].obj_num, &object_body,
-                        &generation)) {
-                    decrypted = malloc(blen);
-                    check_memory_allocation(decrypted, __LINE__, __FILE__,
-                                            "PDF decrypted stream");
-                    if (pdf_decrypt_stream(
-                            &encryption, tables[t].entries[j].obj_num,
-                            generation, body, blen, decrypted)) {
-                        body = decrypted;
-                    } else {
-                        free(decrypted);
-                        decrypted = NULL;
-                        continue;
-                    }
+                decrypted = malloc(blen);
+                check_memory_allocation(decrypted, __LINE__, __FILE__,
+                                        "PDF decrypted stream");
+                if (pdf_decrypt_stream(
+                        &encryption, tables[t].entries[j].obj_num,
+                        generation, body, blen, decrypted, &blen)) {
+                    body = decrypted;
                 } else {
-                    continue;
+                    free(decrypted);
+                    return false;
                 }
             }
             // A filter chain names several filters; try both verifiers and let
             // each self-gate on its signature (the raw body matches at most one).
             bool valid = (!is_flate || pdf_flate_body_ok(body, blen)) &&
                          (!is_dct || pdf_jpeg_body_ok(body, blen));
+            if (decrypted) {
+                // Decryption must not turn a damaged first decoder signature
+                // into an unrecognised encoding that silently skips validation.
+                if (pdf_first_stream_filter_is(dictionary, dictionary_length, "FlateDecode")) {
+                    valid = valid && blen >= 2 && (body[0] & 15) == 8
+                        && (body[0] >> 4) <= 7 && !(body[1] & 0x20)
+                        && (((unsigned)body[0] << 8) | body[1]) % 31 == 0;
+                }
+                if (pdf_first_stream_filter_is(dictionary, dictionary_length, "DCTDecode")) {
+                    valid = valid && blen >= 3 && body[0] == 0xff && body[1] == 0xd8;
+                }
+            }
             if (is_xml && !pdf_xml_body_ok(body, blen)) {
                 if (is_metadata_stream) {
                     // A metadata object wholly within one block cannot acquire
@@ -6949,6 +7401,12 @@ static bool pdf_streams_decode_ok(char *data, uint64_t length,
             }
             free(decrypted);
             if (!valid) {
+#ifdef PDF_TRACE_VALIDATE
+                lock_fprintf(stdout, "[PDFVAL] stream obj=%d off=%" PRIu64
+                    " length=%zu flate=%d jpeg=%d xml=%d metadata=%d\n",
+                    tables[t].entries[j].obj_num, off, blen, is_flate,
+                    is_dct, is_xml, is_metadata_stream);
+#endif
                 return false;
             }
         }
@@ -7342,6 +7800,203 @@ static inline bool pdf_serialize_xref_search_state(
 /* CARVE STATE FUNCTION DEFINITIONS                   */
 /*******************************************************/
 
+// INT03 extends only PDF state; older PDF checkpoint records start with an
+// inactive three-run search. Encode fields explicitly, without struct padding.
+static bool pdf_serialize_three_run_search(PDFThreeRunSearch *s, FILE *fp,
+                                            StateSerialization mode) {
+    size_t (*fb)(void *, size_t, size_t, FILE *) = mode == SERIALIZE
+        ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite : fread;
+    if (fb(&s->active, sizeof(s->active), 1, fp) != 1
+        || fb(&s->candidate_signature, sizeof(s->candidate_signature), 1, fp) != 1
+        || fb(&s->context_signature, sizeof(s->context_signature), 1, fp) != 1
+        || fb(&s->stream_length, sizeof(s->stream_length), 1, fp) != 1
+        || fb(&s->initial_blocks, sizeof(s->initial_blocks), 1, fp) != 1
+        || fb(&s->stream_offset, sizeof(s->stream_offset), 1, fp) != 1
+        || fb(&s->block_span, sizeof(s->block_span), 1, fp) != 1
+        || fb(s->anchors, sizeof(*s->anchors), 2, fp) != 2
+        || fb(&s->anchor_count, sizeof(s->anchor_count), 1, fp) != 1
+        || fb(&s->anchor_index, sizeof(s->anchor_index), 1, fp) != 1
+        || fb(&s->prefix_limit, sizeof(s->prefix_limit), 1, fp) != 1
+        || fb(&s->middle_length, sizeof(s->middle_length), 1, fp) != 1
+        || fb(&s->prefix_length, sizeof(s->prefix_length), 1, fp) != 1
+        || fb(&s->next_actual, sizeof(s->next_actual), 1, fp) != 1) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (s->phase > PDF_ZLIB_BACKBONE
+        || (s->active && (s->initial_blocks == 0 || s->stream_length == 0
+        || s->stream_offset < 0 || (uint32_t)s->stream_offset >= scalpel_state.blocksize
+        || s->block_span < 1 || s->anchor_count < 1 || s->anchor_count > 2
+        || s->anchor_index < 0 || s->anchor_index >= s->anchor_count
+        || s->anchors[0] < 0 || (s->anchor_count == 2 && s->anchors[1] < 0)
+        || (s->phase == PDF_ZLIB_TWO_RUN
+            && (s->prefix_length < 0 || s->prefix_length >= s->block_span))
+        || (s->phase == PDF_ZLIB_THREE_RUN && (s->block_span < 2
+        || s->prefix_limit < 0 || s->prefix_limit >= s->block_span - 1
+        || s->middle_length < 1 || s->middle_length >= s->block_span
+        || s->prefix_length < 0 || s->prefix_length > s->prefix_limit
+        || s->prefix_length > s->block_span - 1 - s->middle_length
+        || s->next_actual < 0))))) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    return true;
+}
+
+// Preserve auxiliary stream-search decisions and reject malformed cursors.
+static bool pdf_serialize_auxiliary_search(PDFInteriorSearchState *search,
+                                          FILE *fp, StateSerialization mode) {
+    size_t (*io)(void *, size_t, size_t, FILE *) = mode == SERIALIZE
+        ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite : fread;
+#define PDF_AUX_FIELD(field) \
+    if (io(&search->field, sizeof(search->field), 1, fp) != 1) { return false; }
+    PDF_AUX_FIELD(jpeg.active);
+    PDF_AUX_FIELD(jpeg.preferred_done);
+    PDF_AUX_FIELD(jpeg.signature);
+    PDF_AUX_FIELD(jpeg.insert);
+    PDF_AUX_FIELD(jpeg.next_actual);
+    PDF_AUX_FIELD(icc.active);
+    PDF_AUX_FIELD(icc.signature);
+    PDF_AUX_FIELD(icc.next_actual);
+    PDF_AUX_FIELD(icc.viable_runs);
+    PDF_AUX_FIELD(icc.best_score);
+    PDF_AUX_FIELD(icc.second_score);
+    PDF_AUX_FIELD(icc.best_actual);
+    PDF_AUX_FIELD(icc.second_actual);
+#undef PDF_AUX_FIELD
+    return search->jpeg.active <= 1 && search->jpeg.preferred_done <= 1
+        && search->jpeg.next_actual >= 0 && search->jpeg.insert <= INT64_MAX
+        && search->icc.active <= 1 && search->icc.next_actual >= 0
+        && search->icc.best_actual >= -1 && search->icc.second_actual >= -1
+        && (!(search->jpeg.active || search->icc.active) || search->active)
+        && (!search->icc.active
+            || (search->icc.best_score <= search->icc.second_score
+                && ((search->icc.best_actual < 0)
+                    == (search->icc.best_score == UINT64_MAX))
+                && ((search->icc.second_actual < 0)
+                    == (search->icc.second_score == UINT64_MAX))));
+}
+
+// Physical replacement and logical split cursors have separate scopes.
+static bool pdf_serialize_interior_zlib_search(PDFInteriorSearchState *search,
+                                              FILE *fp, StateSerialization mode) {
+    size_t (*io)(void *, size_t, size_t, FILE *) = mode == SERIALIZE
+        ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite : fread;
+#define PDF_ZLIB_FIELD(field) \
+    if (io(&search->field, sizeof(search->field), 1, fp) != 1) { return false; }
+    PDF_ZLIB_FIELD(zero.active);
+    PDF_ZLIB_FIELD(zero.signature);
+    PDF_ZLIB_FIELD(zero.next_actual);
+    PDF_ZLIB_FIELD(split.active);
+    PDF_ZLIB_FIELD(split.signature);
+    PDF_ZLIB_FIELD(split.next_split);
+#undef PDF_ZLIB_FIELD
+    return search->zero.active <= 1 && search->zero.next_actual >= 0
+        && search->split.active <= 1 && search->split.next_split >= -1
+        && (!(search->zero.active || search->split.active) || search->active);
+}
+
+// Release the layout frontier independently of disposable parser state.
+static void pdf_physical_search_clear(PDFPhysicalRunSearch *search) {
+    free(search->boundaries);
+    free(search->solution_actuals);
+    memset(search, 0, sizeof(*search));
+}
+
+// State clones own their frontier and first successful layout.
+static void pdf_physical_search_copy(PDFPhysicalRunSearch *dest,
+                                     const PDFPhysicalRunSearch *source) {
+    *dest = *source;
+    dest->boundaries = NULL;
+    dest->solution_actuals = NULL;
+    if (source->boundary_count) {
+        dest->boundaries = malloc(source->boundary_count * sizeof(*dest->boundaries));
+        check_memory_allocation(dest->boundaries, __LINE__, __FILE__, "PDF boundaries");
+        memcpy(dest->boundaries, source->boundaries,
+               source->boundary_count * sizeof(*dest->boundaries));
+    }
+    if (source->total_slots) {
+        dest->solution_actuals = malloc(source->total_slots * sizeof(*dest->solution_actuals));
+        check_memory_allocation(dest->solution_actuals, __LINE__, __FILE__, "PDF layout");
+        memcpy(dest->solution_actuals, source->solution_actuals,
+               source->total_slots * sizeof(*dest->solution_actuals));
+    }
+}
+
+// Encode physical layouts without pointers or native struct padding.
+static bool pdf_serialize_physical_search(PDFPhysicalRunSearch *search,
+                                          FILE *fp, StateSerialization mode) {
+    size_t (*io)(void *, size_t, size_t, FILE *) = mode == SERIALIZE
+        ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite : fread;
+#define PDF_PHYSICAL_FIELD(field) \
+    if (io(&search->field, sizeof(search->field), 1, fp) != 1) { return false; }
+    PDF_PHYSICAL_FIELD(active);
+    PDF_PHYSICAL_FIELD(enumerated);
+    PDF_PHYSICAL_FIELD(complete);
+    PDF_PHYSICAL_FIELD(signature);
+    PDF_PHYSICAL_FIELD(boundary_count);
+    PDF_PHYSICAL_FIELD(total_slots);
+    PDF_PHYSICAL_FIELD(valid_layouts);
+    PDF_PHYSICAL_FIELD(trials);
+    PDF_PHYSICAL_FIELD(solution_length);
+    PDF_PHYSICAL_FIELD(next_footer);
+#undef PDF_PHYSICAL_FIELD
+    if (search->active > 1 || search->enumerated > 1 || search->complete > 1
+        || search->valid_layouts > 2
+        || search->boundary_count > SIZE_MAX / sizeof(*search->boundaries)
+        || search->total_slots > SIZE_MAX / sizeof(*search->solution_actuals)
+        || (!search->active && (search->boundary_count || search->total_slots
+            || search->enumerated || search->complete || search->valid_layouts))
+        || (search->active && (search->boundary_count == 0
+            || search->boundary_count >= search->total_slots
+            || search->solution_length == 0 || scalpel_state.blocksize == 0
+            || 1 + (search->solution_length - 1) / scalpel_state.blocksize
+                < search->total_slots))) {
+        return false;
+    }
+    if (mode == DESERIALIZE && search->active) {
+        search->boundaries = malloc(search->boundary_count * sizeof(*search->boundaries));
+        search->solution_actuals = malloc(search->total_slots * sizeof(*search->solution_actuals));
+        check_memory_allocation(search->boundaries, __LINE__, __FILE__, "PDF boundaries");
+        check_memory_allocation(search->solution_actuals, __LINE__, __FILE__, "PDF layout");
+    }
+    if ((search->boundary_count && io(search->boundaries, sizeof(*search->boundaries),
+            search->boundary_count, fp) != search->boundary_count)
+        || (search->total_slots && io(search->solution_actuals, sizeof(*search->solution_actuals),
+            search->total_slots, fp) != search->total_slots)) {
+        return false;
+    }
+    for (uint64_t i = 0; i < search->boundary_count; i++) {
+        if (search->boundaries[i] == 0 || search->boundaries[i] >= search->total_slots
+            || (i && search->boundaries[i] <= search->boundaries[i - 1])) {
+            return false;
+        }
+    }
+    for (uint64_t i = 0; search->valid_layouts && i < search->total_slots; i++) {
+        if (search->solution_actuals[i] < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Decoder state is reconstructed; completed source trials and phase decisions persist.
+static bool pdf_serialize_zlib_backbone_search(PDFZlibBackboneSearch *search,
+                                              FILE *fp, StateSerialization mode) {
+    size_t (*io)(void *, size_t, size_t, FILE *) = mode == SERIALIZE
+        ? (size_t (*)(void *, size_t, size_t, FILE *))fwrite : fread;
+#define PDF_BACKBONE_FIELD(field) \
+    if (io(&search->field, sizeof(search->field), 1, fp) != 1) { return false; }
+    PDF_BACKBONE_FIELD(cursor.active);
+    PDF_BACKBONE_FIELD(cursor.preferred_done);
+    PDF_BACKBONE_FIELD(cursor.signature);
+    PDF_BACKBONE_FIELD(cursor.insert);
+    PDF_BACKBONE_FIELD(cursor.next_actual);
+    PDF_BACKBONE_FIELD(complete);
+#undef PDF_BACKBONE_FIELD
+    return search->cursor.active <= 1 && search->cursor.preferred_done <= 1
+        && search->cursor.insert <= INT64_MAX && search->cursor.next_actual >= 0
+        && search->complete <= 1 && (!search->complete || search->cursor.active);
+}
+
 /**
  * @description  Serializes or deserializes a PDFCarveState (its xref tables,
  *               object entries, and linearization fields) to/from a checkpoint file,
@@ -7376,6 +8031,9 @@ static inline bool pdf_serialize_carve_state(void **state, FILE *fp,
         (*s)->partial_search_length = 0;
         (*s)->partial_search_next = 0;
         memset(&(*s)->interior_search, 0, sizeof((*s)->interior_search));
+        memset(&(*s)->three_run, 0, sizeof((*s)->three_run));
+        (*s)->physical_search_active = false;
+        memset((*s)->physical_search, 0, sizeof((*s)->physical_search));
         pdf_xref_search_state_init(&(*s)->xref_search);
     }
 
@@ -7404,11 +8062,16 @@ static inline bool pdf_serialize_carve_state(void **state, FILE *fp,
     }
     pdf_serialize_xref_search_state(&(*s)->xref_search, fp, mode);
 
-    uint64_t interior_version = UINT64_C(0x504446494e543032);
+    uint64_t interior_version = UINT64_C(0x504446494e543037);
     PDFInteriorSearchState *interior = &(*s)->interior_search;
     if (fb(&interior_version, sizeof(interior_version), 1, fp) != 1
         || (interior_version != UINT64_C(0x504446494e543031)
-            && interior_version != UINT64_C(0x504446494e543032))
+            && interior_version != UINT64_C(0x504446494e543032)
+            && interior_version != UINT64_C(0x504446494e543033)
+            && interior_version != UINT64_C(0x504446494e543034)
+            && interior_version != UINT64_C(0x504446494e543035)
+            && interior_version != UINT64_C(0x504446494e543036)
+            && interior_version != UINT64_C(0x504446494e543037))
         || fb(&interior->active, sizeof(interior->active), 1, fp) != 1
         || fb(&interior->table, sizeof(interior->table), 1, fp) != 1
         || fb(&interior->entry, sizeof(interior->entry), 1, fp) != 1
@@ -7426,15 +8089,38 @@ static inline bool pdf_serialize_carve_state(void **state, FILE *fp,
                 || interior->repair.prefix_length > interior->repair.prefix_limit))) {
         handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
-    if (interior_version == UINT64_C(0x504446494e543032)
+    if (interior_version >= UINT64_C(0x504446494e543032)
         && (fb(&interior->gap_extra, sizeof(interior->gap_extra), 1, fp) != 1
             || fb(&interior->gap_slot, sizeof(interior->gap_slot), 1, fp) != 1
             || (interior->gap_extra != 0
                 && (!interior->active || interior->gap_slot == 0)))) {
         handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
     }
+    if (interior_version >= UINT64_C(0x504446494e543036)
+        && (fb(&(*s)->three_run.phase, sizeof((*s)->three_run.phase), 1, fp) != 1
+            || !pdf_serialize_zlib_backbone_search(&(*s)->three_run.backbone, fp, mode)
+            || !pdf_serialize_zlib_backbone_search(&interior->zlib, fp, mode))) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (interior_version >= UINT64_C(0x504446494e543033)) {
+        pdf_serialize_three_run_search(&(*s)->three_run, fp, mode);
+    }
+    if (interior_version >= UINT64_C(0x504446494e543034)
+        && !pdf_serialize_auxiliary_search(interior, fp, mode)) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
+    if (interior_version >= UINT64_C(0x504446494e543035)
+        && !pdf_serialize_interior_zlib_search(interior, fp, mode)) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
 
     uint64_t prefix_version = UINT64_C(0x5044465052465832);
+    if (interior_version >= UINT64_C(0x504446494e543037)
+        && (fb(&(*s)->physical_search_active, sizeof((*s)->physical_search_active), 1, fp) != 1
+            || !pdf_serialize_physical_search(&(*s)->physical_search[0], fp, mode)
+            || !pdf_serialize_physical_search(&(*s)->physical_search[1], fp, mode))) {
+        handle_error(SCALPEL_ERROR_CHECKPOINT, NULL, __LINE__, __FILE__);
+    }
     uint64_t prefix_length = (*s)->partial_prefix ? (*s)->partial_prefix->length : 0;
     uint64_t prefix_count = (*s)->partial_prefix ? (*s)->partial_prefix->count : 0;
     if (fb(&prefix_version, sizeof(prefix_version), 1, fp) != 1
@@ -7529,6 +8215,11 @@ static inline void *pdf_clone_carve_state(const void *srcstate) {
     d->partial_search_length = s->partial_search_length;
     d->partial_search_next = s->partial_search_next;
     d->interior_search = s->interior_search;
+    d->three_run = s->three_run;
+    d->physical_search_active = s->physical_search_active;
+    for (size_t i = 0; i < 2; i++) {
+        pdf_physical_search_copy(&d->physical_search[i], &s->physical_search[i]);
+    }
     if (d->partial_prefix) {
         atomic_fetch_add_explicit(&d->partial_prefix->references, 1, memory_order_relaxed);
     }
@@ -7581,6 +8272,9 @@ static inline void pdf_free_carve_state(void **state) {
     s->num_tables = 0;
     pdf_xref_search_state_clear(&s->xref_search);
     pdf_partial_prefix_release(s->partial_prefix);
+    for (size_t i = 0; i < 2; i++) {
+        pdf_physical_search_clear(&s->physical_search[i]);
+    }
     free(s);
     *state = NULL;
 }
@@ -7962,7 +8656,7 @@ static int pdf_try_zlib_backbone_insertion(
     const roaring64_bitmap_t *outside_apps,
     const roaring64_bitmap_t *backbone_apps,
     int64_t *replacement,
-    uint64_t *probes) {
+    uint64_t *probes, PDFBackboneSearch *search) {
     FileMirror *fm = scalpel_state.filemirror;
     const size_t bsz = scalpel_state.blocksize;
 #ifdef PDF_TRACE_STALL
@@ -7971,7 +8665,11 @@ static int pdf_try_zlib_backbone_insertion(
     int best_status = 0;
 #endif
 
-    for (int64_t run_start = 0;
+    if (search->insert != insert) {
+        search->insert = insert;
+        search->next_actual = 0;
+    }
+    for (int64_t run_start = search->next_actual;
          run_start <= total_actual - (int64_t)missing;
          run_start++) {
         if (((++*probes & 0xffU) == 0U) &&
@@ -7979,6 +8677,8 @@ static int pdf_try_zlib_backbone_insertion(
                                  memory_order_acquire)) {
             return -1;
         }
+
+        search->next_actual = run_start + 1;
 
         bool viable = true;
         for (size_t i = 0; i < missing; i++) {
@@ -8109,7 +8809,8 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
                                               int stream_len,
                                               int64_t start_slot,
                                               int64_t end_slot,
-                                              bool exhaustive) {
+                                              bool exhaustive,
+                                              PDFZlibBackboneSearch *search) {
     (void)work;
     if (!candidate || stream_len <= 0 || start_slot < 0 ||
         end_slot <= start_slot ||
@@ -8191,6 +8892,7 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
     }
 
     bool solved = false;
+    bool completed = false;
     size_t solved_insert = 0;
     size_t missing = (!overflow && backbone_count < expected)
                          ? expected - backbone_count
@@ -8202,8 +8904,20 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
         start_actual, end_actual, expected, backbone_count, missing,
         preferred_insert, overflow ? 1 : 0);
 #endif
+    const uint64_t signature = XXH64(backbone,
+        backbone_count * sizeof(*backbone),
+        pdf_interior_signature(candidate, stream_at, stream_len));
+    if (!search->cursor.active || search->cursor.signature != signature) {
+        memset(search, 0, sizeof(*search));
+        search->cursor.active = 1;
+        search->cursor.signature = signature;
+    }
+    if (search->complete) {
+        goto cleanup;
+    }
     if (overflow || backbone_count < 2 || backbone[0] != start_actual ||
         backbone[backbone_count - 1] != end_actual) {
+        completed = true;
         goto cleanup;
     }
 
@@ -8275,6 +8989,7 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
             }
         }
         solved = status == 2 && extent_complete;
+        completed = status >= 0;
         inflateEnd(&prefix);
         if (solved) {
             memcpy(assignment, backbone, expected * sizeof(*assignment));
@@ -8291,7 +9006,8 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
     }
 
     uint64_t probes = 0;
-    if (preferred_insert > 0 && preferred_insert < backbone_count) {
+    if (!search->cursor.preferred_done
+        && preferred_insert > 0 && preferred_insert < backbone_count) {
         z_stream preferred;
         memset(&preferred, 0, sizeof(preferred));
         if (inflateInit2(&preferred, 15) != Z_OK) {
@@ -8326,7 +9042,7 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
             int result = pdf_try_zlib_backbone_insertion(
                 &preferred, preferred_fed, backbone, backbone_count,
                 preferred_insert, missing, (size_t)stream_len, total_actual,
-                outside_apps, backbone_apps, replacement, &probes);
+                outside_apps, backbone_apps, replacement, &probes, &search->cursor);
             if (result < 0) {
                 inflateEnd(&preferred);
                 inflateEnd(&prefix);
@@ -8345,20 +9061,27 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
         }
         inflateEnd(&preferred);
     }
+    if (!search->cursor.preferred_done) {
+        search->cursor.preferred_done = 1;
+        search->cursor.insert = 1;
+        search->cursor.next_actual = 0;
+    }
 
     if (!solved && !exhaustive) {
+        completed = true;
         inflateEnd(&prefix);
         goto cleanup;
     }
 
+    const uint64_t resume_insert = search->cursor.insert;
     for (size_t insert = 1;
          prefix_status == 1 && insert < backbone_count && !solved;
          insert++) {
-        if (insert != preferred_insert) {
+        if (insert >= resume_insert && insert != preferred_insert) {
             int result = pdf_try_zlib_backbone_insertion(
                 &prefix, prefix_fed, backbone, backbone_count, insert, missing,
                 (size_t)stream_len, total_actual, outside_apps, backbone_apps,
-                replacement, &probes);
+                replacement, &probes, &search->cursor);
             if (result < 0) {
                 inflateEnd(&prefix);
                 goto cleanup;
@@ -8389,6 +9112,7 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
             prefix_fed += take;
         }
     }
+    completed = prefix_status >= 0;
     inflateEnd(&prefix);
 
     if (solved) {
@@ -8413,6 +9137,9 @@ static bool pdf_repair_interior_zlib_backbone(ThreadWork *work,
     }
 
 cleanup:
+    if (completed && !atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        search->complete = 1;
+    }
     free(assignment);
     free(replacement);
     free(backbone);
@@ -8431,11 +9158,15 @@ static int pdf_try_jpeg_backbone_insertion(
     const roaring64_bitmap_t *outside_apps,
     const roaring64_bitmap_t *backbone_apps,
     int64_t *replacement,
-    uint64_t *probes) {
+    uint64_t *probes, PDFBackboneSearch *search) {
     FileMirror *fm = scalpel_state.filemirror;
     const size_t bsz = scalpel_state.blocksize;
 
-    for (int64_t run_start = 0;
+    if (search->insert != insert) {
+        search->insert = insert;
+        search->next_actual = 0;
+    }
+    for (int64_t run_start = search->next_actual;
          run_start <= total_actual - (int64_t)missing;
          run_start++) {
         if (((++*probes & 0xffU) == 0U) &&
@@ -8443,6 +9174,7 @@ static int pdf_try_jpeg_backbone_insertion(
                                  memory_order_acquire)) {
             return -1;
         }
+        search->next_actual = run_start + 1;
 
         bool viable = true;
         for (size_t i = 0; i < missing; i++) {
@@ -8532,9 +9264,10 @@ static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work,
                                               int stream_len,
                                               int64_t start_slot,
                                               int64_t end_slot,
-                                              bool exhaustive) {
+                                              bool exhaustive,
+                                              PDFBackboneSearch *search) {
     (void)work;
-    if (!candidate || stream_len <= 0 || start_slot < 0 ||
+    if (!candidate || !search || stream_len <= 0 || start_slot < 0 ||
         end_slot <= start_slot ||
         end_slot >= (int64_t)blockvector_get_num_blocks(candidate->b)) {
         return false;
@@ -8679,7 +9412,16 @@ static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work,
     }
 
     uint64_t probes = 0;
-    if (preferred_insert > 0 && preferred_insert < backbone_count) {
+    const uint64_t signature = XXH64(backbone,
+        backbone_count * sizeof(*backbone),
+        pdf_interior_signature(candidate, stream_at, stream_len));
+    if (!search->active || search->signature != signature) {
+        memset(search, 0, sizeof(*search));
+        search->active = 1;
+        search->signature = signature;
+    }
+    if (!search->preferred_done
+        && preferred_insert > 0 && preferred_insert < backbone_count) {
         JpegStreamReassembler preferred = prefix;
         int status = 1;
         for (size_t i = 1; i < preferred_insert && status == 1; i++) {
@@ -8699,7 +9441,8 @@ static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work,
         if (status == 1) {
             int result = pdf_try_jpeg_backbone_insertion(
                 &preferred, backbone, backbone_count, preferred_insert, missing,
-                total_actual, outside_apps, backbone_apps, replacement, &probes);
+                total_actual, outside_apps, backbone_apps, replacement, &probes,
+                search);
             if (result < 0) {
                 jpeg_stream_reassembler_free(&prefix);
                 goto cleanup;
@@ -8710,17 +9453,24 @@ static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work,
             }
         }
     }
+    if (!search->preferred_done) {
+        search->preferred_done = 1;
+        search->insert = 1;
+        search->next_actual = 0;
+    }
 
     if (!solved && exhaustive) {
+        const uint64_t resume_insert = search->insert;
         int prefix_status = 1;
         for (size_t insert = 1;
              insert < backbone_count && prefix_status == 1 && !solved;
              insert++) {
-            if (insert != preferred_insert) {
+            // Recreate decoder context without repeating completed source trials.
+            if (insert >= resume_insert && insert != preferred_insert) {
                 int result = pdf_try_jpeg_backbone_insertion(
                     &prefix, backbone, backbone_count, insert, missing,
                     total_actual, outside_apps, backbone_apps, replacement,
-                    &probes);
+                    &probes, search);
                 if (result < 0) {
                     break;
                 }
@@ -8767,6 +9517,9 @@ static bool pdf_repair_interior_jpeg_backbone(ThreadWork *work,
     }
 
 cleanup:
+    if (!atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        memset(search, 0, sizeof(*search));
+    }
     free(assignment);
     free(replacement);
     free(backbone);
@@ -8796,7 +9549,8 @@ static bool pdf_repair_interior_zlib_zero_run(ThreadWork *work,
                                               int64_t stream_at,
                                               int stream_len,
                                               int64_t start_slot,
-                                              int64_t end_slot) {
+                                              int64_t end_slot,
+                                              PDFZeroRunSearch *search) {
     (void)work;
     FileMirror *fm = scalpel_state.filemirror;
     const size_t bsz = scalpel_state.blocksize;
@@ -8885,7 +9639,11 @@ static bool pdf_repair_interior_zlib_zero_run(ThreadWork *work,
     bool solved = false;
     uint64_t probes = 0;
 
-    for (int64_t run_start = 0;
+    const uint64_t signature = pdf_interior_signature(candidate, stream_at, stream_len);
+    if (!search->active || search->signature != signature) {
+        *search = (PDFZeroRunSearch){.active = 1, .signature = signature};
+    }
+    for (int64_t run_start = search->next_actual;
          run_start <= total_actual - run_length && !solved;
          run_start++) {
         if (((++probes & 0xffU) == 0U) &&
@@ -8893,6 +9651,7 @@ static bool pdf_repair_interior_zlib_zero_run(ThreadWork *work,
                                  memory_order_acquire)) {
             break;
         }
+        search->next_actual = run_start + 1;
 
         bool viable = true;
         for (int i = 0; i < run_length; i++) {
@@ -9393,9 +10152,9 @@ static bool pdf_repair_interior_icc_lut(ThreadWork *work,
                                         int64_t stream_at,
                                         int stream_len,
                                         int64_t start_slot,
-                                        int64_t end_slot) {
+                                        int64_t end_slot, PDFICCSearch *search) {
     (void)work;
-    if (!candidate || stream_at < 0 || stream_len < 132 || start_slot < 0 ||
+    if (!candidate || !search || stream_at < 0 || stream_len < 132 || start_slot < 0 ||
         end_slot <= start_slot ||
         end_slot >= (int64_t)blockvector_get_num_blocks(candidate->b)) {
         return false;
@@ -9645,13 +10404,45 @@ static bool pdf_repair_interior_icc_lut(ThreadWork *work,
     check_memory_allocation(best_replacement, __LINE__, __FILE__,
                             "PDF ICC best run");
 
-    uint64_t best_score = UINT64_MAX;
-    uint64_t second_score = UINT64_MAX;
-    uint64_t viable_runs = 0;
+    const uint64_t signature = pdf_interior_signature(candidate, stream_at, stream_len);
+    bool retained_available = search->active && search->signature == signature;
+    const int64_t retained[] = {search->best_actual, search->second_actual};
+    for (size_t rank = 0; retained_available && rank < 2; rank++) {
+        if (retained[rank] < 0) {
+            continue;
+        }
+        if (retained[rank] > total_actual - run_length) {
+            retained_available = false;
+            break;
+        }
+        for (int i = 0; i < run_length; i++) {
+            int64_t actual = retained[rank] + i;
+            int64_t app = filemirror_apparent_blocknumber(fm, actual);
+            if (app < 0 || filemirror_actual_block_covered(fm, actual)
+                || filemirror_actual_block_is_zero(fm, actual)
+                || roaring64_bitmap_contains(outside_apps, (uint64_t)app)) {
+                retained_available = false;
+                break;
+            }
+        }
+    }
+    if (!retained_available) {
+        *search = (PDFICCSearch){.active = 1, .signature = signature,
+            .best_score = UINT64_MAX, .second_score = UINT64_MAX,
+            .best_actual = -1, .second_actual = -1};
+    }
+    uint64_t best_score = search->best_score;
+    uint64_t second_score = search->second_score;
+    uint64_t viable_runs = search->viable_runs;
+    if (search->best_actual >= 0) {
+        for (int i = 0; i < run_length; i++) {
+            best_replacement[i] = search->best_actual + i;
+        }
+    }
     uint64_t probes = 0;
     bool interrupted = false;
 
-    for (int64_t run_start = 0;
+    for (int64_t run_start = search->next_actual;
          run_start <= total_actual - run_length;
          run_start++) {
         if (((++probes & 0xffU) == 0U) &&
@@ -9660,6 +10451,7 @@ static bool pdf_repair_interior_icc_lut(ThreadWork *work,
             interrupted = true;
             break;
         }
+        search->next_actual = run_start + 1;
 
         bool viable = true;
         for (int i = 0; i < run_length; i++) {
@@ -9751,14 +10543,20 @@ static bool pdf_repair_interior_icc_lut(ThreadWork *work,
         }
 
         if (score < best_score) {
+            search->second_actual = search->best_actual;
+            search->best_actual = run_start;
             second_score = best_score;
             best_score = score;
             memcpy(best_replacement, replacement,
                    (size_t)run_length * sizeof(*best_replacement));
         } else if (score < second_score) {
             second_score = score;
+            search->second_actual = run_start;
         }
     }
+    search->best_score = best_score;
+    search->second_score = second_score;
+    search->viable_runs = viable_runs;
 
     bool accepted = !interrupted && viable_runs >= 2 &&
                     best_score != UINT64_MAX &&
@@ -9789,6 +10587,9 @@ static bool pdf_repair_interior_icc_lut(ThreadWork *work,
         }
     }
 
+    if (!interrupted) {
+        memset(search, 0, sizeof(*search));
+    }
     free(best_replacement);
     free(replacement);
     roaring64_bitmap_free(outside_apps);
@@ -9894,21 +10695,29 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
 
             if (filter == NOFILTER) {
                 if (has_hole && pdf_repair_interior_icc_lut(
-                        work, candidate, sdat, slen, sslot, eslot)) {
+                        work, candidate, sdat, slen, sslot, eslot, &search->icc)) {
                     any = true;
                     data = blockvector_get_data_pointer(candidate->b);
                     length = (int64_t)blockvector_get_data_length(candidate->b);
                 }
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                    goto interrupted;
+                }
+                memset(&search->icc, 0, sizeof(search->icc));
                 continue;
             }
 
             if (filter == JPEG) {
                 if (pdf_repair_interior_jpeg_backbone(
-                        work, candidate, sdat, slen, sslot, eslot, true)) {
+                        work, candidate, sdat, slen, sslot, eslot, true, &search->jpeg)) {
                     any = true;
                     data = blockvector_get_data_pointer(candidate->b);
                     length = (int64_t)blockvector_get_data_length(candidate->b);
                 }
+                if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                    goto interrupted;
+                }
+                memset(&search->jpeg, 0, sizeof(search->jpeg));
                 continue;
             }
 
@@ -9916,7 +10725,7 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
                 bool repaired = false;
                 if (search->gap_extra == 0 && !search->repair.active) {
                     repaired = pdf_repair_interior_zlib_zero_run(
-                        work, candidate, sdat, slen, sslot, eslot);
+                        work, candidate, sdat, slen, sslot, eslot, &search->zero);
                 }
                 if (!repaired && search->gap_extra == 0 &&
                     !atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
@@ -9941,7 +10750,10 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
             }
 
             bool backbone_repaired = pdf_repair_interior_zlib_backbone(
-                work, candidate, sdat, slen, sslot, eslot, true);
+                work, candidate, sdat, slen, sslot, eslot, true, &search->zlib);
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                goto interrupted;
+            }
             data = blockvector_get_data_pointer(candidate->b);
             length = (int64_t)blockvector_get_data_length(candidate->b);
             if (backbone_repaired) {
@@ -10017,7 +10829,16 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
 
                     uint64_t probes = 0;
                     bool interrupted = false;
-                    for (int split = span; split >= 0 && !complete; split--) {
+                    const uint64_t geometry[] = {(uint64_t)D0, (uint64_t)end_actual,
+                        (uint64_t)span};
+                    const uint64_t signature = XXH64(geometry, sizeof(geometry),
+                        pdf_interior_signature(candidate, sdat, slen));
+                    if (!search->split.active || search->split.signature != signature) {
+                        search->split = (PDFInteriorSplitSearch){.active = 1,
+                            .signature = signature, .next_split = span};
+                    }
+                    for (int split = search->split.next_split;
+                         split >= 0 && !complete; split--) {
                         if (((++probes & 0x0fU) == 0U) &&
                             atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                                  memory_order_acquire)) {
@@ -10034,6 +10855,7 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
                                 (size_t)slen) == -1) {
                             break;
                         }
+                        search->split.next_split = split - 1;
 
                         bool split_ok = true;
                         for (int k = 1; k <= span && split_ok; k++) {
@@ -10128,10 +10950,13 @@ static bool pdf_fill_interior_stream_holes(ThreadWork *work, CarveInfo *candidat
             }
             free(split_actual);
             if(pdf_repair_interior_zlib_zero_run(work, candidate, sdat, slen,
-                                                 sslot, eslot)){
+                                                 sslot, eslot, &search->zero)){
                 any = true;
                 data = blockvector_get_data_pointer(candidate->b);
                 length = (int64_t)blockvector_get_data_length(candidate->b);
+            }
+            if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+                goto interrupted;
             }
         }
     }
@@ -10357,6 +11182,52 @@ static int pdf_compare_run_evidence(const void *a, const void *b) {
     return 0;
 }
 
+// A saved layout may become unavailable when another recovery consumes blocks.
+static bool pdf_physical_solution_available(CarveInfo *candidate,
+                                             const PDFPhysicalRunSearch *search) {
+    if (!search->valid_layouts) {
+        return true;
+    }
+    FileMirror *fm = scalpel_state.filemirror;
+    uint64_t slots = CEILDIV(search->solution_length, scalpel_state.blocksize);
+    uint64_t image_blocks = CEILDIV(filemirror_filesize(fm), scalpel_state.blocksize);
+    int64_t last = search->solution_actuals[search->total_slots - 1];
+    if (last < 0) {
+        return false;
+    }
+    for (uint64_t slot = 0; slot < slots; slot++) {
+        uint64_t extra = slot < search->total_slots ? 0 : slot - search->total_slots + 1;
+        if (extra > (uint64_t)(INT64_MAX - last)) {
+            return false;
+        }
+        int64_t actual = slot < search->total_slots ? search->solution_actuals[slot]
+            : last + (int64_t)extra;
+        if (actual < 0 || (uint64_t)actual >= image_blocks) {
+            return false;
+        }
+        int64_t apparent = filemirror_apparent_blocknumber(fm, actual);
+        if (apparent < 0 || filemirror_actual_block_is_zero(fm, actual)
+            || (filemirror_actual_block_covered(fm, actual)
+                && !apparent_block_in_blockvector(candidate->b, apparent))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Preserve only this helper's state; validation may have updated other fields.
+static void pdf_store_physical_search(CarveInfo *candidate, bool logical_groups,
+                                       const PDFPhysicalRunSearch *search) {
+    PDFCarveState *state = carve_get_state(candidate->carvehashkey);
+    if (state) {
+        PDFPhysicalRunSearch *saved = &state->physical_search[logical_groups ? 1 : 0];
+        pdf_physical_search_clear(saved);
+        pdf_physical_search_copy(saved, search);
+        carve_put_state(candidate->carvehashkey, state);
+        pdf_free_carve_state((void **)&state);
+    }
+}
+
 /**
  * @description  Completes a linearized PDF assembled from multiple physically
  *               contiguous runs. Xref-positioned objects provide mappings of
@@ -10490,7 +11361,7 @@ static bool pdf_try_linearized_physical_runs(ThreadWork *work,
         malloc(boundary_count * sizeof(*boundaries));
     int64_t *actuals = malloc(total_slots * sizeof(*actuals));
     int64_t *solution_actuals =
-        malloc(total_slots * sizeof(*solution_actuals));
+        calloc(total_slots, sizeof(*solution_actuals));
     check_memory_allocation(boundary_lo, __LINE__, __FILE__,
                             "PDF physical-run boundary minima");
     check_memory_allocation(boundary_hi, __LINE__, __FILE__,
@@ -10512,11 +11383,41 @@ static bool pdf_try_linearized_physical_runs(ThreadWork *work,
         }
     }
 
-    bool done = !ranges_valid;
+    uint64_t signature = pdf_interior_signature(candidate, 0, 0);
+    signature = XXH64(&exact_length, sizeof(exact_length), signature);
+    for (size_t i = 0; i < chain_count; i++) {
+        uint64_t fields[] = { (uint64_t)chain[i].delta, chain[i].min_slot,
+                              chain[i].max_slot, chain[i].count };
+        signature = XXH64(fields, sizeof(fields), signature);
+    }
+    PDFPhysicalRunSearch search = { .active = 1, .signature = signature,
+        .boundary_count = boundary_count, .total_slots = total_slots,
+        .solution_length = exact_length, .boundaries = boundaries,
+        .solution_actuals = solution_actuals };
+    state = carve_get_state(candidate->carvehashkey);
+    if (state) {
+        PDFPhysicalRunSearch *saved = &state->physical_search[logical_groups ? 1 : 0];
+        bool resume = saved->active && saved->signature == signature
+            && saved->boundary_count == boundary_count && saved->total_slots == total_slots;
+        for (size_t i = 0; resume && i < boundary_count; i++) {
+            resume = saved->boundaries[i] >= boundary_lo[i]
+                && saved->boundaries[i] <= boundary_hi[i];
+        }
+        if (resume && pdf_physical_solution_available(candidate, saved)) {
+            search = *saved;
+            search.boundaries = boundaries;
+            search.solution_actuals = solution_actuals;
+            memcpy(boundaries, saved->boundaries, boundary_count * sizeof(*boundaries));
+            memcpy(solution_actuals, saved->solution_actuals, total_slots * sizeof(*solution_actuals));
+        }
+        pdf_free_carve_state((void **)&state);
+    }
+
+    bool done = search.enumerated || !ranges_valid;
     bool interrupted = false;
-    uint64_t valid_layouts = 0;
-    uint64_t trials = 0;
-    while (!done && valid_layouts < 2) {
+    uint64_t valid_layouts = search.valid_layouts;
+    uint64_t trials = search.trials;
+    while (!search.complete && !done && valid_layouts < 2) {
         if ((trials & 31U) == 0 &&
             atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                  memory_order_acquire)) {
@@ -10628,9 +11529,9 @@ static bool pdf_try_linearized_physical_runs(ThreadWork *work,
         done = !advanced;
     }
 
-    bool verified = !interrupted && done && valid_layouts == 1;
-    uint64_t solution_length = exact_length;
-    uint64_t solution_slots = total_slots;
+    bool verified = !search.complete && !interrupted && done && valid_layouts == 1;
+    uint64_t solution_length = search.solution_length;
+    uint64_t solution_slots = CEILDIV(solution_length, blocksize);
     bool incremental_update_evidence = false;
 
     /*
@@ -10684,6 +11585,10 @@ static bool pdf_try_linearized_physical_runs(ThreadWork *work,
 
             for (uint64_t footer_index = 0;
                  footer_index < offsets->numfooters; footer_index++) {
+                uint64_t footer_start = offsets->footers[footer_index];
+                if (footer_start < search.next_footer) {
+                    continue;
+                }
                 if (atomic_load_explicit(&REASS_RETURN_TO_IDLE,
                                          memory_order_acquire)) {
                     interrupted = true;
@@ -10691,7 +11596,8 @@ static bool pdf_try_linearized_physical_runs(ThreadWork *work,
                     break;
                 }
 
-                uint64_t footer_start = offsets->footers[footer_index];
+                search.next_footer = footer_start == UINT64_MAX
+                    ? UINT64_MAX : footer_start + 1;
                 size_t footer_length = offsets->footerlens
                                            ? offsets->footerlens[footer_index]
                                            : 5;
@@ -10867,6 +11773,12 @@ static bool pdf_try_linearized_physical_runs(ThreadWork *work,
         }
     }
 
+    search.enumerated = done;
+    search.valid_layouts = valid_layouts;
+    search.trials = trials;
+    search.solution_length = solution_length;
+    search.complete = !interrupted;
+    pdf_store_physical_search(candidate, logical_groups, &search);
     free(solution_actuals);
     free(actuals);
     free(boundaries);
@@ -10881,13 +11793,18 @@ static bool pdf_try_linearized_physical_runs(ThreadWork *work,
 // Both interpretations use the same complete-file and unique-layout checks.
 static bool pdf_complete_linearized_physical_runs(ThreadWork *work,
                                                    CarveInfo *candidate) {
-    if (pdf_try_linearized_physical_runs(work, candidate, false)) {
-        return true;
+    bool solved = pdf_try_linearized_physical_runs(work, candidate, false);
+    if (!solved && !atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+        solved = pdf_try_linearized_physical_runs(work, candidate, true);
     }
-    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
-        return false;
+    PDFCarveState *state = carve_get_state(candidate->carvehashkey);
+    if (state) {
+        state->physical_search_active =
+            atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire);
+        carve_put_state(candidate->carvehashkey, state);
+        pdf_free_carve_state((void **)&state);
     }
-    return pdf_try_linearized_physical_runs(work, candidate, true);
+    return solved;
 }
 
 // Recognize classic xref rows between arbitrary carving block boundaries.
@@ -11049,6 +11966,7 @@ void pdf_reassembly(ThreadWork *work,
     bool state_initialized = false;
     bool resume_interior_scan = false;
     bool resume_partial_search = false;
+    bool resume_physical_search = false;
 #ifdef PDF_TRACE_REASM
     uint64_t dbg_start_blocks = blockvector_get_num_blocks(candidate->b);
     int dbg_s2_scans = 0, dbg_s2_best = -1, dbg_s2_found = 0;
@@ -11061,11 +11979,15 @@ void pdf_reassembly(ThreadWork *work,
         state_initialized = state && state->initialized;
         resume_interior_scan = state && state->interior_search.active;
         resume_partial_search = state && state->partial_search_active;
+        resume_physical_search = state && state->physical_search_active;
         pdf_free_carve_state((void **)&state);
     }
 
     if (resume_partial_search) {
         goto finish_partial;
+    }
+    if (resume_physical_search) {
+        goto finish_physical;
     }
     if (resume_interior_scan) {
         goto finish_interiors;
@@ -11405,6 +12327,13 @@ void pdf_reassembly(ThreadWork *work,
 
 finish_interiors:
     candidate = *c;
+    // The displaced trailer can contain the stream's missing tail. Acquire it
+    // before asking the stream checksum to guide interior gap removal.
+    pdf_complete_trailer(work, candidate);
+    if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
+        return;
+    }
+    candidate = *c;
     // Xref adoption places object-HEADER blocks but not the stream interiors
     // between them; fill any verifiable interior holes before validating.
     pdf_fill_interior_stream_holes(work, candidate);
@@ -11413,6 +12342,8 @@ finish_interiors:
     }
     candidate = *c;
     pdf_fill_physically_bridged_holes(work, candidate);
+finish_physical:
+    candidate = *c;
     pdf_complete_linearized_physical_runs(work, candidate);
     if (pdf_reassembly_poll(work, c, uuidp, uuidc)) {
         return;
@@ -12058,30 +12989,32 @@ static inline uint32_t pdf_block_validate(char *data,
     return needleidx;
 }
 
-/**
- * @description         Validates a full PDF file by locating and analyzing
- *                      its xref entries and ensuring all objects are in their
- *                      expected locations.
- *
- * @param data          The buffer containing the candidate.
- * @param length        The length of the buffer.
- * @param validates     Boolean to determine whether the file validates.
- * @param validates_to  The offset to which the file validates.
- * @param promising     Boolean to determine whether the file is promising.
- * @param needleidx     The offset into the search spec array.
- * @param blocksize     The block size used for carving.
- * @param carvehashkey  The hash key for carving.
- *
- * @return              Void.
- */
-static inline void pdf_file_validate(char *data,
+// Preserve PDF trailing whitespace without consuming arbitrary image padding.
+static uint64_t pdf_include_trailing_whitespace(const char *data,
+                                                uint64_t length,
+                                                uint64_t end) {
+    for (unsigned count = 0; length > 0 && end < length - 1 && count < 8; count++) {
+        unsigned char c = (unsigned char)data[end + 1];
+        if (c != '\t' && c != '\n' && c != '\f' && c != '\r' && c != ' ') {
+            break;
+        }
+        end++;
+    }
+    return end;
+}
+
+// Validate xref locations, object structure and supported stream encodings.
+// unverified_complete distinguishes a complete structural hypothesis from an
+// incomplete prefix, without claiming unsupported ciphertext has been decoded.
+static void pdf_file_validate_content(char *data,
     uint64_t length,
     bool *validates,
     uint64_t *validates_to,
     bool *promising,
     uint32_t needleidx,
     uint32_t blocksize,
-    void *carvehashkey){
+    void *carvehashkey, bool *unverified_complete){
+    *unverified_complete = false;
     if (!data || length < 9 || blocksize == 0) {
         *validates = false;
         *promising = false;
@@ -12092,6 +13025,27 @@ static inline void pdf_file_validate(char *data,
     *validates = false;
     *validates_to = blocksize - 1;
 #ifdef NOFRAG
+    // A candidate may include the next independent PDF. Validate its prefix
+    // first, using this same routine and all stream checks. On failure retain
+    // the full search, including fragmented and embedded-header cases.
+    for (uint64_t next = blocksize; next < length && length - next >= 9;
+         next += blocksize) {
+        if (!memcmp(data + next, "%PDF-", 5) &&
+            (data[next + 5] == '1' || data[next + 5] == '2') &&
+            data[next + 6] == '.' && data[next + 7] >= '0' &&
+            data[next + 7] <= '7' &&
+            (data[next + 8] == '\r' || data[next + 8] == '\n')) {
+            pdf_file_validate_content(data, next, validates, validates_to, promising,
+                                      needleidx, blocksize, carvehashkey,
+                                      unverified_complete);
+            if (*validates || *unverified_complete) {
+                return;
+            }
+            *validates_to = blocksize - 1;
+            *promising = true;
+            break;
+        }
+    }
     XrefObject *xref_list = NULL;
     int xref_count = 0;
     int validated_xref_count = 0;
@@ -12213,6 +13167,10 @@ static inline void pdf_file_validate(char *data,
 
         xref_tables[xref_count - 1].entries = analyze_xref(data, xref_list[xref_count - 1].offset,
             length, &xref_tables[xref_count - 1].count, &xref_end_offset);
+#ifdef PDF_TRACE_VALIDATE
+        lock_fprintf(stdout, "[PDFVAL] table offset=%" PRIu64 " entries=%d end=%" PRIu64 "\n",
+            xref_list[xref_count - 1].offset, xref_tables[xref_count - 1].count, xref_end_offset);
+#endif
         if(xref_tables[xref_count - 1].entries && xref_tables[xref_count - 1].count > 0){
         // Choose bucket size based on entry count
         int bucket_count = 101;
@@ -12364,8 +13322,8 @@ static inline void pdf_file_validate(char *data,
                     (tail_ptr = memmem(&data[validation_cutoff], 190, "%%EOF", 5))){
                     validation_cutoff = tail_ptr - data + 4;
                 }
-                if((tail_ptr = memmem(&data[9], validation_cutoff, "%PDF-1", 6)) ||
-                (tail_ptr = memmem(&data[9], validation_cutoff, "%PDF-2", 6))){
+                if((tail_ptr = memmem(&data[9], validation_cutoff - 8, "%PDF-1", 6)) ||
+                (tail_ptr = memmem(&data[9], validation_cutoff - 8, "%PDF-2", 6))){
                     validation_cutoff = tail_ptr - data;
                     goto search_backward;
                 }
@@ -12375,7 +13333,8 @@ static inline void pdf_file_validate(char *data,
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
                     *promising = damaged_metadata;
                     *validates = !damaged_metadata;
-                    *validates_to = validation_cutoff;
+                    *unverified_complete = damaged_metadata;
+                    *validates_to = pdf_include_trailing_whitespace(data, length, validation_cutoff);
                     return;
                 }
                 else if(validation_cutoff < length - 1 &&
@@ -12385,14 +13344,16 @@ static inline void pdf_file_validate(char *data,
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
                     *promising = damaged_metadata;
                     *validates = !damaged_metadata;
-                    *validates_to = validation_cutoff;
+                    *unverified_complete = damaged_metadata;
+                    *validates_to = pdf_include_trailing_whitespace(data, length, validation_cutoff);
                     return;
                 }
                 else{
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
                     *promising = damaged_metadata;
                     *validates = !damaged_metadata;
-                    *validates_to = validation_cutoff;
+                    *unverified_complete = damaged_metadata;
+                    *validates_to = pdf_include_trailing_whitespace(data, length, validation_cutoff);
                     return;
                 }
                 break;
@@ -12416,7 +13377,7 @@ static inline void pdf_file_validate(char *data,
     search_backward:
     fflush(stdout);
     for(uint64_t i = validation_cutoff; i > 9; i--){
-        if(!memcmp(&data[i], "%%EOF", 5)){
+        if(i < length && length - i >= 5 && !memcmp(&data[i], "%%EOF", 5)){
             char *tail_ptr;
             validation_cutoff = i + 4;
             if((tail_ptr = memmem(&data[9], validation_cutoff - 9, "%PDF-1", 6)) ||
@@ -12431,7 +13392,8 @@ static inline void pdf_file_validate(char *data,
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
                     *promising = damaged_metadata;
                     *validates = !damaged_metadata;
-                    *validates_to = validation_cutoff;
+                    *unverified_complete = damaged_metadata;
+                    *validates_to = pdf_include_trailing_whitespace(data, length, validation_cutoff);
                     return;
                 }
                 else if(validation_cutoff < length - 1 &&
@@ -12441,14 +13403,16 @@ static inline void pdf_file_validate(char *data,
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
                     *promising = damaged_metadata;
                     *validates = !damaged_metadata;
-                    *validates_to = validation_cutoff;
+                    *unverified_complete = damaged_metadata;
+                    *validates_to = pdf_include_trailing_whitespace(data, length, validation_cutoff);
                     return;
                 }
                 else{
                     if(check_startxref(data, validation_cutoff) == 0) goto startxref_fail;
                     *promising = damaged_metadata;
                     *validates = !damaged_metadata;
-                    *validates_to = validation_cutoff;
+                    *unverified_complete = damaged_metadata;
+                    *validates_to = pdf_include_trailing_whitespace(data, length, validation_cutoff);
                     return;
                 }
                 break;
@@ -12461,6 +13425,29 @@ static inline void pdf_file_validate(char *data,
         *validates_to = kg_validation_cutoff;
     return;
 #endif
+}
+
+/**
+ * @description         Validates a full PDF using its cross-reference tables,
+ *                      object structure and supported stream encodings.
+ * @param data          Candidate bytes.
+ * @param length        Number of bytes available.
+ * @param validates     Whether the candidate passes validation.
+ * @param validates_to  Inclusive byte offset of the accepted extent.
+ * @param promising     Whether an unvalidated candidate remains useful.
+ * @param needleidx     Search-spec index.
+ * @param blocksize     Carving block size.
+ * @param carvehashkey  Candidate state key.
+ */
+static inline void pdf_file_validate(char *data, uint64_t length, bool *validates,
+    uint64_t *validates_to, bool *promising, uint32_t needleidx,
+    uint32_t blocksize, void *carvehashkey) {
+    bool unverified_complete = false;
+    pdf_file_validate_content(data, length, validates, validates_to, promising,
+                              needleidx, blocksize, carvehashkey, &unverified_complete);
+    if (length && *validates_to >= length) {
+        *validates_to = length - 1;
+    }
 }
 
 // Skip PDF whitespace and comments with interruption checks for partial scans.
@@ -13103,7 +14090,28 @@ save:
 // Capture initial bytes before the backend trims the candidate for reassembly.
 static void pdf_candidate_preserve_prefix(CarveInfo *candidate, bool *validates,
                                            uint64_t *validates_to, bool *promising) {
-    (void)validates_to;
+    if (!*validates && *promising && scalpel_state.write_promising
+        && *validates_to < blockvector_get_data_length(candidate->b)) {
+        bool complete = false, checked = false, partial = false;
+        uint64_t end = 0;
+        pdf_file_validate_content(blockvector_get_data_pointer(candidate->b),
+            *validates_to + 1, &checked, &end, &partial, candidate->needleidx,
+            scalpel_state.blocksize, candidate->carvehashkey, &complete);
+        if (complete && end <= *validates_to) {
+            // Keep a complete but unverified encrypted/document hypothesis,
+            // including in contiguous-only mode. Do not claim its blocks.
+            CarveInfo snapshot = *candidate;
+            clone_blockvector(candidate->b, &snapshot.b, false);
+            blockvector_set_data_length(snapshot.b, end + 1);
+            resize_blockvector(snapshot.b, CEILDIV(end + 1, scalpel_state.blocksize));
+            inflate_blockvector(snapshot.b);
+            snapshot.flavor = PROMISING;
+            CarveInfo *preserved = &snapshot;
+            write_candidate(&preserved, true);
+            candidate->partial_artifact_written |= snapshot.partial_artifact_written;
+            free_blockvector(&snapshot.b);
+        }
+    }
     if (!*validates && *promising && !candidate->deposited && !scalpel_state.no_defrag) {
         pdf_preserve_partial_prefix(candidate);
     }

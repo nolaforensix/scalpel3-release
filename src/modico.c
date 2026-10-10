@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -70,6 +74,7 @@
 #include "onnxruntime_c_api.h"
 #include "gpu_meminfo.h"
 #include "modico.h"
+#include "scalpel_output.h"
 #include "modico_cuda.h"
 #include "onnx_cuda_options.h"
 #include "onnx_providers.h"
@@ -161,7 +166,7 @@ typedef struct {
 static void mc_log_ort_status(OrtStatus *status, const char *context)
 {
     const char *msg = g_ort->GetErrorMessage(status);
-    fprintf(stderr, "[modico] %s failed: %s\n",
+    lock_fprintf(stderr, "MoDiCo: %s failed: %s\n",
             context ? context : "ORT operation",
             msg ? msg : "(null)");
     g_ort->ReleaseStatus(status);
@@ -470,8 +475,8 @@ static uint64_t mc_cache_policy_value(const char *environment,
     value = strtoull(configured, &end, 10);
     if (errno != 0 || end == configured || *end != '\0'
         || value < minimum || value > maximum) {
-        fprintf(stderr,
-                "[modico] ignoring invalid %s=%s; using %llu.\n",
+        lock_fprintf(stderr,
+                "WARNING: MoDiCo is ignoring invalid %s=%s; using %llu.\n",
                 environment, configured,
                 (unsigned long long)default_value);
         return default_value;
@@ -887,16 +892,16 @@ static int mc_cache_prune_locked(const mc_cache_guard_t *guard,
 
     mc_cache_remove_empty_directories(guard->root, guard->root, guard->leaf);
     if (removed_entries > 0) {
-        fprintf(stderr,
-                "[modico] cache pruning removed %zu inactive entr%s "
+        lock_fprintf(stdout,
+                "MoDiCo cache pruning removed %zu inactive entr%s "
                 "(%.1f MiB); %.1f MiB remain.\n",
                 removed_entries, removed_entries == 1 ? "y" : "ies",
                 (double)removed_bytes / 1048576.0,
                 (double)inventory.total_bytes / 1048576.0);
     }
     if (inventory.total_bytes > max_bytes) {
-        fprintf(stderr,
-                "[modico] cache temporarily exceeds its %llu MiB limit "
+        lock_fprintf(stdout,
+                "MoDiCo cache temporarily exceeds its %llu MiB limit "
                 "because all remaining entries are active or newly created.\n",
                 (unsigned long long)max_mib);
     }
@@ -1124,7 +1129,7 @@ static int mc_prepare_coreml_cache(mc_session_t *s, const char *model_path,
     }
     if (length < 0 || (size_t)length >= sizeof(root)
         || !mc_sha256_file_hex(model_path, model_hash)) {
-        fprintf(stderr, "[modico] CoreML cache disabled: could not hash %s.\n",
+        lock_fprintf(stderr, "MoDiCo: CoreML cache disabled: could not hash %s.\n",
                 model_path ? model_path : "(null)");
         return 0;
     }
@@ -1144,7 +1149,7 @@ static int mc_prepare_coreml_cache(mc_session_t *s, const char *model_path,
                       "%s/%s/%s", root, model_hash, options_hash);
     if (length < 0 || (size_t)length >= sizeof(s->coreml_cache_dir)
         || !mc_mkdir_p(s->coreml_cache_dir)) {
-        fprintf(stderr, "[modico] CoreML cache disabled: cannot create %s.\n",
+        lock_fprintf(stderr, "MoDiCo: CoreML cache disabled: cannot create %s.\n",
                 length >= 0 && (size_t)length < sizeof(s->coreml_cache_dir)
                     ? s->coreml_cache_dir : root);
         s->coreml_cache_dir[0] = '\0';
@@ -1156,15 +1161,17 @@ static int mc_prepare_coreml_cache(mc_session_t *s, const char *model_path,
                               s->coreml_cache_dir,
                               "SCALPEL3_MODICO_COREML_CACHE_MAX_MIB",
                               "SCALPEL3_MODICO_COREML_CACHE_MAX_AGE_DAYS")) {
-        fprintf(stderr,
-                "[modico] CoreML cache disabled: lifecycle control failed.\n");
+        lock_fprintf(stderr,
+                "MoDiCo: CoreML cache disabled: lifecycle control failed.\n");
         s->coreml_cache_dir[0] = '\0';
         return 0;
     }
-    fprintf(stderr,
-            "[modico] CoreML model cache: %s (state=%s, model_sha256=%s)\n",
-            s->coreml_cache_dir, cache_warm ? "warm" : "cold",
-            model_hash);
+    lock_fprintf(stdout,
+            "MoDiCo CoreML model cache:\n"
+            "  State:                    %s\n"
+            "  Model SHA256:             %s\n"
+            "  Directory:                %s\n",
+            cache_warm ? "warm" : "cold", model_hash, s->coreml_cache_dir);
     return 1;
 }
 #endif
@@ -1301,15 +1308,17 @@ static int mc_prepare_tensorrt_cache(mc_session_t *s, int device_id)
                               s->tensorrt_cache_dir,
                               "SCALPEL3_MODICO_TENSORRT_CACHE_MAX_MIB",
                               "SCALPEL3_MODICO_TENSORRT_CACHE_MAX_AGE_DAYS")) {
-        fprintf(stderr,
-                "[modico] TensorRT cache disabled: lifecycle control failed.\n");
+        lock_fprintf(stderr,
+                "MoDiCo: TensorRT cache disabled: lifecycle control failed.\n");
         s->tensorrt_cache_dir[0] = '\0';
         return 0;
     }
 
-    fprintf(stderr, "[modico] TensorRT cache: %s (state=%s).\n",
-            s->tensorrt_cache_dir,
-            s->tensorrt_cache_warm ? "warm" : "cold");
+    lock_fprintf(stdout,
+            "MoDiCo TensorRT cache:\n"
+            "  State:                    %s\n"
+            "  Directory:                %s\n",
+            s->tensorrt_cache_warm ? "warm" : "cold", s->tensorrt_cache_dir);
     return 1;
 #else
     (void)s;
@@ -1324,7 +1333,7 @@ static int mc_init_api(void)
     if (g_ort == NULL) {
         g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
         if (g_ort == NULL) {
-            fprintf(stderr, "Failed to get ORT API (ORT_API_VERSION=%d). "
+            lock_fprintf(stderr, "Failed to get ORT API (ORT_API_VERSION=%d). "
                             "Header/library version mismatch?\n", ORT_API_VERSION);
             return 0;
         }
@@ -1434,13 +1443,13 @@ static int mc_tensorrt_requested(mc_session_t *s, int device_id)
     }
 
     if (!onnx_tensorrt_available(reason, sizeof(reason))) {
-        fprintf(stderr, "[modico] TensorRT unavailable; using CUDA: %s\n",
+        lock_fprintf(stdout, "MoDiCo TensorRT unavailable; using CUDA: %s\n",
                 reason[0] ? reason : "no compatible runtime");
         return 0;
     }
     if (!mc_prepare_tensorrt_cache(s, device_id)) {
-        fprintf(stderr,
-                "[modico] TensorRT cache is unavailable; using CUDA.\n");
+        lock_fprintf(stdout,
+                "MoDiCo TensorRT cache is unavailable; using CUDA.\n");
         return 0;
     }
     if (configured || s->tensorrt_cache_warm
@@ -1459,8 +1468,8 @@ static int mc_tensorrt_requested(mc_session_t *s, int device_id)
             cold_minimum = (uint64_t)parsed;
         }
         else {
-            fprintf(stderr,
-                    "[modico] ignoring invalid "
+            lock_fprintf(stderr,
+                    "WARNING: MoDiCo is ignoring invalid "
                     "SCALPEL3_MODICO_TENSORRT_COLD_MIN_BLOCKS=%s.\n",
                     threshold_environment);
         }
@@ -1469,8 +1478,8 @@ static int mc_tensorrt_requested(mc_session_t *s, int device_id)
         return 1;
     }
 
-    fprintf(stderr,
-            "[modico] using native CUDA for %llu expected blocks; the "
+    lock_fprintf(stdout,
+            "MoDiCo is using native CUDA for %llu expected blocks; the "
             "TensorRT cache is cold and its build threshold is %llu blocks.\n",
             (unsigned long long)s->expected_blocks,
             (unsigned long long)cold_minimum);
@@ -1486,15 +1495,17 @@ static int mc_append_cuda_provider(mc_session_t *s, int device_id)
 
     if (!s || !s->opts
         || !onnx_cuda_provider_options(device_id, &cuda_opts, &policy)) {
-        fprintf(stderr,
-                "[modico] CUDA memory policy could not query device %d.\n",
+        lock_fprintf(stderr,
+                "MoDiCo: CUDA memory policy could not query device %d.\n",
                 device_id);
         return 0;
     }
 
-    fprintf(stderr,
-            "[modico] CUDA device %d (physical %d): %.1f MiB free, "
-            "%.1f MiB arena limit (%.0f%%).\n",
+    lock_fprintf(stdout,
+            "MoDiCo CUDA memory policy:\n"
+            "  Device:                   %d (physical %d)\n"
+            "  Available memory:         %.1f MiB\n"
+            "  Arena limit:              %.1f MiB (%.0f%%)\n",
             device_id, policy.physical_device_id,
             policy.free_bytes / 1048576.0,
             policy.arena_limit / 1048576.0,
@@ -1566,11 +1577,11 @@ static int mc_append_tensorrt_provider(mc_session_t *s, int device_id)
     }
     if (status) {
         mc_log_ort_status(status, "TensorRT execution provider setup");
-        fprintf(stderr, "[modico] TensorRT setup failed; using CUDA.\n");
+        lock_fprintf(stdout, "MoDiCo TensorRT setup failed; using CUDA.\n");
         return 0;
     }
 
-    fprintf(stderr, "[modico] TensorRT FP32 enabled (device=%d).\n",
+    lock_fprintf(stdout, "MoDiCo TensorRT FP32 enabled on CUDA device %d.\n",
             device_id);
     return 1;
 }
@@ -1608,8 +1619,8 @@ static int mc_append_coreml_provider(mc_session_t *s, const char *model_path)
             compute_units = "CPUAndNeuralEngine";
         }
         else {
-            fprintf(stderr,
-                    "[modico] ignoring invalid CoreML compute units: %s\n",
+            lock_fprintf(stderr,
+                    "WARNING: MoDiCo is ignoring invalid CoreML compute units: %s\n",
                     compute_env);
         }
         keys[count] = "MLComputeUnits";
@@ -1621,8 +1632,8 @@ static int mc_append_coreml_provider(mc_session_t *s, const char *model_path)
             specialization = "FastPrediction";
         }
         else if (strcasecmp(specialization_env, "Default") != 0) {
-            fprintf(stderr,
-                    "[modico] ignoring invalid CoreML specialization: %s\n",
+            lock_fprintf(stderr,
+                    "WARNING: MoDiCo is ignoring invalid CoreML specialization: %s\n",
                     specialization_env);
         }
         keys[count] = "SpecializationStrategy";
@@ -1642,11 +1653,14 @@ static int mc_append_coreml_provider(mc_session_t *s, const char *model_path)
         values[count++] = s->coreml_cache_dir;
     }
 
-    fprintf(stderr,
-            "[modico] CoreML options: compute_units=%s specialization=%s "
-            "low_precision=%d profile_compute_plan=%d\n",
-            compute_units, specialization, low_precision,
-            profile_compute_plan);
+    lock_fprintf(stdout,
+            "MoDiCo CoreML options:\n"
+            "  Compute units:            %s\n"
+            "  Specialization:           %s\n"
+            "  Low precision:            %s\n"
+            "  Compute plan profiling:   %s\n",
+            compute_units, specialization, low_precision ? "yes" : "no",
+            profile_compute_plan ? "yes" : "no");
     OrtStatus *st =
         g_ort->SessionOptionsAppendExecutionProvider(s->opts, "CoreML",
                                                      keys, values, count);
@@ -1792,8 +1806,8 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
             s->cuda_user_stream = mc_cuda_stream_create(
                 s->device_id, reason, sizeof(reason));
             if (!s->cuda_user_stream) {
-                fprintf(stderr,
-                        "[modico] shared CUDA stream unavailable; "
+                lock_fprintf(stdout,
+                        "MoDiCo shared CUDA stream unavailable; "
                         "host preprocessing remains available: %s\n",
                         reason[0] ? reason : "initialization failed");
             }
@@ -1807,7 +1821,7 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
             return NULL;
         }
         strncpy(s->execution_provider, "cuda", sizeof(s->execution_provider) - 1);
-        fprintf(stderr, "[modico] requested CUDA execution provider (device=%d)\n",
+        lock_fprintf(stdout, "MoDiCo requested CUDA execution provider on device %d.\n",
                 s->device_id);
     }
     else if (mc_coreml_requested(accelerator)) {
@@ -1822,9 +1836,9 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
             return NULL;
         }
         strncpy(s->execution_provider, "coreml", sizeof(s->execution_provider) - 1);
-        fprintf(stderr,
-                "[modico] requested CoreML execution provider "
-                "(static batch=%d)\n",
+        lock_fprintf(stdout,
+                "MoDiCo requested CoreML execution provider "
+                "(static batch size %d).\n",
                 s->static_batch_size);
     }
 
@@ -1837,8 +1851,8 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
         g_ort->CreateSession(s->env, model_path, s->opts, &s->session);
     if (create_status && s->tensorrt_enabled) {
         mc_log_ort_status(create_status, "TensorRT session creation");
-        fprintf(stderr,
-                "[modico] TensorRT cannot compile this model; using CUDA.\n");
+        lock_fprintf(stdout,
+                "MoDiCo TensorRT cannot compile this model; using CUDA.\n");
         s->tensorrt_enabled = 0;
         s->run_batch_size = 0;
         s->tensorrt_cache_dir[0] = '\0';
@@ -1854,8 +1868,8 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
         clock_gettime(CLOCK_MONOTONIC, &session_end);
         s->timing.session_create_seconds =
             mc_elapsed_seconds(&session_start, &session_end);
-        fprintf(stderr,
-                "[modico:timing] provider=%s session_create_secs=%.6f\n",
+        lock_fprintf(stdout,
+                "MoDiCo session timing: provider=%s session_create_secs=%.6f\n",
                 s->execution_provider, s->timing.session_create_seconds);
     }
     if (create_status) {
@@ -1891,7 +1905,7 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
         goto fail;
     }
     if (s->input_count != 1 && s->input_count != 3) {
-        fprintf(stderr, "[modico] unexpected input count=%zu\n",
+        lock_fprintf(stderr, "MoDiCo: unexpected input count=%zu\n",
                 s->input_count);
         goto fail;
     }
@@ -1915,13 +1929,13 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
                    "scalpel3_global_histogram_counts") != 0
             || strcmp(s->local_histogram_input_name,
                       "scalpel3_local_histogram_counts") != 0) {
-            fprintf(stderr,
-                    "[modico] unsupported three-input model: %s, %s\n",
+            lock_fprintf(stderr,
+                    "MoDiCo: unsupported three-input model: %s, %s\n",
                     s->global_histogram_input_name,
                     s->local_histogram_input_name);
             goto fail;
         }
-        fprintf(stderr, "[modico] native histogram inputs enabled.\n");
+        lock_fprintf(stdout, "MoDiCo native histogram inputs enabled.\n");
     }
     if (!mc_ort_succeeded(g_ort->SessionGetOutputName(s->session, 0, alloc,
                                                       &s->output_name),
@@ -1946,7 +1960,7 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
         goto fail;
     }
     if (ndims == 0 || ndims > 8) {
-        fprintf(stderr, "[modico] unexpected output ndims=%zu\n", ndims);
+        lock_fprintf(stderr, "MoDiCo: unexpected output ndims=%zu\n", ndims);
         goto fail;
     }
     if (!mc_ort_succeeded(g_ort->GetDimensions(tensor_info, dims, ndims),
@@ -1954,7 +1968,7 @@ mc_session_t *mc_create_session_with_accelerator_device_for_workload(
         goto fail;
     }
     if (dims[ndims - 1] <= 0 || dims[ndims - 1] > INT_MAX) {
-        fprintf(stderr, "[modico] invalid output class count=%lld\n",
+        lock_fprintf(stderr, "MoDiCo: invalid output class count=%lld\n",
                 (long long)dims[ndims - 1]);
         goto fail;
     }
@@ -1989,7 +2003,7 @@ void mc_destroy_session(mc_session_t *s)
             mc_log_ort_status(st, "profiling finalization");
         }
         else if (profile_path) {
-            fprintf(stderr, "[modico] ONNX Runtime profile: %s\n",
+            lock_fprintf(stdout, "MoDiCo ONNX Runtime profile: %s\n",
                     profile_path);
             st = g_ort->AllocatorFree(alloc, profile_path);
             if (st) {
@@ -2143,7 +2157,7 @@ int mc_terminate_current_run(mc_session_t *s)
     OrtStatus *st = g_ort->RunOptionsSetTerminate(s->run_options);
     if (st) {
         const char *msg = g_ort->GetErrorMessage(st);
-        fprintf(stderr, "[modico] failed to terminate active ORT run: %s\n",
+        lock_fprintf(stderr, "MoDiCo: failed to terminate active ORT run: %s\n",
                 msg ? msg : "(null)");
         g_ort->ReleaseStatus(st);
         return 1;
@@ -2197,8 +2211,8 @@ static int mc_prepare_histogram_inputs(mc_session_t *s, const uint8_t *bytes,
                                        int block_size, size_t *windows_out)
 {
     if (block_size < 32 || (block_size - 32) % 16 != 0) {
-        fprintf(stderr,
-                "[modico] unsupported histogram block size=%d\n",
+        lock_fprintf(stderr,
+                "MoDiCo: unsupported histogram block size=%d\n",
                 block_size);
         return 1;
     }
@@ -2377,8 +2391,8 @@ static int mc_prepare_cuda_fastpath(mc_session_t *s,
         s->cuda_user_stream,
         reason, sizeof(reason));
     if (!s->cuda_preprocessor) {
-        fprintf(stderr,
-                "[modico] CUDA device preprocessing unavailable; using "
+        lock_fprintf(stdout,
+                "MoDiCo CUDA device preprocessing unavailable; using "
                 "host preprocessing: %s\n",
                 reason[0] ? reason : "initialization failed");
         s->cuda_fastpath_state = -1;
@@ -2430,8 +2444,8 @@ static int mc_prepare_cuda_fastpath(mc_session_t *s,
         mc_log_ort_status(status, "CUDA device tensor binding");
         mc_release_cuda_fastpath(s);
         s->cuda_fastpath_state = -1;
-        fprintf(stderr,
-                "[modico] using host preprocessing for this session.\n");
+        lock_fprintf(stdout,
+                "MoDiCo is using host preprocessing for this session.\n");
         return 0;
     }
 
@@ -2439,9 +2453,9 @@ static int mc_prepare_cuda_fastpath(mc_session_t *s,
     s->cuda_fastpath_batch_size = run_batch;
     s->cuda_fastpath_block_size = block_size;
     s->cuda_fastpath_histogram_windows = histogram_windows;
-    fprintf(stderr,
-            "[modico] CUDA device preprocessing enabled "
-            "(device=%d, batch=%d).\n",
+    lock_fprintf(stdout,
+            "MoDiCo CUDA device preprocessing enabled "
+            "(device %d, batch size %d).\n",
             s->device_id, run_batch);
     return 1;
 }
@@ -2485,8 +2499,8 @@ static int mc_run_cuda_fastpath(mc_session_t *s,
     if (!mc_cuda_preprocessor_prepare(s->cuda_preprocessor, bytes,
                                       batch_size, reason,
                                       sizeof(reason))) {
-        fprintf(stderr,
-                "[modico] CUDA preprocessing failed: %s\n",
+        lock_fprintf(stderr,
+                "MoDiCo: CUDA preprocessing failed: %s\n",
                 reason[0] ? reason : "unknown CUDA error");
         return MC_INFERENCE_RETRYABLE;
     }
@@ -2502,7 +2516,7 @@ static int mc_run_cuda_fastpath(mc_session_t *s,
     if (run_status) {
         const char *message = g_ort->GetErrorMessage(run_status);
         mc_inference_status_t result = mc_classify_ort_failure(message);
-        fprintf(stderr, "[modico] bound ORT Run failed: %s\n",
+        lock_fprintf(stderr, "MoDiCo: bound ORT Run failed: %s\n",
                 message ? message : "(null)");
         g_ort->ReleaseStatus(run_status);
         return result;
@@ -2510,7 +2524,7 @@ static int mc_run_cuda_fastpath(mc_session_t *s,
     if (!mc_cuda_preprocessor_copy_output(s->cuda_preprocessor, logits_out,
                                           batch_size, reason,
                                           sizeof(reason))) {
-        fprintf(stderr, "[modico] CUDA output transfer failed: %s\n",
+        lock_fprintf(stderr, "MoDiCo: CUDA output transfer failed: %s\n",
                 reason[0] ? reason : "unknown CUDA error");
         return MC_INFERENCE_RETRYABLE;
     }
@@ -2655,8 +2669,8 @@ static int mc_run_internal(mc_session_t *s,
                          ? s->run_batch_size
                          : batch_size);
     if (batch_size > run_batch) {
-        fprintf(stderr,
-                "[modico] batch_size=%d exceeds configured session batch=%d\n",
+        lock_fprintf(stderr,
+                "MoDiCo: batch_size=%d exceeds configured session batch=%d\n",
                 batch_size, run_batch);
         return MC_INFERENCE_FATAL;
     }
@@ -2666,8 +2680,8 @@ static int mc_run_internal(mc_session_t *s,
     size_t histogram_windows = 0;
     if (s->input_count == 3) {
         if (block_size < 32 || (block_size - 32) % 16 != 0) {
-            fprintf(stderr,
-                    "[modico] unsupported histogram block size=%d\n",
+            lock_fprintf(stderr,
+                    "MoDiCo: unsupported histogram block size=%d\n",
                     block_size);
             return MC_INFERENCE_FATAL;
         }
@@ -2746,7 +2760,7 @@ static int mc_run_internal(mc_session_t *s,
     if (run_status != NULL) {
         const char *msg = g_ort->GetErrorMessage(run_status);
         mc_inference_status_t result = mc_classify_ort_failure(msg);
-        fprintf(stderr, "[modico] ORT Run failed: %s\n", msg ? msg : "(null)");
+        lock_fprintf(stderr, "MoDiCo: ORT Run failed: %s\n", msg ? msg : "(null)");
         g_ort->ReleaseStatus(run_status);
         if (output_tensor && output_tensor != s->persistent_output) {
             g_ort->ReleaseValue(output_tensor);
@@ -2755,7 +2769,7 @@ static int mc_run_internal(mc_session_t *s,
     }
 
     if (!output_tensor) {
-        fprintf(stderr, "[modico] ORT Run returned no output tensor.\n");
+        lock_fprintf(stderr, "MoDiCo: ORT Run returned no output tensor.\n");
         return MC_INFERENCE_FATAL;
     }
 
@@ -2765,7 +2779,7 @@ static int mc_run_internal(mc_session_t *s,
     if (data_status) {
         const char *msg = g_ort->GetErrorMessage(data_status);
         int result = mc_classify_ort_failure(msg);
-        fprintf(stderr, "[modico] output tensor access failed: %s\n",
+        lock_fprintf(stderr, "MoDiCo: output tensor access failed: %s\n",
                 msg ? msg : "(null)");
         g_ort->ReleaseStatus(data_status);
         if (output_tensor != s->persistent_output) {
@@ -2937,8 +2951,8 @@ mc_session_t *mc_create_session_auto_with_accelerator_device_for_workload(
 
     case MC_KIND_INT8:
         if (!int8_available) {
-            fprintf(stderr,
-                "[modico] MC_KIND_INT8 requested but %s does not exist — "
+            lock_fprintf(stdout,
+                "MoDiCo INT8 model requested but %s does not exist; "
                 "falling back to FP32.\n", int8_path);
             kind   = MC_KIND_FP32;
             chosen = fp32_path;
@@ -2980,14 +2994,18 @@ mc_session_t *mc_create_session_auto_with_accelerator_device_for_workload(
         info_out->selected_path[sizeof(info_out->selected_path) - 1] = '\0';
     }
 
-    fprintf(stderr,
-            "[modico] auto-select: ep=%s cpu_fast_int8=%s int8_file=%s -> loading %s (%s)\n",
+    lock_fprintf(stdout,
+            "MoDiCo model selection:\n"
+            "  Execution provider:       %s\n"
+            "  CPU fast INT8 support:    %s\n"
+            "  INT8 model available:     %s\n"
+            "  Precision:                %s\n"
+            "  Model:                    %s\n",
             mc_cuda_requested(accelerator) ? "cuda"
                 : (mc_coreml_requested(accelerator) ? "coreml" : "cpu"),
             int8_supported ? "yes" : "no",
             int8_available ? "yes" : "no",
-            chosen,
-            kind == MC_KIND_INT8 ? "INT8" : "FP32");
+            kind == MC_KIND_INT8 ? "INT8" : "FP32", chosen);
 
     return mc_create_session_with_accelerator_device_for_workload(
         chosen, intra_op_threads, accelerator, device_id, expected_blocks);

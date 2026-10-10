@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -24,11 +28,8 @@
 // Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
-// scalpel3 is a complete rewrite of the open source scalpel, which was originally developed by
-// Golden G. Richard III in 2005 and then enhanced by both Vico Marziale and Golden G. Richard until
-// ~2013. Earlier versions of scalpel had their roots in Foremost 0.69. The emphasis of scalpel3 is
-// on *practical* solutions to solving file fragmentation for selected file types and making this
-// process as fast as possible on modern hardware.
+// The emphasis of scalpel3 is on *practical* solutions to solving file fragmentation for selected
+// file types and making this process as fast as possible on modern hardware.
 //
 // IMPORTANT: scalpel3 internals differ significantly from earlier versions of scalpel and the
 // configuration for scalpel3 is NOT compatible with earlier versions.
@@ -61,6 +62,9 @@ static void process_command_line_args(int argc, char *argv[]);
 static void initialize_state(int argc, char *argv[]);
 static char *resolve_running_executable(const char *argv0);
 static void hash_running_executable(const char *argv0);
+static void resolve_carve_window(const struct stat *image_stat);
+static void validate_resource_directory(const char *path, const char *setting);
+static void validate_scalpel3_home(const char *home);
 
 static bool parse_bounded_uint64(const char *value, uint64_t minimum,
                                  uint64_t maximum, uint64_t *parsed);
@@ -1006,6 +1010,92 @@ static void hash_running_executable(const char *argv0) {
 }
 
 
+// Resolve omitted window bounds from the blockmap before inference or validators
+// use them. The full blockmap is still checked and loaded by filemirror_start().
+//
+static void resolve_carve_window(const struct stat *image_stat) {
+
+  uint32_t blocksize;
+  uint64_t numblocks, start_block, end_block;
+  FILE *fp = fopen(scalpel_state.blockmap_pathname, "rb");
+
+  if (! fp) {
+    handle_error(SCALPEL_ERROR_NO_BLOCKMAP, scalpel_state.blockmap_pathname,
+                 __LINE__, __FILE__);
+  }
+  bool header_read = fread(&blocksize, sizeof(blocksize), 1, fp) == 1
+                     && fread(&numblocks, sizeof(numblocks), 1, fp) == 1
+                     && fread(&start_block, sizeof(start_block), 1, fp) == 1
+                     && fread(&end_block, sizeof(end_block), 1, fp) == 1;
+  fclose(fp);
+  if (! header_read || ! numblocks || blocksize < 512 || blocksize % 512
+      || start_block > end_block || end_block >= numblocks) {
+    handle_error(SCALPEL_ERROR_BLOCKMAP_FORMAT, scalpel_state.blockmap_pathname,
+                 __LINE__, __FILE__);
+  }
+  if (blocksize != scalpel_state.blocksize) {
+    handle_error(SCALPEL_ERROR_BLOCKSIZE, NULL, __LINE__, __FILE__);
+  }
+  const uint64_t image_blocks = (uint64_t)image_stat->st_size / blocksize
+      + ((uint64_t)image_stat->st_size % blocksize != 0);
+  if (numblocks != image_blocks) {
+    handle_error(SCALPEL_ERROR_IMAGE_BLOCKFILESIZE, NULL, __LINE__, __FILE__);
+  }
+  if (scalpel_state.start_block != UINT64_MAX) {
+    start_block = scalpel_state.start_block;
+  }
+  if (scalpel_state.end_block != UINT64_MAX) {
+    end_block = scalpel_state.end_block;
+  }
+  if (start_block > end_block || end_block >= numblocks) {
+    handle_error(SCALPEL_ERROR_BAD_START_END_BLOCKS, NULL, __LINE__, __FILE__);
+  }
+  scalpel_state.start_block = start_block;
+  scalpel_state.end_block = end_block;
+}
+
+
+// A missing resource directory is a configuration error, not an unsupported
+// model size. Do not silently select a different installation's models.
+//
+static void validate_resource_directory(const char *path, const char *setting) {
+
+  struct stat directory;
+  if (stat(path, &directory) != 0 || ! S_ISDIR(directory.st_mode)
+      || access(path, R_OK | X_OK) != 0) {
+    lock_fprintf(stderr,
+                 "\nERROR: %s does not identify a readable resource directory: %s\n"
+                 "Correct %s before running Scalpel3.\n",
+                 setting, path, setting);
+    handle_error(SCALPEL_ERROR_RESOURCE_PATH, "Invalid resource directory.",
+                 __LINE__, __FILE__);
+  }
+}
+
+
+// SCALPEL3_HOME names the repository root, not its src directory.
+//
+static void validate_scalpel3_home(const char *home) {
+
+  char source_directory[PATH_MAX];
+  struct stat directory;
+  int written = snprintf(source_directory, sizeof(source_directory),
+                          "%s/src", home);
+  if (written < 0 || (size_t)written >= sizeof(source_directory)
+      || stat(source_directory, &directory) != 0
+      || ! S_ISDIR(directory.st_mode)) {
+    lock_fprintf(stderr,
+                 "\nERROR: SCALPEL3_HOME must name the Scalpel3 repository root, not its src directory.\n"
+                 "Current value: %s\n"
+                 "Use: export SCALPEL3_HOME=\"/path/to/scalpel3-release\"\n"
+                 "The selected directory must contain src/exe_vision/unix.\n",
+                 home);
+    handle_error(SCALPEL_ERROR_RESOURCE_PATH, "Invalid SCALPEL3_HOME.",
+                 __LINE__, __FILE__);
+  }
+}
+
+
 // initialize scalpel state variable and set configuration
 void initialize_state(int argc, char *argv[]) {
   char **argvcopy = argv;
@@ -1029,7 +1119,7 @@ void initialize_state(int argc, char *argv[]) {
   scalpel_state.no_defrag = false;
   scalpel_state.halt_after = HALT_AFTER_NONE;
   scalpel_state.backtrack = true;
-  scalpel_state.start_block = 0;
+  scalpel_state.start_block = UINT64_MAX;
   scalpel_state.end_block = UINT64_MAX;
   scalpel_state.reservations = true;
   scalpel_state.memory_profiling = false;
@@ -1165,8 +1255,10 @@ void initialize_state(int argc, char *argv[]) {
     handle_error(SCALPEL_ERROR_BAD_BLOCKSIZE, "main()", __LINE__, __FILE__);
   }
 
-  // check consistency of start_block and end_block
-  if (scalpel_state.end_block < scalpel_state.start_block) {
+  // Unspecified bounds are checked after inheriting the blockmap window.
+  if (scalpel_state.start_block != UINT64_MAX
+      && scalpel_state.end_block != UINT64_MAX
+      && scalpel_state.end_block < scalpel_state.start_block) {
     // fatal
     handle_error(SCALPEL_ERROR_BAD_START_END_BLOCKS, "main()", __LINE__, __FILE__);
   }
@@ -1302,7 +1394,7 @@ static void initialize_AI(const char *scalpel3_home) {
   }
 
   modico_intra_threads = modico_onnx_intra_threads(onnx_accel);
-  scalpel_log("MoDiCo ONNX intra-op threads: %d\n",
+  scalpel_log("MoDiCo ONNX intra-op threads: %d.\n",
               modico_intra_threads);
 
   // set up the optional MoDiCo block classifier. MoDiCo scores each block's
@@ -1344,13 +1436,21 @@ static void initialize_AI(const char *scalpel3_home) {
   // directory under the scalpel3 tree.
   char modico_dir[PATH_MAX];
   const char *env_dir = getenv("SCALPEL3_MODICO_DIR");
+  int modico_dir_length;
   if (env_dir && strlen(env_dir)) {
-    snprintf(modico_dir, sizeof(modico_dir), "%s", env_dir);
+    modico_dir_length = snprintf(modico_dir, sizeof(modico_dir), "%s", env_dir);
   }
   else {
-    snprintf(modico_dir, sizeof(modico_dir), "%s/src/exe_vision/unix",
-             scalpel3_home);
+    modico_dir_length = snprintf(modico_dir, sizeof(modico_dir),
+                                 "%s/src/exe_vision/unix", scalpel3_home);
   }
+  if (modico_dir_length < 0 || (size_t)modico_dir_length >= sizeof(modico_dir)) {
+    handle_error(SCALPEL_ERROR_RESOURCE_PATH, "MoDiCo model directory pathname is too long.",
+                 __LINE__, __FILE__);
+  }
+  validate_resource_directory(modico_dir,
+                               env_dir && *env_dir ? "SCALPEL3_MODICO_DIR"
+                                                   : "SCALPEL3_HOME");
 
   // The three-input graph-cut artifact moves histogram construction out of
   // the ONNX graph and works with both CUDA and CoreML. The historical
@@ -1504,29 +1604,19 @@ static void initialize_AI(const char *scalpel3_home) {
   scalpel_state.modico_num_specs = scalpel_state.num_specs;
   scalpel_state.modico_enabled = true;
 
-  char enabled_msg[PATH_MAX + 160];
-  int enabled_len = snprintf(enabled_msg, sizeof(enabled_msg),
-                             "MoDiCo enabled: %s.onnx (%d classes), %d of %u carved "
-                             "types mapped, execution provider=%s",
-                             modico_base, model_classes, mapped,
-                             scalpel_state.num_specs,
-                             modico_onnx_global_provider());
-  if (modico_onnx_global_uses_cuda()
-      && enabled_len > 0 && (size_t)enabled_len < sizeof(enabled_msg)) {
-    int appended = snprintf(enabled_msg + enabled_len,
-                            sizeof(enabled_msg) - (size_t)enabled_len,
-                            " device=%d", modico_onnx_global_device_id());
-    if (appended > 0) {
-      enabled_len += appended;
-    }
+  scalpel_log("MoDiCo enabled:\n"
+              "  Execution provider:       %s\n"
+              "  Model classes:            %d\n"
+              "  Carved types mapped:      %d of %u\n"
+              "  Model:                    %s\n",
+              modico_onnx_global_provider(), model_classes, mapped,
+              scalpel_state.num_specs, modico_onnx_global_model_path());
+  if (modico_onnx_global_uses_cuda()) {
+    scalpel_log("  CUDA device:              %d\n"
+                "  Inference backend:        %s\n",
+                modico_onnx_global_device_id(),
+                modico_onnx_global_uses_tensorrt() ? "tensorrt" : "cuda");
   }
-  if (modico_onnx_global_uses_tensorrt()
-      && enabled_len > 0 && (size_t)enabled_len < sizeof(enabled_msg)) {
-    snprintf(enabled_msg + enabled_len,
-             sizeof(enabled_msg) - (size_t)enabled_len,
-             ", inference backend=tensorrt");
-  }
-  scalpel_log("%s.\n", enabled_msg);
 }
 
 
@@ -1609,6 +1699,7 @@ int main(int argc, char *argv[]) {
     lock_fprintf(stderr, "%s", BLACK);
     exit(-1);
   }
+  validate_scalpel3_home(scalpel3_home);
 
   // reconstruct command line for log
   cmdline[0] = 0;
@@ -1664,10 +1755,13 @@ int main(int argc, char *argv[]) {
     signal(SIGABRT, sigsegv_signal_handler);
   }
 
-  // stat() image file to make sure it's non-empty
-  if (lstat(scalpel_state.image_pathname, &s) || s.st_size == 0) {
+  // Follow image symlinks so window validation uses the actual image size.
+  if (stat(scalpel_state.image_pathname, &s) || s.st_size <= 0) {
     lock_fprintf(stderr, "The image file must exist and be non-empty.  Aborting.\n");
     return -1;
+  }
+  if (! scalpel_state.restore_from_checkpoint) {
+    resolve_carve_window(&s);
   }
 
   if (scalpel_state.mode_verbose) {
@@ -1720,6 +1814,7 @@ int main(int argc, char *argv[]) {
     frame_message("ATTEMPTING TO RESTART FROM CHECKPOINT");
     // get checkpointed scalpel state before proceeding with CP restoration
     restore_checkpointed_scalpel_state();
+    resolve_carve_window(&s);
   }
 
   scalpel_log("Backtrace on crash is %s.\n", scalpel_state.disable_backtrace ? "OFF" : "ON");

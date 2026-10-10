@@ -1,7 +1,11 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and contributors.
+// The Scalpel Project is Copyright (C) 2005-2026 by Golden G. Richard III
+// and contributors.
+//
+// Scalpel3 is Copyright (C) 2021-2026 by Golden G. Richard III and the
+// contributors listed in AUTHORS.
 //
 // This file is part of Scalpel3.
 //
@@ -55,7 +59,7 @@
 #define ISOBMFF_MAX_METADATA_SIZE UINT64_C(1073741824)
 #define ISOBMFF_PAYLOAD_CONFIDENCE_MAX 99
 #define ISOBMFF_CARVE_STATE_MAGIC UINT32_C(0x49534f42)
-#define ISOBMFF_CARVE_STATE_VERSION 15U
+#define ISOBMFF_CARVE_STATE_VERSION 16U
 #define ISOBMFF_REASSEMBLY_POLL_INTERVAL UINT64_C(256)
 #define ISOBMFF_NO_MIDDLE_DELTA INT64_MIN
 #define ISOBMFF_MAX_STORED_SOLUTIONS 32U
@@ -186,7 +190,7 @@ typedef struct IsoBmffTgaRleState {
 } IsoBmffTgaRleState;
 
 typedef struct IsoBmffSolution {
-  uint64_t footer_index;
+  uint64_t footer_offset;
   uint64_t base_split;
   uint64_t first_split;
   uint64_t second_split;
@@ -207,6 +211,7 @@ typedef struct IsoBmffCarveState {
   uint64_t archive_extent;
   uint64_t mdat_start;
   uint64_t mdat_end;
+  // Physical footer offsets remain stable when checkpoint pruning compacts the table.
   uint64_t footer_cursor;
   uint64_t active_footer;
   uint64_t preferred_footer;
@@ -316,6 +321,16 @@ static inline void isobmff_reassembly(
     uuid_string_t uuidc);
 static inline void isobmff_finish_active_context(
     IsoBmffCarveState *state);
+static inline void isobmff_finish_footer(IsoBmffCarveState *state);
+static inline bool isobmff_fast_stage(uint32_t stage);
+static inline uint64_t isobmff_footer_at_or_after(
+    const SearchSpec *spec, uint64_t offset);
+static inline uint64_t isobmff_footer_index(
+    const SearchSpec *spec, uint64_t offset);
+static inline uint64_t isobmff_next_footer(
+    const SearchSpec *spec, IsoBmffCarveState *state);
+static inline void isobmff_advance_middle_cursor(
+    IsoBmffCarveState *state, uint64_t next_second);
 
 
 static inline uint16_t isobmff_read_be16(const uint8_t *data) {
@@ -2982,7 +2997,7 @@ static inline bool isobmff_tga_feed_logical_range(
     uint64_t logical_offset, uint64_t length) {
 
   IsoBmffSolution baseline = {
-    .footer_index = UINT64_MAX,
+    .footer_offset = UINT64_MAX,
     .base_split = base_split,
     .first_split = UINT64_MAX,
     .second_split = UINT64_MAX,
@@ -3466,6 +3481,10 @@ static inline bool isobmff_state_valid(const IsoBmffCarveState *state) {
 
   return state && state->magic == ISOBMFF_CARVE_STATE_MAGIC
       && state->version == ISOBMFF_CARVE_STATE_VERSION
+      && state->stage >= ISOBMFF_STAGE_PAIR_FOOTER
+      && state->stage <= ISOBMFF_STAGE_TGA_MIDDLE_RUN
+      && state->kind >= ISOBMFF_KIND_MOV
+      && state->kind <= ISOBMFF_KIND_MP4
       && state->stored_solution_count <= ISOBMFF_MAX_STORED_SOLUTIONS
       && state->stored_solution_count <= state->solution_count;
 }
@@ -3743,6 +3762,35 @@ static inline bool isobmff_serialize_carve_state(
     handle_error(SCALPEL_ERROR_CHECKPOINT, "ISO BMFF carve state",
                  __LINE__, __FILE__);
   }
+  if (mode == DESERIALIZE && (*carve_state)->version == 15U
+      && (*carve_state)->magic == ISOBMFF_CARVE_STATE_MAGIC
+      && (*carve_state)->stage >= ISOBMFF_STAGE_PAIR_FOOTER
+      && (*carve_state)->stage <= ISOBMFF_STAGE_TGA_MIDDLE_RUN
+      && (*carve_state)->kind >= ISOBMFF_KIND_MOV
+      && (*carve_state)->kind <= ISOBMFF_KIND_MP4
+      && (*carve_state)->stored_solution_count <= ISOBMFF_MAX_STORED_SOLUTIONS
+      && (*carve_state)->stored_solution_count <= (*carve_state)->solution_count) {
+    // Version 15 stored table indices. Retain completed mappings and fast-path
+    // progress, but repeat the footer search whose physical frontier was not saved.
+    IsoBmffCarveState *legacy = *carve_state;
+    bool footer_search_started = legacy->footer_cursor != 0
+        || legacy->preferred_footer_tried
+        || legacy->active_footer != UINT64_MAX;
+    if (legacy->stage != ISOBMFF_STAGE_FINISHED && !legacy->fast_context
+        && !isobmff_fast_stage(legacy->stage)) {
+      isobmff_finish_footer(legacy);
+    }
+    legacy->footer_cursor = 0;
+    legacy->active_footer = UINT64_MAX;
+    legacy->preferred_footer = UINT64_MAX;
+    legacy->preferred_footer_tried = footer_search_started;
+    legacy->version = ISOBMFF_CARVE_STATE_VERSION;
+    for (uint32_t index = 0;
+         index < legacy->stored_solution_count
+         && index < ISOBMFF_MAX_STORED_SOLUTIONS; index++) {
+      legacy->solutions[index].mapping.footer_offset = UINT64_MAX;
+    }
+  }
   if (mode == DESERIALIZE && !isobmff_state_valid(*carve_state)) {
     free(*carve_state);
     *carve_state = NULL;
@@ -3861,11 +3909,82 @@ static inline uint64_t isobmff_preferred_footer(
     uint64_t actual = spec->offsets.footers[index] - 1;
     uint64_t distance = actual > target ? actual - target : target - actual;
     if (preferred == UINT64_MAX || distance < best_distance) {
-      preferred = index;
+      preferred = spec->offsets.footers[index];
       best_distance = distance;
     }
   }
   return preferred;
+}
+
+
+// Header/footer discovery and pruning retain increasing physical offset order.
+static inline uint64_t isobmff_footer_at_or_after(
+    const SearchSpec *spec, uint64_t offset) {
+
+  if (!spec || !spec->offsets.footers) {
+    return 0;
+  }
+  uint64_t first = 0;
+  uint64_t last = spec->offsets.numfooters;
+  while (first < last) {
+    uint64_t middle = first + (last - first) / 2;
+    if (spec->offsets.footers[middle] < offset) {
+      first = middle + 1;
+    }
+    else {
+      last = middle;
+    }
+  }
+  return first;
+}
+
+
+static inline uint64_t isobmff_footer_index(
+    const SearchSpec *spec, uint64_t offset) {
+
+  if (!spec || !spec->offsets.footers || offset == UINT64_MAX) {
+    return UINT64_MAX;
+  }
+  uint64_t index = isobmff_footer_at_or_after(spec, offset);
+  return index < spec->offsets.numfooters
+      && spec->offsets.footers[index] == offset ? index : UINT64_MAX;
+}
+
+
+static inline uint64_t isobmff_next_footer(
+    const SearchSpec *spec, IsoBmffCarveState *state) {
+
+  if (!spec || !state || !spec->offsets.footers) {
+    return UINT64_MAX;
+  }
+  if (!state->preferred_footer_tried) {
+    state->preferred_footer_tried = true;
+    uint64_t index = isobmff_footer_index(spec, state->preferred_footer);
+    if (index != UINT64_MAX) {
+      return index;
+    }
+  }
+  uint64_t index = isobmff_footer_at_or_after(spec, state->footer_cursor);
+  while (index < spec->offsets.numfooters) {
+    uint64_t offset = spec->offsets.footers[index];
+    state->footer_cursor = offset == UINT64_MAX ? offset : offset + 1;
+    if (offset != 0 && offset != UINT64_MAX
+        && offset != state->preferred_footer) {
+      return index;
+    }
+    index++;
+  }
+  return UINT64_MAX;
+}
+
+
+// Decoder warm-up may revisit bytes, but must not regress the next untried split.
+static inline void isobmff_advance_middle_cursor(
+    IsoBmffCarveState *state, uint64_t next_second) {
+
+  if (state->middle_second_cursor < next_second) {
+    state->middle_second_cursor = next_second;
+  }
 }
 
 
@@ -4232,7 +4351,7 @@ static inline bool isobmff_prepare_metadata_payload_context(
   }
 
   IsoBmffSolution solution = {
-    .footer_index = UINT64_MAX,
+    .footer_offset = UINT64_MAX,
     .base_split = base_split,
     .first_split = UINT64_MAX,
     .second_split = UINT64_MAX,
@@ -4683,10 +4802,10 @@ static inline bool isobmff_solution_matches_saved(
 
   for (uint32_t index = 0; index < state->stored_solution_count; index++) {
     const IsoBmffStoredSolution *saved = &state->solutions[index];
+    // The same physical mapping is not a new solution after footer-table pruning.
     if (saved->extent == context->extent
         && saved->prefix_delta == context->prefix_delta
         && saved->suffix_delta == context->suffix_delta
-        && saved->mapping.footer_index == solution->footer_index
         && saved->mapping.base_split == solution->base_split
         && saved->mapping.first_split == solution->first_split
         && saved->mapping.second_split == solution->second_split
@@ -5201,21 +5320,9 @@ static inline void isobmff_reassembly(
         }
       }
       while (true) {
-        uint64_t footer = UINT64_MAX;
-        if (!state->preferred_footer_tried
-            && state->preferred_footer < spec->offsets.numfooters) {
-          footer = state->preferred_footer;
-          state->preferred_footer_tried = true;
-        }
-        else {
-          while (state->footer_cursor < spec->offsets.numfooters
-                 && state->footer_cursor == state->preferred_footer) {
-            state->footer_cursor++;
-          }
-          if (state->footer_cursor >= spec->offsets.numfooters) {
-            break;
-          }
-          footer = state->footer_cursor++;
+        uint64_t footer = isobmff_next_footer(spec, state);
+        if (footer == UINT64_MAX) {
+          break;
         }
         if (isobmff_prepare_footer_context(*candidate, footer, &context)) {
           if (getenv("SCALPEL_ISOBMFF_DEBUG")) {
@@ -5229,7 +5336,7 @@ static inline void isobmff_reassembly(
                     context.anchor_count);
           }
           context_ready = true;
-          state->active_footer = footer;
+          state->active_footer = spec->offsets.footers[footer];
           state->expected_moov_offset = context.maximum_split
                                         * scalpel_state.blocksize
                                         + context.moov_actual
@@ -5268,7 +5375,8 @@ static inline void isobmff_reassembly(
     else if (!context_ready) {
       if (state->active_footer == UINT64_MAX
           || !isobmff_prepare_footer_context(
-              *candidate, state->active_footer, &context)
+              *candidate, isobmff_footer_index(spec, state->active_footer),
+              &context)
           || context.anchor_count != state->anchor_count
           || context.extent != state->archive_extent) {
         isobmff_footer_context_clear(&context);
@@ -5514,7 +5622,7 @@ static inline void isobmff_reassembly(
 
           if (state->current_score == state->best_score) {
             IsoBmffSolution solution = {
-              .footer_index = UINT64_MAX,
+              .footer_offset = UINT64_MAX,
               .base_split = split,
               .first_split = split,
               .second_split = split,
@@ -5619,7 +5727,7 @@ static inline void isobmff_reassembly(
 
         uint8_t header[18];
         IsoBmffSolution baseline = {
-          .footer_index = UINT64_MAX,
+          .footer_offset = UINT64_MAX,
           .base_split = state->active_base_split,
           .first_split = UINT64_MAX,
           .second_split = UINT64_MAX,
@@ -5716,7 +5824,7 @@ static inline void isobmff_reassembly(
         uint8_t header[18];
         IsoBmffTgaRleState prefix;
         IsoBmffSolution baseline = {
-          .footer_index = UINT64_MAX,
+          .footer_offset = UINT64_MAX,
           .base_split = state->active_base_split,
           .first_split = UINT64_MAX,
           .second_split = UINT64_MAX,
@@ -5784,7 +5892,7 @@ static inline void isobmff_reassembly(
                     && isobmff_tga_rle_stream_complete(&complete)) {
                   int64_t middle_delta = 0;
                   IsoBmffSolution solution = {
-                    .footer_index = UINT64_MAX,
+                    .footer_offset = UINT64_MAX,
                     .base_split = state->active_base_split,
                     .first_split = first,
                     .second_split = second,
@@ -5844,7 +5952,7 @@ static inline void isobmff_reassembly(
 
               state->middle_first_cursor = first;
               state->middle_actual_cursor = actual;
-              state->middle_second_cursor = second + 1;
+              isobmff_advance_middle_cursor(state, second + 1);
               if (isobmff_reassembly_poll(
                       work, candidate, state, uuidp, uuidc, &iterations)) {
                 free(trial);
@@ -6016,7 +6124,7 @@ static inline void isobmff_reassembly(
 
         if (state->current_score == state->best_score) {
           IsoBmffSolution solution = {
-            .footer_index = state->active_footer,
+            .footer_offset = state->active_footer,
             .base_split = split,
             .first_split = split,
             .second_split = split,
@@ -6166,7 +6274,7 @@ static inline void isobmff_reassembly(
               state->middle_first_cursor = first;
               state->middle_second_cursor = second + 1;
               IsoBmffSolution solution = {
-                .footer_index = state->active_footer,
+                .footer_offset = state->active_footer,
                 .base_split = state->active_base_split,
                 .first_split = first,
                 .second_split = second,
