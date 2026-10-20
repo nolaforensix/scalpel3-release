@@ -64,6 +64,8 @@
 #define ISOBMFF_NO_MIDDLE_DELTA INT64_MIN
 #define ISOBMFF_MAX_STORED_SOLUTIONS 32U
 #define ISOBMFF_PROMISING_OUTPUT_BUDGET UINT64_C(536870912)
+#define ISOBMFF_TGA_MEMO_MAX_ENTRIES 16U
+#define ISOBMFF_TGA_MEMO_BUDGET UINT64_C(8388608)
 
 enum {
   ISOBMFF_STAGE_PAIR_FOOTER = 1,
@@ -171,6 +173,22 @@ typedef struct IsoBmffLayout {
   bool terminal_size;
   bool metadata_valid;
 } IsoBmffLayout;
+
+typedef struct IsoBmffTgaSampleMemoEntry {
+  uint8_t *data;
+  uint64_t offset;
+  uint64_t length;
+  uint32_t track_index;
+} IsoBmffTgaSampleMemoEntry;
+
+// Transient trial-batch ownership; never part of the serialized carve state.
+typedef struct IsoBmffTgaSampleMemo {
+  IsoBmffTgaSampleMemoEntry entries[ISOBMFF_TGA_MEMO_MAX_ENTRIES];
+  IsoBmffTgaSampleMemoEntry failed;
+  uint64_t failed_prefix;
+  uint64_t payload_bytes;
+  uint32_t count;
+} IsoBmffTgaSampleMemo;
 
 typedef struct IsoBmffTgaRleState {
   uint64_t bytes_seen;
@@ -331,6 +349,22 @@ static inline uint64_t isobmff_next_footer(
     const SearchSpec *spec, IsoBmffCarveState *state);
 static inline void isobmff_advance_middle_cursor(
     IsoBmffCarveState *state, uint64_t next_second);
+static inline void isobmff_tga_sample_memo_clear(
+    IsoBmffTgaSampleMemo *memo);
+static inline bool isobmff_trial_sample_content_valid(
+    const IsoBmffTrack *track, const uint8_t *data, uint64_t length,
+    uint32_t track_index, uint64_t offset, IsoBmffTgaSampleMemo *memo);
+static inline bool isobmff_validate_track_samples_with_memo(
+    const uint8_t *data, uint64_t length, IsoBmffLayout *layout,
+    IsoBmffTrack *track, bool require_valid_samples,
+    IsoBmffTgaSampleMemo *memo, uint32_t track_index);
+static inline IsoBmffParseResult isobmff_parse_file_with_memo(
+    const uint8_t *data, uint64_t length, IsoBmffLayout *layout,
+    bool require_valid_samples, IsoBmffTgaSampleMemo *memo);
+static inline bool isobmff_solution_complete_with_memo(
+    int64_t prefix_delta, int64_t suffix_delta,
+    const IsoBmffSolution *solution, uint64_t extent,
+    uint8_t *data, IsoBmffLayout *layout, IsoBmffTgaSampleMemo *memo);
 
 
 static inline uint16_t isobmff_read_be16(const uint8_t *data) {
@@ -1195,13 +1229,24 @@ static inline bool isobmff_tga_header_valid(
 }
 
 
-static inline bool isobmff_tga_sample_valid(const uint8_t *data,
-                                             uint64_t length) {
+// On failure, optionally report a sufficient byte prefix and packet work.
+// Equality of that prefix and total length preserves the failure, not success.
+static inline bool isobmff_tga_sample_valid_with_failure(
+    const uint8_t *data, uint64_t length, uint64_t *failure_prefix,
+    uint64_t *failure_packets) {
 
   uint64_t position = 0;
   uint64_t pixels = 0;
+  uint64_t examined = 18;
+  uint64_t packets = 0;
   uint8_t pixel_bytes = 0;
   bool rle = false;
+  if (failure_prefix) {
+    *failure_prefix = 0;
+  }
+  if (failure_packets) {
+    *failure_packets = 0;
+  }
   if (!isobmff_tga_header_valid(data, length, &position, &pixels,
                                 &pixel_bytes, &rle)) {
     return false;
@@ -1220,29 +1265,56 @@ static inline bool isobmff_tga_sample_valid(const uint8_t *data,
     uint64_t decoded = 0;
     while (decoded < pixels) {
       if (position >= length) {
-        return false;
+        break;
       }
       uint8_t packet = data[position++];
+      examined = position;
+      packets++;
       uint64_t count = (uint64_t)(packet & 0x7fU) + 1U;
       if (count > pixels - decoded) {
-        return false;
+        break;
       }
       uint64_t bytes = (packet & 0x80U) != 0
           ? pixel_bytes : count * pixel_bytes;
       if (bytes > length - position) {
-        return false;
+        break;
       }
       position += bytes;
       decoded += count;
+    }
+    if (decoded < pixels) {
+      if (failure_prefix) {
+        *failure_prefix = examined;
+      }
+      if (failure_packets) {
+        *failure_packets = packets;
+      }
+      return false;
     }
   }
   if (position == length) {
     return true;
   }
   static const uint8_t footer_signature[18] = "TRUEVISION-XFILE.";
-  return length - position == 26
+  bool valid = length - position == 26
       && memcmp(data + position + 8, footer_signature,
                 sizeof(footer_signature)) == 0;
+  if (!valid) {
+    if (failure_prefix) {
+      *failure_prefix = length - position == 26 ? length : examined;
+    }
+    if (failure_packets) {
+      *failure_packets = packets;
+    }
+  }
+  return valid;
+}
+
+
+static inline bool isobmff_tga_sample_valid(const uint8_t *data,
+                                             uint64_t length) {
+
+  return isobmff_tga_sample_valid_with_failure(data, length, NULL, NULL);
 }
 
 
@@ -1891,19 +1963,131 @@ static inline bool isobmff_sample_content_valid(
 }
 
 
+// Free owned snapshots and reset an initialized trial-batch memo for reuse.
+static inline void isobmff_tga_sample_memo_clear(
+    IsoBmffTgaSampleMemo *memo) {
+
+  if (!memo) {
+    return;
+  }
+  for (uint32_t index = 0; index < memo->count; index++) {
+    free(memo->entries[index].data);
+  }
+  free(memo->failed.data);
+  memset(memo, 0, sizeof(*memo));
+}
+
+
+// Cache RLE-TGA content checks only, never sample bounds or parser results.
+// Positive entries take priority over one disposable failed-prefix snapshot.
+static inline bool isobmff_trial_sample_content_valid(
+    const IsoBmffTrack *track, const uint8_t *data, uint64_t length,
+    uint32_t track_index, uint64_t offset, IsoBmffTgaSampleMemo *memo) {
+
+  if (!memo || track->codec != ISOBMFF_FOURCC('t', 'g', 'a', ' ')
+      || !data || length < 18 || length > SIZE_MAX
+      || (data[2] != 9 && data[2] != 10 && data[2] != 11)) {
+    return isobmff_sample_content_valid(track, data, length);
+  }
+  bool occupied = false;
+  for (uint32_t index = 0; index < memo->count; index++) {
+    const IsoBmffTgaSampleMemoEntry *entry = &memo->entries[index];
+    if (entry->track_index == track_index && entry->offset == offset
+        && entry->length == length) {
+      if (memcmp(entry->data, data, (size_t)length) == 0) {
+        return true;
+      }
+      occupied = true;
+      break;
+    }
+  }
+  if (memo->failed.data) {
+    if (memo->failed.track_index == track_index
+        && memo->failed.offset == offset && memo->failed.length == length
+        && memcmp(memo->failed.data, data, (size_t)memo->failed_prefix) == 0) {
+      return false;
+    }
+    // Drop a miss before decoding or allocating, retaining all positive entries.
+    free(memo->failed.data);
+    memset(&memo->failed, 0, sizeof(memo->failed));
+    memo->failed_prefix = 0;
+  }
+  uint64_t failure_prefix = 0;
+  uint64_t failure_packets = 0;
+  bool valid = isobmff_tga_sample_valid_with_failure(
+      data, length, &failure_prefix, &failure_packets);
+  if (!valid && failure_packets >= 32 && failure_prefix > 0
+      && failure_prefix <= length
+      // At most 65535*65535+1 packets can precede a failure; this cannot wrap.
+      && failure_prefix <= failure_packets * UINT64_C(64)
+      && sizeof(*memo) <= ISOBMFF_TGA_MEMO_BUDGET
+      && memo->payload_bytes <= ISOBMFF_TGA_MEMO_BUDGET - sizeof(*memo)
+      && failure_prefix <= ISOBMFF_TGA_MEMO_BUDGET - sizeof(*memo)
+                               - memo->payload_bytes) {
+    // Cost policy only: skip short or byte-heavy failures, never evict positives.
+    uint8_t *snapshot = (uint8_t *)malloc((size_t)failure_prefix);
+    if (snapshot) {
+      memcpy(snapshot, data, (size_t)failure_prefix);
+      memo->failed = (IsoBmffTgaSampleMemoEntry) {
+        .data = snapshot,
+        .offset = offset,
+        .length = length,
+        .track_index = track_index
+      };
+      memo->failed_prefix = failure_prefix;
+    }
+  }
+  if (!valid || occupied || memo->count == ISOBMFF_TGA_MEMO_MAX_ENTRIES
+      || sizeof(*memo) > ISOBMFF_TGA_MEMO_BUDGET
+      || memo->payload_bytes > ISOBMFF_TGA_MEMO_BUDGET - sizeof(*memo)
+      || length > ISOBMFF_TGA_MEMO_BUDGET - sizeof(*memo)
+                      - memo->payload_bytes) {
+    return valid;
+  }
+  // Optional reuse must not make allocation failure change the content result.
+  uint8_t *snapshot = (uint8_t *)malloc((size_t)length);
+  if (!snapshot) {
+    return valid;
+  }
+  memcpy(snapshot, data, (size_t)length);
+  memo->entries[memo->count++] = (IsoBmffTgaSampleMemoEntry) {
+    .data = snapshot,
+    .offset = offset,
+    .length = length,
+    .track_index = track_index
+  };
+  memo->payload_bytes += length;
+  return valid;
+}
+
+
 static inline uint32_t isobmff_samples_per_chunk(
     const IsoBmffTrack *track, uint64_t chunk_index) {
 
-  if (!track || chunk_index >= track->chunk_count) {
+  if (!track || chunk_index >= track->chunk_count
+      || track->sample_to_chunk_count == 0) {
     return 0;
   }
   uint64_t chunk_number = chunk_index + 1;
-  for (uint64_t entry = track->sample_to_chunk_count; entry > 0; entry--) {
-    if (chunk_number >= track->sample_to_chunk[entry - 1].first_chunk) {
-      return track->sample_to_chunk[entry - 1].samples_per_chunk;
+  uint64_t last = track->sample_to_chunk_count - 1;
+  if (chunk_number >= track->sample_to_chunk[last].first_chunk) {
+    return track->sample_to_chunk[last].samples_per_chunk;
+  }
+
+  // Parsed stsc entries have strictly increasing first_chunk values.
+  // Keep the common final run constant-time; otherwise find the upper bound.
+  uint64_t low = 0;
+  uint64_t high = last;
+  while (low < high) {
+    uint64_t middle = low + (high - low) / 2;
+    if (chunk_number >= track->sample_to_chunk[middle].first_chunk) {
+      low = middle + 1;
+    }
+    else {
+      high = middle;
     }
   }
-  return 0;
+  return low > 0 ? track->sample_to_chunk[low - 1].samples_per_chunk : 0;
 }
 
 
@@ -2005,9 +2189,10 @@ static inline bool isobmff_record_mdat(
 }
 
 
-static inline bool isobmff_validate_track_samples(
+static inline bool isobmff_validate_track_samples_with_memo(
     const uint8_t *data, uint64_t length, IsoBmffLayout *layout,
-    IsoBmffTrack *track) {
+    IsoBmffTrack *track, bool require_valid_samples,
+    IsoBmffTgaSampleMemo *memo, uint32_t track_index) {
 
   uint64_t sample = 0;
   bool strong = isobmff_sample_strong(track);
@@ -2032,10 +2217,14 @@ static inline bool isobmff_validate_track_samples(
       if (strong) {
         track->strong_samples++;
         layout->strong_samples++;
-        if (!isobmff_sample_content_valid(track, data + position,
-                                          sample_size)) {
+        if (!isobmff_trial_sample_content_valid(
+                track, data + position, sample_size, track_index, position,
+                require_valid_samples ? memo : NULL)) {
           track->invalid_strong_samples++;
           layout->invalid_strong_samples++;
+          if (require_valid_samples) {
+            return false;
+          }
         }
       }
       position += sample_size;
@@ -2046,8 +2235,18 @@ static inline bool isobmff_validate_track_samples(
 }
 
 
-static inline IsoBmffParseResult isobmff_parse_file(
-    const uint8_t *data, uint64_t length, IsoBmffLayout *layout) {
+static inline bool isobmff_validate_track_samples(
+    const uint8_t *data, uint64_t length, IsoBmffLayout *layout,
+    IsoBmffTrack *track, bool require_valid_samples) {
+
+  return isobmff_validate_track_samples_with_memo(
+      data, length, layout, track, require_valid_samples, NULL, 0);
+}
+
+
+static inline IsoBmffParseResult isobmff_parse_file_with_memo(
+    const uint8_t *data, uint64_t length, IsoBmffLayout *layout,
+    bool require_valid_samples, IsoBmffTgaSampleMemo *memo) {
 
   if (!layout) {
     return ISOBMFF_PARSE_INVALID;
@@ -2151,8 +2350,9 @@ static inline IsoBmffParseResult isobmff_parse_file(
 
   layout->metadata_valid = true;
   for (uint32_t track = 0; track < layout->track_count; track++) {
-    if (!isobmff_validate_track_samples(data, layout->parsed_extent,
-                                        layout, &layout->tracks[track])) {
+    if (!isobmff_validate_track_samples_with_memo(
+            data, layout->parsed_extent, layout, &layout->tracks[track],
+            require_valid_samples, memo, track)) {
       layout->metadata_valid = false;
       break;
     }
@@ -2163,6 +2363,23 @@ static inline IsoBmffParseResult isobmff_parse_file(
   }
   return layout->metadata_valid ? ISOBMFF_PARSE_COMPLETE
                                 : ISOBMFF_PARSE_PARTIAL;
+}
+
+
+static inline IsoBmffParseResult isobmff_parse_file_internal(
+    const uint8_t *data, uint64_t length, IsoBmffLayout *layout,
+    bool require_valid_samples) {
+
+  return isobmff_parse_file_with_memo(
+      data, length, layout, require_valid_samples, NULL);
+}
+
+
+// Ordinary validation retains complete sample summaries for partial recovery.
+static inline IsoBmffParseResult isobmff_parse_file(
+    const uint8_t *data, uint64_t length, IsoBmffLayout *layout) {
+
+  return isobmff_parse_file_internal(data, length, layout, false);
 }
 
 
@@ -2497,7 +2714,7 @@ static inline bool isobmff_anchor_bytes_valid(
 static inline bool isobmff_anchor_at_delta(
     const IsoBmffAnchor *anchor, int64_t delta) {
 
-  if (!anchor || scalpel_state.blocksize == 0) {
+  if (!anchor || scalpel_state.blocksize == 0 || delta == INT64_MIN) {
     return false;
   }
   uint64_t logical_block = anchor->logical_offset
@@ -2738,7 +2955,7 @@ static inline bool isobmff_solution_actual_block(
       && slot < solution->second_split) {
     delta = solution->middle_delta;
   }
-  if (slot > (uint64_t)INT64_MAX
+  if (delta == INT64_MIN || slot > (uint64_t)INT64_MAX
       || (delta < 0 && slot < (uint64_t)(-delta))
       || (delta > 0 && slot > (uint64_t)(INT64_MAX - delta))) {
     return false;
@@ -3230,10 +3447,10 @@ static inline bool isobmff_materialize_solution(
 }
 
 
-static inline bool isobmff_solution_complete(
+static inline bool isobmff_solution_complete_with_memo(
     int64_t prefix_delta, int64_t suffix_delta,
     const IsoBmffSolution *solution, uint64_t extent,
-    uint8_t *data, IsoBmffLayout *layout) {
+    uint8_t *data, IsoBmffLayout *layout, IsoBmffTgaSampleMemo *memo) {
 
   if (!layout) {
     return false;
@@ -3243,11 +3460,23 @@ static inline bool isobmff_solution_complete(
                                     solution, extent, data)) {
     return false;
   }
-  IsoBmffParseResult result = isobmff_parse_file(data, extent, layout);
+  // A rejected complete trial is discarded; later sample failures add no value.
+  IsoBmffParseResult result = isobmff_parse_file_with_memo(
+      data, extent, layout, true, memo);
   return result == ISOBMFF_PARSE_COMPLETE && layout->metadata_valid
       && layout->saw_moov && layout->mdat_count > 0
       && layout->invalid_strong_samples == 0
       && layout->parsed_extent == extent && !layout->terminal_size;
+}
+
+
+static inline bool isobmff_solution_complete(
+    int64_t prefix_delta, int64_t suffix_delta,
+    const IsoBmffSolution *solution, uint64_t extent,
+    uint8_t *data, IsoBmffLayout *layout) {
+
+  return isobmff_solution_complete_with_memo(
+      prefix_delta, suffix_delta, solution, extent, data, layout, NULL);
 }
 
 
@@ -6130,7 +6359,7 @@ static inline void isobmff_reassembly(
             .second_split = split,
             .middle_delta = ISOBMFF_NO_MIDDLE_DELTA
           };
-          IsoBmffLayout layout;
+          IsoBmffLayout layout = {0};
           if (isobmff_solution_alac_boundaries_valid(
                   &context, context.prefix_delta, context.suffix_delta,
                   &solution)
@@ -6247,6 +6476,7 @@ static inline void isobmff_reassembly(
         }
         continue;
       }
+      IsoBmffTgaSampleMemo tga_memo = {0};
       uint8_t *trial = (uint8_t *)malloc((size_t)context.extent);
       uint64_t trial_capacity = context.extent;
       if (!trial) {
@@ -6303,9 +6533,10 @@ static inline void isobmff_reassembly(
                       &context, context.prefix_delta,
                       context.suffix_delta, &solution)) {
                 IsoBmffLayout layout;
-                if (isobmff_solution_complete(
+                if (isobmff_solution_complete_with_memo(
                         context.prefix_delta, context.suffix_delta,
-                        &solution, solution_extent, trial, &layout)) {
+                        &solution, solution_extent, trial, &layout,
+                        &tga_memo)) {
                   IsoBmffFooterContext solution_context = context;
                   solution_context.extent = solution_extent;
                   solution_context.logical_blocks = CEILDIV(
@@ -6322,6 +6553,7 @@ static inline void isobmff_reassembly(
               }
               if (isobmff_reassembly_poll(
                       work, candidate, state, uuidp, uuidc, &iterations)) {
+                isobmff_tga_sample_memo_clear(&tga_memo);
                 free(trial);
                 isobmff_footer_context_clear(&context);
                 isobmff_free_carve_state((void **)&state);
@@ -6344,12 +6576,14 @@ static inline void isobmff_reassembly(
         state->middle_second_cursor = 0;
         if (isobmff_reassembly_poll(
                 work, candidate, state, uuidp, uuidc, &iterations)) {
+          isobmff_tga_sample_memo_clear(&tga_memo);
           free(trial);
           isobmff_footer_context_clear(&context);
           isobmff_free_carve_state((void **)&state);
           return;
         }
       }
+      isobmff_tga_sample_memo_clear(&tga_memo);
       free(trial);
       if (state->stage == ISOBMFF_STAGE_FINISHED) {
         isobmff_footer_context_clear(&context);

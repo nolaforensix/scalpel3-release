@@ -238,6 +238,15 @@ static inline bool access_preparation_poll(ThreadWork *work, CarveInfo **candida
     uuid_string_t uuidp, uuid_string_t uuidc, uint64_t *iterations, AccessCarveState *state);
 static inline void access_reassembly_continue(ThreadWork *work, CarveInfo **candidate,
     uuid_string_t uuidp, uuid_string_t uuidc, AccessCarveState *state);
+static inline uint64_t access_reassembly_terminal_boundary(
+    const uint8_t *data, uint64_t length, const int64_t *mapping,
+    uint64_t first_block);
+static inline AccessRecoveryResult access_reassembly_endpoint_boundary(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint64_t first_block, uint64_t retained_blocks,
+    uint64_t target_length, uint8_t *trial_data, const int64_t *trial_mapping,
+    const AccessLayout *support_layout, uint64_t *run_width,
+    uint64_t *iterations, AccessCarveState *state);
 static inline AccessRecoveryResult access_reassembly_gap_search(
     ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
     uuid_string_t uuidc, uint64_t prefix_blocks, uint64_t total_blocks,
@@ -2325,6 +2334,138 @@ static inline bool access_reassembly_write_mapping_hypothesis(
   return complete;
 }
 
+// A terminal physical zero run is only a trial boundary when the unchanged
+// mapping has a live relationship failure into its complete allocated pages.
+// This does not infer EOF or validate any replacement mapping.
+//
+static inline uint64_t access_reassembly_terminal_boundary(
+    const uint8_t *data, uint64_t length, const int64_t *mapping,
+    uint64_t first_block) {
+  const uint64_t blocksize = scalpel_state.blocksize;
+
+  if (!data || !mapping || blocksize == 0 || length == 0
+      || length > SIZE_MAX || length > UINT64_MAX - (blocksize - 1)) {
+    return 0;
+  }
+  const uint64_t blocks = CEILDIV(length, blocksize);
+
+  if (first_block == 0 || first_block >= blocks) {
+    return 0;
+  }
+  AccessLayout header;
+
+  if (!access_header_parse(data, length, &header)
+      || header.unsupported_encoding || header.page_size == 0
+      || length % header.page_size != 0) {
+    return 0;
+  }
+  const uint64_t image_blocks =
+      filemirror_apparent_blocks(scalpel_state.filemirror);
+  uint64_t zero_suffix = blocks;
+
+  // Check the unchanged mapping once and locate its contiguous physical zero
+  // suffix. Later page-aligned starts must not repeat a full parse or memcmp.
+  for (uint64_t next = blocks; next != 0; next--) {
+    const uint64_t slot = next - 1;
+    const int64_t apparent = mapping[slot];
+
+    if (apparent < 0 || (uint64_t)apparent >= image_blocks) {
+      return 0;
+    }
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent);
+
+    if (actual < 0
+        || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+      return 0;
+    }
+    uint64_t available = 0;
+    const uint8_t *source = (const uint8_t *)
+        filemirror_actual_block_data_pointer(
+            scalpel_state.filemirror, actual, &available);
+    const uint64_t offset = slot * blocksize;
+    const uint64_t needed = length - offset < blocksize
+        ? length - offset : blocksize;
+
+    if (!source || available < needed
+        || memcmp(data + offset, source, (size_t)needed) != 0) {
+      return 0;
+    }
+    if (zero_suffix == next
+        && (next == blocks || (apparent < INT64_MAX
+                               && apparent + 1 == mapping[next]))
+        && filemirror_actual_block_is_zero(
+               scalpel_state.filemirror, actual)) {
+      zero_suffix = slot;
+    }
+  }
+  if (zero_suffix == blocks) {
+    return 0;
+  }
+  if (first_block < zero_suffix) {
+    first_block = zero_suffix;
+  }
+  // A duplicated physical block in the earlier mapping forbids every suffix
+  // start up to and including its logical position in the zero run.
+  for (uint64_t slot = 0; slot < zero_suffix; slot++) {
+    if (mapping[slot] >= mapping[zero_suffix]
+        && mapping[slot] <= mapping[blocks - 1]) {
+      const uint64_t after_overlap = zero_suffix
+          + (uint64_t)(mapping[slot] - mapping[zero_suffix]) + 1;
+
+      if (first_block < after_overlap) {
+        first_block = after_overlap;
+      }
+    }
+  }
+  if (first_block >= blocks) {
+    return 0;
+  }
+
+  AccessLayout layout;
+  const bool valid = access_parse(data, length, &layout);
+  bool supported = !valid && !layout.unsupported_encoding
+      && layout.page_size != 0 && layout.used_pages
+      && length % layout.page_size == 0
+      && layout.failure_offset >= layout.page_size
+      && layout.failure_offset < layout.repair_offset
+      && layout.repair_offset < length
+      && layout.repair_offset % layout.page_size == 0;
+  uint64_t boundary = 0;
+
+  if (supported) {
+    const uint64_t repair_page = layout.repair_offset / layout.page_size;
+
+    supported = repair_page < layout.available_pages
+        && layout.used_pages[repair_page] != 0;
+  }
+  if (supported) {
+    for (uint64_t slot = first_block; slot < blocks; slot++) {
+      const uint64_t first_byte = slot * blocksize;
+
+      if (first_byte > layout.repair_offset) {
+        break;
+      }
+      if (first_byte % layout.page_size != 0
+          || first_byte <= layout.failure_offset) {
+        continue;
+      }
+      uint8_t page[ACCESS_JET4_PAGE_SIZE];
+
+      if (access_reassembly_pages_valid(
+              data, length, &layout, layout.page_size,
+              first_byte - layout.page_size, page, page, false)) {
+        boundary = slot;
+      }
+      // A later start includes every allocated prefix page checked here.
+      // A local failure cannot be repaired by advancing within this zero run.
+      break;
+    }
+  }
+  access_layout_clear(&layout);
+  return boundary;
+}
+
 // Test physically ordered tails in increasing gap width. Complete mappings are
 // ranked by block evidence, physical boundaries, and locality. Partial
 // mappings must advance beyond the retained prefix and prefer the nearest
@@ -2384,6 +2525,7 @@ static inline AccessRecoveryResult access_reassembly_gap_search(
 
       const bool preferred = skip == preferred_skip;
       uint64_t supported_mapping_blocks = prefix_blocks;
+      uint64_t terminal_zero_blocks = 0;
 
       if (preferred) {
         for (uint64_t offset = 0; offset < remaining; offset++) {
@@ -2411,6 +2553,9 @@ static inline AccessRecoveryResult access_reassembly_gap_search(
               break;
             }
             end++;
+          }
+          if (end == remaining) {
+            terminal_zero_blocks = prefix_blocks + offset;
           }
           if (end < remaining) {
             const int64_t following_apparent =
@@ -2446,6 +2591,14 @@ static inline AccessRecoveryResult access_reassembly_gap_search(
       access_reassembly_parse_trial(trial_data, target_length, &valid,
                                     &progress, &repair_offset,
                                     &trial_profile);
+      if (preferred && !valid && terminal_zero_blocks > prefix_blocks) {
+        const uint64_t terminal_boundary = access_reassembly_terminal_boundary(
+            trial_data, target_length, trial_mapping, terminal_zero_blocks);
+
+        if (terminal_boundary != 0) {
+          supported_mapping_blocks = terminal_boundary;
+        }
+      }
       if (scalpel_state.mode_verbose && skip == preferred_skip) {
         lock_fprintf(
             stdout,
@@ -3277,6 +3430,131 @@ static inline void access_reassembly(ThreadWork *work,
   access_free_carve_state((void **)&state);
 }
 
+// Extend a retained trailing zero run only when the unchanged ordered mapping
+// has a relationship failure in that run. Scratch continuation bytes are not
+// retained; the existing solvers still decide whether any repair is acceptable.
+//
+static inline AccessRecoveryResult access_reassembly_endpoint_boundary(
+    ThreadWork *work, CarveInfo **candidate, uuid_string_t uuidp,
+    uuid_string_t uuidc, uint64_t first_block, uint64_t retained_blocks,
+    uint64_t target_length, uint8_t *trial_data, const int64_t *trial_mapping,
+    const AccessLayout *support_layout, uint64_t *run_width,
+    uint64_t *iterations, AccessCarveState *state) {
+  const uint64_t blocksize = scalpel_state.blocksize;
+
+  if (!work || !candidate || !*candidate || !(*candidate)->b
+      || !trial_data || !trial_mapping || !support_layout || !run_width
+      || !iterations || !state || blocksize == 0
+      || target_length == 0 || target_length > SIZE_MAX
+      || target_length > UINT64_MAX - (blocksize - 1)
+      || first_block == 0 || first_block >= retained_blocks
+      || retained_blocks > blockvector_get_num_blocks((*candidate)->b)) {
+    return ACCESS_RECOVERY_NO_MATCH;
+  }
+  const uint64_t target_blocks = CEILDIV(target_length, blocksize);
+  const int64_t first_apparent = trial_mapping[first_block];
+
+  if (first_apparent < 0 || retained_blocks >= target_blocks
+      || target_blocks - first_block - 1
+             > (uint64_t)(INT64_MAX - first_apparent)
+      || !access_reassembly_range_available(
+             *candidate, first_apparent, target_blocks - first_block,
+             first_block, -1, 0)) {
+    return ACCESS_RECOVERY_NO_MATCH;
+  }
+
+  uint64_t end = retained_blocks;
+
+  while (end < target_blocks) {
+    const int64_t apparent = first_apparent + (int64_t)(end - first_block);
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent);
+
+    if (actual < 0
+        || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+      return ACCESS_RECOVERY_NO_MATCH;
+    }
+    if (!filemirror_actual_block_is_zero(scalpel_state.filemirror, actual)) {
+      break;
+    }
+    end++;
+    if (access_preparation_poll(
+            work, candidate, uuidp, uuidc, iterations, state)) {
+      memset(trial_data + retained_blocks * blocksize, 0,
+             (size_t)(target_length - retained_blocks * blocksize));
+      return ACCESS_RECOVERY_INTERRUPTED;
+    }
+  }
+  if (end >= target_blocks
+      || !access_reassembly_span_contains_allocated_page(
+             first_block, end - first_block, support_layout)) {
+    return ACCESS_RECOVERY_NO_MATCH;
+  }
+  const int64_t following_actual = filemirror_actual_blocknumber(
+      scalpel_state.filemirror,
+      first_apparent + (int64_t)(end - first_block));
+
+  if (following_actual < 0
+      || filemirror_actual_block_covered(
+             scalpel_state.filemirror, following_actual)
+      || filemirror_get_blocktype(scalpel_state.filemirror, following_actual,
+                               (*candidate)->needleidx)
+      < ACCESS_BLOCK_CONFIDENCE) {
+    return ACCESS_RECOVERY_NO_MATCH;
+  }
+
+  AccessRecoveryResult result = ACCESS_RECOVERY_NO_MATCH;
+  bool complete = true;
+
+  for (uint64_t slot = first_block; slot < target_blocks; slot++) {
+    const int64_t apparent = first_apparent + (int64_t)(slot - first_block);
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent);
+
+    if (actual < 0
+        || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+      complete = false;
+      break;
+    }
+    uint64_t source_length = 0;
+    const uint8_t *source = (const uint8_t *)
+        filemirror_actual_block_data_pointer(
+            scalpel_state.filemirror, actual, &source_length);
+    const uint64_t offset = slot * blocksize;
+    const uint64_t length = target_length - offset < blocksize
+        ? target_length - offset : blocksize;
+
+    if (!source || source_length < length
+        || (slot < retained_blocks && trial_mapping[slot] != apparent)) {
+      complete = false;
+      break;
+    }
+    if (slot >= retained_blocks) {
+      memcpy(trial_data + offset, source, (size_t)length);
+    }
+    if (access_preparation_poll(
+            work, candidate, uuidp, uuidc, iterations, state)) {
+      result = ACCESS_RECOVERY_INTERRUPTED;
+      complete = false;
+      break;
+    }
+  }
+  if (complete) {
+    AccessLayout unchanged;
+    const bool valid = access_parse(trial_data, target_length, &unchanged);
+
+    if (!valid && unchanged.repair_offset >= first_block * blocksize
+        && unchanged.repair_offset < end * blocksize) {
+      *run_width = end - first_block;
+      result = ACCESS_RECOVERY_MATCH;
+    }
+    access_layout_clear(&unchanged);
+  }
+  memset(trial_data + retained_blocks * blocksize, 0,
+         (size_t)(target_length - retained_blocks * blocksize));
+  return result;
+}
+
 static inline void access_reassembly_continue(ThreadWork *work,
                                      CarveInfo **candidate,
                                      uuid_string_t uuidp,
@@ -3665,7 +3943,7 @@ static inline void access_reassembly_continue(ThreadWork *work,
       // boundary, while retaining the confidence-only fallback below for
       // nonzero gaps.
       for (uint64_t slot = 1;
-           slot + 1 < blocks && !supported_gap_found; slot++) {
+           slot < blocks && !supported_gap_found; slot++) {
         const int64_t previous_apparent = trial_mapping[slot - 1];
         const int64_t first_apparent = trial_mapping[slot];
 
@@ -3701,6 +3979,29 @@ static inline void access_reassembly_continue(ThreadWork *work,
             break;
           }
           end++;
+        }
+        if (end == blocks && have_support_layout) {
+          uint64_t endpoint_width = 0;
+          const AccessRecoveryResult endpoint =
+              access_reassembly_endpoint_boundary(
+                  work, candidate, uuidp, uuidc, slot, blocks,
+                  target_length, trial_data, trial_mapping, &support_layout,
+                  &endpoint_width, &iterations, state);
+
+          if (endpoint == ACCESS_RECOVERY_INTERRUPTED) {
+            access_layout_clear(&support_layout);
+            free(solution_mapping);
+            free(partial_mapping);
+            free(trial_mapping);
+            free(trial_data);
+            return;
+          }
+          if (endpoint == ACCESS_RECOVERY_MATCH) {
+            supported_prefix_blocks = slot;
+            supported_apparent = previous_apparent;
+            supported_gap_width = endpoint_width;
+            supported_gap_found = true;
+          }
         }
         if (end < blocks && end > slot) {
           const int64_t following_apparent = trial_mapping[end];
@@ -3759,6 +4060,24 @@ static inline void access_reassembly_continue(ThreadWork *work,
                     scan_apparent, 1)) {
               break;
             }
+            // Repair an earlier invalid allocated page before searching for
+            // a later zero-filled hole. A low raw score alone is insufficient:
+            // valid encoded pages still pass the logical-page parser.
+            if (have_support_layout
+                && access_reassembly_span_contains_allocated_page(
+                       scan_slot, 1, &support_layout)
+                && filemirror_get_blocktype(
+                       scalpel_state.filemirror, scan_actual,
+                       (*candidate)->needleidx) < ACCESS_BLOCK_CONFIDENCE) {
+              uint8_t page[ACCESS_JET4_PAGE_SIZE];
+
+              if (!access_reassembly_pages_valid(
+                      trial_data, target_length, &support_layout,
+                      scan_slot * (uint64_t)scalpel_state.blocksize,
+                      scalpel_state.blocksize, page, page, false)) {
+                break;
+              }
+            }
             trial_mapping[scan_slot] = scan_apparent;
             scan_slot++;
             scan_apparent++;
@@ -3781,6 +4100,21 @@ static inline void access_reassembly_continue(ThreadWork *work,
               scan_apparent++;
             }
 
+            if (scan_slot == target_blocks && have_support_layout) {
+              for (uint64_t offset = 0; offset < scan_slot - zero_slot; offset++) {
+                trial_mapping[zero_slot + offset] = zero_apparent + (int64_t)offset;
+              }
+              const uint64_t terminal_boundary =
+                  access_reassembly_terminal_boundary(
+                      trial_data, target_length, trial_mapping, zero_slot);
+
+              if (terminal_boundary != 0) {
+                supported_prefix_blocks = terminal_boundary;
+                supported_apparent = trial_mapping[terminal_boundary - 1];
+                supported_gap_width = scan_slot - terminal_boundary;
+                supported_gap_found = true;
+              }
+            }
             if (scan_slot < target_blocks && scan_apparent >= 0
                 && (uint64_t)scan_apparent < apparent_blocks) {
               const int64_t following_actual =

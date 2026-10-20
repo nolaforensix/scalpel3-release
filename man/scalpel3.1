@@ -408,9 +408,12 @@ providers use zero. This is separate from Scalpel3's thread pools.
 Override the pathname of the reusable MoDiCo confidence cache. By default,
 scalpel3 uses the input blockmap pathname with \fI.modico\fR appended. Set this
 variable to \fBoff\fR, \fBfalse\fR, \fBno\fR, or \fB0\fR to disable cache reuse.
-The cache is accepted only when its evidence image, initial blockmap, model,
-execution provider, confidence policy, and file type mapping all match the
-current run. Regular block validators still run after a cache hit.
+The cache is accepted only when its evidence image, initial blockmap, carve
+window, block size, model, class map, execution provider, inference configuration,
+and confidence policy match the current run. Changing the active file types
+with \fB-z\fR or \fB-U\fR does not invalidate it, even when enabling types
+omitted from the run that created the cache. Regular block validators still
+run after a cache hit. Older cache formats are rebuilt automatically.
 .TP
 .B SCALPEL3_MODICO_TENSORRT
 On Linux with CUDA, scalpel3 automatically uses FP32 TensorRT for standard

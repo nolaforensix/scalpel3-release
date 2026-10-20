@@ -33,6 +33,7 @@
 #include "gpu_meminfo.h"         // central accelerator-memory query + batch planner
 #include "onnx_providers.h"      // resolved ONNX execution provider + GPU device list
 #include <openssl/evp.h>
+#include <onnxruntime_c_api.h>
 #include <poll.h>
 
 // track header/footer patterns that require thread-based searching
@@ -3850,7 +3851,7 @@ done:
 #define MODICO_CACHE_MAGIC "S3MODIC1"
 #define MODICO_CACHE_FOOTER_MAGIC "S3MCEND1"
 #define MODICO_CACHE_MAGIC_SIZE 8
-#define MODICO_CACHE_FORMAT_VERSION 2U
+#define MODICO_CACHE_FORMAT_VERSION 3U
 #define MODICO_CACHE_POLICY_VERSION 1U
 #define MODICO_CACHE_PROVIDER_SIZE 32U
 #define MODICO_CACHE_HASH_BUFFER_BYTES (1024U * 1024U)
@@ -3879,6 +3880,8 @@ typedef struct ModicoPostTiming {
   uint64_t batch_count;
 } ModicoPostTiming;
 
+typedef struct ModicoCacheWriter ModicoCacheWriter;
+
 typedef struct ModicoWorker {
   FileMirror *fm;
   mc_session_t *sess;
@@ -3901,13 +3904,14 @@ typedef struct ModicoWorker {
   uint64_t graded_writes;
   uint64_t promoted;
   ModicoPostTiming post_timing;
+  ModicoCacheWriter *cache_writer;
   int failure;
   bool interrupted;
 } ModicoWorker;
 
 typedef struct ModicoCacheIdentity {
   uint32_t blocksize;
-  uint32_t mapped_specs;
+  uint32_t num_classes;
   uint64_t image_size;
   uint64_t num_blocks;
   uint64_t num_apparent_blocks;
@@ -3918,7 +3922,7 @@ typedef struct ModicoCacheIdentity {
   unsigned char image_hash[SHA256_DIGEST_LENGTH];
   unsigned char blockmap_hash[SHA256_DIGEST_LENGTH];
   unsigned char model_hash[SHA256_DIGEST_LENGTH];
-  unsigned char mapping_hash[SHA256_DIGEST_LENGTH];
+  unsigned char configuration_hash[SHA256_DIGEST_LENGTH];
 } ModicoCacheIdentity;
 
 typedef struct ModicoCacheStats {
@@ -3926,6 +3930,18 @@ typedef struct ModicoCacheStats {
   uint64_t graded_writes;
   uint64_t promoted;
 } ModicoCacheStats;
+
+struct ModicoCacheWriter {
+  FILE *fp;
+  EVP_MD_CTX *context;
+  pthread_mutex_t lock;
+  ModicoCacheIdentity identity;
+  uint64_t records;
+  bool failed;
+  char path[PATH_MAX];
+  char temporary_path[PATH_MAX];
+  char directory[PATH_MAX];
+};
 
 typedef enum ModicoCacheResult {
   MODICO_CACHE_MISS = 0,
@@ -3955,7 +3971,9 @@ static int modico_apply_batch_once(FileMirror *fm, mc_session_t *sess,
                                    uint64_t *graded_writes,
                                    uint64_t *promoted,
                                    uint64_t *processed,
-                                   ModicoPostTiming *timing);
+                                   ModicoPostTiming *timing,
+                                   ModicoCacheWriter *cache_writer,
+                                   unsigned char *cache_record);
 static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
                               const uint8_t *inbuf, float *logits,
                               const int64_t *batch_actual,
@@ -3965,7 +3983,9 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
                               double promote_margin,
                               uint64_t *graded_writes,
                               uint64_t *promoted, uint64_t *processed,
-                              int *settled_batch, ModicoPostTiming *timing);
+                              int *settled_batch, ModicoPostTiming *timing,
+                              ModicoCacheWriter *cache_writer,
+                              unsigned char *cache_record);
 static void modico_dump_decisions(FileMirror *fm, uint64_t num_blocks,
                                   uint32_t num_specs,
                                   const int *spec_to_class);
@@ -3974,10 +3994,10 @@ static void *modico_worker_thread(void *arg);
 static bool modico_cache_path(char *path, size_t path_size);
 static bool modico_cache_hash_file(const char *path, const char *label,
                                    unsigned char hash[SHA256_DIGEST_LENGTH]);
-static bool modico_cache_mapping_hash(
+static bool modico_cache_configuration_hash(
     unsigned char hash[SHA256_DIGEST_LENGTH]);
 static bool modico_cache_identity(ModicoCacheIdentity *identity,
-                                  uint32_t mapped_specs,
+                                  uint32_t num_classes,
                                   double promote_margin);
 static bool modico_cache_write_header(FILE *fp,
                                       const ModicoCacheIdentity *identity,
@@ -3993,9 +4013,18 @@ static bool modico_cache_directory(const char *path, char *directory,
 static ModicoCacheResult modico_cache_load(
     const char *path, const ModicoCacheIdentity *identity,
     ModicoCacheStats *stats);
-static bool modico_cache_save(const char *path,
-                              const ModicoCacheIdentity *identity,
-                              const ModicoCacheStats *stats);
+static bool modico_cache_begin(ModicoCacheWriter *writer, const char *path,
+                               const ModicoCacheIdentity *identity);
+static void modico_cache_append(ModicoCacheWriter *writer, uint64_t actual,
+                                const float *logits, int num_classes,
+                                float max_logit, double sum, int argmax,
+                                bool confident, unsigned char *record);
+static bool modico_cache_finish(ModicoCacheWriter *writer, bool publish,
+                                uint64_t classified);
+static bool modico_cache_read_record(FILE *fp, EVP_MD_CTX *context,
+                                     uint32_t num_classes, uint64_t *actual,
+                                     unsigned char *scores);
+static void modico_cache_clear_priors(void);
 
 
 // select the reusable MoDiCo cache pathname.  By default it travels with the blockmap because the
@@ -4079,32 +4108,57 @@ static bool modico_cache_hash_file(const char *path, const char *label,
 }
 
 
-// hash the semantic SearchSpec-to-model mapping rather than the class map pathname.  This captures
-// aliases and configuration order while allowing an unchanged mapping file to move between hosts.
-static bool modico_cache_mapping_hash(
+// bind class indices to the complete class map and inference configuration, never the active
+// SearchSpec selection. Hash values rather than paths so identical resources can move.
+static bool modico_cache_configuration_hash(
     unsigned char hash[SHA256_DIGEST_LENGTH]) {
 
   EVP_MD_CTX *context = EVP_MD_CTX_new();
   unsigned int hash_length = 0;
-  uint32_t num_specs = scalpel_state.modico_num_specs;
+  unsigned char classmap_hash[SHA256_DIGEST_LENGTH];
+  char path[PATH_MAX];
+  const char *configured = getenv("SCALPEL3_MODICO_CLASSMAP");
+  const char *directory = getenv("SCALPEL3_MODICO_DIR");
+  const char *version = OrtGetApiBase()->GetVersionString();
+  const char *options[] = {
+    "SCALPEL3_MODICO_COREML_COMPUTE_UNITS",
+    "SCALPEL3_MODICO_COREML_SPECIALIZATION",
+    "SCALPEL3_MODICO_COREML_LOW_PRECISION",
+    "SCALPEL3_MODICO_GPU_PREPROCESS",
+  };
+  int written;
   bool ok = false;
 
-  if (! context || ! scalpel_state.modico_spec_to_class
+  if (configured && *configured) {
+    written = snprintf(path, sizeof(path), "%s", configured);
+  }
+  else if (directory && *directory) {
+    written = snprintf(path, sizeof(path), "%s/class_names.json", directory);
+  }
+  else {
+    char model_directory[PATH_MAX];
+    const char *model_path = modico_onnx_global_model_path();
+    if (! model_path
+        || ! modico_cache_directory(model_path, model_directory, sizeof(model_directory))) {
+      goto done;
+    }
+    written = snprintf(path, sizeof(path), "%s/class_names.json", model_directory);
+  }
+  if (written < 0 || (size_t)written >= sizeof(path)
+      || ! modico_cache_hash_file(path, "class map", classmap_hash)
+      || ! context || ! version
       || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1
-      || EVP_DigestUpdate(context, &num_specs, sizeof(num_specs)) != 1) {
+      || EVP_DigestUpdate(context, classmap_hash, sizeof(classmap_hash)) != 1
+      || EVP_DigestUpdate(context, version, strlen(version) + 1) != 1) {
     goto done;
   }
 
-  for (uint32_t spec = 0; spec < num_specs; spec++) {
-    uint32_t name_length = (uint32_t)strlen(
-        scalpel_state.search_specs[spec].FILETYPE);
-    int class_index = scalpel_state.modico_spec_to_class[spec];
-
-    if (EVP_DigestUpdate(context, &name_length, sizeof(name_length)) != 1
-        || EVP_DigestUpdate(context,
-                            scalpel_state.search_specs[spec].FILETYPE,
-                            name_length) != 1
-        || EVP_DigestUpdate(context, &class_index, sizeof(class_index)) != 1) {
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    const char *value = getenv(options[i]);
+    if (! value) {
+      value = "";
+    }
+    if (EVP_DigestUpdate(context, value, strlen(value) + 1) != 1) {
       goto done;
     }
   }
@@ -4124,7 +4178,7 @@ static bool modico_cache_mapping_hash(
 // build the complete identity for a reusable prior.  Provider is part of the identity because small
 // floating-point differences around a promotion boundary can otherwise change stored confidence.
 static bool modico_cache_identity(ModicoCacheIdentity *identity,
-                                  uint32_t mapped_specs,
+                                  uint32_t num_classes,
                                   double promote_margin) {
 
   const char *model_path = modico_onnx_global_model_path();
@@ -4137,7 +4191,7 @@ static bool modico_cache_identity(ModicoCacheIdentity *identity,
 
   memset(identity, 0, sizeof(*identity));
   identity->blocksize = scalpel_state.blocksize;
-  identity->mapped_specs = mapped_specs;
+  identity->num_classes = num_classes;
   identity->image_size = filemirror_filesize(scalpel_state.filemirror);
   identity->num_blocks = CEILDIV(identity->image_size, identity->blocksize);
   identity->num_apparent_blocks = filemirror_apparent_blocks(
@@ -4157,7 +4211,7 @@ static bool modico_cache_identity(ModicoCacheIdentity *identity,
       && modico_cache_hash_file(scalpel_state.blockmap_pathname, "blockmap",
                                 identity->blockmap_hash)
       && modico_cache_hash_file(model_path, "model", identity->model_hash)
-      && modico_cache_mapping_hash(identity->mapping_hash);
+      && modico_cache_configuration_hash(identity->configuration_hash);
 }
 
 
@@ -4204,7 +4258,7 @@ static bool modico_cache_identity_matches(
 
   return stored && expected
       && stored->blocksize == expected->blocksize
-      && stored->mapped_specs == expected->mapped_specs
+      && stored->num_classes == expected->num_classes
       && stored->image_size == expected->image_size
       && stored->num_blocks == expected->num_blocks
       && stored->num_apparent_blocks == expected->num_apparent_blocks
@@ -4219,7 +4273,7 @@ static bool modico_cache_identity_matches(
                 SHA256_DIGEST_LENGTH) == 0
       && memcmp(stored->model_hash, expected->model_hash,
                 SHA256_DIGEST_LENGTH) == 0
-      && memcmp(stored->mapping_hash, expected->mapping_hash,
+      && memcmp(stored->configuration_hash, expected->configuration_hash,
                 SHA256_DIGEST_LENGTH) == 0;
 }
 
@@ -4247,179 +4301,328 @@ static bool modico_cache_directory(const char *path, char *directory,
 }
 
 
-// verify and restore a reusable prior. The payload is hashed before any column is installed, so a
-// truncated or corrupt cache cannot partially modify the live confidence table.
+// decode one sparse all-class record. Only classes above grade 2 need storage; absence of an
+// entire block record is never interpreted as a prediction. Class indices are strictly ordered.
+static bool modico_cache_read_record(FILE *fp, EVP_MD_CTX *context,
+                                     uint32_t num_classes, uint64_t *actual,
+                                     unsigned char *scores) {
+  uint32_t count;
+  uint32_t previous = 0;
+  uint32_t promotions = 0;
+
+  if (fread(actual, sizeof(*actual), 1, fp) != 1
+      || fread(&count, sizeof(count), 1, fp) != 1
+      || count > num_classes
+      || EVP_DigestUpdate(context, actual, sizeof(*actual)) != 1
+      || EVP_DigestUpdate(context, &count, sizeof(count)) != 1) {
+    return false;
+  }
+  memset(scores, 2, num_classes);
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t index;
+    unsigned char score;
+    if (fread(&index, sizeof(index), 1, fp) != 1
+        || fread(&score, sizeof(score), 1, fp) != 1
+        || index >= num_classes || (i > 0 && index <= previous)
+        || score <= 2 || score > BLOCK_CONFIDENCE_VALID
+        || EVP_DigestUpdate(context, &index, sizeof(index)) != 1
+        || EVP_DigestUpdate(context, &score, sizeof(score)) != 1) {
+      return false;
+    }
+    if (score == BLOCK_CONFIDENCE_VALID && ++promotions > 1) {
+      return false;
+    }
+    scores[index] = score;
+    previous = index;
+  }
+  return true;
+}
+
+
+// cache installation is the first writer of these freshly initialized columns. If a second-pass
+// read fails or is interrupted, restore that initial state before fresh inference or shutdown.
+static void modico_cache_clear_priors(void) {
+  FileMirror *fm = scalpel_state.filemirror;
+  uint64_t full_blocks = filemirror_filesize(fm) / scalpel_state.blocksize;
+
+  for (uint64_t apparent = 0; apparent < filemirror_apparent_blocks(fm); apparent++) {
+    int64_t actual = filemirror_actual_blocknumber(fm, (int64_t)apparent);
+    if (actual < 0 || (uint64_t)actual >= full_blocks
+        || filemirror_get_exemplar(fm, actual) != actual) {
+      continue;
+    }
+    for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
+      if (scalpel_state.modico_spec_to_class[spec] >= 0) {
+        filemirror_set_blocktype(fm, actual, spec, BLOCK_CONFIDENCE_INVALID);
+      }
+    }
+  }
+}
+
+
+// verify all records and exact exemplar coverage before touching classifications. Repeat verification
+// while installing, including the digest, so late I/O failure cannot leave accepted partial state.
 static ModicoCacheResult modico_cache_load(
     const char *path, const ModicoCacheIdentity *identity,
     ModicoCacheStats *stats) {
-
   ModicoCacheIdentity stored_identity;
   ModicoCacheStats stored_stats;
-  unsigned char stored_payload_hash[SHA256_DIGEST_LENGTH];
-  unsigned char payload_hash[SHA256_DIGEST_LENGTH];
-  char footer_magic[MODICO_CACHE_MAGIC_SIZE];
-  unsigned char *column = NULL;
+  ModicoCacheStats restored = {0, 0, 0};
+  unsigned char first_hash[SHA256_DIGEST_LENGTH];
+  unsigned char *remaining = NULL;
+  unsigned char *scores = NULL;
+  BlocktypeAssignment *assignments = NULL;
   EVP_MD_CTX *context = NULL;
   FILE *fp = NULL;
-  unsigned int hash_length = 0;
   bool valid = false;
+  bool applied = false;
 
-  if (! path || ! *path || ! identity || ! stats) {
+  if (! path || ! *path || ! identity || ! stats || ! identity->blocksize
+      || ! identity->num_classes || identity->num_blocks > SIZE_MAX - 7
+      || scalpel_state.block_validation_complete) {
     return MODICO_CACHE_MISS;
   }
   fp = fopen(path, "rb");
   if (! fp) {
     return MODICO_CACHE_MISS;
   }
+  if (! modico_cache_read_header(fp, &stored_identity, &stored_stats)
+      || ! modico_cache_identity_matches(&stored_identity, identity)) {
+    goto done;
+  }
+  size_t bitmap_bytes = (size_t)((identity->num_blocks + 7) / 8);
+  remaining = (unsigned char *)malloc(bitmap_bytes ? bitmap_bytes : 1);
+  scores = (unsigned char *)malloc(identity->num_classes);
+  assignments = (BlocktypeAssignment *)malloc(
+      (size_t)scalpel_state.modico_num_specs * sizeof(*assignments));
+  check_memory_allocation(remaining, __LINE__, __FILE__, "MoDiCo cache coverage");
+  check_memory_allocation(scores, __LINE__, __FILE__, "MoDiCo cache scores");
+  check_memory_allocation(assignments, __LINE__, __FILE__, "MoDiCo cache assignments");
   context = EVP_MD_CTX_new();
-  column = (unsigned char *)malloc((size_t)identity->num_blocks);
-  check_memory_allocation(column, __LINE__, __FILE__, "MoDiCo cache column");
-  if (! context
-      || ! modico_cache_read_header(fp, &stored_identity, &stored_stats)
-      || ! modico_cache_identity_matches(&stored_identity, identity)
-      || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
+  if (! context) {
     goto done;
   }
 
-  for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
-    if (scalpel_state.modico_spec_to_class[spec] < 0) {
-      continue;
-    }
-    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
-      goto done;
-    }
-    if (fread(column, 1, (size_t)identity->num_blocks, fp)
-            != identity->num_blocks
-        || EVP_DigestUpdate(context, column,
-                            (size_t)identity->num_blocks) != 1) {
-      goto done;
-    }
-  }
-  if (fread(footer_magic, 1, sizeof(footer_magic), fp) != sizeof(footer_magic)
-      || memcmp(footer_magic, MODICO_CACHE_FOOTER_MAGIC,
-                sizeof(footer_magic)) != 0
-      || fread(stored_payload_hash, 1, sizeof(stored_payload_hash), fp)
-             != sizeof(stored_payload_hash)
-      || fgetc(fp) != EOF
-      || EVP_DigestFinal_ex(context, payload_hash, &hash_length) != 1
-      || hash_length != SHA256_DIGEST_LENGTH
-      || memcmp(stored_payload_hash, payload_hash,
-                SHA256_DIGEST_LENGTH) != 0) {
-    goto done;
-  }
+  for (int pass = 0; pass < 2; pass++) {
+    uint64_t expected = 0;
+    FileMirror *fm = scalpel_state.filemirror;
+    unsigned char stored_hash[SHA256_DIGEST_LENGTH];
+    unsigned char payload_hash[SHA256_DIGEST_LENGTH];
+    unsigned int hash_length = 0;
+    char footer_magic[MODICO_CACHE_MAGIC_SIZE];
 
-  if (fseek(fp, (long)(MODICO_CACHE_MAGIC_SIZE + sizeof(uint32_t) * 2
-                       + sizeof(ModicoCacheIdentity)
-                       + sizeof(ModicoCacheStats)), SEEK_SET) != 0) {
+    memset(remaining, 0, bitmap_bytes);
+    for (uint64_t apparent = 0; apparent < identity->num_apparent_blocks; apparent++) {
+      if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+        goto done;
+      }
+      int64_t actual = filemirror_actual_blocknumber(fm, (int64_t)apparent);
+      if (actual < 0 || (uint64_t)actual >= identity->image_size / identity->blocksize
+          || filemirror_get_exemplar(fm, actual) != actual) {
+        continue;
+      }
+      remaining[(uint64_t)actual / 8] |= (unsigned char)(1U << (actual % 8));
+      expected++;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0
+        || ! modico_cache_read_header(fp, &stored_identity, &stored_stats)
+        || ! modico_cache_identity_matches(&stored_identity, identity)
+        || stored_stats.classified != expected
+        || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
+      goto done;
+    }
+    for (uint64_t row = 0; row < expected; row++) {
+      uint64_t actual;
+      if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+          || ! modico_cache_read_record(fp, context, identity->num_classes,
+                                        &actual, scores)
+          || actual >= identity->num_blocks
+          || ! (remaining[actual / 8] & (1U << (actual % 8)))) {
+        goto done;
+      }
+      remaining[actual / 8] &= (unsigned char)~(1U << (actual % 8));
+      if (pass == 1) {
+        uint32_t count = 0;
+        bool promoted = false;
+        for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
+          int index = scalpel_state.modico_spec_to_class[spec];
+          if (index < 0 || (uint32_t)index >= identity->num_classes) {
+            continue;
+          }
+          assignments[count].filetype = spec;
+          assignments[count].blocktype = (BlockValidationDecision)scores[index];
+          promoted |= scores[index] == BLOCK_CONFIDENCE_VALID;
+          count++;
+        }
+        filemirror_set_blocktype_batch(fm, (int64_t)actual, assignments, count);
+        applied = true;
+        restored.classified++;
+        restored.graded_writes += count;
+        restored.promoted += promoted;
+      }
+    }
+    if (fread(footer_magic, 1, sizeof(footer_magic), fp) != sizeof(footer_magic)
+        || memcmp(footer_magic, MODICO_CACHE_FOOTER_MAGIC, sizeof(footer_magic)) != 0
+        || fread(stored_hash, 1, sizeof(stored_hash), fp) != sizeof(stored_hash)
+        || fgetc(fp) != EOF || ferror(fp)
+        || EVP_DigestFinal_ex(context, payload_hash, &hash_length) != 1
+        || hash_length != SHA256_DIGEST_LENGTH
+        || memcmp(stored_hash, payload_hash, sizeof(payload_hash)) != 0) {
+      goto done;
+    }
+    if (pass == 0) {
+      memcpy(first_hash, payload_hash, sizeof(first_hash));
+    }
+    else if (memcmp(first_hash, payload_hash, sizeof(first_hash)) != 0) {
+      goto done;
+    }
+  }
+  if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
     goto done;
   }
-  for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
-    if (scalpel_state.modico_spec_to_class[spec] < 0) {
-      continue;
-    }
-    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
-      goto done;
-    }
-    if (fread(column, 1, (size_t)identity->num_blocks, fp)
-            != identity->num_blocks
-        || ! filemirror_replace_blocktype_column(scalpel_state.filemirror,
-                                                  spec, column,
-                                                  identity->num_blocks)) {
-      goto done;
-    }
-  }
-  *stats = stored_stats;
+  *stats = restored;
   valid = true;
 
  done:
+  if (! valid && applied) {
+    modico_cache_clear_priors();
+  }
   EVP_MD_CTX_free(context);
   fclose(fp);
-  free(column);
-  if (! valid
-      && atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
-                              memory_order_acquire)) {
+  free(assignments);
+  free(scores);
+  free(remaining);
+  if (! valid && atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
     return MODICO_CACHE_INTERRUPTED;
   }
   return valid ? MODICO_CACHE_HIT : MODICO_CACHE_MISS;
 }
 
 
-// write the prior to a temporary file, append a payload digest and completion marker, durably close
-// it, and atomically publish it.  Cache write failures are nonfatal because inference already
-// produced valid in-memory classifications for this run.
-static bool modico_cache_save(const char *path,
-                              const ModicoCacheIdentity *identity,
-                              const ModicoCacheStats *stats) {
-
-  unsigned char payload_hash[SHA256_DIGEST_LENGTH];
-  unsigned char *column = NULL;
-  char temporary_path[PATH_MAX];
-  char directory[PATH_MAX];
-  EVP_MD_CTX *context = NULL;
-  FILE *fp = NULL;
-  unsigned int hash_length = 0;
+// stream to a private temporary file rather than retaining an image-by-class matrix in memory.
+// Failure only disables caching; inference and structural validation remain unchanged.
+static bool modico_cache_begin(ModicoCacheWriter *writer, const char *path,
+                               const ModicoCacheIdentity *identity) {
+  ModicoCacheStats stats = {0, 0, 0};
+  int fd;
   int written;
+
+  memset(writer, 0, sizeof(*writer));
+  if (! copy_string_complete(writer->path, sizeof(writer->path), path)
+      || ! modico_cache_directory(path, writer->directory, sizeof(writer->directory))) {
+    return false;
+  }
+  written = snprintf(writer->temporary_path, sizeof(writer->temporary_path),
+                     "%s.tmp.XXXXXX", path);
+  if (written < 0 || (size_t)written >= sizeof(writer->temporary_path)) {
+    return false;
+  }
+  fd = mkstemp(writer->temporary_path);
+  if (fd < 0) {
+    return false;
+  }
+  writer->fp = fdopen(fd, "w+b");
+  if (! writer->fp) {
+    close(fd);
+    unlink(writer->temporary_path);
+    return false;
+  }
+  writer->identity = *identity;
+  writer->context = EVP_MD_CTX_new();
+  if (! writer->context
+      || EVP_DigestInit_ex(writer->context, EVP_sha256(), NULL) != 1
+      || ! modico_cache_write_header(writer->fp, identity, &stats)) {
+    fclose(writer->fp);
+    writer->fp = NULL;
+    EVP_MD_CTX_free(writer->context);
+    writer->context = NULL;
+    unlink(writer->temporary_path);
+    return false;
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_init(&writer->lock, NULL), __LINE__, __FILE__);
+  return true;
+}
+
+
+// grade every model class with the identical arithmetic used for live assignments. Sparse byte
+// scores avoid storing logits or rounding probabilities before applying the decision policy.
+static void modico_cache_append(ModicoCacheWriter *writer, uint64_t actual,
+                                const float *logits, int num_classes,
+                                float max_logit, double sum, int argmax,
+                                bool confident, unsigned char *record) {
+  uint32_t count = 0;
+  size_t length = sizeof(actual) + sizeof(count);
+  bool valid = isfinite(sum) && sum > 0.0;
+
+  for (int index = 0; valid && index < num_classes; index++) {
+    if (! isfinite(logits[index])) {
+      valid = false;
+      break;
+    }
+    unsigned char score = (unsigned char)(index == argmax && confident
+        ? BLOCK_CONFIDENCE_VALID
+        : modico_grade(exp((double)(logits[index] - max_logit)) / sum));
+    if (score > 2) {
+      uint32_t class_index = (uint32_t)index;
+      memcpy(record + length, &class_index, sizeof(class_index));
+      length += sizeof(class_index);
+      record[length++] = score;
+      count++;
+    }
+  }
+  memcpy(record, &actual, sizeof(actual));
+  memcpy(record + sizeof(actual), &count, sizeof(count));
+
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&writer->lock), __LINE__, __FILE__);
+  if (! writer->failed) {
+    if (! valid || fwrite(record, 1, length, writer->fp) != length
+        || EVP_DigestUpdate(writer->context, record, length) != 1) {
+      writer->failed = true;
+    }
+    else {
+      writer->records++;
+    }
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&writer->lock), __LINE__, __FILE__);
+}
+
+
+// finish after joining all workers. Never replace a previous complete cache on an interrupted or
+// failed run. Keep close outside short-circuit expressions so every open stream is cleaned up.
+static bool modico_cache_finish(ModicoCacheWriter *writer, bool publish,
+                                uint64_t classified) {
+  unsigned char hash[SHA256_DIGEST_LENGTH];
+  unsigned int hash_length = 0;
+  ModicoCacheStats stats = {classified, 0, 0};
   bool ok = false;
 
-  if (! path || ! *path || ! identity || ! stats
-      || ! modico_cache_directory(path, directory, sizeof(directory))) {
-    return false;
-  }
-  written = snprintf(temporary_path, sizeof(temporary_path), "%s.tmp.%ld",
-                     path, (long)getpid());
-  if (written < 0 || (size_t)written >= sizeof(temporary_path)) {
-    return false;
-  }
-
-  column = (unsigned char *)malloc((size_t)identity->num_blocks);
-  check_memory_allocation(column, __LINE__, __FILE__, "MoDiCo cache column");
-  context = EVP_MD_CTX_new();
-  fp = fopen(temporary_path, "wb");
-  if (! context || ! fp
-      || ! modico_cache_write_header(fp, identity, stats)
-      || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
-    goto done;
-  }
-
-  for (uint32_t spec = 0; spec < scalpel_state.modico_num_specs; spec++) {
-    if (scalpel_state.modico_spec_to_class[spec] < 0) {
-      continue;
-    }
-    if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
-        || ! filemirror_copy_blocktype_column(scalpel_state.filemirror, spec,
-                                              column, identity->num_blocks)
-        || fwrite(column, 1, (size_t)identity->num_blocks, fp)
-               != identity->num_blocks
-        || EVP_DigestUpdate(context, column,
-                            (size_t)identity->num_blocks) != 1) {
-      goto done;
+  if (publish && ! writer->failed && writer->records == classified
+      && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)
+      && EVP_DigestFinal_ex(writer->context, hash, &hash_length) == 1
+      && hash_length == SHA256_DIGEST_LENGTH
+      && fwrite(MODICO_CACHE_FOOTER_MAGIC, 1, MODICO_CACHE_MAGIC_SIZE, writer->fp)
+          == MODICO_CACHE_MAGIC_SIZE
+      && fwrite(hash, 1, sizeof(hash), writer->fp) == sizeof(hash)
+      && fseek(writer->fp, 0, SEEK_SET) == 0
+      && modico_cache_write_header(writer->fp, &writer->identity, &stats)) {
+    bool closed = checkpoint_durable_close(writer->fp);
+    writer->fp = NULL;
+    if (closed
+        && ! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT, memory_order_acquire)) {
+      ok = checkpoint_atomic_replace(writer->temporary_path, writer->path,
+                                      writer->directory);
     }
   }
-  if (EVP_DigestFinal_ex(context, payload_hash, &hash_length) != 1
-      || hash_length != SHA256_DIGEST_LENGTH
-      || fwrite(MODICO_CACHE_FOOTER_MAGIC, 1, MODICO_CACHE_MAGIC_SIZE, fp)
-             != MODICO_CACHE_MAGIC_SIZE
-      || fwrite(payload_hash, 1, sizeof(payload_hash), fp)
-             != sizeof(payload_hash)
-      || ! checkpoint_durable_close(fp)) {
-    fp = NULL;
-    goto done;
-  }
-  fp = NULL;
-  if (! checkpoint_atomic_replace(temporary_path, path, directory)) {
-    goto done;
-  }
-  ok = true;
-
- done:
-  if (fp) {
-    fclose(fp);
+  if (writer->fp) {
+    fclose(writer->fp);
+    writer->fp = NULL;
   }
   if (! ok) {
-    unlink(temporary_path);
+    unlink(writer->temporary_path);
   }
-  EVP_MD_CTX_free(context);
-  free(column);
+  EVP_MD_CTX_free(writer->context);
+  writer->context = NULL;
+  MUTEX_ERROR_CHECK(pthread_mutex_destroy(&writer->lock), __LINE__, __FILE__);
   return ok;
 }
 
@@ -4737,7 +4940,9 @@ static int modico_apply_batch_once(FileMirror *fm, mc_session_t *sess,
                                    double promote_margin,
                                    uint64_t *graded_writes,
                                    uint64_t *promoted, uint64_t *processed,
-                                   ModicoPostTiming *timing) {
+                                   ModicoPostTiming *timing,
+                                   ModicoCacheWriter *cache_writer,
+                                   unsigned char *cache_record) {
   int result = mc_classify_batch(sess, inbuf, batch_n, (int)blocksize, logits);
   struct timespec output_start = {0, 0};
   struct timespec output_end = {0, 0};
@@ -4783,6 +4988,11 @@ static int modico_apply_batch_once(FileMirror *fm, mc_session_t *sess,
     bool confident = (top1 - top2) > promote_margin;
     bool did_promote = false;
     uint32_t nassign = 0;
+
+    if (cache_writer) {
+      modico_cache_append(cache_writer, (uint64_t)actual, lg, num_classes,
+                           maxl, sum, argmax, confident, cache_record);
+    }
 
     for (uint32_t s = 0; s < num_specs; s++) {
       int c = spec_to_class[s];
@@ -4849,13 +5059,16 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
                               double promote_margin,
                               uint64_t *graded_writes,
                               uint64_t *promoted, uint64_t *processed,
-                              int *settled_batch, ModicoPostTiming *timing) {
+                              int *settled_batch, ModicoPostTiming *timing,
+                              ModicoCacheWriter *cache_writer,
+                              unsigned char *cache_record) {
   uint64_t done = 0;
   int result = modico_apply_batch_once(fm, sess, inbuf, logits,
                                        batch_actual, assignments, batch_n,
                                        blocksize, num_classes, num_specs,
                                        spec_to_class, promote_margin,
-                                       graded_writes, promoted, &done, timing);
+                                       graded_writes, promoted, &done, timing,
+                                       cache_writer, cache_record);
   *processed = done;
   if (result == MC_INFERENCE_OK) {
     *settled_batch = batch_n;
@@ -4878,7 +5091,7 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
                               assignments, first_n, blocksize, num_classes,
                               num_specs, spec_to_class, promote_margin,
                               graded_writes, promoted, &first,
-                              &first_settled, timing);
+                              &first_settled, timing, cache_writer, cache_record);
   *processed += first;
   if (result != MC_INFERENCE_OK) {
     return result;
@@ -4892,7 +5105,8 @@ static int modico_apply_batch(FileMirror *fm, mc_session_t *sess,
                               logits, batch_actual + first_n, assignments,
                               second_n, blocksize, num_classes, num_specs,
                               spec_to_class, promote_margin, graded_writes,
-                              promoted, &second, &second_settled, timing);
+                              promoted, &second, &second_settled, timing,
+                              cache_writer, cache_record);
   *processed += second;
   if (result == MC_INFERENCE_OK) {
     *settled_batch = first_settled < second_settled
@@ -4925,6 +5139,7 @@ static void modico_report_progress(ModicoWorker *worker, uint64_t done) {
 
 static void *modico_worker_thread(void *arg) {
   ModicoWorker *worker = (ModicoWorker *)arg;
+  unsigned char *cache_record = NULL;
   uint8_t *inbuf = (uint8_t *)malloc((size_t)worker->batch_size
                                      * worker->blocksize);
   float *logits = (float *)malloc((size_t)worker->batch_size
@@ -4943,6 +5158,11 @@ static void *modico_worker_thread(void *arg) {
                           "modico worker batch_actual");
   check_memory_allocation(assignments, __LINE__, __FILE__,
                           "modico worker assignments");
+  if (worker->cache_writer) {
+    cache_record = (unsigned char *)malloc(sizeof(uint64_t) + sizeof(uint32_t)
+        + (size_t)worker->num_classes * (sizeof(uint32_t) + sizeof(unsigned char)));
+    check_memory_allocation(cache_record, __LINE__, __FILE__, "MoDiCo cache record");
+  }
 
   int batch_n = 0;
 
@@ -5005,7 +5225,8 @@ static void *modico_worker_thread(void *arg) {
                                worker->num_specs, worker->spec_to_class,
                                worker->promote_margin, &worker->graded_writes,
                                &worker->promoted, &done, &settled_batch,
-                               &worker->post_timing);
+                               &worker->post_timing, worker->cache_writer,
+                               cache_record);
         worker->classified += done;
         modico_report_progress(worker, done);
         batch_n = 0;
@@ -5053,7 +5274,8 @@ static void *modico_worker_thread(void *arg) {
                            worker->num_specs, worker->spec_to_class,
                            worker->promote_margin, &worker->graded_writes,
                            &worker->promoted, &done, &settled_batch,
-                           &worker->post_timing);
+                           &worker->post_timing, worker->cache_writer,
+                           cache_record);
     worker->classified += done;
     modico_report_progress(worker, done);
     if (result != MC_INFERENCE_OK) {
@@ -5075,6 +5297,7 @@ static void *modico_worker_thread(void *arg) {
   free(logits);
   free(batch_actual);
   free(assignments);
+  free(cache_record);
   return NULL;
 }
 
@@ -5151,7 +5374,7 @@ static void modico_populate_blocktypes(void) {
 
     clock_gettime(CLOCK_MONOTONIC, &cache_start);
     cache_identity_ready = modico_cache_identity(&cache_identity,
-                                                 mapped_specs,
+                                                 (uint32_t)num_classes,
                                                  promote_margin);
     if (atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,
                              memory_order_acquire)) {
@@ -5312,6 +5535,10 @@ static void modico_populate_blocktypes(void) {
   struct timespec mc_t0, mc_t1;
   clock_gettime(CLOCK_MONOTONIC, &mc_t0);
 
+  ModicoCacheWriter cache_writer;
+  bool cache_writer_started = cache_enabled && cache_identity_ready
+      && modico_cache_begin(&cache_writer, cache_path, &cache_identity);
+
   atomic_ullong next_apparent;
   atomic_ullong shared_classified;
   atomic_int shared_failure;
@@ -5351,6 +5578,7 @@ static void modico_populate_blocktypes(void) {
     workers[i].promote_margin = promote_margin;
     workers[i].batch_size = session_batches[i];
     workers[i].post_timing.enabled = mc_timing_enabled(sessions[i]);
+    workers[i].cache_writer = cache_writer_started ? &cache_writer : NULL;
 
     // Claim granularity: the full ceiling amortizes cursor traffic on large
     // images, but on a small image a coarse claim can hand nearly all blocks
@@ -5410,6 +5638,12 @@ static void modico_populate_blocktypes(void) {
   double mc_secs = (mc_t1.tv_sec - mc_t0.tv_sec)
                    + (mc_t1.tv_nsec - mc_t0.tv_nsec) / 1e9;
   int failure = atomic_load_explicit(&shared_failure, memory_order_acquire);
+  bool cache_published = false;
+  if (cache_writer_started) {
+    bool publish = ! interrupted && failure == MC_INFERENCE_OK
+        && ! atomic_load_explicit(&watcher.terminated, memory_order_acquire);
+    cache_published = modico_cache_finish(&cache_writer, publish, classified);
+  }
 
   for (int i = 0; i < session_count; i++) {
     if (mc_timing_enabled(sessions[i])) {
@@ -5492,10 +5726,7 @@ static void modico_populate_blocktypes(void) {
     modico_dump_decisions(fm, num_blocks, num_specs, spec_to_class);
 
     if (cache_enabled && cache_identity_ready) {
-      cache_stats.classified = classified;
-      cache_stats.graded_writes = graded_writes;
-      cache_stats.promoted = promoted;
-      if (modico_cache_save(cache_path, &cache_identity, &cache_stats)) {
+      if (cache_published) {
         scalpel_log("MoDiCo cache published: %s.\n", cache_path);
       }
       else if (! atomic_load_explicit(&TAKE_CHECKPOINT_AND_EXIT,

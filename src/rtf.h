@@ -96,9 +96,10 @@ typedef struct RtfValidationSummary {
 } RtfValidationSummary;
 
 #define RTF_SEARCH_MAGIC UINT32_C(0x52544631)
-#define RTF_STATE_ENVELOPE_MAGIC UINT32_C(0x52544632)
+#define RTF_STATE_ENVELOPE_MAGIC UINT32_C(0x52544633)
 typedef enum {
-  RTF_SEARCH_NONE, RTF_SEARCH_RANK, RTF_SEARCH_TRIAL, RTF_SEARCH_PARTIAL, RTF_SEARCH_BLOCK
+  RTF_SEARCH_NONE, RTF_SEARCH_RANK, RTF_SEARCH_TRIAL, RTF_SEARCH_PARTIAL,
+  RTF_SEARCH_BLOCK, RTF_SEARCH_COMPLETED
 } RtfSearchPhase;
 
 typedef struct {
@@ -129,12 +130,782 @@ typedef struct {
   bool local_forward;
 } RtfSearchProgress;
 
+// RTF_COMPLETED_CUE_INDEX_BEGIN
+#ifndef RTF_CUE_INDEX_H
+#define RTF_CUE_INDEX_H
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef enum {
+  RTF_COMPLETED_CUES_COLLECT,
+  RTF_COMPLETED_CUES_HEAPIFY,
+  RTF_COMPLETED_CUES_SORT,
+  RTF_COMPLETED_CUES_DEDUP,
+  RTF_COMPLETED_CUES_SCAN,
+  RTF_COMPLETED_CUES_READY
+} RtfCompletedCueStage;
+
+typedef enum {
+  RTF_COMPLETED_CUE_PREFIX = 1,
+  RTF_COMPLETED_CUE_FULL = 2
+} RtfCompletedCueKind;
+
+typedef struct {
+  uint8_t word[64];
+  uint8_t length;
+  uint8_t kind;
+  uint64_t earliest;
+} RtfCompletedCueKey;
+
+typedef struct {
+  uint64_t length;
+  uint64_t blocksize;
+  uint64_t capacity;
+  uint64_t count;
+  uint64_t collect_seam;
+  uint64_t heap_cursor;
+  uint64_t heap_end;
+  uint64_t dedup_read;
+  uint64_t dedup_write;
+  uint64_t scan_offset;
+  uint64_t word_start;
+  uint64_t word_length;
+  uint64_t steps;
+  RtfCompletedCueStage stage;
+  bool slash_parity;
+  bool word_alpha;
+  bool in_word;
+  RtfCompletedCueKey *keys;
+  uint64_t parity_bytes;
+  uint8_t *seam_parity;
+} RtfCompletedCues;
+
+/* Immutable data and canonical internal seams are required. All non-pointer
+ * fields and the key array are resumable state; no source pointer is retained.
+ * One step unit is a seam, heap operation, dedup entry, or scan byte/token byte.
+ * Heap and key lookup operations perform at most 64 binary levels.
+ */
+static inline RtfCompletedCues *rtf_completed_cues_init(
+    uint64_t length, uint32_t blocksize);
+static inline RtfCompletedCues *rtf_completed_cues_new(
+    uint64_t length, uint32_t blocksize);
+static inline bool rtf_completed_cues_step(
+    RtfCompletedCues *cues, const uint8_t *data, uint64_t work_budget);
+static inline bool rtf_completed_cues_query(
+    const RtfCompletedCues *cues, const uint8_t *data,
+    uint64_t boundary, uint64_t right_length);
+static inline bool rtf_completed_cues_ready(const RtfCompletedCues *cues);
+static inline RtfCompletedCues *rtf_completed_cues_clone(
+    const RtfCompletedCues *cues);
+static inline void rtf_completed_cues_free(RtfCompletedCues *cues);
+static inline size_t rtf_completed_cues_size(const RtfCompletedCues *cues);
+static inline bool rtf_completed_cues_write(
+    const RtfCompletedCues *cues, FILE *stream);
+static inline bool rtf_completed_cues_read(RtfCompletedCues **cues, FILE *stream);
+
+#ifndef RTF_COMPLETED_CUES_COUNT
+#define RTF_COMPLETED_CUES_COUNT(event, amount) ((void)0)
+#endif
+
+static inline bool rtf_completed_cues_word_byte(uint8_t value) {
+  return isalpha((unsigned char)value) || isdigit((unsigned char)value)
+      || value == '-';
+}
+
+static inline bool rtf_completed_cues_full_word(
+    const uint8_t *word, uint64_t length) {
+  uint64_t offset = 0;
+  while (offset < length && isalpha((unsigned char)word[offset])) {
+    offset++;
+  }
+  if (offset == 0) {
+    return false;
+  }
+  if (offset < length && word[offset] == '-') {
+    offset++;
+    if (offset == length || !isdigit((unsigned char)word[offset])) {
+      return false;
+    }
+  }
+  while (offset < length && isdigit((unsigned char)word[offset])) {
+    offset++;
+  }
+  return offset == length;
+}
+
+/* Collection may request an escaped seam too. That harmless superset avoids
+ * walking a long escape run while collecting; query checks its exact parity.
+ */
+static inline bool rtf_completed_cues_derive(
+    const uint8_t *data, uint64_t boundary, uint64_t right_length,
+    RtfCompletedCueKey *prefix, RtfCompletedCueKey *full, uint64_t *slash) {
+  if (!data || boundary == 0 || right_length == 0
+      || !isalpha((unsigned char)data[boundary])) {
+    return false;
+  }
+  uint64_t start = boundary;
+  while (start != 0 && boundary - start < 64
+         && isalpha((unsigned char)data[start - 1])) {
+    RTF_COMPLETED_CUES_COUNT(derive_bytes, 1);
+    start--;
+  }
+  if (start == 0 || start == boundary || data[start - 1] != '\\'
+      || boundary - start >= 64) {
+    return false;
+  }
+  *prefix = (RtfCompletedCueKey){0};
+  *full = (RtfCompletedCueKey){0};
+  *slash = start - 1;
+  prefix->length = (uint8_t)(boundary - start);
+  prefix->kind = RTF_COMPLETED_CUE_PREFIX;
+  prefix->earliest = UINT64_MAX;
+  memcpy(prefix->word, data + start, prefix->length);
+  memcpy(full->word, prefix->word, prefix->length);
+  uint64_t right = 0;
+  while (right < right_length && prefix->length + right < 64
+         && rtf_completed_cues_word_byte(data[boundary + right])) {
+    RTF_COMPLETED_CUES_COUNT(derive_bytes, 1);
+    full->word[prefix->length + right] = data[boundary + right];
+    right++;
+  }
+  if (right == 0 || (right < right_length
+      && rtf_completed_cues_word_byte(data[boundary + right]))) {
+    return true;
+  }
+  const uint64_t length = prefix->length + right;
+  if (!rtf_completed_cues_full_word(full->word, length)) {
+    return true;
+  }
+  full->length = (uint8_t)length;
+  full->kind = RTF_COMPLETED_CUE_FULL;
+  full->earliest = UINT64_MAX;
+  return true;
+}
+
+static inline int rtf_completed_cues_compare(
+    const RtfCompletedCueKey *left, const RtfCompletedCueKey *right) {
+  RTF_COMPLETED_CUES_COUNT(key_compares, 1);
+  if (left->kind != right->kind) {
+    return left->kind < right->kind ? -1 : 1;
+  }
+  const size_t length = left->length < right->length
+      ? left->length : right->length;
+  RTF_COMPLETED_CUES_COUNT(compare_bytes, length);
+  const int compared = memcmp(left->word, right->word, length);
+  if (compared != 0) {
+    return compared;
+  }
+  return (left->length > right->length) - (left->length < right->length);
+}
+
+static inline void rtf_completed_cues_sift(
+    RtfCompletedCues *cues, uint64_t root, uint64_t end) {
+  while (root < end / 2) {
+    RTF_COMPLETED_CUES_COUNT(heap_levels, 1);
+    uint64_t child = root * 2 + 1;
+    if (child + 1 < end && rtf_completed_cues_compare(
+            &cues->keys[child], &cues->keys[child + 1]) < 0) {
+      child++;
+    }
+    if (rtf_completed_cues_compare(&cues->keys[root],
+                                   &cues->keys[child]) >= 0) {
+      break;
+    }
+    const RtfCompletedCueKey temporary = cues->keys[root];
+    cues->keys[root] = cues->keys[child];
+    cues->keys[child] = temporary;
+    root = child;
+  }
+}
+
+static inline uint64_t rtf_completed_cues_find(
+    const RtfCompletedCues *cues, const uint8_t *word,
+    uint8_t length, uint8_t kind) {
+  RtfCompletedCueKey key = {.length = length, .kind = kind};
+  memcpy(key.word, word, length);
+  uint64_t lower = 0;
+  uint64_t upper = cues->count;
+  while (lower < upper) {
+    RTF_COMPLETED_CUES_COUNT(lookup_levels, 1);
+    const uint64_t middle = lower + (upper - lower) / 2;
+    const int compared = rtf_completed_cues_compare(&cues->keys[middle], &key);
+    if (compared == 0) {
+      return middle;
+    }
+    if (compared < 0) {
+      lower = middle + 1;
+    }
+    else {
+      upper = middle;
+    }
+  }
+  return UINT64_MAX;
+}
+
+static inline void rtf_completed_cues_match(
+    RtfCompletedCues *cues, const uint8_t *data, uint8_t kind) {
+  const uint64_t found = rtf_completed_cues_find(
+      cues, data + cues->word_start, (uint8_t)cues->word_length, kind);
+  if (found != UINT64_MAX && cues->keys[found].earliest == UINT64_MAX) {
+    cues->keys[found].earliest = cues->scan_offset;
+    RTF_COMPLETED_CUES_COUNT(match_updates, 1);
+  }
+}
+
+static inline RtfCompletedCues *rtf_completed_cues_new(
+    uint64_t length, uint32_t blocksize) {
+  if (blocksize == 0 || length > SIZE_MAX) {
+    return NULL;
+  }
+  const uint64_t seams = length == 0 ? 0 : (length - 1) / blocksize;
+  if (seams > (SIZE_MAX - sizeof(RtfCompletedCues))
+                  / sizeof(RtfCompletedCueKey) / 2
+      || seams / 8 + (seams % 8 != 0) > SIZE_MAX - sizeof(RtfCompletedCues)
+          - (size_t)(seams * 2) * sizeof(RtfCompletedCueKey)) {
+    return NULL;
+  }
+  RtfCompletedCues *cues = calloc(1, sizeof(*cues));
+  check_memory_allocation(cues, __LINE__, __FILE__, "RTF completed cue state");
+  if (!cues) {
+    return NULL;
+  }
+  cues->length = length;
+  cues->blocksize = blocksize;
+  cues->capacity = seams * 2;
+  cues->parity_bytes = seams / 8 + (seams % 8 != 0);
+  cues->collect_seam = 1;
+  cues->stage = cues->capacity == 0
+      ? RTF_COMPLETED_CUES_READY : RTF_COMPLETED_CUES_COLLECT;
+  if (cues->capacity != 0) {
+    cues->keys = calloc((size_t)cues->capacity, sizeof(*cues->keys));
+    check_memory_allocation(cues->keys, __LINE__, __FILE__, "RTF completed cue keys");
+    if (!cues->keys) {
+      free(cues);
+      return NULL;
+    }
+    cues->seam_parity = calloc((size_t)cues->parity_bytes, 1);
+    check_memory_allocation(cues->seam_parity, __LINE__, __FILE__, "RTF cue seam parity");
+    if (!cues->seam_parity) {
+      free(cues->keys);
+      free(cues);
+      return NULL;
+    }
+  }
+  return cues;
+}
+
+static inline RtfCompletedCues *rtf_completed_cues_init(
+    uint64_t length, uint32_t blocksize) {
+  return rtf_completed_cues_new(length, blocksize);
+}
+
+static inline bool rtf_completed_cues_ready(const RtfCompletedCues *cues) {
+  return cues && cues->stage == RTF_COMPLETED_CUES_READY;
+}
+
+static inline bool rtf_completed_cues_step(
+    RtfCompletedCues *cues, const uint8_t *data, uint64_t work_budget) {
+  if (!cues || (!data && cues->length != 0)) {
+    return false;
+  }
+  while (work_budget != 0 && !rtf_completed_cues_ready(cues)) {
+    work_budget--;
+    cues->steps++;
+    RTF_COMPLETED_CUES_COUNT(units, 1);
+    switch (cues->stage) {
+      case RTF_COMPLETED_CUES_COLLECT: {
+        if (cues->collect_seam > cues->capacity / 2) {
+          cues->heap_cursor = cues->count / 2;
+          cues->heap_end = cues->count;
+          cues->stage = cues->count == 0
+              ? RTF_COMPLETED_CUES_READY : RTF_COMPLETED_CUES_HEAPIFY;
+          break;
+        }
+        const uint64_t boundary = cues->collect_seam * cues->blocksize;
+        uint64_t right_length = cues->length - boundary;
+        if (right_length > cues->blocksize) {
+          right_length = cues->blocksize;
+        }
+        RtfCompletedCueKey prefix;
+        RtfCompletedCueKey full;
+        uint64_t slash = 0;
+        if (rtf_completed_cues_derive(data, boundary, right_length,
+                                      &prefix, &full, &slash)) {
+          cues->keys[cues->count++] = prefix;
+          if (full.kind != 0) {
+            cues->keys[cues->count++] = full;
+          }
+        }
+        cues->collect_seam++;
+        break;
+      }
+      case RTF_COMPLETED_CUES_HEAPIFY:
+        if (cues->heap_cursor == 0) {
+          cues->stage = RTF_COMPLETED_CUES_SORT;
+        }
+        else {
+          cues->heap_cursor--;
+          rtf_completed_cues_sift(cues, cues->heap_cursor, cues->count);
+        }
+        break;
+      case RTF_COMPLETED_CUES_SORT:
+        if (cues->heap_end <= 1) {
+          cues->stage = RTF_COMPLETED_CUES_DEDUP;
+        }
+        else {
+          cues->heap_end--;
+          const RtfCompletedCueKey temporary = cues->keys[0];
+          cues->keys[0] = cues->keys[cues->heap_end];
+          cues->keys[cues->heap_end] = temporary;
+          rtf_completed_cues_sift(cues, 0, cues->heap_end);
+        }
+        break;
+      case RTF_COMPLETED_CUES_DEDUP:
+        if (cues->dedup_read == cues->count) {
+          cues->count = cues->dedup_write;
+          cues->stage = RTF_COMPLETED_CUES_SCAN;
+        }
+        else {
+          if (cues->dedup_write == 0 || rtf_completed_cues_compare(
+                  &cues->keys[cues->dedup_write - 1],
+                  &cues->keys[cues->dedup_read]) != 0) {
+            cues->keys[cues->dedup_write++] = cues->keys[cues->dedup_read];
+          }
+          cues->dedup_read++;
+        }
+        break;
+      case RTF_COMPLETED_CUES_SCAN:
+        if (cues->scan_offset == cues->length) {
+          cues->stage = RTF_COMPLETED_CUES_READY;
+          break;
+        }
+        if (cues->scan_offset != 0 && cues->scan_offset % cues->blocksize == 0
+            && cues->in_word && cues->word_alpha
+            && cues->word_length != 0 && cues->word_length < 64) {
+          const uint64_t seam = cues->scan_offset / cues->blocksize - 1;
+          cues->seam_parity[seam / 8] |= (uint8_t)(1u << (seam % 8));
+        }
+        RTF_COMPLETED_CUES_COUNT(scan_bytes, 1);
+        if (!cues->in_word) {
+          const uint8_t value = data[cues->scan_offset++];
+          cues->slash_parity = value == '\\' && !cues->slash_parity;
+          if (value == '\\' && cues->slash_parity
+              && cues->scan_offset < cues->length
+              && isalpha((unsigned char)data[cues->scan_offset])) {
+            cues->word_start = cues->scan_offset;
+            cues->word_length = 0;
+            cues->word_alpha = true;
+            cues->in_word = true;
+          }
+        }
+        else {
+          const uint8_t value = data[cues->scan_offset++];
+          cues->word_length++;
+          cues->word_alpha = cues->word_alpha && isalpha((unsigned char)value);
+          cues->slash_parity = false;
+          const bool has_next = cues->scan_offset < cues->length;
+          const bool next_word = has_next
+              && rtf_completed_cues_word_byte(data[cues->scan_offset]);
+          if (cues->word_alpha && cues->word_length < 64 && has_next
+              && isalpha((unsigned char)data[cues->scan_offset])) {
+            rtf_completed_cues_match(cues, data, RTF_COMPLETED_CUE_PREFIX);
+          }
+          else if (has_next && !next_word) {
+            rtf_completed_cues_match(cues, data, RTF_COMPLETED_CUE_FULL);
+          }
+          if (!next_word || cues->word_length == 64) {
+            cues->in_word = false;
+          }
+        }
+        break;
+      case RTF_COMPLETED_CUES_READY:
+        break;
+      default:
+        return false;
+    }
+  }
+  return rtf_completed_cues_ready(cues);
+}
+
+static inline bool rtf_completed_cues_query(
+    const RtfCompletedCues *cues, const uint8_t *data,
+    uint64_t boundary, uint64_t right_length) {
+  if (!rtf_completed_cues_ready(cues) || !data || cues->count == 0
+      || cues->blocksize == 0 || boundary == 0
+      || boundary >= cues->length || boundary % cues->blocksize != 0) {
+    return false;
+  }
+  uint64_t expected_right = cues->length - boundary;
+  if (expected_right > cues->blocksize) {
+    expected_right = cues->blocksize;
+  }
+  if (right_length != expected_right) {
+    return false;
+  }
+  const uint64_t seam = boundary / cues->blocksize - 1;
+  if (!(cues->seam_parity[seam / 8] & (uint8_t)(1u << (seam % 8)))) {
+    return false;
+  }
+  RtfCompletedCueKey prefix;
+  RtfCompletedCueKey full;
+  uint64_t slash = 0;
+  if (!rtf_completed_cues_derive(data, boundary, right_length,
+                                &prefix, &full, &slash)) {
+    return false;
+  }
+  if (full.kind != 0) {
+    const uint64_t found = rtf_completed_cues_find(
+        cues, full.word, full.length, full.kind);
+    if (found != UINT64_MAX && cues->keys[found].earliest <= slash) {
+      return false;
+    }
+  }
+  const uint64_t found = rtf_completed_cues_find(
+      cues, prefix.word, prefix.length, prefix.kind);
+  return found != UINT64_MAX && cues->keys[found].earliest < slash;
+}
+
+static inline RtfCompletedCues *rtf_completed_cues_clone(
+    const RtfCompletedCues *cues) {
+  if (!cues) {
+    return NULL;
+  }
+  RtfCompletedCues *copy = malloc(sizeof(*copy));
+  check_memory_allocation(copy, __LINE__, __FILE__, "RTF cloned cue state");
+  if (!copy) {
+    return NULL;
+  }
+  *copy = *cues;
+  copy->keys = NULL;
+  copy->seam_parity = NULL;
+  if (copy->capacity != 0) {
+    copy->keys = malloc((size_t)copy->capacity * sizeof(*copy->keys));
+    check_memory_allocation(copy->keys, __LINE__, __FILE__, "RTF cloned cue keys");
+    if (!copy->keys) {
+      free(copy);
+      return NULL;
+    }
+    memcpy(copy->keys, cues->keys, (size_t)copy->capacity * sizeof(*copy->keys));
+    copy->seam_parity = malloc((size_t)copy->parity_bytes);
+    check_memory_allocation(copy->seam_parity, __LINE__, __FILE__, "RTF cloned seam parity");
+    if (!copy->seam_parity) {
+      free(copy->keys);
+      free(copy);
+      return NULL;
+    }
+    memcpy(copy->seam_parity, cues->seam_parity, (size_t)copy->parity_bytes);
+  }
+  return copy;
+}
+
+static inline void rtf_completed_cues_free(RtfCompletedCues *cues) {
+  if (cues) {
+    free(cues->keys);
+    free(cues->seam_parity);
+    free(cues);
+  }
+}
+
+static inline size_t rtf_completed_cues_size(const RtfCompletedCues *cues) {
+  return cues ? sizeof(*cues) + (size_t)cues->capacity * sizeof(*cues->keys)
+      + (size_t)cues->parity_bytes : 0;
+}
+
+static inline bool rtf_completed_cues_scalars_valid(const RtfCompletedCues *cues) {
+  if (!cues || cues->blocksize == 0 || cues->blocksize > UINT32_MAX
+      || cues->length > SIZE_MAX || (unsigned)cues->stage > RTF_COMPLETED_CUES_READY) {
+    return false;
+  }
+  const uint64_t seams = cues->length == 0 ? 0
+      : (cues->length - 1) / cues->blocksize;
+  if (seams > (SIZE_MAX - sizeof(*cues)) / sizeof(*cues->keys) / 2
+      || cues->capacity != seams * 2 || cues->count > cues->capacity
+      || cues->parity_bytes != seams / 8 + (seams % 8 != 0)
+      || cues->parity_bytes > SIZE_MAX - sizeof(*cues)
+                                 - (size_t)cues->capacity * sizeof(*cues->keys)
+      || cues->collect_seam == 0 || cues->collect_seam > seams + 1
+      || cues->heap_cursor > cues->capacity / 2
+      || cues->heap_end > cues->capacity
+      || cues->dedup_read > cues->capacity
+      || cues->dedup_write > cues->dedup_read
+      || cues->scan_offset > cues->length || cues->word_start > cues->scan_offset
+      || cues->word_length > 64) {
+    return false;
+  }
+  if (cues->stage == RTF_COMPLETED_CUES_COLLECT) {
+    if (cues->count > 2 * (cues->collect_seam - 1)
+        || cues->heap_cursor != 0 || cues->heap_end != 0) {
+      return false;
+    }
+  }
+  else if (cues->collect_seam != seams + 1) {
+    return false;
+  }
+  if (cues->stage <= RTF_COMPLETED_CUES_DEDUP
+      && (cues->heap_end > cues->count || cues->dedup_read > cues->count)) {
+    return false;
+  }
+  if (cues->stage < RTF_COMPLETED_CUES_SCAN
+      && (cues->scan_offset != 0 || cues->word_start != 0
+          || cues->word_length != 0 || cues->in_word
+          || cues->slash_parity || cues->word_alpha)) {
+    return false;
+  }
+  if (cues->stage < RTF_COMPLETED_CUES_DEDUP
+      && (cues->dedup_read != 0 || cues->dedup_write != 0)) {
+    return false;
+  }
+  if (cues->stage >= RTF_COMPLETED_CUES_SCAN && cues->count != 0
+      && cues->dedup_write != cues->count) {
+    return false;
+  }
+  if ((cues->stage == RTF_COMPLETED_CUES_SCAN && cues->count == 0)
+      || (cues->stage == RTF_COMPLETED_CUES_READY && cues->count != 0
+          && cues->scan_offset != cues->length)) {
+    return false;
+  }
+  if (cues->in_word && (cues->stage != RTF_COMPLETED_CUES_SCAN
+      || cues->word_start == 0 || cues->word_length >= 64
+      || cues->word_start > UINT64_MAX - cues->word_length
+      || cues->word_start + cues->word_length != cues->scan_offset
+      || cues->scan_offset >= cues->length)) {
+    return false;
+  }
+  return true;
+}
+
+static inline bool rtf_completed_cues_keys_valid(const RtfCompletedCues *cues) {
+  if (cues->capacity != 0 && (!cues->keys || !cues->seam_parity)) {
+    return false;
+  }
+  for (uint64_t index = 0; index < cues->capacity; index++) {
+    const RtfCompletedCueKey *key = &cues->keys[index];
+    if (key->kind == 0) {
+      if (index < cues->count || key->length != 0 || key->earliest != 0) {
+        return false;
+      }
+    }
+    else {
+      if (key->length == 0 || key->length > 64
+          || (key->kind != RTF_COMPLETED_CUE_PREFIX
+              && key->kind != RTF_COMPLETED_CUE_FULL)
+          || (key->earliest != UINT64_MAX
+              && (key->earliest >= cues->length
+                  || key->earliest < (uint64_t)key->length + 1
+                  || key->earliest > cues->scan_offset))) {
+        return false;
+      }
+      if (key->kind == RTF_COMPLETED_CUE_PREFIX) {
+        if (key->length >= 64) {
+          return false;
+        }
+        for (uint64_t offset = 0; offset < key->length; offset++) {
+          if (!isalpha((unsigned char)key->word[offset])) {
+            return false;
+          }
+        }
+      }
+      else if (!rtf_completed_cues_full_word(key->word, key->length)) {
+        return false;
+      }
+      if (cues->stage < RTF_COMPLETED_CUES_SCAN && key->earliest != UINT64_MAX) {
+        return false;
+      }
+    }
+    for (uint64_t offset = key->length; offset < 64; offset++) {
+      if (key->word[offset] != 0) {
+        return false;
+      }
+    }
+    if (cues->stage >= RTF_COMPLETED_CUES_SCAN && index != 0
+        && index < cues->count
+        && rtf_completed_cues_compare(&cues->keys[index - 1], key) >= 0) {
+      return false;
+    }
+  }
+  for (uint64_t byte = 0; byte < cues->parity_bytes; byte++) {
+    uint8_t allowed = 0;
+    for (unsigned bit = 0; bit < 8; bit++) {
+      const uint64_t seam = byte * 8 + bit + 1;
+      if (cues->stage >= RTF_COMPLETED_CUES_SCAN && seam <= cues->capacity / 2
+          && seam * cues->blocksize < cues->scan_offset) {
+        allowed |= (uint8_t)(1u << bit);
+      }
+    }
+    if (cues->seam_parity[byte] & (uint8_t)~allowed) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static inline bool rtf_completed_cues_put_u64(FILE *stream, uint64_t value) {
+  uint8_t bytes[8];
+  for (unsigned index = 0; index < 8; index++) {
+    bytes[index] = (uint8_t)(value >> (index * 8));
+  }
+  return fwrite(bytes, sizeof(bytes), 1, stream) == 1;
+}
+
+static inline bool rtf_completed_cues_get_u64(FILE *stream, uint64_t *value) {
+  uint8_t bytes[8];
+  if (fread(bytes, sizeof(bytes), 1, stream) != 1) {
+    return false;
+  }
+  *value = 0;
+  for (unsigned index = 0; index < 8; index++) {
+    *value |= (uint64_t)bytes[index] << (index * 8);
+  }
+  return true;
+}
+
+static inline bool rtf_completed_cues_write(
+    const RtfCompletedCues *cues, FILE *stream) {
+  if (!stream || !rtf_completed_cues_scalars_valid(cues)
+      || !rtf_completed_cues_keys_valid(cues)) {
+    return false;
+  }
+  const uint64_t fields[] = {
+    cues->length, cues->blocksize, cues->capacity, cues->count,
+    cues->collect_seam, cues->heap_cursor, cues->heap_end,
+    cues->dedup_read, cues->dedup_write, cues->scan_offset,
+    cues->word_start, cues->word_length, cues->steps, cues->stage,
+    cues->slash_parity, cues->word_alpha, cues->in_word, cues->parity_bytes
+  };
+  if (fwrite("RTFCUE02", 8, 1, stream) != 1) {
+    return false;
+  }
+  for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
+    if (!rtf_completed_cues_put_u64(stream, fields[index])) {
+      return false;
+    }
+  }
+  for (uint64_t index = 0; index < cues->capacity; index++) {
+    const RtfCompletedCueKey *key = &cues->keys[index];
+    const uint8_t descriptor[8] = {key->length, key->kind, 0, 0, 0, 0, 0, 0};
+    if (fwrite(key->word, 64, 1, stream) != 1
+        || fwrite(descriptor, sizeof(descriptor), 1, stream) != 1
+        || !rtf_completed_cues_put_u64(stream, key->earliest)) {
+      return false;
+    }
+  }
+  return cues->parity_bytes == 0
+      || fwrite(cues->seam_parity, (size_t)cues->parity_bytes, 1, stream) == 1;
+}
+
+static inline bool rtf_completed_cues_read(RtfCompletedCues **cues, FILE *stream) {
+  if (!cues || !stream) {
+    return false;
+  }
+  uint8_t magic[8];
+  uint64_t fields[18];
+  if (fread(magic, sizeof(magic), 1, stream) != 1
+      || memcmp(magic, "RTFCUE02", 8) != 0) {
+    return false;
+  }
+  for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
+    if (!rtf_completed_cues_get_u64(stream, &fields[index])) {
+      return false;
+    }
+  }
+  if (fields[13] > RTF_COMPLETED_CUES_READY
+      || fields[14] > 1 || fields[15] > 1 || fields[16] > 1) {
+    return false;
+  }
+  RtfCompletedCues decoded = {
+    .length = fields[0], .blocksize = fields[1], .capacity = fields[2],
+    .count = fields[3], .collect_seam = fields[4], .heap_cursor = fields[5],
+    .heap_end = fields[6], .dedup_read = fields[7], .dedup_write = fields[8],
+    .scan_offset = fields[9], .word_start = fields[10], .word_length = fields[11],
+    .steps = fields[12], .stage = (RtfCompletedCueStage)fields[13],
+    .slash_parity = fields[14] != 0, .word_alpha = fields[15] != 0,
+    .in_word = fields[16] != 0, .parity_bytes = fields[17]
+  };
+  if (!rtf_completed_cues_scalars_valid(&decoded)
+      || sizeof(RtfCompletedCueKey) > 80
+      || decoded.capacity > (UINT64_MAX - decoded.parity_bytes) / 80) {
+    return false;
+  }
+  /* Do not allocate from a corrupt capacity before checking the actual record
+   * space. The parent may have more records after this one, so seek back.
+   */
+  const long position = ftell(stream);
+  if (position < 0 || fseek(stream, 0, SEEK_END) != 0) {
+    return false;
+  }
+  const long end = ftell(stream);
+  if (fseek(stream, position, SEEK_SET) != 0 || end < position
+      || decoded.capacity * 80 + decoded.parity_bytes > (uint64_t)(end - position)) {
+    return false;
+  }
+  RtfCompletedCues *restored = malloc(sizeof(*restored));
+  check_memory_allocation(restored, __LINE__, __FILE__, "RTF restored cue state");
+  if (!restored) {
+    return false;
+  }
+  *restored = decoded;
+  if (restored->capacity != 0) {
+    restored->keys = calloc((size_t)restored->capacity, sizeof(*restored->keys));
+    check_memory_allocation(restored->keys, __LINE__, __FILE__, "RTF restored cue keys");
+    if (!restored->keys) {
+      free(restored);
+      return false;
+    }
+    restored->seam_parity = calloc((size_t)restored->parity_bytes, 1);
+    check_memory_allocation(restored->seam_parity, __LINE__, __FILE__, "RTF restored seam parity");
+    if (!restored->seam_parity) {
+      rtf_completed_cues_free(restored);
+      return false;
+    }
+  }
+  for (uint64_t index = 0; index < restored->capacity; index++) {
+    RtfCompletedCueKey *key = &restored->keys[index];
+    uint8_t descriptor[8];
+    if (fread(key->word, 64, 1, stream) != 1
+        || fread(descriptor, sizeof(descriptor), 1, stream) != 1
+        || !rtf_completed_cues_get_u64(stream, &key->earliest)) {
+      rtf_completed_cues_free(restored);
+      return false;
+    }
+    key->length = descriptor[0];
+    key->kind = descriptor[1];
+    for (unsigned byte = 2; byte < 8; byte++) {
+      if (descriptor[byte] != 0) {
+        rtf_completed_cues_free(restored);
+        return false;
+      }
+    }
+  }
+  if ((restored->parity_bytes != 0
+          && fread(restored->seam_parity, (size_t)restored->parity_bytes, 1, stream) != 1)
+      || !rtf_completed_cues_keys_valid(restored)) {
+    rtf_completed_cues_free(restored);
+    return false;
+  }
+  rtf_completed_cues_free(*cues);
+  *cues = restored;
+  return true;
+}
+
+#endif
+// RTF_COMPLETED_CUE_INDEX_END
+
 typedef struct {
   RtfSearchProgress progress;
   RtfInsertionProgress *insertion;
+  RtfCompletedCues *completed;
   bool block_scan_exhausted;
 } RtfCarveState;
 
+static inline bool rtf_reassembly_completed_search(
+    ThreadWork *work, CarveInfo **candidate, bool following_relocated_run,
+    uuid_string_t uuidp, uuid_string_t uuidc);
 static inline bool rtf_serialize_carve_state(void **state, FILE *fp, StateSerialization mode);
 static inline void *rtf_clone_carve_state(const void *state);
 static inline void rtf_free_carve_state(void **state);
@@ -221,6 +992,9 @@ static inline bool rtf_reassembly_split_hex_escape(
     const uint8_t *left, uint64_t left_length,
     const uint8_t *right, uint64_t right_length);
 static inline bool rtf_reassembly_split_repeated_control_word(
+    const uint8_t *left, uint64_t left_length,
+    const uint8_t *right, uint64_t right_length);
+static inline bool rtf_reassembly_split_control_alternative(
     const uint8_t *left, uint64_t left_length,
     const uint8_t *right, uint64_t right_length);
 static inline uint64_t rtf_reassembly_boundary_cost(
@@ -1797,6 +2571,63 @@ static inline bool rtf_reassembly_split_repeated_control_word(
   return false;
 }
 
+// A stalled candidate may have joined two runs inside a repeated control
+// word. An earlier matching word prefix motivates an alternative search;
+// unfamiliar control words remain legal and are never rejected by this cue.
+//
+static inline bool rtf_reassembly_split_control_alternative(
+    const uint8_t *left, uint64_t left_length,
+    const uint8_t *right, uint64_t right_length) {
+
+  if (!left || left_length == 0 || !right || right_length == 0
+      || !isalpha((unsigned char)right[0])) {
+    return false;
+  }
+  uint64_t start = left_length;
+
+  while (start != 0 && left_length - start < 64
+         && isalpha((unsigned char)left[start - 1])) {
+    start--;
+  }
+  if (start == 0 || start == left_length || left[start - 1] != '\\'
+      || left_length - start >= 64) {
+    return false;
+  }
+  uint64_t backslashes = 1;
+  uint64_t scan = start - 1;
+
+  while (scan != 0 && left[scan - 1] == '\\') {
+    backslashes++;
+    scan--;
+  }
+  if ((backslashes & 1) == 0
+      || rtf_reassembly_split_repeated_control_word(
+             left, left_length, right, right_length)) {
+    return false;
+  }
+  const uint64_t name_length = left_length - start;
+
+  for (uint64_t offset = 0; offset + 1 + name_length < start - 1;
+       offset++) {
+    if (left[offset] != '\\'
+        || memcmp(left + offset + 1, left + start,
+                  (size_t)name_length) != 0
+        || !isalpha((unsigned char)left[offset + 1 + name_length])) {
+      continue;
+    }
+    backslashes = 1;
+    scan = offset;
+    while (scan != 0 && left[scan - 1] == '\\') {
+      backslashes++;
+      scan--;
+    }
+    if ((backslashes & 1) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Compare the byte classes immediately surrounding a proposed boundary.
 // Lower values indicate a more natural continuation of the current content.
 //
@@ -2234,7 +3065,11 @@ static inline bool rtf_reassembly_explore_partial(
                           "RTF partial candidate");
   memcpy(branch, *candidate, sizeof(*branch));
   branch->b = partial;
-  branch->best_choices = NULL;
+  // A branch can join the checkpoint queue independently of its parent.
+  branch->best_choices = malloc(sizeof(Queue));
+  check_memory_allocation(branch->best_choices, __LINE__, __FILE__,
+                          "RTF partial block choices");
+  init_queue(branch->best_choices, sizeof(int64_t), true, NULL, true);
   branch->clone = true;
   branch->cloned = true;
   branch->partial_artifact_written = false;
@@ -2428,6 +3263,7 @@ static inline bool rtf_reassembly_write_inserted_at_stage(
   RtfCarveState *state = rtf_search_load(*candidate);
   // Calls preceding the interrupted search already finished on this prefix.
   if (state && (state->progress.phase == RTF_SEARCH_BLOCK
+                || state->progress.phase == RTF_SEARCH_COMPLETED
                 || state->progress.gap_slot != gap_slot)) {
     rtf_free_carve_state((void **)&state);
     return false;
@@ -3343,12 +4179,27 @@ static inline bool rtf_reassembly_insert_search(ThreadWork *work,
         }
       }
       if (!duplicates_suffix) {
+        bool partial_syntax = false;
+        bool best_partial_syntax = false;
+
+        // Preserve the split-token evidence used to rank trials. Derive it
+        // from the saved ranks so checkpoint restore uses the same ordering.
+        for (uint64_t rank = 0; rank < syntax_choice_count; rank++) {
+          partial_syntax |= syntax_choices[rank].apparent
+                            == choices[choice_index].apparent;
+          best_partial_syntax |= syntax_choices[rank].apparent
+                                 == best_partial_apparent;
+        }
         const bool better_partial = best_partial_apparent < 0
             || partial_blocks > best_partial_blocks
             || (partial_blocks == best_partial_blocks
                 && integrity_progress && !best_partial_integrity)
             || (partial_blocks == best_partial_blocks
                 && integrity_progress == best_partial_integrity
+                && partial_syntax && !best_partial_syntax)
+            || (partial_blocks == best_partial_blocks
+                && integrity_progress == best_partial_integrity
+                && partial_syntax == best_partial_syntax
                 && rtf_reassembly_choice_better(
                        &choices[choice_index], &best_partial_choice,
                        RTF_REASSEMBLY_RANK_LEXICAL));
@@ -3524,7 +4375,9 @@ static inline bool rtf_reassembly_insert_search(ThreadWork *work,
     }
   }
   if (clean_terminal_hypotheses != 0) {
-    if (!extended) {
+    // An internal insertion is only an ordering hypothesis. Keep the
+    // established path as well, even when an alternative parses completely.
+    if (!extended || preserve_existing_suffix) {
       free(trial_data);
       free(suffix);
       return false;
@@ -3557,7 +4410,7 @@ static inline bool rtf_reassembly_insert_search(ThreadWork *work,
     return false;
   }
   if (hypotheses_written != 0) {
-    if (!extended) {
+    if (!extended || preserve_existing_suffix) {
       free(trial_data);
       free(suffix);
       return false;
@@ -3569,6 +4422,109 @@ static inline bool rtf_reassembly_insert_search(ThreadWork *work,
   }
   free(trial_data);
   free(suffix);
+  return false;
+}
+
+// Search completed candidates without replaying cue preprocessing or earlier
+// seams after a checkpoint. One owned state spans all seams; only checkpoint
+// publication clones the cue index. Insertion searches retain their own ranks.
+//
+static inline bool rtf_reassembly_completed_search(
+    ThreadWork *work, CarveInfo **candidate, bool following_relocated_run,
+    uuid_string_t uuidp, uuid_string_t uuidc) {
+
+  BlockVector *parent = (*candidate)->b;
+  const uint64_t length = blockvector_get_data_length(parent);
+  const uint64_t blocks = blockvector_get_num_blocks(parent);
+  RtfCarveState *state = rtf_search_load(*candidate);
+
+  if (!state || !state->completed) {
+    (*candidate)->flavor = PROMISING;
+    rtf_write_terminal_extent_alternative(candidate, length);
+    write_candidate(candidate, true);
+  }
+  if (state && state->progress.phase == RTF_SEARCH_BLOCK) {
+    rtf_free_carve_state((void **)&state);
+    return false;
+  }
+  if (!state) {
+    state = calloc(1, sizeof(*state));
+    check_memory_allocation(state, __LINE__, __FILE__, "RTF completed search");
+    state->progress.magic = RTF_SEARCH_MAGIC;
+    state->progress.phase = RTF_SEARCH_COMPLETED;
+    state->progress.gap_slot = 1;
+    state->progress.following_relocated_run = following_relocated_run;
+  }
+  if (!state->completed) {
+    state->completed = rtf_completed_cues_new(length, scalpel_state.blocksize);
+  }
+
+  while (!rtf_completed_cues_ready(state->completed)) {
+    const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer(parent);
+    rtf_completed_cues_step(state->completed, data, 256);
+    if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+      rtf_free_carve_state((void **)&state);
+      return true;
+    }
+    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+      rtf_search_save(*candidate, state);
+      if (reassembly_time_to_checkpoint(work->id, *candidate, uuidp, uuidc)) {
+        rtf_free_carve_state((void **)&state);
+        return true;
+      }
+    }
+  }
+
+  while (state->progress.gap_slot < blocks) {
+    const uint64_t gap = state->progress.gap_slot;
+    const bool pending = state->progress.phase >= RTF_SEARCH_RANK
+        && state->progress.phase <= RTF_SEARCH_PARTIAL;
+    const int64_t left = blockvector_get_actual_blocknumber(parent, gap - 1);
+    const int64_t right = blockvector_get_actual_blocknumber(parent, gap);
+    const uint64_t boundary = gap * (uint64_t)scalpel_state.blocksize;
+    uint64_t right_length = length - boundary;
+    if (right_length > scalpel_state.blocksize) {
+      right_length = scalpel_state.blocksize;
+    }
+    const uint8_t *data = (const uint8_t *)blockvector_get_data_pointer(parent);
+    const bool eligible = left >= 0 && left < INT64_MAX && right >= 0
+        && (left + 1 != right
+            || rtf_completed_cues_query(state->completed, data,
+                                         boundary, right_length));
+
+    if (pending || eligible) {
+      if (!pending) {
+        state->progress.phase = RTF_SEARCH_NONE;
+        state->progress.next_apparent = 0;
+        state->insertion = calloc(1, sizeof(*state->insertion));
+        check_memory_allocation(state->insertion, __LINE__, __FILE__,
+                                "RTF completed insertion");
+      }
+      if (rtf_reassembly_insert_search(work, candidate, gap, NULL,
+                                      uuidp, uuidc, state)) {
+        rtf_free_carve_state((void **)&state);
+        return true;
+      }
+      free(state->insertion);
+      state->insertion = NULL;
+    }
+    state->progress.phase = RTF_SEARCH_COMPLETED;
+    state->progress.gap_slot = gap + 1;
+    state->progress.next_apparent = 0;
+
+    if (reassembly_check_kill_queue(work, candidate, uuidp, uuidc)) {
+      rtf_free_carve_state((void **)&state);
+      return true;
+    }
+    if (atomic_load_explicit(&REASS_RETURN_TO_IDLE, memory_order_acquire)) {
+      rtf_search_save(*candidate, state);
+      if (reassembly_time_to_checkpoint(work->id, *candidate, uuidp, uuidc)) {
+        rtf_free_carve_state((void **)&state);
+        return true;
+      }
+    }
+  }
+  rtf_free_carve_state((void **)&state);
   return false;
 }
 
@@ -3694,24 +4650,9 @@ static inline void rtf_reassembly(ThreadWork *work,
         destroy_candidate(candidate);
         return;
       }
-      (*candidate)->flavor = PROMISING;
-      rtf_write_terminal_extent_alternative(
-          candidate, current_validates_to + 1);
-      write_candidate(candidate, true);
-
-      for (uint64_t gap_slot = 1; gap_slot < completed_blocks; gap_slot++) {
-        const int64_t left_actual = blockvector_get_actual_blocknumber(
-            blockvector, gap_slot - 1);
-        const int64_t right_actual = blockvector_get_actual_blocknumber(
-            blockvector, gap_slot);
-
-        if (left_actual >= 0 && right_actual >= 0
-            && left_actual + 1 != right_actual) {
-          if (rtf_reassembly_write_inserted_hypotheses(
-                  work, candidate, gap_slot, NULL, following_relocated_run, uuidp, uuidc)) {
-            return;
-          }
-        }
+      if (rtf_reassembly_completed_search(
+              work, candidate, following_relocated_run, uuidp, uuidc)) {
+        return;
       }
       destroy_candidate(candidate);
       return;
@@ -3855,6 +4796,39 @@ static inline void rtf_reassembly(ThreadWork *work,
         blockvector_set_data_length(
             blockvector, trial_slot * (uint64_t)scalpel_state.blocksize);
         adjacent_rejected = true;
+      }
+    }
+
+    // Try a displaced control-word continuation before completing a stalled
+    // prefix in the wrong order. This ranks alternatives, not file validity.
+    if (!resumed_internal_search && adjacent_rejected
+        && !current_summary.active_deep_payload && trial_slot > 1) {
+      for (uint64_t gap_slot = 1; gap_slot < trial_slot; gap_slot++) {
+        const uint8_t *stalled_data = (const uint8_t *)
+            blockvector_get_data_pointer(blockvector);
+
+        if (!stalled_data) {
+          break;
+        }
+        const uint64_t boundary = gap_slot
+                                  * (uint64_t)scalpel_state.blocksize;
+
+        if (rtf_reassembly_split_control_alternative(
+                stalled_data, boundary, stalled_data + boundary,
+                scalpel_state.blocksize)) {
+          if (rtf_reassembly_write_inserted_hypotheses(
+                  work, candidate, gap_slot, &candidate_advanced,
+                  following_relocated_run, uuidp, uuidc)) {
+            return;
+          }
+          if (candidate_advanced) {
+            break;
+          }
+        }
+      }
+      if (candidate_advanced) {
+        following_relocated_run = true;
+        continue;
       }
     }
 
@@ -4134,6 +5108,15 @@ static inline RtfCarveState *rtf_search_load(CarveInfo *candidate) {
   RtfCarveState *state = carve_get_state(candidate->carvehashkey);
   if (state && (state->progress.magic != RTF_SEARCH_MAGIC
       || state->progress.phase == RTF_SEARCH_NONE
+      || (state->progress.phase >= RTF_SEARCH_RANK
+          && state->progress.phase <= RTF_SEARCH_PARTIAL
+          && (state->progress.gap_slot == 0
+              || state->progress.gap_slot > blockvector_get_num_blocks(candidate->b)))
+      || (state->completed
+          && (state->completed->length != blockvector_get_data_length(candidate->b)
+              || state->completed->blocksize != scalpel_state.blocksize
+              || state->progress.gap_slot == 0
+              || state->progress.gap_slot > blockvector_get_num_blocks(candidate->b)))
       || !XXH128_isEqual(state->progress.view, validator_search_view(candidate)))) {
     rtf_free_carve_state((void **)&state);
   }
@@ -4145,7 +5128,12 @@ static inline void rtf_search_save(CarveInfo *candidate, RtfCarveState *state) {
   carve_put_state(candidate->carvehashkey, state);
 }
 
-static inline bool rtf_serialize_carve_state(void **state, FILE *fp, StateSerialization mode) {
+// New envelopes carry the optional completed-cue scan alongside any pending
+// insertion. Read prior validator envelopes without inventing completed work.
+//
+static inline bool rtf_serialize_carve_state(
+    void **state, FILE *fp, StateSerialization mode) {
+
   if (!state || !fp || (mode == SERIALIZE && !*state)) {
     return false;
   }
@@ -4153,26 +5141,42 @@ static inline bool rtf_serialize_carve_state(void **state, FILE *fp, StateSerial
     const RtfCarveState *saved = *state;
     const bool insertion = saved->progress.phase >= RTF_SEARCH_RANK
         && saved->progress.phase <= RTF_SEARCH_PARTIAL;
-    if (insertion != (saved->insertion != NULL)) {
+    if (insertion != (saved->insertion != NULL)
+        || (insertion && saved->progress.gap_slot == 0)
+        || (saved->completed && saved->block_scan_exhausted)
+        || (saved->completed && !insertion
+            && saved->progress.phase != RTF_SEARCH_COMPLETED)
+        || (saved->progress.phase == RTF_SEARCH_COMPLETED && !saved->completed)) {
       return false;
     }
     const uint32_t envelope[] = {
-      RTF_STATE_ENVELOPE_MAGIC, saved->block_scan_exhausted ? 1 : 0
+      RTF_STATE_ENVELOPE_MAGIC, saved->block_scan_exhausted ? 1 : 0,
+      saved->completed ? 1 : 0
     };
     return (!saved->block_scan_exhausted || insertion)
         && fwrite(envelope, sizeof(envelope), 1, fp) == 1
         && fwrite(&saved->progress, sizeof(saved->progress), 1, fp) == 1
-        && (!saved->insertion || fwrite(saved->insertion, sizeof(*saved->insertion), 1, fp) == 1);
+        && (!saved->insertion
+            || fwrite(saved->insertion, sizeof(*saved->insertion), 1, fp) == 1)
+        && (!saved->completed || rtf_completed_cues_write(saved->completed, fp));
   }
+
   RtfCarveState *saved = calloc(1, sizeof(*saved));
   check_memory_allocation(saved, __LINE__, __FILE__, "RTF restored search");
   RtfSearchProgress *p = &saved->progress;
   uint32_t marker = 0;
+  uint32_t completed = 0;
   bool read_ok = fread(&marker, sizeof(marker), 1, fp) == 1;
-  if (read_ok && marker == RTF_STATE_ENVELOPE_MAGIC) {
+  if (read_ok && (marker == RTF_STATE_ENVELOPE_MAGIC
+                 || marker == UINT32_C(0x52544632))) {
     uint32_t exhausted = 0;
     read_ok = fread(&exhausted, sizeof(exhausted), 1, fp) == 1
-        && exhausted <= 1 && fread(p, sizeof(*p), 1, fp) == 1;
+        && exhausted <= 1;
+    if (read_ok && marker == RTF_STATE_ENVELOPE_MAGIC) {
+      read_ok = fread(&completed, sizeof(completed), 1, fp) == 1
+          && completed <= 1;
+    }
+    read_ok = read_ok && fread(p, sizeof(*p), 1, fp) == 1;
     saved->block_scan_exhausted = exhausted != 0;
   }
   else if (read_ok && marker == RTF_SEARCH_MAGIC) {
@@ -4183,15 +5187,20 @@ static inline bool rtf_serialize_carve_state(void **state, FILE *fp, StateSerial
   else {
     read_ok = false;
   }
+  const bool insertion = p->phase >= RTF_SEARCH_RANK
+      && p->phase <= RTF_SEARCH_PARTIAL;
   if (!read_ok || p->magic != RTF_SEARCH_MAGIC
-      || (unsigned)p->phase > RTF_SEARCH_BLOCK || p->next_apparent > INT64_MAX
-      || p->gap_slot > INT64_MAX || p->best.apparent < -1
-      || (saved->block_scan_exhausted
-          && (p->phase < RTF_SEARCH_RANK || p->phase > RTF_SEARCH_PARTIAL))) {
+      || (unsigned)p->phase > RTF_SEARCH_COMPLETED
+      || p->next_apparent > INT64_MAX || p->gap_slot > INT64_MAX
+      || (insertion && p->gap_slot == 0)
+      || p->best.apparent < -1
+      || (saved->block_scan_exhausted && (!insertion || completed))
+      || (completed && !insertion && p->phase != RTF_SEARCH_COMPLETED)
+      || (p->phase == RTF_SEARCH_COMPLETED && (!completed || p->gap_slot == 0))) {
     free(saved);
     return false;
   }
-  if (p->phase >= RTF_SEARCH_RANK && p->phase <= RTF_SEARCH_PARTIAL) {
+  if (insertion) {
     saved->insertion = malloc(sizeof(*saved->insertion));
     check_memory_allocation(saved->insertion, __LINE__, __FILE__, "RTF restored rankings");
     if (fread(saved->insertion, sizeof(*saved->insertion), 1, fp) != 1) {
@@ -4215,6 +5224,10 @@ static inline bool rtf_serialize_carve_state(void **state, FILE *fp, StateSerial
       return false;
     }
   }
+  if (completed && !rtf_completed_cues_read(&saved->completed, fp)) {
+    rtf_free_carve_state((void **)&saved);
+    return false;
+  }
   *state = saved;
   return true;
 }
@@ -4227,6 +5240,7 @@ static inline void *rtf_clone_carve_state(const void *state) {
   RtfCarveState *copy = malloc(sizeof(*copy));
   check_memory_allocation(copy, __LINE__, __FILE__, "RTF search clone");
   *copy = *saved;
+  copy->completed = rtf_completed_cues_clone(saved->completed);
   if (saved->insertion) {
     copy->insertion = malloc(sizeof(*copy->insertion));
     check_memory_allocation(copy->insertion, __LINE__, __FILE__, "RTF ranking clone");
@@ -4239,6 +5253,7 @@ static inline void rtf_free_carve_state(void **state) {
   if (state && *state) {
     RtfCarveState *saved = *state;
     free(saved->insertion);
+    rtf_completed_cues_free(saved->completed);
     free(saved);
     *state = NULL;
   }
@@ -4246,7 +5261,9 @@ static inline void rtf_free_carve_state(void **state) {
 
 static inline size_t rtf_sizeof_carve_state(const void *state) {
   const RtfCarveState *saved = state;
-  return saved ? sizeof(*saved) + (saved->insertion ? sizeof(*saved->insertion) : 0) : 0;
+  return saved ? sizeof(*saved)
+      + (saved->insertion ? sizeof(*saved->insertion) : 0)
+      + rtf_completed_cues_size(saved->completed) : 0;
 }
 
 static inline void rtf_print_carve_state(const void *state) {

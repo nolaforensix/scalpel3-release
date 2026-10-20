@@ -170,7 +170,16 @@ typedef struct MboxTrialBuffer {
   int64_t *actual_blocks;
   uint64_t blocks;
   uint64_t capacity;
+  // Only a warm terminal bridge may defer candidate byte materialization.
+  bool prefix_unmaterialized;
 } MboxTrialBuffer;
+
+// Apparent membership for one unchanged terminal prefix, never serialized.
+typedef struct MboxTerminalIndex {
+  const BlockVector *owner;
+  int64_t *apparent_blocks;
+  uint64_t blocks;
+} MboxTerminalIndex;
 
 typedef enum MboxRunSearchResult {
   MBOX_RUN_SEARCH_NONE = 0,
@@ -339,6 +348,13 @@ static inline void mbox_trial_buffer_init(
 static inline void mbox_trial_buffer_free(MboxTrialBuffer *trial);
 static inline int mbox_compare_actual_blocks(const void *left,
                                              const void *right);
+static inline int mbox_compare_apparent_blocks(const void *left,
+                                               const void *right);
+static inline void mbox_terminal_index_init(MboxTerminalIndex *index,
+                                            BlockVector *blockvector);
+static inline void mbox_terminal_index_free(MboxTerminalIndex *index);
+static inline bool mbox_terminal_index_contains(
+    const MboxTerminalIndex *index, BlockVector *blockvector, int64_t apparent);
 static inline uint64_t mbox_available_run_indexed(
     const CarveInfo *candidate, int64_t first_actual,
     uint64_t maximum_blocks, const MboxTrialBuffer *trial);
@@ -1351,6 +1367,7 @@ mbox_parse_resumable(
     uint32_t base64_line_width_run = 0;
     uint32_t base64_transition_run = 0;
     bool base64_wrap_mismatch = false;
+    bool saved_boundaries_changed = true;
 
     if (header.multipart) {
       memcpy(multipart_boundaries[0], header.boundary,
@@ -1382,24 +1399,33 @@ mbox_parse_resumable(
 
     while (cursor < length) {
       if (save) {
-        *save = (MboxParseCursor){
-            .summary = *summary, .header = header,
-            .message_offset = message_offset, .cursor = cursor,
-            .message_extent = message_extent, .terminal_extent = terminal_extent,
-            .transfer_encoding = transfer_encoding,
-            .multipart_depth = multipart_depth,
-            .base64_line_width = base64_line_width,
-            .base64_wrap_mismatch_offset = base64_wrap_mismatch_offset,
-            .base64_transition_width = base64_transition_width,
-            .base64_line_width_run = base64_line_width_run,
-            .base64_transition_run = base64_transition_run,
-            .saw_boundary = saw_boundary, .closed_boundary = closed_boundary,
-            .utf8_text = utf8_text, .base64_wrap_mismatch = base64_wrap_mismatch,
-            .valid = true};
-        memcpy(save->epilogue_boundary, epilogue_boundary,
-               sizeof(epilogue_boundary));
-        memcpy(save->multipart_boundaries, multipart_boundaries,
-               sizeof(multipart_boundaries));
+        save->summary = *summary;
+        save->message_offset = message_offset;
+        save->cursor = cursor;
+        save->message_extent = message_extent;
+        save->terminal_extent = terminal_extent;
+        save->transfer_encoding = transfer_encoding;
+        save->multipart_depth = multipart_depth;
+        save->base64_line_width = base64_line_width;
+        save->base64_wrap_mismatch_offset = base64_wrap_mismatch_offset;
+        save->base64_transition_width = base64_transition_width;
+        save->base64_line_width_run = base64_line_width_run;
+        save->base64_transition_run = base64_transition_run;
+        save->saw_boundary = saw_boundary;
+        save->closed_boundary = closed_boundary;
+        save->utf8_text = utf8_text;
+        save->base64_wrap_mismatch = base64_wrap_mismatch;
+        save->valid = true;
+        // Preserve the pre-lookahead snapshot without recopying MIME boundaries
+        // on every body line. A new message also refreshes its fixed header.
+        if (saved_boundaries_changed) {
+          save->header = header;
+          memcpy(save->epilogue_boundary, epilogue_boundary,
+                 sizeof(epilogue_boundary));
+          memcpy(save->multipart_boundaries, multipart_boundaries,
+                 sizeof(multipart_boundaries));
+          saved_boundaries_changed = false;
+        }
       }
       MboxLine line;
 
@@ -1510,6 +1536,7 @@ mbox_parse_resumable(
               summary->terminal_observed = true;
               summary->complete_extent = terminal_extent;
               epilogue_boundary[0] = 0;
+              saved_boundaries_changed = true;
             }
           }
           else {
@@ -1532,6 +1559,7 @@ mbox_parse_resumable(
               memcpy(multipart_boundaries[multipart_depth],
                      part.boundary,
                      sizeof(multipart_boundaries[multipart_depth]));
+              saved_boundaries_changed = true;
               multipart_depth++;
               transfer_encoding = MBOX_TRANSFER_UNSPECIFIED;
               utf8_text = false;
@@ -1571,6 +1599,7 @@ mbox_parse_resumable(
             if (mbox_parse_part_header(data, length, line.end, &part)) {
               memcpy(epilogue_boundary, generic_boundary,
                      sizeof(epilogue_boundary));
+              saved_boundaries_changed = true;
               terminal_extent = 0;
               summary->mime_parts++;
               transfer_encoding = part.transfer_encoding;
@@ -1605,6 +1634,7 @@ mbox_parse_resumable(
             base64_transition_width = 0;
             base64_transition_run = 0;
             epilogue_boundary[0] = 0;
+            saved_boundaries_changed = true;
             structural_line = true;
           }
         }
@@ -2154,6 +2184,10 @@ static inline uint64_t mbox_trial_run_buffered(
                                                    maximum_blocks, trial);
 
   if (run_blocks == 0 || committed_blocks > UINT64_MAX - run_blocks) {
+    if (trial && trial->prefix_unmaterialized) {
+      inflate_blockvector(blockvector);
+      trial->prefix_unmaterialized = false;
+    }
     return 0;
   }
 
@@ -2166,6 +2200,12 @@ static inline uint64_t mbox_trial_run_buffered(
     data = trial->data;
   }
   else {
+    // A failed warm-cache append must restore the original materialized bridge
+    // before the existing fresh trial path can read or extend the candidate.
+    if (trial && trial->prefix_unmaterialized) {
+      inflate_blockvector(blockvector);
+      trial->prefix_unmaterialized = false;
+    }
     resize_blockvector(blockvector, committed_blocks + run_blocks);
     for (uint64_t block = 0; block < run_blocks; block++) {
       int64_t apparent = filemirror_apparent_blocknumber(
@@ -2251,9 +2291,10 @@ static inline uint64_t mbox_trial_run(CarveInfo *candidate,
                                complete, accepted_extent, NULL, NULL);
 }
 
-static inline bool mbox_commit_run(CarveInfo *candidate,
-                                   int64_t first_actual,
-                                   uint64_t blocks) {
+static inline bool mbox_commit_run_materialized(CarveInfo *candidate,
+                                                int64_t first_actual,
+                                                uint64_t blocks,
+                                                bool materialize) {
   if (!candidate || !candidate->b || first_actual < 0 || blocks == 0
       || scalpel_state.blocksize == 0) {
     return false;
@@ -2281,8 +2322,20 @@ static inline bool mbox_commit_run(CarveInfo *candidate,
   blockvector_set_data_length(
       blockvector, (old_blocks + blocks)
                        * (uint64_t)scalpel_state.blocksize);
-  inflate_blockvector(blockvector);
+  if (materialize) {
+    inflate_blockvector(blockvector);
+  }
+  else {
+    // Keep the real temporary placement and its per-vector reservations.
+    normalize_blockvector(blockvector);
+  }
   return true;
+}
+
+static inline bool mbox_commit_run(CarveInfo *candidate,
+                                   int64_t first_actual,
+                                   uint64_t blocks) {
+  return mbox_commit_run_materialized(candidate, first_actual, blocks, true);
 }
 
 static inline bool mbox_block_contains_marker(int64_t actual,
@@ -2463,6 +2516,69 @@ static inline int64_t mbox_apparent_at_or_after(uint64_t next_actual) {
   return low;
 }
 
+// Keep signed holes and duplicates; only nonnegative queries can be members.
+static inline int mbox_compare_apparent_blocks(const void *left,
+                                               const void *right) {
+  const int64_t a = *(const int64_t *)left;
+  const int64_t b = *(const int64_t *)right;
+  return (a > b) - (a < b);
+}
+
+// Optional cache: allocation failure or budget overflow retains linear lookup.
+// Terminal trials restore this prefix before the next membership query.
+static inline void mbox_terminal_index_init(MboxTerminalIndex *index,
+                                            BlockVector *blockvector) {
+  memset(index, 0, sizeof(*index));
+  const uint64_t blocks = blockvector_get_num_blocks(blockvector);
+  if (blocks == 0 || blocks > MBOX_TRIAL_BUFFER_BYTES / sizeof(int64_t)
+      || blocks > SIZE_MAX / sizeof(int64_t)) {
+    return;
+  }
+  index->apparent_blocks = malloc((size_t)blocks * sizeof(int64_t));
+  if (!index->apparent_blocks) {
+    return;
+  }
+  for (uint64_t slot = 0; slot < blocks; slot++) {
+    index->apparent_blocks[slot] = blockvector_get_apparent_blocknumber(
+        blockvector, slot);
+  }
+  if (blocks > 1) {
+    qsort(index->apparent_blocks, (size_t)blocks, sizeof(int64_t),
+           mbox_compare_apparent_blocks);
+  }
+  index->owner = blockvector;
+  index->blocks = blocks;
+}
+
+// Do not dereference the owner: checkpoint/kill may already have released it.
+static inline void mbox_terminal_index_free(MboxTerminalIndex *index) {
+  free(index->apparent_blocks);
+  memset(index, 0, sizeof(*index));
+}
+
+static inline bool mbox_terminal_index_contains(
+    const MboxTerminalIndex *index, BlockVector *blockvector, int64_t apparent) {
+  if (apparent < 0) {
+    return false;
+  }
+  if (!index || !index->apparent_blocks || index->owner != blockvector
+      || index->blocks != blockvector_get_num_blocks(blockvector)) {
+    return apparent_block_in_blockvector(blockvector, apparent);
+  }
+  uint64_t low = 0;
+  uint64_t high = index->blocks;
+  while (low < high) {
+    const uint64_t middle = low + (high - low) / 2;
+    if (index->apparent_blocks[middle] < apparent) {
+      low = middle + 1;
+    }
+    else {
+      high = middle;
+    }
+  }
+  return low < index->blocks && index->apparent_blocks[low] == apparent;
+}
+
 static inline MboxRunSearchResult mbox_find_terminal_run(
     ThreadWork *work, CarveInfo **candidate,
     MboxCarveState *search, MboxTerminalContext context,
@@ -2541,8 +2657,14 @@ static inline MboxRunSearchResult mbox_find_terminal_run(
   int64_t apparent = mbox_apparent_at_or_after(state->next_actual);
 
   MboxParseCursor prefix = {0};
+  bool prefix_initialized = false;
+  MboxTerminalIndex index = {0};
+  MboxTrialBuffer trial = {0};
+  MboxTrialBuffer bridge_trial = {0};
+  bool trial_initialized = false;
+  bool bridge_trial_initialized = false;
   if (!state->done) {
-    mbox_prepare_trial_prefix(*candidate, &prefix);
+    mbox_terminal_index_init(&index, blockvector);
   }
   while (!state->done) {
     if (!state->in_marker) {
@@ -2558,8 +2680,8 @@ static inline MboxRunSearchResult mbox_find_terminal_run(
       state->next_actual = (uint64_t)actual + 1;
       bool matches = !filemirror_actual_block_covered(
                          scalpel_state.filemirror, actual)
-          && !apparent_block_in_blockvector(
-                 (*candidate)->b, apparent - 1)
+          && !mbox_terminal_index_contains(
+                 &index, (*candidate)->b, apparent - 1)
           && mbox_block_contains_marker(actual, marker, (uint64_t)marker_length);
       if (matches) {
         state->in_marker = true;
@@ -2578,6 +2700,9 @@ static inline MboxRunSearchResult mbox_find_terminal_run(
             || mbox_checkpoint_search(work, *candidate, search,
                                        checkpoint_blocks, checkpoint_length,
                                        uuidp, uuidc)) {
+          mbox_trial_buffer_free(&trial);
+          mbox_trial_buffer_free(&bridge_trial);
+          mbox_terminal_index_free(&index);
           return MBOX_RUN_SEARCH_STOPPED;
         }
       }
@@ -2591,12 +2716,26 @@ static inline MboxRunSearchResult mbox_find_terminal_run(
     if (maximum_backtrack > MBOX_TERMINAL_BACKTRACK_BLOCKS) {
       maximum_backtrack = MBOX_TERMINAL_BACKTRACK_BLOCKS;
     }
+    // Marker-free scans never use the parser cursor. Prepare it on the base
+    // mapping before any speculative bridge is committed.
+    if (!prefix_initialized) {
+      mbox_prepare_trial_prefix(*candidate, &prefix);
+      prefix_initialized = true;
+    }
     uint32_t bridge_modes = state->bridge_actual >= 0 ? 2U : 1U;
     while (state->backtrack <= maximum_backtrack) {
       while (state->bridge_mode < bridge_modes) {
         uint32_t bridge_mode = state->bridge_mode++;
+        // A prior cold bridge trial populated this fixed-prefix cache and left
+        // the base candidate inflated. Only parser input may borrow the cache;
+        // placement/normalization still acquire the original reservations.
+        bool defer_bridge_inflate = bridge_mode == 1 && bridge_trial.data
+            && bridge_trial.owner == blockvector
+            && base_blocks < UINT64_MAX
+            && bridge_trial.blocks == base_blocks + 1;
         bool bridge_committed = bridge_mode == 1
-            && mbox_commit_run(*candidate, state->bridge_actual, 1);
+            && mbox_commit_run_materialized(
+                *candidate, state->bridge_actual, 1, !defer_bridge_inflate);
 
         if (bridge_mode == 1 && !bridge_committed) {
           continue;
@@ -2605,14 +2744,58 @@ static inline MboxRunSearchResult mbox_find_terminal_run(
         bool complete = false;
         uint64_t complete_extent = 0;
         uint32_t wrap_transitions = 0;
-        uint64_t accepted = mbox_trial_run_scored(
-            *candidate, first_actual, state->backtrack + 2,
-            &complete, &complete_extent, &wrap_transitions, &prefix);
+        uint64_t accepted;
+        if (bridge_committed) {
+          bridge_trial.prefix_unmaterialized = defer_bridge_inflate;
+          if (!bridge_trial_initialized) {
+            const uint64_t blocksize = scalpel_state.blocksize;
+            const uint64_t limit = MBOX_TRIAL_BUFFER_BYTES;
+            const uint64_t maximum = MBOX_TERMINAL_BACKTRACK_BLOCKS + 2;
+            // Reserve the original cache first, even on bridge-first reentry.
+            // Both byte buffers and their physical indexes share one budget.
+            if (blocksize != 0 && base_blocks < limit / blocksize
+                && maximum <= limit / blocksize - base_blocks - 1) {
+              const uint64_t capacity = (base_blocks + maximum) * blocksize;
+              uint64_t remaining = limit - capacity;
+              if (base_blocks <= remaining / sizeof(int64_t)) {
+                remaining -= base_blocks * sizeof(int64_t);
+              }
+              const uint64_t bridge_capacity = capacity + blocksize;
+              if (bridge_capacity <= remaining
+                  && base_blocks + 1
+                         <= (remaining - bridge_capacity) / sizeof(int64_t)) {
+                mbox_trial_buffer_init(&bridge_trial, *candidate, maximum);
+              }
+            }
+            bridge_trial_initialized = true;
+          }
+          accepted = mbox_trial_run_buffered(
+              *candidate, first_actual, state->backtrack + 2,
+              &complete, &complete_extent, &wrap_transitions, &prefix,
+              &bridge_trial);
+        }
+        else {
+          // Scan-only searches need no trial buffer. Attempt once even if the
+          // prefix plus the largest terminal run exceeds the cache budget.
+          if (!trial_initialized) {
+            mbox_trial_buffer_init(&trial, *candidate,
+                                   MBOX_TERMINAL_BACKTRACK_BLOCKS + 2);
+            trial_initialized = true;
+          }
+          accepted = mbox_trial_run_buffered(
+              *candidate, first_actual, state->backtrack + 2,
+              &complete, &complete_extent, &wrap_transitions, &prefix, &trial);
+        }
 
         if (bridge_committed) {
           resize_blockvector(blockvector, base_blocks);
           blockvector_set_data_length(blockvector, base_length);
-          inflate_blockvector(blockvector);
+          // On buffered success the base bytes were never touched. Restore the
+          // original fallback otherwise, and finish before any checkpoint poll.
+          if (!bridge_trial.prefix_unmaterialized) {
+            inflate_blockvector(blockvector);
+          }
+          bridge_trial.prefix_unmaterialized = false;
         }
         uint64_t bridge_blocks = bridge_committed ? 1 : 0;
 
@@ -2636,12 +2819,18 @@ static inline MboxRunSearchResult mbox_find_terminal_run(
         if ((examined & UINT64_C(0xff)) == 0
             && reassembly_check_kill_queue(work, candidate,
                                            uuidp, uuidc)) {
+          mbox_trial_buffer_free(&trial);
+          mbox_trial_buffer_free(&bridge_trial);
+          mbox_terminal_index_free(&index);
           return MBOX_RUN_SEARCH_STOPPED;
         }
         if ((examined & UINT64_C(0x1f)) == 0
             && mbox_checkpoint_search(work, *candidate, search,
                                        checkpoint_blocks, checkpoint_length,
                                        uuidp, uuidc)) {
+          mbox_trial_buffer_free(&trial);
+          mbox_trial_buffer_free(&bridge_trial);
+          mbox_terminal_index_free(&index);
           return MBOX_RUN_SEARCH_STOPPED;
         }
       }
@@ -2653,6 +2842,9 @@ static inline MboxRunSearchResult mbox_find_terminal_run(
       state->done = true;
     }
   }
+  mbox_trial_buffer_free(&trial);
+  mbox_trial_buffer_free(&bridge_trial);
+  mbox_terminal_index_free(&index);
   if (state->best_actual >= 0) {
     if (state->best_bridge_blocks != 0) {
       *selected_bridge_actual = state->bridge_actual;

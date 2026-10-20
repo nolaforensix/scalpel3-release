@@ -70,6 +70,7 @@ typedef struct CalendarParseSummary {
   uint64_t weak_property_count;
   uint64_t root_count;
   bool image_evidence;
+  bool image_pending;
 } CalendarParseSummary;
 
 typedef struct CalendarBase64State {
@@ -78,7 +79,8 @@ typedef struct CalendarBase64State {
   bool ended;
 } CalendarBase64State;
 
-#define CALENDAR_SEARCH_STATE_MAGIC UINT32_C(0x43414c32)
+#define CALENDAR_SEARCH_STATE_MAGIC_V2 UINT32_C(0x43414c32)
+#define CALENDAR_SEARCH_STATE_MAGIC UINT32_C(0x43414c34)
 typedef struct {
   uint32_t magic;
   XXH128_hash_t view;
@@ -96,13 +98,30 @@ typedef struct {
   bool photo_search;
 } CalendarSearchState;
 
+// Keep the previous wire record intact; new fields follow its versioned record.
+typedef struct {
+  CalendarSearchState scan;
+  int64_t continuation_actual;
+  uint64_t continuation_blocks;
+  bool continuation_explored;
+} CalendarSearchProgress;
+
 static inline bool calendar_serialize_carve_state(void **state, FILE *fp, StateSerialization mode);
 static inline void *calendar_clone_carve_state(const void *state);
 static inline void calendar_free_carve_state(void **state);
 static inline size_t calendar_sizeof_carve_state(const void *state);
 static inline void calendar_print_carve_state(const void *state);
+static inline bool calendar_queue_continuation(CarveInfo *candidate,
+                                                uint64_t trial_slot,
+                                                int64_t apparent,
+                                                uint64_t blocks);
 
 static inline uint8_t calendar_ascii_upper(uint8_t value);
+static inline uint64_t calendar_payload_probe(const uint8_t *data,
+                                               uint64_t length,
+                                               bool *image_found,
+                                               uint64_t *first_image,
+                                               bool *image_pending);
 static inline bool calendar_ascii_span_equal(const uint8_t *left,
                                              const uint8_t *right,
                                              uint64_t length);
@@ -141,6 +160,9 @@ static inline bool calendar_ical_temporal_property_valid(
 static inline CalendarParseResult calendar_parse(
     const uint8_t *data, uint64_t length, CalendarProfile profile,
     CalendarParseSummary *summary);
+static inline CalendarParseResult calendar_reassembly_parse_prefix(
+    const uint8_t *data, uint64_t length, CalendarProfile profile,
+    CalendarParseSummary *summary, bool keep_pending);
 static inline uint64_t calendar_jpeg_error(const uint8_t *data,
                                           uint64_t length, bool closed);
 static inline bool calendar_jpeg_huffman_supported(const uint8_t *data,
@@ -257,10 +279,27 @@ static inline uint64_t calendar_jpeg_error(const uint8_t *data,
   if (closed && structural == JPG_VAL_TRUNCATED) {
     return length - 1;
   }
+  if (structural == JPG_VAL_INVALID_QUANT) {
+    // DQT errors can point just past a zero final entry. Keep the evidence
+    // within the available bytes so the encoded-property mapper retains it.
+    return context.error_pos < length ? context.error_pos : length - 1;
+  }
   if (structural == JPG_VAL_INVALID_STRUCTURE
       || structural == JPG_VAL_INVALID_LENGTH
       || structural == JPG_VAL_INVALID_ENTROPY) {
     return context.error_pos;
+  }
+  if (structural == JPG_VAL_INVALID_SOS && context.have_sof
+      && context.precision == 8 && !context.is_progressive
+      && context.scan_start < length && length - context.scan_start > 4
+      && context.error_pos == context.scan_start + 4
+      && calendar_jpeg_huffman_supported(data, length)) {
+    // Other SOS failures can reflect unsupported modes. Use only the
+    // available scan-count contradiction in a parsed sequential frame.
+    const uint8_t scan_components = data[context.error_pos];
+    if (scan_components == 0 || scan_components > context.num_components) {
+      return context.error_pos;
+    }
   }
   if (structural != JPG_VAL_OK && structural != JPG_VAL_TRUNCATED) {
     return UINT64_MAX;
@@ -300,10 +339,14 @@ static inline uint64_t calendar_jpeg_error(const uint8_t *data,
 // Map a nested image contradiction back to its encoded property. This evidence
 // guides fragmented search only; it does not reject an intact damaged contact.
 //
-static inline uint64_t calendar_payload_error(const uint8_t *data,
+static inline uint64_t calendar_payload_probe(const uint8_t *data,
                                              uint64_t length,
                                              bool *image_found,
-                                             uint64_t *first_image) {
+                                             uint64_t *first_image,
+                                             bool *image_pending) {
+  if (image_pending) {
+    *image_pending = false;
+  }
   uint64_t start = 0;
   while (start < length) {
     uint64_t end = start;
@@ -364,6 +407,9 @@ static inline uint64_t calendar_payload_error(const uint8_t *data,
       if (image_found) {
         *image_found = true;
       }
+      if (image_pending && !closed) {
+        *image_pending = true;
+      }
       if (first_image && *first_image == UINT64_MAX) {
         *first_image = value_start;
       }
@@ -388,6 +434,13 @@ static inline uint64_t calendar_payload_error(const uint8_t *data,
   return UINT64_MAX;
 }
 
+static inline uint64_t calendar_payload_error(const uint8_t *data,
+                                             uint64_t length,
+                                             bool *image_found,
+                                             uint64_t *first_image) {
+  return calendar_payload_probe(data, length, image_found, first_image, NULL);
+}
+
 // Refine an already parsed prefix using independent attachment evidence.
 // Rejected trial blocks do not need another decode of the retained prefix.
 //
@@ -395,8 +448,9 @@ static inline CalendarParseResult calendar_check_payload(
     const uint8_t *data, uint64_t length, CalendarParseResult result,
     CalendarParseSummary *summary) {
   if (result != CALENDAR_PARSE_INVALID && scalpel_state.blocksize > 0) {
-    const uint64_t error = calendar_payload_error(data, length,
-                                                 &summary->image_evidence, NULL);
+    const uint64_t error = calendar_payload_probe(data, length,
+                                                 &summary->image_evidence, NULL,
+                                                 &summary->image_pending);
     if (error < length) {
       const uint64_t boundary = error / scalpel_state.blocksize
                                 * (uint64_t)scalpel_state.blocksize;
@@ -405,6 +459,20 @@ static inline CalendarParseResult calendar_check_payload(
       }
       return CALENDAR_PARSE_DAMAGED;
     }
+  }
+  return result;
+}
+
+// Keep an unfinished physical line only in retained data or a physical
+// continuation. Arbitrary nonadjacent trials still need a parsed boundary.
+// This is search progress, not validation; payload checks must run afterward.
+//
+static inline CalendarParseResult calendar_reassembly_parse_prefix(
+    const uint8_t *data, uint64_t length, CalendarProfile profile,
+    CalendarParseSummary *summary, bool keep_pending) {
+  const CalendarParseResult result = calendar_parse(data, length, profile, summary);
+  if (keep_pending && result == CALENDAR_PARSE_TRUNCATED) {
+    summary->validated_end = length;
   }
   return result;
 }
@@ -590,13 +658,86 @@ static inline bool calendar_begin_image_search(CarveInfo **candidate,
   resize_blockvector(blockvector, keep);
   blockvector_set_data_length(blockvector, keep * (uint64_t)scalpel_state.blocksize);
   inflate_blockvector(blockvector);
-  CalendarSearchState progress = {
+  CalendarSearchProgress progress = {.scan = {
     .magic = CALENDAR_SEARCH_STATE_MAGIC,
     .view = validator_search_view(*candidate),
     .best_actual = -1,
     .photo_search = true
-  };
+  }, .continuation_actual = -1};
   carve_put_state((*candidate)->carvehashkey, &progress);
+  return true;
+}
+
+// Preserve one physically adjacent photo continuation when a longer preview
+// wins elsewhere. The original search is unchanged, and neither branch can
+// recursively create more alternatives. Both use the ordinary checkpoint path.
+//
+static inline bool calendar_queue_continuation(CarveInfo *candidate,
+                                                uint64_t trial_slot,
+                                                int64_t apparent,
+                                                uint64_t blocks) {
+  if (!candidate || !candidate->b || scalpel_state.blocksize == 0
+      || trial_slot == 0 || trial_slot >= blockvector_get_num_blocks(candidate->b)) {
+    return false;
+  }
+  const int64_t image_blocks = filemirror_apparent_blocks(scalpel_state.filemirror);
+  if (blocks < 2 || blocks > CALENDAR_IMAGE_PREVIEW_BLOCKS || apparent < 0
+      || apparent >= image_blocks || blocks > (uint64_t)(image_blocks - apparent)
+      || trial_slot > UINT64_MAX / scalpel_state.blocksize - blocks) {
+    return false;
+  }
+  for (uint64_t i = 0; i < blocks; i++) {
+    const int64_t actual = filemirror_actual_blocknumber(
+        scalpel_state.filemirror, apparent + (int64_t)i);
+    if (actual < 0 || filemirror_actual_block_covered(scalpel_state.filemirror, actual)) {
+      return false;
+    }
+    // The trial slot may retain a stale apparent number after deflation.
+    // Only committed prefix positions constrain this alternate run.
+    for (uint64_t slot = 0; slot < trial_slot; slot++) {
+      if (blockvector_get_actual_blocknumber(candidate->b, slot) == actual) {
+        return false;
+      }
+    }
+  }
+  CarveInfo *branch = malloc(sizeof(*branch));
+  check_memory_allocation(branch, __LINE__, __FILE__, "calendar continuation");
+  memcpy(branch, candidate, sizeof(*branch));
+  clone_blockvector(candidate->b, &branch->b, false);
+  branch->best_choices = malloc(sizeof(Queue));
+  check_memory_allocation(branch->best_choices, __LINE__, __FILE__,
+                          "calendar continuation choices");
+  init_queue(branch->best_choices, sizeof(int64_t), true, NULL, true);
+  branch->clone = true;
+  branch->cloned = true;
+  branch->partial_artifact_written = false;
+  branch->newblock = -1;
+  branch->no_initial_block_extension = true;
+  branch->inprogress_pathname[0] = 0;
+  uuid_generate_random(branch->clone_binuuid);
+  resize_blockvector(branch->b, trial_slot + blocks);
+  for (uint64_t i = 0; i < blocks; i++) {
+    blockvector_set_apparent_blocknumber(branch->b, trial_slot + i,
+                                         apparent + (int64_t)i);
+  }
+  blockvector_set_data_length(branch->b,
+                              (trial_slot + blocks) * (uint64_t)scalpel_state.blocksize);
+  inflate_blockvector(branch->b);
+  gen_carve_hash_key(branch->carvehashkey, branch);
+  candidate->cloned = true;
+  CalendarSearchProgress progress = {
+    .scan = {.magic = CALENDAR_SEARCH_STATE_MAGIC,
+             .view = validator_search_view(branch),
+             .best_actual = -1, .photo_search = true},
+    .continuation_actual = -1, .continuation_explored = true
+  };
+  carve_put_state(branch->carvehashkey, &progress);
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&reassembly_work_is_available),
+                    __LINE__, __FILE__);
+  add_to_queue_priority_relaxed(&promising_queue, &branch, candidate->qposition);
+  pthread_cond_broadcast(&reassembly_check_work_available);
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&reassembly_work_is_available),
+                    __LINE__, __FILE__);
   return true;
 }
 
@@ -1651,9 +1792,10 @@ static inline void calendar_reassembly(ThreadWork *work,
 
   (*candidate)->chopped = false;
   inflate_blockvector((*candidate)->b);
-  CalendarSearchState *initial = carve_get_state((*candidate)->carvehashkey);
-  bool photo_search = initial && initial->magic == CALENDAR_SEARCH_STATE_MAGIC
-                      && initial->photo_search;
+  CalendarSearchProgress *initial = carve_get_state((*candidate)->carvehashkey);
+  bool photo_search = initial && initial->scan.magic == CALENDAR_SEARCH_STATE_MAGIC
+                      && initial->scan.photo_search;
+  bool continuation_explored = initial && initial->continuation_explored;
   calendar_free_carve_state((void **)&initial);
 
 restart_search:
@@ -1678,9 +1820,9 @@ restart_search:
     }
 
     CalendarParseSummary current_summary;
-    CalendarParseResult current_result = calendar_parse(
+    CalendarParseResult current_result = calendar_reassembly_parse_prefix(
         (const uint8_t *)blockvector_get_data_pointer(blockvector),
-        blockvector_get_data_length(blockvector), profile, &current_summary);
+        blockvector_get_data_length(blockvector), profile, &current_summary, true);
     if (photo_search) {
       current_result = calendar_check_payload(
           (const uint8_t *)blockvector_get_data_pointer(blockvector),
@@ -1751,7 +1893,10 @@ restart_search:
     bool best_complete = false;
     uint64_t examined = 0;
     uint64_t next_actual = 0;
-    CalendarSearchState *saved = carve_get_state((*candidate)->carvehashkey);
+    int64_t continuation_apparent = -1;
+    uint64_t continuation_blocks = 0;
+    CalendarSearchProgress *saved_progress = carve_get_state((*candidate)->carvehashkey);
+    CalendarSearchState *saved = saved_progress ? &saved_progress->scan : NULL;
     if (saved && XXH128_isEqual(saved->view, validator_search_view(*candidate))) {
       const uint64_t image_actual_blocks = CEILDIV(filemirror_filesize(scalpel_state.filemirror),
                                                    scalpel_state.blocksize);
@@ -1769,9 +1914,19 @@ restart_search:
         best_adjacent = saved->adjacent;
         best_local_forward = saved->local_forward;
         best_complete = saved->complete;
+        if (!continuation_explored && saved_progress->continuation_actual >= 0
+            && saved_progress->continuation_blocks >= 2
+            && saved_progress->continuation_blocks <= CALENDAR_IMAGE_PREVIEW_BLOCKS
+            && (uint64_t)saved_progress->continuation_actual < image_actual_blocks
+            && !filemirror_actual_block_covered(scalpel_state.filemirror,
+                                                saved_progress->continuation_actual)) {
+          continuation_apparent = filemirror_apparent_blocknumber(
+              scalpel_state.filemirror, saved_progress->continuation_actual);
+          continuation_blocks = saved_progress->continuation_blocks;
+        }
       }
     }
-    calendar_free_carve_state((void **)&saved);
+    calendar_free_carve_state((void **)&saved_progress);
 
     resize_blockvector(blockvector, trial_slot + 1);
     blockvector_set_apparent_blocknumber(blockvector, trial_slot, -1);
@@ -1793,7 +1948,7 @@ restart_search:
           return;
         }
         if (checkpoint_poll) {
-          CalendarSearchState progress = {
+          CalendarSearchProgress progress = {.scan = {
             .magic = CALENDAR_SEARCH_STATE_MAGIC, .view = validator_search_view(*candidate),
             .next_actual = (uint64_t)actual,
             .best_actual = best_apparent < 0 ? -1
@@ -1804,7 +1959,11 @@ restart_search:
             .photo_search = photo_search,
             .forward_distance = best_forward_distance,
             .adjacent = best_adjacent, .local_forward = best_local_forward, .complete = best_complete
-          };
+          }, .continuation_actual = continuation_apparent < 0 ? -1
+                  : filemirror_actual_blocknumber(scalpel_state.filemirror,
+                                                   continuation_apparent),
+              .continuation_explored = continuation_explored};
+          progress.continuation_blocks = continuation_blocks;
           carve_put_state((*candidate)->carvehashkey, &progress);
           if (reassembly_time_to_checkpoint(work->id, *candidate, uuidp, uuidc)) {
             return;
@@ -1832,9 +1991,13 @@ restart_search:
       const uint64_t old_length = inflate_blockvector_single_block(
           blockvector, trial_slot);
       CalendarParseSummary trial_summary;
-      CalendarParseResult trial_result = calendar_parse(
+      const bool physical_continuation = actual > 0
+          && blockvector_get_actual_blocknumber(blockvector, trial_slot - 1)
+                 == actual - 1;
+      CalendarParseResult trial_result = calendar_reassembly_parse_prefix(
           (const uint8_t *)blockvector_get_data_pointer(blockvector),
-          blockvector_get_data_length(blockvector), profile, &trial_summary);
+          blockvector_get_data_length(blockvector), profile, &trial_summary,
+          physical_continuation);
       if (photo_search && (trial_result == CALENDAR_PARSE_COMPLETE
                            || trial_result == CALENDAR_PARSE_TRUNCATED)) {
         trial_result = calendar_check_payload(
@@ -1842,7 +2005,7 @@ restart_search:
             blockvector_get_data_length(blockvector), trial_result, &trial_summary);
       }
       uint64_t preview_progress = 1;
-      if (current_summary.image_evidence && trial_summary.image_evidence
+      if (current_summary.image_pending && trial_summary.image_evidence
           && trial_result == CALENDAR_PARSE_TRUNCATED) {
         preview_progress = calendar_preview_image_run(
             blockvector, trial_slot, apparent, profile, &trial_summary);
@@ -1856,7 +2019,15 @@ restart_search:
       const bool local_forward = forward_distance
           <= CALENDAR_LOCAL_FORWARD_BLOCKS;
 
-      if (adjacent && !current_summary.image_evidence && trial_summary.validated_end
+      if (photo_search && !continuation_explored && physical_continuation
+          && trial_result == CALENDAR_PARSE_TRUNCATED
+          && trial_summary.image_evidence && preview_progress > 1
+          && trial_summary.validated_end > current_summary.validated_end) {
+        continuation_apparent = apparent;
+        continuation_blocks = preview_progress;
+      }
+
+      if (adjacent && !current_summary.image_pending && trial_summary.validated_end
                           > current_summary.validated_end
           && (trial_result == CALENDAR_PARSE_COMPLETE
               || trial_result == CALENDAR_PARSE_TRUNCATED)) {
@@ -1887,7 +2058,7 @@ restart_search:
                  && complete != best_complete) {
           better = complete;
         }
-        else if (current_summary.image_evidence
+        else if (current_summary.image_pending
                  && preview_progress != best_preview_progress) {
           better = preview_progress > best_preview_progress;
         }
@@ -1947,6 +2118,11 @@ restart_search:
       break;
     }
 
+    if (continuation_apparent >= 0 && continuation_apparent != best_apparent) {
+      continuation_explored = calendar_queue_continuation(
+          *candidate, trial_slot, continuation_apparent, continuation_blocks);
+    }
+
     blockvector_set_apparent_blocknumber(blockvector, trial_slot,
                                          best_apparent);
     inflate_blockvector_single_block(blockvector, trial_slot);
@@ -1975,13 +2151,35 @@ static inline bool calendar_serialize_carve_state(void **state, FILE *fp, StateS
     return false;
   }
   if (mode == SERIALIZE) {
-    return fwrite(*state, sizeof(CalendarSearchState), 1, fp) == 1;
+    const CalendarSearchProgress *progress = *state;
+    const uint8_t explored = progress->continuation_explored ? 1 : 0;
+    return fwrite(&progress->scan, sizeof(CalendarSearchState), 1, fp) == 1
+        && fwrite(&progress->continuation_actual,
+                  sizeof(progress->continuation_actual), 1, fp) == 1
+        && fwrite(&progress->continuation_blocks,
+                  sizeof(progress->continuation_blocks), 1, fp) == 1
+        && fwrite(&explored, sizeof(explored), 1, fp) == 1;
   }
-  CalendarSearchState saved;
-  if (fread(&saved, sizeof(saved), 1, fp) != 1 || saved.magic != CALENDAR_SEARCH_STATE_MAGIC
-      || saved.best_actual < -1) {
+  CalendarSearchProgress saved = {.continuation_actual = -1};
+  if (fread(&saved.scan, sizeof(saved.scan), 1, fp) != 1
+      || (saved.scan.magic != CALENDAR_SEARCH_STATE_MAGIC
+          && saved.scan.magic != CALENDAR_SEARCH_STATE_MAGIC_V2)
+      || saved.scan.best_actual < -1) {
     return false;
   }
+  if (saved.scan.magic == CALENDAR_SEARCH_STATE_MAGIC) {
+    uint8_t explored;
+    if (fread(&saved.continuation_actual, sizeof(saved.continuation_actual), 1, fp) != 1
+        || saved.continuation_actual < -1
+        || fread(&saved.continuation_blocks, sizeof(saved.continuation_blocks), 1, fp) != 1
+        || saved.continuation_blocks > CALENDAR_IMAGE_PREVIEW_BLOCKS
+        || (saved.continuation_actual >= 0 && saved.continuation_blocks < 2)
+        || fread(&explored, sizeof(explored), 1, fp) != 1 || explored > 1) {
+      return false;
+    }
+    saved.continuation_explored = explored != 0;
+  }
+  saved.scan.magic = CALENDAR_SEARCH_STATE_MAGIC;
   *state = calendar_clone_carve_state(&saved);
   return true;
 }
@@ -1990,7 +2188,7 @@ static inline void *calendar_clone_carve_state(const void *state) {
   if (!state) {
     return NULL;
   }
-  CalendarSearchState *copy = malloc(sizeof(*copy));
+  CalendarSearchProgress *copy = malloc(sizeof(*copy));
   check_memory_allocation(copy, __LINE__, __FILE__, "calendar saved search");
   memcpy(copy, state, sizeof(*copy));
   return copy;
@@ -2004,12 +2202,13 @@ static inline void calendar_free_carve_state(void **state) {
 }
 
 static inline size_t calendar_sizeof_carve_state(const void *state) {
-  return state ? sizeof(CalendarSearchState) : 0;
+  return state ? sizeof(CalendarSearchProgress) : 0;
 }
 
 static inline void calendar_print_carve_state(const void *state) {
-  const CalendarSearchState *saved = state;
-  if (saved) {
+  const CalendarSearchProgress *progress = state;
+  if (progress) {
+    const CalendarSearchState *saved = &progress->scan;
     printf("Calendar search: next physical block=%" PRIu64 " best=%" PRId64 "\n",
            saved->next_actual, saved->best_actual);
   }

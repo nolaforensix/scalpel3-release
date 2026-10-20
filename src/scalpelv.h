@@ -28,5 +28,5 @@
 // Please see LICENSE.md, README.md, and THIRD_PARTY_NOTICES for details.
 //
 
-#define SCALPEL_VERSION    "3.55.0"
+#define SCALPEL_VERSION    "3.56.0"
 

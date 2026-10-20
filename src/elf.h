@@ -9452,6 +9452,65 @@ static inline bool parse_dynamic_view(CarveInfo *candidate,
 
 
 
+static bool elf_dynamic_table_is_consistent(const uint8_t *data, uint64_t length,
+                                             uint64_t offset, uint64_t size,
+                                             bool is_64, bool file_is_le);
+
+// Check a complete, metadata-located dynamic table, not a sliding-window guess.
+// The ABI requires a terminator and a size for each declared function array.
+// Unknown tags and bytes after DT_NULL are not evidence of corruption.
+static bool elf_dynamic_table_is_consistent(const uint8_t *data, uint64_t length,
+                                             uint64_t offset, uint64_t size,
+                                             bool is_64, bool file_is_le) {
+    const uint64_t stride = is_64 ? sizeof(Elf64_Dyn) : sizeof(Elf32_Dyn);
+    const uint64_t pointer_size = is_64 ? sizeof(uint64_t) : sizeof(uint32_t);
+    uint32_t arrays = 0;
+    uint32_t sizes = 0;
+    uint64_t array_sizes[3] = {0};
+
+    if (!data || offset > length || size > length - offset || size < stride) {
+        return false;
+    }
+    for (uint64_t position = 0; position <= size - stride; position += stride) {
+        uint64_t tag;
+        uint64_t value;
+        if (is_64) {
+            Elf64_Dyn entry;
+            memcpy(&entry, data + offset + position, sizeof(entry));
+            tag = to_host_endian_64((uint64_t)entry.d_tag, file_is_le);
+            value = to_host_endian_64(entry.d_un.d_val, file_is_le);
+        }
+        else {
+            Elf32_Dyn entry;
+            memcpy(&entry, data + offset + position, sizeof(entry));
+            tag = to_host_endian_32((uint32_t)entry.d_tag, file_is_le);
+            value = to_host_endian_32(entry.d_un.d_val, file_is_le);
+        }
+        if (tag == DT_NULL) {
+            if ((arrays & sizes) != arrays) {
+                return false;
+            }
+            for (uint32_t i = 0; i < 3; i++) {
+                if ((arrays & (1u << i)) != 0
+                    && array_sizes[i] % pointer_size != 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        switch (tag) {
+        case DT_INIT_ARRAY: arrays |= 1u; break;
+        case DT_FINI_ARRAY: arrays |= 2u; break;
+        case DT_PREINIT_ARRAY: arrays |= 4u; break;
+        case DT_INIT_ARRAYSZ: sizes |= 1u; array_sizes[0] = value; break;
+        case DT_FINI_ARRAYSZ: sizes |= 2u; array_sizes[1] = value; break;
+        case DT_PREINIT_ARRAYSZ: sizes |= 4u; array_sizes[2] = value; break;
+        default: break;
+        }
+    }
+    return false;
+}
+
 static inline bool is_dynamic_ptr_tag(uint64_t tag){
     /* Tags whose d_un is an address / virtual pointer that we can
      * optionally validate against PT_LOAD.
@@ -14271,8 +14330,8 @@ static inline bool elf_relocation_symbols_are_consistent(
  * **Layer 6 — Per-section structural scans (SHT only)**
  *   Every section in the SHT is inspected by type:
  *   - @c SHT_DYNAMIC: scanned via @ref scan_for_valid_dynamic_entries. The
- *     section is rejected if no consecutive valid @c Elf{32,64}_Dyn entries
- *     are found.
+ *     section must also terminate at an aligned @c DT_NULL and include the
+ *     required size tags for any declared initialization/termination arrays.
  *   - @c SHT_REL / @c SHT_RELA: scanned via
  *     @ref scan_for_valid_relocation_entries. The section is rejected if no
  *     consecutive valid relocation entries are found for the file's e_machine.
@@ -14560,10 +14619,13 @@ static inline void elf_file_validate_limited(char *data,
                         is_64, file_is_le,
                         NULL, 0, false);
 
-                    if (ds.count == 0) {
+                    if (ds.count == 0
+                        || !elf_dynamic_table_is_consistent(
+                               (const uint8_t *)data, length, sh_off, sh_size,
+                               is_64, file_is_le)) {
 #ifdef ELF_REASSEMBLY_DEBUG
                         lock_fprintf(stderr,
-                            "[ELF_VALIDATE][%s][ELF32] FAIL: .dynamic scan empty at sh=%u\n",
+                            "[ELF_VALIDATE][%s][ELF32] FAIL: inconsistent .dynamic table at sh=%u\n",
                             cand_id, (unsigned)si);
 #endif
                         *validates = false; *promising = true; *validates_to = blocksize - 1;
@@ -15041,10 +15103,13 @@ static inline void elf_file_validate_limited(char *data,
                         is_64, file_is_le,
                         NULL, 0, false);
 
-                    if (ds.count == 0) {
+                    if (ds.count == 0
+                        || !elf_dynamic_table_is_consistent(
+                               (const uint8_t *)data, length, sh_off, sh_size,
+                               is_64, file_is_le)) {
 #ifdef ELF_REASSEMBLY_DEBUG
                         lock_fprintf(stderr,
-                            "[ELF_VALIDATE][%s][ELF64] FAIL: .dynamic scan empty at sh=%u\n",
+                            "[ELF_VALIDATE][%s][ELF64] FAIL: inconsistent .dynamic table at sh=%u\n",
                             cand_id, (unsigned)si);
 #endif
                         *validates = false; *promising = true; *validates_to = blocksize - 1;
