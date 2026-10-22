@@ -30,3 +30,17 @@ such files are recovered incorrectly.
 Treat validation as evidence of format consistency, not proof of byte-for-byte
 identity. Independently verify recovered executables whenever a trusted original,
 hash or other external evidence is available.
+
+## 3. File-Size Limits And Memory
+
+SQLite, ZIP (including Office packages), RAR, AVI, MOV/MP4, ASF/WMV, MPEG and
+PFF-family files (PST/OST/PAB) have a default recovery limit of 256 MiB
+(268,435,456 bytes). Files exceeding the applicable limit cannot be recovered
+in full and may be truncated or rejected. These are conservative recovery
+defaults, not limits of the file formats themselves.
+
+For larger files, increase the corresponding `MAXIMUMSIZE` in `src/scalpelconf.c`
+or the named constant it uses in the validator header, then rebuild. Increasing
+these limits can substantially increase memory use: candidates may be allocated
+before their true length is known, and concurrent workers and validator scratch
+buffers add to the total. A per-file limit is not a process-wide RAM budget.

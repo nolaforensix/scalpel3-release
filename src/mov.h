@@ -51,7 +51,8 @@
    | ((uint32_t)(uint8_t)(c) << 8) | (uint32_t)(uint8_t)(d))
 
 #define ISOBMFF_MINIMUM_SIZE UINT64_C(16)
-#define ISOBMFF_MAXIMUM_SIZE UINT64_C(1099511627776)
+// Default recovery ceiling, not a format limit; raise deliberately for larger files.
+#define ISOBMFF_MAXIMUM_SIZE UINT64_C(268435456)
 #define ISOBMFF_MAX_TRACKS 64U
 #define ISOBMFF_MAX_MDAT_RANGES 256U
 #define ISOBMFF_MAX_BOX_DEPTH 24U

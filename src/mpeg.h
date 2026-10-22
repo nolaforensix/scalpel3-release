@@ -43,7 +43,8 @@
 #include <mpg123.h>
 
 #define MPEG_MINIMUM_SIZE UINT64_C(12)
-#define MPEG_MAXIMUM_SIZE UINT64_C(1099511627776)
+// Default recovery ceiling, not a format limit; raise deliberately for larger files.
+#define MPEG_MAXIMUM_SIZE UINT64_C(268435456)
 #define MPEG_PS_PREFIX UINT32_C(0x00000100)
 #define MPEG_PS_PACK_ID UINT8_C(0xba)
 #define MPEG_PS_SYSTEM_ID UINT8_C(0xbb)

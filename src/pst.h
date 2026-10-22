@@ -69,7 +69,8 @@
 #define PST_PAGE_TYPE_NBT                    UINT8_C(0x81)
 #define PST_PAGE_TYPE_AMAP                   UINT8_C(0x84)
 #define PST_MAXIMUM_BTREE_DEPTH              UINT32_C(64)
-#define PST_MAXIMUM_FILE_SIZE                UINT64_C(1099511627776)
+// Default recovery ceiling, not a format limit; raise deliberately for larger files.
+#define PST_MAXIMUM_FILE_SIZE                UINT64_C(268435456)
 #define PST_BLOCK_CONFIDENCE                 95
 #define PST_STATE_MAGIC                      UINT32_C(0x50535452)
 #define PST_STATE_VERSION                    UINT32_C(6)

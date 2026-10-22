@@ -81,7 +81,12 @@
 // MINIMUMSIZE will not be recovered.
 //
 // o The MAXIMUMSIZE for this file type. This value MUST be specified. Files larger than MAXIMUMSIZE
-// will be truncated to MAXIMUMSIZE bytes.
+// cannot be recovered in full and may be truncated or rejected by the validator. Initial
+// candidate allocation can scale with this limit before validation determines the actual size.
+// Use conservative defaults: a large format limit is not a suitable default memory budget.
+// SQLite, ZIP, RAR, AVI, MOV/MP4, ASF/WMV, MPEG and PFF-family files default to 256 MiB.
+// To recover larger files, raise the relevant limit here (or its named constant in the validator
+// header), rebuild, and allow for concurrent candidates and validator working storage.
 //
 // o SEARCHTYPE, which defines the carving strategy. The available options are SEARCHTYPE_FORWARD
 // (this is the default and most commonly used option, which initially matches a header with the
@@ -861,7 +866,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .MASTER = false,
       .CASESENSITIVE = true,
       .MINIMUMSIZE = SQLITE_MINIMUM_PAGE_SIZE,
-      .MAXIMUMSIZE = UINT64_C(1099511627776),
+      .MAXIMUMSIZE = UINT64_C(268435456),  // 256 MiB default recovery limit
       .HEADER = {0},
       .HEADERFUNC = sqlite_header_discovery,
       .FOOTER = {0},
@@ -888,7 +893,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .CASESENSITIVE = true,
       .MINIMUMSIZE = ZIP_LOCAL_HEADER_SIZE + ZIP_CENTRAL_HEADER_SIZE
                      + ZIP_EOCD_SIZE,
-      .MAXIMUMSIZE = UINT64_C(1099511627776),
+      .MAXIMUMSIZE = UINT64_C(268435456),  // 256 MiB default recovery limit
       .HEADER = "/\x50\x4b\x03\x04|\x50\x4b\x30\x30\x50\x4b\x03\x04/",
       .HEADERFUNC = NULL,
       .FOOTER = {0},
@@ -910,7 +915,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .MASTER = false,
       .CASESENSITIVE = true,
       .MINIMUMSIZE = 20,
-      .MAXIMUMSIZE = UINT64_C(1099511627776),
+      .MAXIMUMSIZE = UINT64_C(268435456),  // 256 MiB default recovery limit
       .HEADER = "/\x52\x61\x72\x21\x1a\x07\\x{00}|\x52\x61\x72\x21\x1a\x07\x01\\x{00}/",
       .FOOTER = "/\xc4\x3d\x7b\\x{00}\x40\x07\\x{00}|\x1d\x77\x56\x51\x03\x05\x04\\x{00}/",
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
