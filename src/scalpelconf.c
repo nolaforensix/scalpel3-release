@@ -37,8 +37,8 @@
 // If you are adding a new file type to scalpel3, please read this file carefully. Each file type
 // must have an element in the INITIAL_SEARCH_SPECS array (defined below) and a separate .h file
 // (e.g., for gif files, gif.h) that contains the implementation of file-type specific functions.
-// Studying the synthetic "abc" file type (with functions defined in "abc.h") will be useful in
-// getting started.
+// Studying the synthetic "abc" and "123" file types (with functions defined in "abc.h" and "123.h")
+// will be useful in getting started.
 //
 //
 // *************************************
@@ -56,9 +56,9 @@
 // exe_vision/unix/class_names.json or be explicitly mapped to one in modico_classmap.c. The class
 // names file is model metadata; it is not the list of Scalpel file types. Do NOT add names to
 // class_names.json unless the MoDiCo model has been retrained/exported with the same class order.
-// For alternate Scalpel names that share an existing byte-level class, add an
-// alias in modico_classmap.c instead. If no mapping exists, Scalpel still works normally, but MoDiCo
-// will not populate block confidence values for that file type.
+// For alternate Scalpel names that share an existing byte-level class, add an alias in
+// modico_classmap.c instead. If no mapping exists, Scalpel still works normally, but MoDiCo will
+// not populate block confidence values for that file type.
 //
 // o A boolean MASTER tag which must be set to true or false. Master file types are templates that
 // support dynamic creation of new file subtypes during runtime (in the block verification phase).
@@ -81,12 +81,10 @@
 // MINIMUMSIZE will not be recovered.
 //
 // o The MAXIMUMSIZE for this file type. This value MUST be specified. Files larger than MAXIMUMSIZE
-// cannot be recovered in full and may be truncated or rejected by the validator. Initial
-// candidate allocation can scale with this limit before validation determines the actual size.
-// Use conservative defaults: a large format limit is not a suitable default memory budget.
-// SQLite, ZIP, RAR, AVI, MOV/MP4, ASF/WMV, MPEG and PFF-family files default to 256 MiB.
-// To recover larger files, raise the relevant limit here (or its named constant in the validator
-// header), rebuild, and allow for concurrent candidates and validator working storage.
+// cannot be recovered in full and may be truncated or rejected by the validator. Initial candidate
+// allocation can scale with this limit before validation determines the actual size.  In general,
+// use conservative defaults on machines without abundant RAM. To recover larger files, raise the
+// relevant limits.
 //
 // o SEARCHTYPE, which defines the carving strategy. The available options are SEARCHTYPE_FORWARD
 // (this is the default and most commonly used option, which initially matches a header with the
@@ -103,21 +101,19 @@
 // at one of the established file types (e.g., "abc.h") for an example. NULL is permissible for
 // BLOCKVALIDATOR; this marks every block as a potential candidate for inclusion in a file of this
 // type. NULL is better than a block validator that simply validates every block without
-// scrutinizing the associated data.
+// scrutinizing the associated data. The value returned by a block validator is the needleidx under
+// which the block's decision is recorded. The confidence value itself is carried in and out via the
+// 'decision' argument: on entry it holds the confidence currently stored for the block, which may
+// be a prior set by an earlier classifier such as MoDiCo, and on return it holds the confidence the
+// validator wants stored. A validator normally returns the same needleidx it was passed. However,
+// if it recognizes the block as a more specific subtype of its file type, it returns that subtype's
+// needleidx and the framework records the decision against the subtype rather than the base file
+// type. For example, csv_master_block_validate() creates an "<N>-col.csv" subtype via
+// add_file_subtype() and returns the new subtype's needleidx.
 //
-// The value RETURNED by a block validator is the needleidx under which the block's decision is
-// recorded. (The confidence value itself is carried in and out via the 'decision' argument: on
-// entry it holds the confidence currently stored for the block, which may be a prior set by an
-// earlier classifier such as MoDiCo, and on return it holds the confidence the validator wants
-// stored.) A validator normally returns the same needleidx it was passed. However, if it recognizes
-// the block as a more specific SUBTYPE of its file type, it returns that subtype's needleidx and the
-// framework records the decision against the subtype rather than the base file type. For example,
-// csv_master_block_validate() creates an "<N>-col.csv" subtype via add_file_subtype() and returns the
-// new subtype's needleidx.
-//
-// o BATCHEDBLOCKVALIDATOR is an alternative to BLOCKVALIDATOR and is MUTUALLY EXCLUSIVE with it (a
-// file type may define one or the other, never both; scalpel3 aborts at startup if both are set).
-// Whereas a BLOCKVALIDATOR is handed one block at a time by the validation threads, a
+// o BATCHEDBLOCKVALIDATOR is an alternative to BLOCKVALIDATOR and is **mutually exclusive** with it
+// (a file type may define one or the other, never both; scalpel3 aborts at startup if both are
+// set).  Whereas a BLOCKVALIDATOR is handed one block at a time by the validation threads, a
 // BATCHEDBLOCKVALIDATOR is invoked once and iterates the apparent blocks itself, deciding each
 // block's type and recording the decision directly via the block state API. It runs on the main
 // thread, in parallel with the validation threads that service the single-block validators. Like a
@@ -159,13 +155,23 @@
 // it, and saved validator state must still be reconciled with any candidate changes after a
 // blockmap update.
 //
+// o OUTPUTTYPEFUNC optionally identifies a more specific output type, such as a Word document or
+// PowerPoint presentation inside a ZIP container. Before writing output, Scalpel3 calls this
+// function with the candidate's data, its length, and a map identifying missing blocks. The
+// function examines only present blocks, without modifying the data, and returns a lowercase type
+// name in static storage, such as "docx", or NULL to retain FILETYPE. Scalpel3 copies the name and
+// does not free the returned string. It uses the name for the output directory and filename
+// extension. Each call must identify the data provided for that write, rather than reuse an earlier
+// conclusion that may no longer match the candidate.  See zip_output_type() for an example. Most
+// file types do not need this function.
+//
 // o REASSEMBLYFUNC defines an optional custom reassembly function. The default (if unspecified) is
-// the generic LR_reassembly() function, which performs best-effort, left-to-right reassembly. This
-// function must be thread-safe. It must also be stateless, aside from the use of the API for
-// 'state' in carving candidates. If files associated with a file type cannot be generated in a
-// left-to-right fashion (e.g., ZIP files, which contain critical metadata at the end of the file),
-// then a custom reassembly function must be written. See LR_reassembly() in reassembly.c for
-// extensive documentation on this process.
+// the generic LR_reassembly() function, which performs best-effort, left-to-right reassembly with
+// backtracking. This function must be thread-safe. It must also be stateless, aside from the use of
+// the API for 'state' in carving candidates. If files associated with a file type cannot be
+// generated in a left-to-right fashion (e.g., ZIP files, which contain critical metadata at the end
+// of the file), then a custom reassembly function must be written. See LR_reassembly() in
+// reassembly.c for extensive documentation on this process.
 //
 // o DONTCARVE defines an optional "don't carve" function for a file type. This function can
 // evaluate the data associated with a file or its SHA256 hash value (which is passed to the
@@ -345,9 +351,9 @@
 // ****** IMPORTANT NOTES ******
 // *****************************
 //
-// ** To optimize performance, scalpel3 requires that headers and footers be at ** most one block in
-// size. This is because headers and footers that lay ** across a block boundary are only detected
-// if they are at most a single ** block long.
+// To optimize performance, scalpel3 requires that headers and footers be at most one block in
+// size. This is because headers and footers that lay across a block boundary are only detected if
+// they are at most a single block long.
 //
 // Headers and footers are decoded before use. To specify a value in hexadecimal use \x[0-f][0-f].
 // OCTAL NOTATION FOR EMBEDDED CHARACTERS IS NOT SUPPORTED. Welcome to the 21st century! Spaces can
@@ -901,6 +907,7 @@ SearchSpec INITIAL_SEARCH_SPECS[] = {
       .SEARCHTYPE = SEARCHTYPE_FORWARD,
       .FILEVALIDATOR = zip_file_validate_seed,
       .CANDIDATEVALIDATOR = cfbf_zip_candidate_validate,
+      .OUTPUTTYPEFUNC = zip_output_type,
       .SERIALIZECARVESTATEFUNC = zip_serialize_carve_state,
       .CLONECARVESTATEFUNC = zip_clone_carve_state,
       .FREECARVESTATEFUNC = zip_free_carve_state,

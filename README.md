@@ -51,6 +51,18 @@ o Some validators err on the side of not "stealing" blocks when a candidate cann
   VALIDATED.  In general, use the -w option to maximize file recovery, as this always writes PROMISING
   candidates.
 
+# Recovered File Names
+
+ZIP-based Office documents are written with document extensions such as `.docx`, `.pptx`, and
+`.xlsx` when their reconstructed package metadata identifies the type. This also applies to partial
+snapshots when the identifying metadata is available. Missing, conflicting, or unsupported metadata
+leaves the output named `.zip`; each later snapshot is checked again. A document extension does not
+mean the file is complete or has passed validation.
+
+These documents still use the ZIP validator and are selected as `zip` with `-z` or excluded with
+`-U`. Output directories and blockvector sidecars follow the identified type, with independent
+directory numbering for each type. Other file types keep their existing naming behavior.
+
 # Hardware Recommendations
 
 Scalpel3 supports CPU-only execution using `-Y cpu`. For demanding workloads, we recommend a

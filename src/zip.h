@@ -499,6 +499,916 @@ static inline bool zip_normal_scan_codec(
 static inline uint16_t zip_read_le16(const uint8_t *data);
 static inline uint32_t zip_read_le32(const uint8_t *data);
 static inline uint64_t zip_read_le64(const uint8_t *data);
+// Output-only OPC classification. These limits are deliberate unknown fallbacks,
+// not recovery limits. ZIP64, non-ASCII/escaped part names, prefixed XML and
+// methods other than stored/deflate are outside this small parser's contract.
+#define ZIP_OUTPUT_ENTRIES       2048u
+#define ZIP_OUTPUT_DIRECTORY     (UINT64_C(2) * 1024 * 1024)
+#define ZIP_OUTPUT_LOCAL_LIMIT   (UINT64_C(64) * 1024 * 1024)
+#define ZIP_OUTPUT_STREAM_LIMIT  (UINT64_C(4) * 1024 * 1024)
+#define ZIP_OUTPUT_XML_LIMIT     (256u * 1024u)
+#define ZIP_OUTPUT_XML_ITEMS     256u
+#define ZIP_OUTPUT_NAME_LIMIT    1024u
+#define ZIP_OUTPUT_EXTRA_LIMIT   4096u
+
+typedef struct ZipOutputText {
+  const unsigned char *data;
+  size_t length;
+} ZipOutputText;
+
+typedef struct ZipOutputEntry {
+  ZipOutputText name;
+  uint64_t offset;
+  uint64_t data_offset;
+  uint32_t compressed;
+  uint32_t uncompressed;
+  uint32_t crc;
+  uint16_t flags;
+  uint16_t method;
+} ZipOutputEntry;
+
+typedef struct ZipOutputXmlTag {
+  ZipOutputText name;
+  ZipOutputText keys[4];
+  ZipOutputText values[4];
+  uint32_t attributes;
+  bool closing;
+  bool empty;
+  bool declaration;
+} ZipOutputXmlTag;
+
+static bool zip_output_range(const OutputSnapshot *snapshot, uint64_t offset,
+                             uint64_t length);
+static bool zip_output_text(ZipOutputText text, const char *literal);
+static int zip_output_compare_text(ZipOutputText a, ZipOutputText b);
+static int zip_output_compare_name(const void *a, const void *b);
+static int zip_output_compare_offset(const void *a, const void *b);
+static bool zip_output_path(ZipOutputText name, bool absolute);
+static bool zip_output_entry(const OutputSnapshot *snapshot, uint64_t offset,
+                             bool central, ZipOutputEntry *entry,
+                             uint64_t *next);
+static int zip_output_directory(const OutputSnapshot *snapshot,
+                                ZipOutputEntry *entries, uint32_t *count,
+                                uint64_t *central_offset);
+static bool zip_output_local(const OutputSnapshot *snapshot,
+                             ZipOutputEntry *entries, uint32_t *count);
+static int zip_output_stream(const OutputSnapshot *snapshot,
+                              ZipOutputEntry *entry, uint64_t *next,
+                              uint64_t *budget);
+static bool zip_output_match_local(const OutputSnapshot *snapshot,
+                                   ZipOutputEntry *entry, uint64_t limit,
+                                   bool required);
+static unsigned char *zip_output_metadata(const OutputSnapshot *snapshot,
+                                          const ZipOutputEntry *entry);
+static bool zip_output_space(unsigned char c);
+static void zip_output_xml_space(ZipOutputText *input);
+static bool zip_output_xml_misc(ZipOutputText *input);
+static bool zip_output_xml_name(ZipOutputText *input, ZipOutputText *name);
+static bool zip_output_xml_tag(ZipOutputText *input, ZipOutputXmlTag *tag);
+static const ZipOutputText *zip_output_attribute(const ZipOutputXmlTag *tag,
+                                                const char *name);
+static const char *zip_output_mime(ZipOutputText content_type);
+static bool zip_output_xml(unsigned char *data, size_t length, bool types,
+                           ZipOutputText *main_part, const char **type);
+const char *zip_output_type(const OutputSnapshot *snapshot);
+
+// Validate every touched block before obtaining a pointer into the snapshot.
+static bool zip_output_range(const OutputSnapshot *snapshot, uint64_t offset,
+                             uint64_t length) {
+  if (!snapshot || !snapshot->data || !snapshot->present
+      || snapshot->blocksize == 0 || snapshot->length > SIZE_MAX
+      || offset > snapshot->length || length > snapshot->length - offset) {
+    return false;
+  }
+  if (length == 0) {
+    return true;
+  }
+  const uint64_t last = (offset + length - 1) / snapshot->blocksize;
+  if (last >= snapshot->numblocks) {
+    return false;
+  }
+  for (uint64_t block = offset / snapshot->blocksize; block <= last; block++) {
+    if (!snapshot->present[block]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Compare bounded, non-NUL-terminated XML and ZIP strings.
+static bool zip_output_text(ZipOutputText text, const char *literal) {
+  return text.length == strlen(literal)
+         && memcmp(text.data, literal, text.length) == 0;
+}
+
+// OPC part names are ASCII-case-insensitively unique; no URI decoding is done.
+static int zip_output_compare_text(ZipOutputText a, ZipOutputText b) {
+  const size_t length = a.length < b.length ? a.length : b.length;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char x = a.data[i];
+    unsigned char y = b.data[i];
+    if (x >= 'A' && x <= 'Z') {
+      x += 'a' - 'A';
+    }
+    if (y >= 'A' && y <= 'Z') {
+      y += 'a' - 'A';
+    }
+    if (x != y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return a.length == b.length ? 0 : (a.length < b.length ? -1 : 1);
+}
+
+// Sort private entry copies, never the caller's snapshot.
+static int zip_output_compare_name(const void *a, const void *b) {
+  return zip_output_compare_text(((const ZipOutputEntry *)a)->name,
+                                 ((const ZipOutputEntry *)b)->name);
+}
+
+// Physical ordering also exposes duplicate local offsets and overlap.
+static int zip_output_compare_offset(const void *a, const void *b) {
+  const uint64_t x = ((const ZipOutputEntry *)a)->offset;
+  const uint64_t y = ((const ZipOutputEntry *)b)->offset;
+  return x == y ? 0 : (x < y ? -1 : 1);
+}
+
+// Accept only unambiguous URI paths; reject aliases instead of normalizing them.
+static bool zip_output_path(ZipOutputText name, bool absolute) {
+  if (name.length == 0 || name.length > ZIP_OUTPUT_NAME_LIMIT
+      || (name.data[0] == '/') != absolute) {
+    return false;
+  }
+  size_t start = absolute ? 1 : 0;
+  if (start == name.length) {
+    return false;
+  }
+  for (size_t i = start; i <= name.length; i++) {
+    if (i == name.length || name.data[i] == '/') {
+      const size_t size = i - start;
+      if (size == 0 || name.data[i - 1] == '.'
+          || (size == 1 && name.data[start] == '.')
+          || (size == 2 && name.data[start] == '.'
+              && name.data[start + 1] == '.')) {
+        return false;
+      }
+      start = i + 1;
+    }
+    else if (name.data[i] < 33 || name.data[i] > 126
+             || strchr("\\:%?#&<>\"", name.data[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Read one complete, bounded ZIP32 header and its name/extra fields.
+static bool zip_output_entry(const OutputSnapshot *snapshot, uint64_t offset,
+                             bool central, ZipOutputEntry *entry,
+                             uint64_t *next) {
+  const uint64_t fixed = central ? ZIP_CENTRAL_HEADER_SIZE : ZIP_LOCAL_HEADER_SIZE;
+  if (!zip_output_range(snapshot, offset, fixed)) {
+    return false;
+  }
+  const unsigned char *p = snapshot->data + offset;
+  if (zip_read_le32(p) != (central ? ZIP_CENTRAL_HEADER_SIGNATURE
+                                  : ZIP_LOCAL_HEADER_SIGNATURE)) {
+    return false;
+  }
+  const uint16_t name_size = zip_read_le16(p + (central ? 28 : 26));
+  const uint16_t extra_size = zip_read_le16(p + (central ? 30 : 28));
+  const uint16_t comment_size = central ? zip_read_le16(p + 32) : 0;
+  const uint64_t size = fixed + name_size + extra_size + comment_size;
+  if (name_size > ZIP_OUTPUT_NAME_LIMIT || extra_size > ZIP_OUTPUT_EXTRA_LIMIT
+      || !zip_output_range(snapshot, offset, size)
+      || (central && zip_read_le16(p + 34) != 0)
+      || zip_read_le16(p + (central ? 6 : 4)) > 20) {
+    return false;
+  }
+  memset(entry, 0, sizeof(*entry));
+  entry->name = (ZipOutputText){p + fixed, name_size};
+  // Directory records are harmless, but the final slash is not a part-name byte.
+  ZipOutputText path = entry->name;
+  if (path.length != 0 && path.data[path.length - 1] == '/') {
+    path.length--;
+  }
+  entry->flags = zip_read_le16(p + (central ? 8 : 6));
+  entry->method = zip_read_le16(p + (central ? 10 : 8));
+  entry->crc = zip_read_le32(p + (central ? 16 : 14));
+  entry->compressed = zip_read_le32(p + (central ? 20 : 18));
+  entry->uncompressed = zip_read_le32(p + (central ? 24 : 22));
+  entry->offset = central ? zip_read_le32(p + 42) : offset;
+  entry->data_offset = central ? 0 : offset + size;
+  if (!zip_output_path(path, false) || (entry->flags & ~UINT16_C(0x080e)) != 0
+      || (entry->method != ZIP_METHOD_STORED && entry->method != ZIP_METHOD_DEFLATE)
+      || (entry->method == ZIP_METHOD_STORED && (entry->flags & 6) != 0)
+      || entry->compressed == ZIP_UINT32_SENTINEL
+      || entry->uncompressed == ZIP_UINT32_SENTINEL
+      || entry->offset == ZIP_UINT32_SENTINEL) {
+    return false;
+  }
+  for (uint64_t pos = fixed + name_size; pos < fixed + name_size + extra_size;) {
+    const uint64_t remaining = fixed + name_size + extra_size - pos;
+    if (remaining < 4) {
+      return false;
+    }
+    const uint16_t id = zip_read_le16(p + pos);
+    const uint16_t length = zip_read_le16(p + pos + 2);
+    if (length > remaining - 4 || id == ZIP_EXTRA_ID_ZIP64
+        || id == ZIP_EXTRA_ID_UNICODE_PATH || id == ZIP_EXTRA_ID_AES) {
+      return false;
+    }
+    pos += 4 + length;
+  }
+  *next = offset + size;
+  return true;
+}
+
+// Locate a present EOCD in at most 65557 tail bytes. A recognized but incomplete
+// or unsupported directory is not silently replaced with local-only evidence.
+static int zip_output_directory(const OutputSnapshot *snapshot,
+                                ZipOutputEntry *entries, uint32_t *count,
+                                uint64_t *central_offset) {
+  if (snapshot->length < ZIP_EOCD_SIZE) {
+    return 0;
+  }
+  const uint64_t start = snapshot->length > 65557 ? snapshot->length - 65557 : 0;
+  for (uint64_t pos = snapshot->length - ZIP_EOCD_SIZE;; pos--) {
+    if (zip_output_range(snapshot, pos, ZIP_EOCD_SIZE)
+        && zip_read_le32(snapshot->data + pos) == ZIP_EOCD_SIGNATURE) {
+      const unsigned char *p = snapshot->data + pos;
+      const uint32_t number = zip_read_le16(p + 10);
+      const uint64_t size = zip_read_le32(p + 12);
+      const uint64_t offset = zip_read_le32(p + 16);
+      if (zip_read_le16(p + 4) != 0 || zip_read_le16(p + 6) != 0
+          || zip_read_le16(p + 8) != number || number == 0
+          || number > ZIP_OUTPUT_ENTRIES || size > ZIP_OUTPUT_DIRECTORY
+          || offset > pos || size != pos - offset
+          || !zip_output_range(snapshot, pos, ZIP_EOCD_SIZE + zip_read_le16(p + 20))
+          || !zip_output_range(snapshot, offset, size)) {
+        return -1;
+      }
+      uint64_t cursor = offset;
+      for (uint32_t i = 0; i < number; i++) {
+        if (cursor >= pos
+            || !zip_output_entry(snapshot, cursor, true, entries + i, &cursor)
+            || cursor > pos || entries[i].offset >= offset) {
+          return -1;
+        }
+      }
+      if (cursor != pos) {
+        return -1;
+      }
+      *count = number;
+      *central_offset = offset;
+      return 1;
+    }
+    if (pos == start) {
+      break;
+    }
+  }
+  return 0;
+}
+
+// Resolve descriptor-based deflate members without searching for PK signatures.
+// The whole local scan shares a compressed-plus-expanded byte budget. A missing
+// range returns zero; corrupt streams, unsupported methods and limits return -1.
+static int zip_output_stream(const OutputSnapshot *snapshot,
+                              ZipOutputEntry *entry, uint64_t *next,
+                              uint64_t *budget) {
+  if (entry->method != ZIP_METHOD_DEFLATE) {
+    return -1;
+  }
+  z_stream stream = {0};
+  if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
+    return -1;
+  }
+  unsigned char output[8192];
+  uint32_t crc = 0;
+  int result = -1;
+  while (stream.total_in + stream.total_out < *budget) {
+    if (stream.avail_in == 0) {
+      const uint64_t position = entry->data_offset + stream.total_in;
+      if (position >= snapshot->length) {
+        result = 0;
+        break;
+      }
+      uint64_t size = snapshot->blocksize - position % snapshot->blocksize;
+      if (size > 4096) {
+        size = 4096;
+      }
+      if (size > snapshot->length - position) {
+        size = snapshot->length - position;
+      }
+      if (size > *budget - stream.total_in - stream.total_out) {
+        size = *budget - stream.total_in - stream.total_out;
+      }
+      if (!zip_output_range(snapshot, position, size)) {
+        result = 0;
+        break;
+      }
+      stream.next_in = (Bytef *)(snapshot->data + position);
+      stream.avail_in = (uInt)size;
+    }
+    stream.next_out = output;
+    stream.avail_out = sizeof(output);
+    const int status = inflate(&stream, Z_NO_FLUSH);
+    crc = crc32(crc, output, sizeof(output) - stream.avail_out);
+    if (stream.total_in + stream.total_out > *budget) {
+      break;
+    }
+    if (status == Z_STREAM_END) {
+      result = 1;
+      break;
+    }
+    if (status != Z_OK) {
+      break;
+    }
+  }
+  const uint32_t compressed = (uint32_t)stream.total_in;
+  const uint32_t uncompressed = (uint32_t)stream.total_out;
+  inflateEnd(&stream);
+  if (result != 1) {
+    return result;
+  }
+  uint64_t position = entry->data_offset + compressed;
+  if (!zip_output_range(snapshot, position, 4)) {
+    return 0;
+  }
+  if (zip_read_le32(snapshot->data + position) == ZIP_DATA_DESCRIPTOR_SIGNATURE) {
+    position += 4;
+  }
+  if (!zip_output_range(snapshot, position, 12)) {
+    return 0;
+  }
+  const unsigned char *p = snapshot->data + position;
+  if (zip_read_le32(p) != crc || zip_read_le32(p + 4) != compressed
+      || zip_read_le32(p + 8) != uncompressed
+      || (entry->crc != 0 && entry->crc != crc)
+      || (entry->compressed != 0 && entry->compressed != compressed)
+      || (entry->uncompressed != 0 && entry->uncompressed != uncompressed)) {
+    return -1;
+  }
+  entry->crc = crc;
+  entry->compressed = compressed;
+  entry->uncompressed = uncompressed;
+  *next = position + 12;
+  *budget -= (uint64_t)compressed + uncompressed;
+  return 1;
+}
+
+// Follow validated local-header lengths, not arbitrary PK signatures in payload.
+// A missing next header ends partial evidence; exhausting a bound returns unknown.
+static bool zip_output_local(const OutputSnapshot *snapshot,
+                             ZipOutputEntry *entries, uint32_t *count) {
+  uint64_t offset = 0;
+  uint64_t stream_budget = ZIP_OUTPUT_STREAM_LIMIT;
+  *count = 0;
+  while (offset < snapshot->length) {
+    if (offset >= ZIP_OUTPUT_LOCAL_LIMIT || *count == ZIP_OUTPUT_ENTRIES) {
+      return false;
+    }
+    if (!zip_output_range(snapshot, offset, ZIP_LOCAL_HEADER_SIZE)) {
+      break;
+    }
+    if (zip_read_le32(snapshot->data + offset) == ZIP_CENTRAL_HEADER_SIGNATURE) {
+      // A full directory must be checked, rather than ignored, when it is here.
+      return false;
+    }
+    uint64_t next;
+    ZipOutputEntry *entry = entries + *count;
+    if (!zip_output_entry(snapshot, offset, false, entry, &next)) {
+      return false;
+    }
+    (*count)++;
+    if ((entry->flags & ZIP_FLAG_DATA_DESCRIPTOR) != 0) {
+      const int streamed = zip_output_stream(snapshot, entry, &next, &stream_budget);
+      if (streamed < 0) {
+        return false;
+      }
+      if (streamed == 0) {
+        // An incomplete descriptor does not establish sizes or CRC, even when
+        // the local header supplies plausible nonzero values for them.
+        entry->compressed = 0;
+        entry->uncompressed = 0;
+        break;
+      }
+      offset = next;
+    }
+    else {
+      offset = next + entry->compressed;
+    }
+  }
+  return *count != 0;
+}
+
+// Cross-check any present local header against its central record. Metadata
+// requires both its local header and descriptor; unrelated payload may be absent.
+static bool zip_output_match_local(const OutputSnapshot *snapshot,
+                                   ZipOutputEntry *entry, uint64_t limit,
+                                   bool required) {
+  const bool descriptor = (entry->flags & ZIP_FLAG_DATA_DESCRIPTOR) != 0;
+  const uint64_t minimum = ZIP_LOCAL_HEADER_SIZE + entry->name.length
+                           + entry->compressed + (descriptor ? 12 : 0);
+  if (entry->offset > limit || minimum > limit - entry->offset) {
+    return false;
+  }
+  if (!zip_output_range(snapshot, entry->offset, ZIP_LOCAL_HEADER_SIZE)) {
+    return !required;
+  }
+  ZipOutputEntry local;
+  uint64_t next;
+  if (!zip_output_entry(snapshot, entry->offset, false, &local, &next)
+      || local.name.length != entry->name.length
+      || memcmp(local.name.data, entry->name.data, entry->name.length) != 0
+      || local.flags != entry->flags || local.method != entry->method
+      || next > limit || entry->compressed > limit - next) {
+    return false;
+  }
+  if ((!descriptor || local.crc != 0) && local.crc != entry->crc) {
+    return false;
+  }
+  if (((!descriptor || local.compressed != 0) && local.compressed != entry->compressed)
+      || ((!descriptor || local.uncompressed != 0)
+          && local.uncompressed != entry->uncompressed)) {
+    return false;
+  }
+  entry->data_offset = next;
+  next += entry->compressed;
+  if (!descriptor) {
+    return next == limit;
+  }
+  const uint64_t size = limit - next;
+  if (size != 12 && size != 16) {
+    return false;
+  }
+  if (!zip_output_range(snapshot, next, size)) {
+    return !required;
+  }
+  const unsigned char *p = snapshot->data + next;
+  if (size == 16) {
+    if (zip_read_le32(p) != ZIP_DATA_DESCRIPTOR_SIGNATURE) {
+      return false;
+    }
+    p += 4;
+  }
+  return zip_read_le32(p) == entry->crc
+         && zip_read_le32(p + 4) == entry->compressed
+         && zip_read_le32(p + 8) == entry->uncompressed;
+}
+
+// Decode exactly one bounded metadata member, checking stream termination, both
+// sizes and CRC. No archive library receives the potentially sparse snapshot.
+static unsigned char *zip_output_metadata(const OutputSnapshot *snapshot,
+                                          const ZipOutputEntry *entry) {
+  if (entry->compressed == 0 || entry->compressed > ZIP_OUTPUT_XML_LIMIT
+      || entry->uncompressed == 0 || entry->uncompressed > ZIP_OUTPUT_XML_LIMIT
+      || !zip_output_range(snapshot, entry->data_offset, entry->compressed)) {
+    return NULL;
+  }
+  unsigned char *data = malloc((size_t)entry->uncompressed + 1);
+  check_memory_allocation(data, __LINE__, __FILE__, "ZIP output metadata");
+  const unsigned char *source = snapshot->data + entry->data_offset;
+  bool valid = false;
+  if (entry->method == ZIP_METHOD_STORED) {
+    valid = entry->compressed == entry->uncompressed;
+    if (valid) {
+      memcpy(data, source, entry->uncompressed);
+    }
+  }
+  else if (entry->method == ZIP_METHOD_DEFLATE) {
+    z_stream stream = {0};
+    stream.next_in = (Bytef *)source;
+    stream.avail_in = entry->compressed;
+    stream.next_out = data;
+    stream.avail_out = entry->uncompressed + 1;
+    if (inflateInit2(&stream, -MAX_WBITS) == Z_OK) {
+      valid = inflate(&stream, Z_FINISH) == Z_STREAM_END
+              && stream.total_in == entry->compressed
+              && stream.total_out == entry->uncompressed;
+      inflateEnd(&stream);
+    }
+  }
+  if (!valid || crc32(0, data, entry->uncompressed) != entry->crc) {
+    free(data);
+    return NULL;
+  }
+  data[entry->uncompressed] = 0;
+  return data;
+}
+
+// XML whitespace is deliberately not locale-dependent.
+static bool zip_output_space(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static void zip_output_xml_space(ZipOutputText *input) {
+  while (input->length != 0 && zip_output_space(input->data[0])) {
+    input->data++;
+    input->length--;
+  }
+}
+
+// Consume only complete comments and whitespace, including after the root.
+static bool zip_output_xml_misc(ZipOutputText *input) {
+  zip_output_xml_space(input);
+  while (input->length >= 4 && memcmp(input->data, "<!--", 4) == 0) {
+    size_t i = 4;
+    while (i + 2 < input->length
+           && !(input->data[i] == '-' && input->data[i + 1] == '-')) {
+      i++;
+    }
+    if (i + 2 >= input->length || input->data[i + 2] != '>') {
+      return false;
+    }
+    input->data += i + 3;
+    input->length -= i + 3;
+    zip_output_xml_space(input);
+  }
+  return true;
+}
+
+// Namespaced/prefixed names are unsupported; the root must bind the default NS.
+static bool zip_output_xml_name(ZipOutputText *input, ZipOutputText *name) {
+  size_t length = 0;
+  while (length < input->length) {
+    const unsigned char c = input->data[length];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+          || c == '_' || (length != 0 && ((c >= '0' && c <= '9')
+                                        || c == '-' || c == '.')))) {
+      break;
+    }
+    length++;
+  }
+  if (length == 0 || length > 32) {
+    return false;
+  }
+  *name = (ZipOutputText){input->data, length};
+  input->data += length;
+  input->length -= length;
+  return true;
+}
+
+// Tokenize only the small XML subset used by OPC manifests. No DTD, entity,
+// CDATA, text content or general processing instruction can enter this parser.
+static bool zip_output_xml_tag(ZipOutputText *input, ZipOutputXmlTag *tag) {
+  memset(tag, 0, sizeof(*tag));
+  if (!zip_output_xml_misc(input) || input->length < 3 || input->data[0] != '<') {
+    return false;
+  }
+  input->data++;
+  input->length--;
+  if (input->data[0] == '/' || input->data[0] == '?') {
+    tag->closing = input->data[0] == '/';
+    tag->declaration = input->data[0] == '?';
+    input->data++;
+    input->length--;
+  }
+  if (!zip_output_xml_name(input, &tag->name)) {
+    return false;
+  }
+  while (input->length != 0) {
+    const bool separated = zip_output_space(input->data[0]);
+    zip_output_xml_space(input);
+    if (input->length == 0) {
+      return false;
+    }
+    if (input->data[0] == '>') {
+      input->data++;
+      input->length--;
+      return !tag->declaration;
+    }
+    if (input->length >= 2 && input->data[1] == '>'
+        && (input->data[0] == '/' || input->data[0] == '?')) {
+      if (tag->closing || (input->data[0] == '?') != tag->declaration) {
+        return false;
+      }
+      tag->empty = true;
+      input->data += 2;
+      input->length -= 2;
+      return true;
+    }
+    const uint32_t n = tag->attributes;
+    if (!separated || tag->closing || n == 4
+        || !zip_output_xml_name(input, tag->keys + n)) {
+      return false;
+    }
+    for (uint32_t j = 0; j < n; j++) {
+      if (zip_output_compare_text(tag->keys[j], tag->keys[n]) == 0) {
+        return false;
+      }
+    }
+    zip_output_xml_space(input);
+    if (input->length < 3 || input->data[0] != '=') {
+      return false;
+    }
+    input->data++;
+    input->length--;
+    zip_output_xml_space(input);
+    if (input->length == 0 || (input->data[0] != '"' && input->data[0] != '\'')) {
+      return false;
+    }
+    const unsigned char quote = input->data[0];
+    size_t size = 1;
+    while (size < input->length && input->data[size] != quote) {
+      if (input->data[size] < 32 || input->data[size] > 126
+          || input->data[size] == '<' || input->data[size] == '&') {
+        return false;
+      }
+      size++;
+    }
+    if (size == input->length || size - 1 > ZIP_OUTPUT_NAME_LIMIT) {
+      return false;
+    }
+    tag->values[n] = (ZipOutputText){input->data + 1, size - 1};
+    tag->attributes++;
+    input->data += size + 1;
+    input->length -= size + 1;
+  }
+  return false;
+}
+
+// Attributes are matched exactly, after duplicate detection by the tokenizer.
+static const ZipOutputText *zip_output_attribute(const ZipOutputXmlTag *tag,
+                                                const char *name) {
+  for (uint32_t i = 0; i < tag->attributes; i++) {
+    if (zip_output_text(tag->keys[i], name)) {
+      return tag->values + i;
+    }
+  }
+  return NULL;
+}
+
+// Match main-part media types, never filenames or directory names alone.
+static const char *zip_output_mime(ZipOutputText content_type) {
+  static const struct {
+    const char *mime;
+    const char *type;
+  } types[] = {
+    {"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml", "docx"},
+    {"application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml", "dotx"},
+    {"application/vnd.ms-word.document.macroEnabled.main+xml", "docm"},
+    {"application/vnd.ms-word.template.macroEnabledTemplate.main+xml", "dotm"},
+    {"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml", "pptx"},
+    {"application/vnd.openxmlformats-officedocument.presentationml.template.main+xml", "potx"},
+    {"application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml", "ppsx"},
+    {"application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml", "pptm"},
+    {"application/vnd.ms-powerpoint.template.macroEnabled.main+xml", "potm"},
+    {"application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml", "ppsm"},
+    {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml", "xlsx"},
+    {"application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml", "xltx"},
+    {"application/vnd.ms-excel.sheet.macroEnabled.main+xml", "xlsm"},
+    {"application/vnd.ms-excel.template.macroEnabled.main+xml", "xltm"}
+  };
+  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+    if (zip_output_text(content_type, types[i].mime)) {
+      return types[i].type;
+    }
+  }
+  return NULL;
+}
+
+// Parse a two-level OPC manifest completely. Unknown nodes/attributes, duplicate
+// keys, multiple main parts and external package-root relationships fail closed.
+static bool zip_output_xml(unsigned char *data, size_t length, bool types,
+                           ZipOutputText *main_part, const char **type) {
+  ZipOutputText input = {data, length};
+  ZipOutputText keys[ZIP_OUTPUT_XML_ITEMS];
+  bool overrides[ZIP_OUTPUT_XML_ITEMS];
+  uint32_t count = 0;
+  bool found = false;
+  bool rels_default = false;
+  bool rels_override = false;
+  bool rels_overridden = false;
+  if (input.length >= 3 && memcmp(input.data, "\xef\xbb\xbf", 3) == 0) {
+    input.data += 3;
+    input.length -= 3;
+  }
+  const unsigned char *document_start = input.data;
+  for (size_t i = 0; i < input.length; i++) {
+    if ((input.data[i] < 32 && !zip_output_space(input.data[i]))
+        || input.data[i] > 126 || input.data[i] == '&') {
+      return false;
+    }
+  }
+  ZipOutputXmlTag tag;
+  if (!zip_output_xml_tag(&input, &tag)) {
+    return false;
+  }
+  if (tag.declaration) {
+    if (tag.name.data != document_start + 2
+        || !zip_output_text(tag.name, "xml") || tag.attributes == 0
+        || !zip_output_text(tag.keys[0], "version")
+        || !zip_output_text(tag.values[0], "1.0")) {
+      return false;
+    }
+    for (uint32_t i = 1; i < tag.attributes; i++) {
+      if (zip_output_text(tag.keys[i], "encoding")) {
+        if (i != 1 || (!zip_output_text(tag.values[i], "UTF-8")
+                       && !zip_output_text(tag.values[i], "utf-8"))) {
+          return false;
+        }
+      }
+      else if (!zip_output_text(tag.keys[i], "standalone")
+               || (!zip_output_text(tag.values[i], "yes")
+                   && !zip_output_text(tag.values[i], "no"))) {
+        return false;
+      }
+    }
+    if (!zip_output_xml_tag(&input, &tag)) {
+      return false;
+    }
+  }
+  const char *root = types ? "Types" : "Relationships";
+  const char *ns = types ? "http://schemas.openxmlformats.org/package/2006/content-types"
+                         : "http://schemas.openxmlformats.org/package/2006/relationships";
+  if (tag.closing || tag.empty || tag.declaration || !zip_output_text(tag.name, root)
+      || tag.attributes != 1 || !zip_output_text(tag.keys[0], "xmlns")
+      || !zip_output_text(tag.values[0], ns)) {
+    return false;
+  }
+  while (zip_output_xml_tag(&input, &tag)) {
+    if (tag.closing) {
+      if (!zip_output_text(tag.name, root)) {
+        return false;
+      }
+      return found && (!types || (rels_overridden ? rels_override : rels_default))
+             && zip_output_xml_misc(&input) && input.length == 0;
+    }
+    if (tag.declaration || count == ZIP_OUTPUT_XML_ITEMS) {
+      return false;
+    }
+    const bool override = types && zip_output_text(tag.name, "Override");
+    const ZipOutputText *key;
+    if (types) {
+      if (!override && !zip_output_text(tag.name, "Default")) {
+        return false;
+      }
+      key = zip_output_attribute(&tag, override ? "PartName" : "Extension");
+      const ZipOutputText *mime = zip_output_attribute(&tag, "ContentType");
+      if (!key || !mime || tag.attributes != 2 || key->length == 0
+          || mime->length == 0 || (override && !zip_output_path(*key, true))) {
+        return false;
+      }
+      if (!override) {
+        for (size_t i = 0; i < key->length; i++) {
+          const unsigned char c = key->data[i];
+          if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9'))) {
+            return false;
+          }
+        }
+      }
+      const bool relationship_mime = zip_output_text(*mime,
+          "application/vnd.openxmlformats-package.relationships+xml");
+      if (!override && zip_output_text(*key, "rels")) {
+        rels_default = relationship_mime;
+      }
+      if (override && zip_output_text(*key, "/_rels/.rels")) {
+        rels_overridden = true;
+        rels_override = relationship_mime;
+      }
+      const char *main_type = zip_output_mime(*mime);
+      if (main_type) {
+        if (!override || found) {
+          return false;
+        }
+        found = true;
+        *type = main_type;
+        *main_part = (ZipOutputText){key->data + 1, key->length - 1};
+      }
+      else if ((mime->length >= 9
+                && memcmp(mime->data + mime->length - 9, ".main+xml", 9) == 0)
+               || (mime->length >= 5
+                   && memcmp(mime->data + mime->length - 5, ".main", 5) == 0)) {
+        return false;
+      }
+    }
+    else {
+      key = zip_output_attribute(&tag, "Id");
+      const ZipOutputText *relation = zip_output_attribute(&tag, "Type");
+      const ZipOutputText *target = zip_output_attribute(&tag, "Target");
+      const ZipOutputText *mode = zip_output_attribute(&tag, "TargetMode");
+      if (!zip_output_text(tag.name, "Relationship") || !key || !relation || !target
+          || key->length == 0 || relation->length == 0
+          || tag.attributes != (mode ? 4u : 3u)
+          || (mode && !zip_output_text(*mode, "Internal"))
+          || !zip_output_path(*target, target->length != 0 && target->data[0] == '/')) {
+        return false;
+      }
+      ZipOutputText id = *key;
+      ZipOutputText parsed_id;
+      if (!zip_output_xml_name(&id, &parsed_id) || id.length != 0) {
+        return false;
+      }
+      if (zip_output_text(*relation, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument")
+          || zip_output_text(*relation, "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument")) {
+        if (found) {
+          return false;
+        }
+        found = true;
+        *main_part = *target;
+        if (target->data[0] == '/') {
+          main_part->data++;
+          main_part->length--;
+        }
+      }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+      if (overrides[i] == override && zip_output_compare_text(keys[i], *key) == 0) {
+        return false;
+      }
+    }
+    keys[count] = *key;
+    overrides[count++] = override;
+    if (!tag.empty) {
+      ZipOutputXmlTag end;
+      if (!zip_output_xml_tag(&input, &end) || !end.closing
+          || end.name.length != tag.name.length
+          || memcmp(end.name.data, tag.name.data, tag.name.length) != 0) {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+// Classify immutable emission bytes only. Missing metadata, contradictory ZIP
+// records, unsupported XML and every exceeded budget leave the output as ZIP.
+const char *zip_output_type(const OutputSnapshot *snapshot) {
+  if (!zip_output_range(snapshot, 0, ZIP_LOCAL_HEADER_SIZE)
+      || zip_read_le32(snapshot->data) != ZIP_LOCAL_HEADER_SIGNATURE) {
+    return NULL;
+  }
+  ZipOutputEntry *entries = calloc(ZIP_OUTPUT_ENTRIES, sizeof(*entries));
+  check_memory_allocation(entries, __LINE__, __FILE__, "ZIP output entries");
+  uint32_t count = 0;
+  uint64_t central_offset = 0;
+  const int directory = zip_output_directory(snapshot, entries, &count, &central_offset);
+  const char *result = NULL;
+  unsigned char *types = NULL;
+  unsigned char *rels = NULL;
+  if (directory < 0 || (directory == 0 && !zip_output_local(snapshot, entries, &count))) {
+    goto done;
+  }
+  qsort(entries, count, sizeof(*entries), zip_output_compare_name);
+  for (uint32_t i = 1; i < count; i++) {
+    if (zip_output_compare_text(entries[i - 1].name, entries[i].name) == 0) {
+      goto done;
+    }
+  }
+  qsort(entries, count, sizeof(*entries), zip_output_compare_offset);
+  ZipOutputEntry *type_entry = NULL;
+  ZipOutputEntry *rel_entry = NULL;
+  for (uint32_t i = 0; i < count; i++) {
+    ZipOutputEntry *entry = entries + i;
+    const bool is_types = zip_output_text(entry->name, "[Content_Types].xml");
+    const bool is_rels = zip_output_text(entry->name, "_rels/.rels");
+    if (directory != 0) {
+      const uint64_t limit = i + 1 < count ? entries[i + 1].offset : central_offset;
+      if ((i == 0 && entry->offset != 0)
+          || !zip_output_match_local(snapshot, entry, limit, is_types || is_rels)) {
+        goto done;
+      }
+    }
+    if (is_types) {
+      type_entry = entry;
+    }
+    if (is_rels) {
+      rel_entry = entry;
+    }
+  }
+  if (!type_entry || !rel_entry) {
+    goto done;
+  }
+  types = zip_output_metadata(snapshot, type_entry);
+  rels = zip_output_metadata(snapshot, rel_entry);
+  ZipOutputText type_part = {0};
+  ZipOutputText rel_part = {0};
+  const char *type = NULL;
+  if (!types || !rels
+      || !zip_output_xml(types, type_entry->uncompressed, true, &type_part, &type)
+      || !zip_output_xml(rels, rel_entry->uncompressed, false, &rel_part, &type)
+      || type_part.length != rel_part.length
+      || memcmp(type_part.data, rel_part.data, type_part.length) != 0) {
+    goto done;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    if (entries[i].name.length == type_part.length
+        && memcmp(entries[i].name.data, type_part.data, type_part.length) == 0
+        && entries[i].compressed != 0 && entries[i].uncompressed != 0
+        && &entries[i] != type_entry && &entries[i] != rel_entry) {
+      result = type;
+      break;
+    }
+  }
+done:
+  free(types);
+  free(rels);
+  free(entries);
+  return result;
+}
+
 static inline bool zip_has_archive_header(const uint8_t *data,
                                           uint64_t length);
 static inline char *zip_footer_discovery(char *base,

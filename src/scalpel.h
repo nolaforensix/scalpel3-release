@@ -270,6 +270,7 @@ typedef enum StateSerialization {
 typedef struct FileMirror FileMirror;
 typedef struct BlockVector BlockVector;
 typedef struct EssentialBlockVector EssentialBlockVector;
+typedef struct OutputSnapshot OutputSnapshot;
 
 
 // defines header/footer search strategy for file type
@@ -771,6 +772,10 @@ typedef struct SearchSpec {
                              bool *validates,
                              uint64_t *validates_to,
                              bool *promising);
+
+  // Optional output-only identification; return a static lowercase type label
+  // or NULL for FILETYPE. No mutation, I/O, retained snapshot or validation.
+  const char *(*OUTPUTTYPEFUNC)(const OutputSnapshot *snapshot);
 
   // don't carve function
   bool (*DONTCARVE)(char *data,                                  // pointer to buffer containing data to evaluate

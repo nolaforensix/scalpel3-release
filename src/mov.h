@@ -216,6 +216,19 @@ typedef struct IsoBmffSolution {
   int64_t middle_delta;
 } IsoBmffSolution;
 
+// Local to one trial buffer over the read-only image, never checkpointed.
+typedef struct IsoBmffMaterializedTrial {
+  IsoBmffSolution solution;
+  int64_t prefix_delta;
+  int64_t suffix_delta;
+  uint64_t extent;
+  uint64_t image_size;
+  uint64_t blocksize;
+  const void *filemirror;
+  const uint8_t *data;
+  bool valid;
+} IsoBmffMaterializedTrial;
+
 typedef struct IsoBmffStoredSolution {
   IsoBmffSolution mapping;
   uint64_t extent;
@@ -3409,14 +3422,25 @@ static inline uint64_t isobmff_solution_extent(
 }
 
 
-static inline bool isobmff_materialize_solution(
+static inline bool isobmff_materialize_solution_cached(
     int64_t prefix_delta, int64_t suffix_delta,
     const IsoBmffSolution *solution, uint64_t extent,
-    uint8_t *data) {
+    uint8_t *data, IsoBmffMaterializedTrial *memo) {
 
+  IsoBmffMaterializedTrial previous = {0};
+  if (memo) {
+    previous = *memo;
+    // A failed materialization must not authorize reuse.
+    memo->valid = false;
+  }
   if (!solution || !data || scalpel_state.blocksize == 0) {
     return false;
   }
+  uint64_t image_size = filemirror_filesize(scalpel_state.filemirror);
+  bool reusable = previous.valid && previous.data == data
+      && previous.filemirror == scalpel_state.filemirror
+      && previous.blocksize == scalpel_state.blocksize
+      && previous.image_size == image_size;
   uint64_t blocks = CEILDIV(extent, scalpel_state.blocksize);
   if (solution->base_split == 0 || solution->base_split > blocks
       || (solution->middle_delta != ISOBMFF_NO_MIDDLE_DELTA
@@ -3438,27 +3462,64 @@ static inline bool isobmff_materialize_solution(
     if (count > scalpel_state.blocksize) {
       count = scalpel_state.blocksize;
     }
-    if (!isobmff_copy_actual_bytes(
+    int64_t previous_actual = -1;
+    if (reusable && offset <= previous.extent
+        && count <= previous.extent - offset
+        && isobmff_solution_actual_block(
+            previous.prefix_delta, previous.suffix_delta,
+            &previous.solution, slot, &previous_actual)
+        && previous_actual == actual_block) {
+      uint64_t available = 0;
+      // Check current readability even when these physical bytes are unchanged.
+      if (!filemirror_actual_block_data_pointer(
+              scalpel_state.filemirror, actual_block, &available)
+          || available < count) {
+        return false;
+      }
+    }
+    else if (!isobmff_copy_actual_bytes(
             (uint64_t)actual_block * scalpel_state.blocksize,
             data + offset, count)) {
       return false;
     }
   }
+  if (memo) {
+    memo->solution = *solution;
+    memo->prefix_delta = prefix_delta;
+    memo->suffix_delta = suffix_delta;
+    memo->extent = extent;
+    memo->image_size = image_size;
+    memo->blocksize = scalpel_state.blocksize;
+    memo->filemirror = scalpel_state.filemirror;
+    memo->data = data;
+    memo->valid = true;
+  }
   return true;
 }
 
 
-static inline bool isobmff_solution_complete_with_memo(
+static inline bool isobmff_materialize_solution(
     int64_t prefix_delta, int64_t suffix_delta,
     const IsoBmffSolution *solution, uint64_t extent,
-    uint8_t *data, IsoBmffLayout *layout, IsoBmffTgaSampleMemo *memo) {
+    uint8_t *data) {
+
+  return isobmff_materialize_solution_cached(
+      prefix_delta, suffix_delta, solution, extent, data, NULL);
+}
+
+
+static inline bool isobmff_solution_complete_with_trial_memo(
+    int64_t prefix_delta, int64_t suffix_delta,
+    const IsoBmffSolution *solution, uint64_t extent,
+    uint8_t *data, IsoBmffLayout *layout, IsoBmffTgaSampleMemo *memo,
+    IsoBmffMaterializedTrial *trial_memo) {
 
   if (!layout) {
     return false;
   }
   memset(layout, 0, sizeof(*layout));
-  if (!isobmff_materialize_solution(prefix_delta, suffix_delta,
-                                    solution, extent, data)) {
+  if (!isobmff_materialize_solution_cached(prefix_delta, suffix_delta,
+                                         solution, extent, data, trial_memo)) {
     return false;
   }
   // A rejected complete trial is discarded; later sample failures add no value.
@@ -3468,6 +3529,16 @@ static inline bool isobmff_solution_complete_with_memo(
       && layout->saw_moov && layout->mdat_count > 0
       && layout->invalid_strong_samples == 0
       && layout->parsed_extent == extent && !layout->terminal_size;
+}
+
+
+static inline bool isobmff_solution_complete_with_memo(
+    int64_t prefix_delta, int64_t suffix_delta,
+    const IsoBmffSolution *solution, uint64_t extent,
+    uint8_t *data, IsoBmffLayout *layout, IsoBmffTgaSampleMemo *memo) {
+
+  return isobmff_solution_complete_with_trial_memo(
+      prefix_delta, suffix_delta, solution, extent, data, layout, memo, NULL);
 }
 
 
@@ -6478,6 +6549,7 @@ static inline void isobmff_reassembly(
         continue;
       }
       IsoBmffTgaSampleMemo tga_memo = {0};
+      IsoBmffMaterializedTrial trial_memo = {0};
       uint8_t *trial = (uint8_t *)malloc((size_t)context.extent);
       uint64_t trial_capacity = context.extent;
       if (!trial) {
@@ -6519,6 +6591,7 @@ static inline void isobmff_reassembly(
                   first, second, actual,
                   CEILDIV(solution_extent, scalpel_state.blocksize));
               if (solution_extent > trial_capacity) {
+                trial_memo.valid = false;
                 uint8_t *grown = (uint8_t *)realloc(
                     trial, (size_t)solution_extent);
                 if (!grown) {
@@ -6534,10 +6607,10 @@ static inline void isobmff_reassembly(
                       &context, context.prefix_delta,
                       context.suffix_delta, &solution)) {
                 IsoBmffLayout layout;
-                if (isobmff_solution_complete_with_memo(
+                if (isobmff_solution_complete_with_trial_memo(
                         context.prefix_delta, context.suffix_delta,
                         &solution, solution_extent, trial, &layout,
-                        &tga_memo)) {
+                        &tga_memo, &trial_memo)) {
                   IsoBmffFooterContext solution_context = context;
                   solution_context.extent = solution_extent;
                   solution_context.logical_blocks = CEILDIV(

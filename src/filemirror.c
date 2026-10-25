@@ -359,6 +359,18 @@ char *blockvector_get_data_pointer(BlockVector *b) {
 }
 
 
+// Borrow the same byte view and presence map used by the output writer. The
+// caller must keep b stable and must not retain this view after publishing b.
+void blockvector_get_output_snapshot(BlockVector *b, OutputSnapshot *snapshot) {
+
+  snapshot->data = (const unsigned char *)blockvector_get_data_pointer(b);
+  snapshot->length = b->length;
+  snapshot->blocksize = b->filemirror->blocksize;
+  snapshot->numblocks = b->numblocks;
+  snapshot->present = b->valid;
+}
+
+
 // output blockvector contents for debugging
 void display_blockvector(BlockVector *b, char *msg) {
 

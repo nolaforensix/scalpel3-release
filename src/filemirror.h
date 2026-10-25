@@ -82,6 +82,16 @@ typedef struct FileMirror FileMirror;
 // main blockvector type
 typedef struct BlockVector BlockVector;
 
+// Borrowed, read-only view of the exact output snapshot. Bytes in absent blocks
+// must not be inspected: the writer emits zeroes there, not the scratch buffer.
+typedef struct OutputSnapshot {
+  const unsigned char *data;
+  uint64_t length;
+  uint64_t blocksize;
+  uint64_t numblocks;
+  const bool *present;
+} OutputSnapshot;
+
 // since BlockVector is an opaque type, this data structure allows exposing apparent and actual
 // block numbers for a blockvector for debugging and human-in-the-loop decision-making, while hiding
 // details that depend on filemirror and scalpel3 state. An instance of EssentialBlockVector can be
@@ -134,6 +144,7 @@ void blockvector_set_apparent_blocknumber(BlockVector *b, uint64_t index, int64_
 int64_t blockvector_get_apparent_blocknumber(BlockVector *b, uint64_t index);
 int64_t blockvector_get_actual_blocknumber(BlockVector *b, uint64_t index);
 char *blockvector_get_data_pointer(BlockVector *b);
+void blockvector_get_output_snapshot(BlockVector *b, OutputSnapshot *snapshot);
 uint64_t blockvector_data_pointer_offset_to_actual_location(BlockVector *b, uint64_t offset);
 void normalize_blockvector(BlockVector *b);
 void free_blockvector(BlockVector **b);

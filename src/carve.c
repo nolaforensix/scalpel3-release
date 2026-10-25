@@ -98,6 +98,24 @@ struct timespec starttime;
 static CheckpointSelection restored_checkpoint;
 static bool restored_checkpoint_selected = false;
 
+// Output-only types do not create search specifications. Restore starts a new
+// timestamped output directory, so these counters are intentionally ephemeral.
+typedef struct OutputTypeDirectory {
+  char type[MAX_STRING_LENGTH];
+  CarveInfoFlavor flavor;
+  uint64_t number;
+  uint64_t count;
+  struct OutputTypeDirectory *next;
+} OutputTypeDirectory;
+
+static OutputTypeDirectory *output_type_directories;
+static char output_type_root[PATH_MAX];
+static pthread_mutex_t output_type_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static FilePublicationReservation reserve_typed_output(
+    CarveInfo *candidate, const char *type, const char *hash,
+    const char *uuidp, const char *uuidc, char *pathname, char *staging);
+
 // command line overrides for threadpool sizes and number of CPU cores
 uint32_t max_filemirror_threads_override = 0;
 uint32_t max_reassembly_threads_override = 0;
@@ -579,6 +597,9 @@ static void update_inprogress_directories(void) {
   CarveInfo **c;
 
   frame_message("WIPING INPROGRESS DIRECTORIES");
+  // A checkpoint can perform additional carving after its first idle barrier.
+  // Drain those writes before deleting old snapshots or changing their names.
+  filemirror_wait_for_vector_operations(scalpel_state.filemirror);
   // first wipe all files in the INPROGRESS directory
   snprintf(purge_pathname, PATH_MAX, "*INPROGRESS/*/*");
   delete_files_recursive(scalpel_state.base_output_directory, purge_pathname);
@@ -2137,6 +2158,8 @@ static void scalpel_state_serialization(StateSerialization mode, char *filename)
       scalpel_state.search_specs[i].FILEVALIDATOR = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].FILEVALIDATOR;
       scalpel_state.search_specs[i].CANDIDATEVALIDATOR =
           INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].CANDIDATEVALIDATOR;
+      scalpel_state.search_specs[i].OUTPUTTYPEFUNC =
+          INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].OUTPUTTYPEFUNC;
       scalpel_state.search_specs[i].DONTCARVE = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].DONTCARVE;
       scalpel_state.search_specs[i].REASSEMBLYFUNC = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype].REASSEMBLYFUNC;
       scalpel_state.search_specs[i].SERIALIZECARVESTATEFUNC = INITIAL_SEARCH_SPECS[scalpel_state.search_specs[i].mastertype]
@@ -6174,6 +6197,87 @@ static void prune_header_footer_database(void) {
 }
 
 
+// Allocate consecutive directories independently for each displayed type and
+// flavor. The lock protects names/counters only; writer threads never take it.
+static FilePublicationReservation reserve_typed_output(
+    CarveInfo *candidate, const char *type, const char *hash,
+    const char *uuidp, const char *uuidc, char *pathname, char *staging) {
+
+  char directory[PATH_MAX];
+  if (candidate->flavor != INPROGRESS && candidate->flavor != PROMISING
+      && candidate->flavor != VALIDATED) {
+    handle_error(SCALPEL_GENERAL_ABORT, "Invalid output flavor", __LINE__, __FILE__);
+  }
+  const char *flavor = candidate->flavor == INPROGRESS ? "INPROGRESS"
+                       : candidate->flavor == PROMISING ? "PROMISING" : "VALIDATED";
+  bool new_snapshot = candidate->flavor != INPROGRESS || !candidate->inprogress_pathname[0];
+  MUTEX_ERROR_CHECK(pthread_mutex_lock(&output_type_lock), __LINE__, __FILE__);
+  if (strcmp(output_type_root, scalpel_state.output_directory)) {
+    while (output_type_directories) {
+      OutputTypeDirectory *next = output_type_directories->next;
+      free(output_type_directories);
+      output_type_directories = next;
+    }
+    snprintf(output_type_root, sizeof(output_type_root), "%s", scalpel_state.output_directory);
+  }
+  OutputTypeDirectory *entry = output_type_directories;
+  while (entry && (entry->flavor != candidate->flavor || strcmp(entry->type, type))) {
+    entry = entry->next;
+  }
+  if (!entry) {
+    entry = calloc(1, sizeof(*entry));
+    check_memory_allocation(entry, __LINE__, __FILE__, "output type directory");
+    snprintf(entry->type, sizeof(entry->type), "%s", type);
+    entry->flavor = candidate->flavor;
+    entry->next = output_type_directories;
+    output_type_directories = entry;
+  }
+  if (!new_snapshot) {
+    snprintf(pathname, PATH_MAX, "%s", candidate->inprogress_pathname);
+  }
+  else {
+    int length;
+    if (scalpel_state.organize_subdirectories) {
+      length = snprintf(directory, sizeof(directory), "%s/%s/%s-%" PRIu64,
+                        scalpel_state.output_directory, flavor, type, entry->number);
+    }
+    else {
+      length = snprintf(directory, sizeof(directory), "%s/%s", scalpel_state.output_directory, flavor);
+    }
+    if (length < 0 || (size_t)length >= sizeof(directory)) {
+      handle_error(SCALPEL_ERROR_FILE_WRITE, "Output directory is too long", __LINE__, __FILE__);
+    }
+    if (mkdir(directory, 0777) != 0 && errno != EEXIST) {
+      handle_error(SCALPEL_ERROR_FILE_WRITE, directory, __LINE__, __FILE__);
+    }
+    if (candidate->flavor == INPROGRESS) {
+      length = snprintf(pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$.%s", directory, uuidp, uuidc, type);
+    }
+    else {
+      length = snprintf(pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$-%s%s.%s", directory, uuidp, uuidc, hash,
+                        candidate->flavor == PROMISING && candidate->chopped ? "-CHOPPED" : "", type);
+    }
+    if (length < 0 || length >= PATH_MAX
+        || (candidate->flavor == INPROGRESS && (size_t)length >= sizeof(candidate->inprogress_pathname))) {
+      handle_error(SCALPEL_ERROR_FILE_WRITE, "Output pathname is too long", __LINE__, __FILE__);
+    }
+  }
+  FilePublicationReservation result = filemirror_reserve_output(pathname, candidate->flavor, staging);
+  if (result == FILE_PUBLICATION_RESERVED && new_snapshot) {
+    if (candidate->flavor == INPROGRESS) {
+      strcpy(candidate->inprogress_pathname, pathname);
+    }
+    entry->count++;
+    if (entry->count == MAX_FILES_PER_SUBDIRECTORY && scalpel_state.organize_subdirectories) {
+      entry->number++;
+      entry->count = 0;
+    }
+  }
+  MUTEX_ERROR_CHECK(pthread_mutex_unlock(&output_type_lock), __LINE__, __FILE__);
+  return result;
+}
+
+
 // write file and possibly blockvector, subject to configuration options. A file type's (optional)
 // NOCARVE function can override the carving operation to avoid writing files that are, e.g., known
 // to be uninteresting.
@@ -6190,8 +6294,11 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
   char file_pathname[PATH_MAX];
   char file_staging_pathname[PATH_MAX];
   char blockvector_pathname[PATH_MAX];
+  char superseded_pathname[MAX_STRING_LENGTH] = {0};
   unsigned char sha256[32];
-  BlockVector *cloneb;
+  BlockVector *cloneb = NULL;
+  const char *output_type = scalpel_state.search_specs[candidate->needleidx].FILETYPE;
+  char identified_type[32];
 
   char sha256hex[32 * 2 + sizeof("-CHOPPED")];
 
@@ -6275,6 +6382,50 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
 
   if (! dont_carve) {
 
+    // Classify the publication snapshot, not speculative bytes beyond the
+    // INPROGRESS prefix. This same clone is handed to the asynchronous writer.
+    if (preserve) {
+      clone_blockvector(candidate->b, &cloneb, false);
+      if (candidate->flavor == INPROGRESS && candidate->best_validates_to > 0
+          && candidate->best_validates_to + 1 < blockvector_get_data_length(cloneb)
+          && scalpel_state.blocksize > 0) {
+        blockvector_set_data_length(cloneb, candidate->best_validates_to + 1);
+        resize_blockvector(cloneb, CEILDIV(candidate->best_validates_to + 1, scalpel_state.blocksize));
+      }
+    }
+    if (scalpel_state.search_specs[candidate->needleidx].OUTPUTTYPEFUNC) {
+      OutputSnapshot snapshot;
+      blockvector_get_output_snapshot(cloneb ? cloneb : candidate->b, &snapshot);
+      const char *label = scalpel_state.search_specs[candidate->needleidx].OUTPUTTYPEFUNC(&snapshot);
+      if (label) {
+        size_t length = strnlen(label, sizeof(identified_type));
+        bool safe = length > 0 && length < sizeof(identified_type);
+        for (size_t i = 0; safe && i < length; i++) {
+          safe = (label[i] >= 'a' && label[i] <= 'z')
+                 || (label[i] >= '0' && label[i] <= '9')
+                 || (i > 0 && label[i] == '-');
+        }
+        if (safe) {
+          memcpy(identified_type, label, length + 1);
+          output_type = identified_type;
+        }
+        else if (scalpel_state.mode_verbose) {
+          lock_fprintf(stdout, "Ignoring an unsafe output type label for %s.\n", output_type);
+        }
+      }
+    }
+
+    // Usually the refresh has already removed this old path. For direct writes,
+    // drain the old generation now but retire it only after replacement succeeds.
+    if (candidate->flavor == INPROGRESS && candidate->inprogress_pathname[0]) {
+      const char *extension = strrchr(candidate->inprogress_pathname, '.');
+      if (! extension || strcmp(extension + 1, output_type)) {
+        filemirror_wait_for_vector_operations(scalpel_state.filemirror);
+        strcpy(superseded_pathname, candidate->inprogress_pathname);
+        candidate->inprogress_pathname[0] = 0;
+      }
+    }
+
     if (scalpel_state.mode_verbose) {
       lock_fprintf(stdout,
                    "write_candidate() processing candidate with UUIDs\n"
@@ -6283,174 +6434,198 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
                    candidate->flavor == PROMISING ? "PROMISING" : (candidate->flavor == VALIDATED ? "VALIDATED" : "INPROGRESS"));
     }
 
-    // lock needle for filename creation
-    MUTEX_ERROR_CHECK(pthread_mutex_lock(&scalpel_state.search_specs[candidate->needleidx].filewritelock), __LINE__, __FILE__);
-
-    // one more file to write
-    file_pathname[0] = 0;
-    file_staging_pathname[0] = 0;
-    blockvector_pathname[0] = 0;
-
-    // get pathname for carved file and associated blockvector
-
-    // flavor and subdir first
-    if (scalpel_state.organize_subdirectories) {
-      if (candidate->flavor == VALIDATED && scalpel_state.search_specs[candidate->needleidx].validated_in_subdir == 0) {
-        // first file in new subdir, so update subdir name and call mkdir()
-        snprintf(scalpel_state.search_specs[candidate->needleidx].v_current_subdir, PATH_MAX, "%s/%s/%s-%1" PRIu64 "",
-                 scalpel_state.output_directory, "VALIDATED", scalpel_state.search_specs[candidate->needleidx].FILETYPE,
-                 scalpel_state.search_specs[candidate->needleidx].v_organize_dir_num);
-        mkdir(scalpel_state.search_specs[candidate->needleidx].v_current_subdir, 0777);
+    if (scalpel_state.search_specs[candidate->needleidx].OUTPUTTYPEFUNC) {
+      reservation = reserve_typed_output(candidate, output_type, sha256hex,
+                                         uuidp, uuidc, file_pathname, file_staging_pathname);
+      if (reservation == FILE_PUBLICATION_RESERVED) {
+        if (candidate->flavor == VALIDATED) {
+          atomic_fetch_add_explicit(&scalpel_state.validated_files, 1, memory_order_acq_rel);
+          atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].validated_files, 1, memory_order_acq_rel);
+        }
       }
-      else if (candidate->flavor == PROMISING && scalpel_state.search_specs[candidate->needleidx].promising_in_subdir == 0) {
-        // first file in new subdir, so update subdir name and call mkdir()
-        snprintf(scalpel_state.search_specs[candidate->needleidx].p_current_subdir, PATH_MAX, "%s/%s/%s-%1" PRIu64 "",
-                 scalpel_state.output_directory, "PROMISING", scalpel_state.search_specs[candidate->needleidx].FILETYPE,
-                 scalpel_state.search_specs[candidate->needleidx].p_organize_dir_num);
-        mkdir(scalpel_state.search_specs[candidate->needleidx].p_current_subdir, 0777);
+      else if (candidate->flavor != INPROGRESS
+               && (reservation == FILE_PUBLICATION_COMMITTED || reservation == FILE_PUBLICATION_IN_PROGRESS)) {
+        dont_carve = true;
       }
-      else if (candidate->flavor == INPROGRESS && scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir == 0
-               && ! candidate->inprogress_pathname[0]) {
-        // no fixed inprogress_pathname yet and first file in new subdir, so update subdir name and
-        // call mkdir()
-        snprintf(scalpel_state.search_specs[candidate->needleidx].i_current_subdir, PATH_MAX, "%s/%s/%s-%1" PRIu64 "",
-                 scalpel_state.output_directory, "INPROGRESS", scalpel_state.search_specs[candidate->needleidx].FILETYPE,
-                 scalpel_state.search_specs[candidate->needleidx].i_organize_dir_num);
-        mkdir(scalpel_state.search_specs[candidate->needleidx].i_current_subdir, 0777);
+      else {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
+      }
+      blockvector_pathname[0] = 0;
+      if (scalpel_state.write_blockvectors) {
+        snprintf(blockvector_pathname, sizeof(blockvector_pathname), "%s.BLOCKVECTOR.txt", file_pathname);
       }
     }
     else {
-      // no organization into subdirs
-      snprintf(scalpel_state.search_specs[candidate->needleidx].v_current_subdir, PATH_MAX, "%s/%s", scalpel_state.output_directory,
-               "VALIDATED");
-      snprintf(scalpel_state.search_specs[candidate->needleidx].p_current_subdir, PATH_MAX, "%s/%s", scalpel_state.output_directory,
-               "PROMISING");
-      snprintf(scalpel_state.search_specs[candidate->needleidx].i_current_subdir, PATH_MAX, "%s/%s", scalpel_state.output_directory,
-               "INPROGRESS");
-    }
+      // Keep the legacy filename/counter path unchanged for other validators.
+      // lock needle for filename creation
+      MUTEX_ERROR_CHECK(pthread_mutex_lock(&scalpel_state.search_specs[candidate->needleidx].filewritelock), __LINE__, __FILE__);
 
-    switch (candidate->flavor) {
-    case VALIDATED:
-      // put UUIDS in filenames for job tracking
-      snprintf(file_pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$-%s.%s",
-               scalpel_state.search_specs[candidate->needleidx].v_current_subdir, uuidp, uuidc, sha256hex,
-               scalpel_state.search_specs[candidate->needleidx].FILETYPE);
+      // one more file to write
+      file_pathname[0] = 0;
+      file_staging_pathname[0] = 0;
+      blockvector_pathname[0] = 0;
 
-      // reserve a hidden staging pathname. The final pathname remains absent until the asynchronous
-      // writer has completed and atomically publishes the recovered file.
-      reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
-                                               file_staging_pathname);
-      if (reservation == FILE_PUBLICATION_RESERVED) {
-        // one more validated file
-        scalpel_state.search_specs[candidate->needleidx].validated_in_subdir++;
-        atomic_fetch_add_explicit(&scalpel_state.validated_files, 1, memory_order_acq_rel);
-        atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].validated_files, 1, memory_order_acq_rel);
+      // get pathname for carved file and associated blockvector
 
-        // only a reasonable number of files in each subdir
-        if (scalpel_state.search_specs[candidate->needleidx].validated_in_subdir == MAX_FILES_PER_SUBDIRECTORY
-            && scalpel_state.organize_subdirectories) {
-          // reached max # of files per subdir; next write will be in a new subdir
-          scalpel_state.search_specs[candidate->needleidx].v_organize_dir_num++;
-          scalpel_state.search_specs[candidate->needleidx].v_current_subdir[0] = 0;
-          scalpel_state.search_specs[candidate->needleidx].validated_in_subdir = 0;
+      // flavor and subdir first
+      if (scalpel_state.organize_subdirectories) {
+        if (candidate->flavor == VALIDATED && scalpel_state.search_specs[candidate->needleidx].validated_in_subdir == 0) {
+          // first file in new subdir, so update subdir name and call mkdir()
+          snprintf(scalpel_state.search_specs[candidate->needleidx].v_current_subdir, PATH_MAX, "%s/%s/%s-%1" PRIu64 "",
+                   scalpel_state.output_directory, "VALIDATED", scalpel_state.search_specs[candidate->needleidx].FILETYPE,
+                   scalpel_state.search_specs[candidate->needleidx].v_organize_dir_num);
+          mkdir(scalpel_state.search_specs[candidate->needleidx].v_current_subdir, 0777);
+        }
+        else if (candidate->flavor == PROMISING && scalpel_state.search_specs[candidate->needleidx].promising_in_subdir == 0) {
+          // first file in new subdir, so update subdir name and call mkdir()
+          snprintf(scalpel_state.search_specs[candidate->needleidx].p_current_subdir, PATH_MAX, "%s/%s/%s-%1" PRIu64 "",
+                   scalpel_state.output_directory, "PROMISING", scalpel_state.search_specs[candidate->needleidx].FILETYPE,
+                   scalpel_state.search_specs[candidate->needleidx].p_organize_dir_num);
+          mkdir(scalpel_state.search_specs[candidate->needleidx].p_current_subdir, 0777);
+        }
+        else if (candidate->flavor == INPROGRESS && scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir == 0
+                 && ! candidate->inprogress_pathname[0]) {
+          // no fixed inprogress_pathname yet and first file in new subdir, so update subdir name and
+          // call mkdir()
+          snprintf(scalpel_state.search_specs[candidate->needleidx].i_current_subdir, PATH_MAX, "%s/%s/%s-%1" PRIu64 "",
+                   scalpel_state.output_directory, "INPROGRESS", scalpel_state.search_specs[candidate->needleidx].FILETYPE,
+                   scalpel_state.search_specs[candidate->needleidx].i_organize_dir_num);
+          mkdir(scalpel_state.search_specs[candidate->needleidx].i_current_subdir, 0777);
         }
       }
-      else if (reservation == FILE_PUBLICATION_COMMITTED
-               || reservation == FILE_PUBLICATION_IN_PROGRESS) {
-        // genuine duplicate--work sharing can validate the same candidate twice
-        dont_carve = true;
-      }
       else {
-        // a non-recoverable write error has occurred
-        handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
-      }
-      break;
-
-    case PROMISING:
-      // mark CHOPPED files
-      if (candidate->chopped) {
-        strcat(sha256hex, "-CHOPPED");
+        // no organization into subdirs
+        snprintf(scalpel_state.search_specs[candidate->needleidx].v_current_subdir, PATH_MAX, "%s/%s", scalpel_state.output_directory,
+                 "VALIDATED");
+        snprintf(scalpel_state.search_specs[candidate->needleidx].p_current_subdir, PATH_MAX, "%s/%s", scalpel_state.output_directory,
+                 "PROMISING");
+        snprintf(scalpel_state.search_specs[candidate->needleidx].i_current_subdir, PATH_MAX, "%s/%s", scalpel_state.output_directory,
+                 "INPROGRESS");
       }
 
-      // put UUIDS in filenames for job tracking
-      snprintf(file_pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$-%s.%s",
-               scalpel_state.search_specs[candidate->needleidx].p_current_subdir, uuidp, uuidc, sha256hex,
-               scalpel_state.search_specs[candidate->needleidx].FILETYPE);
-
-      // reserve a hidden staging pathname for write-once publication.
-      reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
-                                               file_staging_pathname);
-      if (reservation == FILE_PUBLICATION_RESERVED) {
-        scalpel_state.search_specs[candidate->needleidx].promising_in_subdir++;
-
-        // only a reasonable number of files in each subdir
-        if (scalpel_state.search_specs[candidate->needleidx].promising_in_subdir == MAX_FILES_PER_SUBDIRECTORY
-            && scalpel_state.organize_subdirectories) {
-          // reached max # of files per subdir; next write will be in a new subdir
-          scalpel_state.search_specs[candidate->needleidx].p_organize_dir_num++;
-          scalpel_state.search_specs[candidate->needleidx].p_current_subdir[0] = 0;
-          scalpel_state.search_specs[candidate->needleidx].promising_in_subdir = 0;
-        }
-      }
-      else if (reservation == FILE_PUBLICATION_COMMITTED
-               || reservation == FILE_PUBLICATION_IN_PROGRESS) {
-        // genuine duplicate--work sharing can validate the same candidate twice
-        dont_carve = true;
-      }
-      else {
-        // a non-recoverable write error has occurred
-        handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
-      }
-      break;
-
-    case INPROGRESS:
-      // INPROGRESS files have a fixed pathname to make monitoring easier. The filename consists
-      // solely of the UUIDs for the candidate to make the name unique.
-
-      if (! candidate->inprogress_pathname[0]) {
-        // no fixed name yet, so generate one
-        snprintf(file_pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$.%s",
-                 scalpel_state.search_specs[candidate->needleidx].i_current_subdir, uuidp, uuidc,
+      switch (candidate->flavor) {
+      case VALIDATED:
+        // put UUIDS in filenames for job tracking
+        snprintf(file_pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$-%s.%s",
+                 scalpel_state.search_specs[candidate->needleidx].v_current_subdir, uuidp, uuidc, sha256hex,
                  scalpel_state.search_specs[candidate->needleidx].FILETYPE);
-        strcpy(candidate->inprogress_pathname, file_pathname);
 
-        scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir++;
+        // reserve a hidden staging pathname. The final pathname remains absent until the asynchronous
+        // writer has completed and atomically publishes the recovered file.
+        reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
+                                                 file_staging_pathname);
+        if (reservation == FILE_PUBLICATION_RESERVED) {
+          // one more validated file
+          scalpel_state.search_specs[candidate->needleidx].validated_in_subdir++;
+          atomic_fetch_add_explicit(&scalpel_state.validated_files, 1, memory_order_acq_rel);
+          atomic_fetch_add_explicit(&scalpel_state.search_specs[candidate->needleidx].validated_files, 1, memory_order_acq_rel);
 
-        // only a reasonable number of files in each subdir
-        if (scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir == MAX_FILES_PER_SUBDIRECTORY
-            && scalpel_state.organize_subdirectories) {
-          // reached max # of files per subdir; next unique inprogress will be in a new subdir
-          scalpel_state.search_specs[candidate->needleidx].i_organize_dir_num++;
-          scalpel_state.search_specs[candidate->needleidx].i_current_subdir[0] = 0;
-          scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir = 0;
+          // only a reasonable number of files in each subdir
+          if (scalpel_state.search_specs[candidate->needleidx].validated_in_subdir == MAX_FILES_PER_SUBDIRECTORY
+              && scalpel_state.organize_subdirectories) {
+            // reached max # of files per subdir; next write will be in a new subdir
+            scalpel_state.search_specs[candidate->needleidx].v_organize_dir_num++;
+            scalpel_state.search_specs[candidate->needleidx].v_current_subdir[0] = 0;
+            scalpel_state.search_specs[candidate->needleidx].validated_in_subdir = 0;
+          }
         }
-      }
-      else {
-        strcpy(file_pathname, candidate->inprogress_pathname);
+        else if (reservation == FILE_PUBLICATION_COMMITTED
+                 || reservation == FILE_PUBLICATION_IN_PROGRESS) {
+          // genuine duplicate--work sharing can validate the same candidate twice
+          dont_carve = true;
+        }
+        else {
+          // a non-recoverable write error has occurred
+          handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
+        }
+        break;
+
+      case PROMISING:
+        // mark CHOPPED files
+        if (candidate->chopped) {
+          strcat(sha256hex, "-CHOPPED");
+        }
+
+        // put UUIDS in filenames for job tracking
+        snprintf(file_pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$-%s.%s",
+                 scalpel_state.search_specs[candidate->needleidx].p_current_subdir, uuidp, uuidc, sha256hex,
+                 scalpel_state.search_specs[candidate->needleidx].FILETYPE);
+
+        // reserve a hidden staging pathname for write-once publication.
+        reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
+                                                 file_staging_pathname);
+        if (reservation == FILE_PUBLICATION_RESERVED) {
+          scalpel_state.search_specs[candidate->needleidx].promising_in_subdir++;
+
+          // only a reasonable number of files in each subdir
+          if (scalpel_state.search_specs[candidate->needleidx].promising_in_subdir == MAX_FILES_PER_SUBDIRECTORY
+              && scalpel_state.organize_subdirectories) {
+            // reached max # of files per subdir; next write will be in a new subdir
+            scalpel_state.search_specs[candidate->needleidx].p_organize_dir_num++;
+            scalpel_state.search_specs[candidate->needleidx].p_current_subdir[0] = 0;
+            scalpel_state.search_specs[candidate->needleidx].promising_in_subdir = 0;
+          }
+        }
+        else if (reservation == FILE_PUBLICATION_COMMITTED
+                 || reservation == FILE_PUBLICATION_IN_PROGRESS) {
+          // genuine duplicate--work sharing can validate the same candidate twice
+          dont_carve = true;
+        }
+        else {
+          // a non-recoverable write error has occurred
+          handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
+        }
+        break;
+
+      case INPROGRESS:
+        // INPROGRESS files have a fixed pathname to make monitoring easier. The filename consists
+        // solely of the UUIDs for the candidate to make the name unique.
+
+        if (! candidate->inprogress_pathname[0]) {
+          // no fixed name yet, so generate one
+          snprintf(file_pathname, PATH_MAX, "%s/UUIDS-$$%s$$%s$$.%s",
+                   scalpel_state.search_specs[candidate->needleidx].i_current_subdir, uuidp, uuidc,
+                   scalpel_state.search_specs[candidate->needleidx].FILETYPE);
+          strcpy(candidate->inprogress_pathname, file_pathname);
+
+          scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir++;
+
+          // only a reasonable number of files in each subdir
+          if (scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir == MAX_FILES_PER_SUBDIRECTORY
+              && scalpel_state.organize_subdirectories) {
+            // reached max # of files per subdir; next unique inprogress will be in a new subdir
+            scalpel_state.search_specs[candidate->needleidx].i_organize_dir_num++;
+            scalpel_state.search_specs[candidate->needleidx].i_current_subdir[0] = 0;
+            scalpel_state.search_specs[candidate->needleidx].inprogress_in_subdir = 0;
+          }
+        }
+        else {
+          strcpy(file_pathname, candidate->inprogress_pathname);
+        }
+
+        reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
+                                                 file_staging_pathname);
+        if (reservation != FILE_PUBLICATION_RESERVED) {
+          handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
+        }
+        break;
+
+      default:
+        handle_error(SCALPEL_GENERAL_ABORT,
+                     "** BAD STATE IN write_candidate() **,\nPLEASE REPORT THIS "
+                     "ERROR, ABORTING.\n",
+                     __LINE__, __FILE__);
       }
 
-      reservation = filemirror_reserve_output(file_pathname, candidate->flavor,
-                                               file_staging_pathname);
-      if (reservation != FILE_PUBLICATION_RESERVED) {
-        handle_error(SCALPEL_ERROR_FILE_WRITE, file_pathname, __LINE__, __FILE__);
+      if (scalpel_state.write_blockvectors) {
+        // generate pathname for blockvector
+        snprintf(blockvector_pathname, PATH_MAX, "%s.BLOCKVECTOR.txt", file_pathname);
       }
-      break;
 
-    default:
-      handle_error(SCALPEL_GENERAL_ABORT,
-                   "** BAD STATE IN write_candidate() **,\nPLEASE REPORT THIS "
-                   "ERROR, ABORTING.\n",
-                   __LINE__, __FILE__);
+      // unlock needle for filename creation. The lock is only needed for filename generation--I/O can
+      // happen without the lock, to increase performance.
+      MUTEX_ERROR_CHECK(pthread_mutex_unlock(&scalpel_state.search_specs[candidate->needleidx].filewritelock), __LINE__, __FILE__);
     }
-
-    if (scalpel_state.write_blockvectors) {
-      // generate pathname for blockvector
-      snprintf(blockvector_pathname, PATH_MAX, "%s.BLOCKVECTOR.txt", file_pathname);
-    }
-
-    // unlock needle for filename creation. The lock is only needed for filename generation--I/O can
-    // happen without the lock, to increase performance.
-    MUTEX_ERROR_CHECK(pthread_mutex_unlock(&scalpel_state.search_specs[candidate->needleidx].filewritelock), __LINE__, __FILE__);
 
     if (scalpel_state.mode_verbose) {
       lock_fprintf(stdout,
@@ -6482,32 +6657,25 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
   }
 
   if (! dont_carve) {
-    // if preserve is set, this is a non-destructive write, so a clone of the blockvector must be
-    // used, as write_blockvector always frees the blockvector
-
-    if (preserve) {
-      // clone blockvector *without* copying the choice info
-      clone_blockvector(candidate->b, &cloneb, false);
-      // For INPROGRESS candidates: trim the clone to best_validates_to + 1
-      // so only validated data is written. This prevents transient exploration
-      // state (unvalidated blocks being tested) from appearing in checkpoints.
-      if (candidate->flavor == INPROGRESS && candidate->best_validates_to > 0
-          && candidate->best_validates_to + 1 < blockvector_get_data_length(cloneb)
-          && scalpel_state.blocksize > 0) {
-        blockvector_set_data_length(cloneb, candidate->best_validates_to + 1);
-        resize_blockvector(cloneb, CEILDIV(candidate->best_validates_to + 1, scalpel_state.blocksize));
-      }
-    }
-    else {
-      cloneb = NULL;
-    }
-
     write_blockvector(cloneb ? cloneb : candidate->b,
                       dont_carve ? NULL : file_pathname,
                       dont_carve ? NULL : file_staging_pathname,
                       (dont_carve || ! scalpel_state.write_blockvectors) ? NULL : blockvector_pathname,
                       candidate->flavor,
                       candidate->flavor == VALIDATED);  // blockmap updates only for validated files
+
+    if (superseded_pathname[0]) {
+      // No naming lock is held. Publication errors terminate before this drain
+      // completes, preserving the previous snapshot if replacement fails.
+      filemirror_wait_for_vector_operations(scalpel_state.filemirror);
+      if (unlink(superseded_pathname) != 0 && errno != ENOENT) {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, superseded_pathname, __LINE__, __FILE__);
+      }
+      snprintf(blockvector_pathname, sizeof(blockvector_pathname), "%s.BLOCKVECTOR.txt", superseded_pathname);
+      if (unlink(blockvector_pathname) != 0 && errno != ENOENT) {
+        handle_error(SCALPEL_ERROR_FILE_WRITE, blockvector_pathname, __LINE__, __FILE__);
+      }
+    }
 
     if (candidate->flavor == PROMISING || candidate->flavor == INPROGRESS) {
       candidate->partial_artifact_written = true;
@@ -6523,6 +6691,12 @@ void write_candidate(CarveInfo **candidatep, bool preserve) {
            && ! duplicate_validation) {
     // suppressed validated candidate (duplicate or DONTCARVE)--still cover the blocks
     filemirror_update_blockmap(scalpel_state.filemirror, candidate->b);
+  }
+
+  // A write-once reservation may suppress publication after the snapshot was
+  // prepared. Only the writer owns clones that were actually submitted.
+  if (dont_carve && cloneb) {
+    free_blockvector(&cloneb);
   }
 
   // A destructive write ends this thread's work regardless of flavor. Preserved
